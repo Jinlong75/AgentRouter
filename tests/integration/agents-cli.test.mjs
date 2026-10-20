@@ -79,6 +79,15 @@ test('secrets：status 只报告 set / missing；set 的值只从标准输入读
 
 test('agents test：在临时仓库与临时公共目录里跑"只回复 OK"，不写入真实任务清单', async t => {
   const { home, call } = setup(t);
+  // 隔离系统临时目录：ar agents test 会建 ar-agent-test-*，与并行运行的超时用例（扫描整个系统临时目录找残留）互相看见会干扰它。
+  const originalTemp = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+  const tmp = path.join(home, 'tmp');
+  fs.mkdirSync(tmp);
+  Object.assign(process.env, { TEMP: tmp, TMP: tmp, TMPDIR: tmp });
+  // 精确还原：原来没有的变量删除，原来有的恢复原值（setup 的 t.after 会删掉整个 home，tmp 一并删除）。
+  t.after(() => { for (const [key, value] of Object.entries(originalTemp)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  // 核对隔离已生效：之后 agents test 建的 ar-agent-test-* 会落在本用例的隔离目录，不再进系统临时目录。
+  assert.equal(os.tmpdir(), tmp, '系统临时目录应指向本用例的隔离目录');
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'ok', profiles: {
     ok: { adapter: 'fake', label: '假执行者', events: [{ kind: 'say', text: 'OK' }, { kind: 'turn', usage: { input: 10, output: 2 } }], report: 'OK\n' },
     bad: { adapter: 'fake', label: '假执行者', events: [{ kind: 'error', text: '接口返回 401' }], report: '没有完成\n', exit: 3 },
