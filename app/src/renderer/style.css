@@ -38,7 +38,7 @@ button { font: inherit; color: inherit; }
 .btn:active { transform: scale(.98); }
 .btn.primary { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); }
 .btn.primary:hover { background: var(--brand-fill-hover); border-color: var(--brand-fill-hover); }
-/* 浅色主题琥珀底与窗口底对比只有 2.0:1，主按钮加 1px --brand 描边（VisualSpec 2） */
+/* 浅色主题琥珀底与窗口底对比只有 2.0:1，主按钮加 1px --brand 描边 */
 [data-theme="light"] .btn.primary, [data-theme="light"] .btn.primary:hover { border-color: var(--brand); }
 .btn.danger { background: transparent; border-color: color-mix(in srgb, var(--fail) 45%, var(--border)); color: var(--fail); }
 .btn.danger:hover { background: var(--fail-bg); }
@@ -379,7 +379,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 
 
 @font-face { font-family: 'AgentRouter Space Grotesk'; src: url('./fonts/SpaceGrotesk.ttf') format('truetype'); font-weight: 300 700; font-display: swap; }
-/* 字标（VisualSpec 1.2）：Space Grotesk 700，全大写，字距 0.12em；侧栏 18px 标记 + 13px，关于页 48px 标记 + 20px */
+/* 字标：Space Grotesk 700，全大写，字距 0.12em；侧栏 18px 标记 + 13px，关于页 48px 标记 + 20px */
 .wordmark { font-family: var(--font-brand); font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text); white-space: nowrap; }
 .tb-l .wordmark { font-size: 13px; line-height: 18px; }
 .about-brand { display: flex; align-items: center; gap: 22px; margin-bottom: 16px; }
@@ -430,11 +430,11 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 /* 托管入口沿用侧栏状态与设置分节尺寸。 */
 .nav-foot button{font:inherit;color:inherit;padding:0;min-height:0;gap:8px;width:100%;margin-top:8px}
 #managed-section{scroll-margin-top:64px}
-/* 列表行的执行者标签（VisualSpec 4.3）：2～3 个字母，等宽 10px，--chip 描边。选择器要比 .trow .tm span 更具体。 */
+/* 列表行的执行者标签：2～3 个字母，等宽 10px，--chip 描边。选择器要比 .trow .tm span 更具体。 */
 .trow .tm .xtag,.xtag{display:inline-block;margin-right:6px;padding:0 4px;border:1px solid var(--chip);border-radius:4px;font:10px/14px var(--font-mono);letter-spacing:.02em;color:var(--text-2);vertical-align:1px;}
 
 /* ---------- Stage03：侧栏分组、表单、模态框、Agent / 项目 / 新建任务 ---------- */
-/* 侧栏"配置"分组标题（VisualSpec 4.2） */
+/* 侧栏"配置"分组标题 */
 .nav-group { margin: 12px 0 2px; padding: 0 10px; height: 20px; display: flex; align-items: center; color: var(--text-3); font-size: 11px; }
 .nav-foot .mono { color: var(--text-3); font-size: 11.5px; }
 .trow.new { animation: flash var(--dur-flash) var(--ease-out); }

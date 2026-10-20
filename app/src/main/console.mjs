@@ -36,7 +36,7 @@ export function claudeLaunch({ dir, name, wt }) {
 
 export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null }) {
   const invalid = () => { throw new Error(messages.invalid); };
-  // 组装参数数组并调用核心，按约定整理结果（见 docs/specs/003）。
+  // 组装参数数组并调用核心，按约定整理结果。
   const run = async (args, { input, timeoutMs, cwd } = {}) => {
     let result;
     try { result = await coreRun(args, { input, timeoutMs, cwd }); }

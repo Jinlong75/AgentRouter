@@ -3,6 +3,12 @@ import { relative, resolve } from 'node:path';
 import { testAgent } from '../lib/compat.mjs';
 import { launcherFor as resolveFile, findOnPath } from '../lib/launcher.mjs';
 import { limitOutput } from '../lib/output.mjs';
+import { trace, traced } from '../lib/trace.mjs';
+
+// 追踪里子进程的结束状态：区分正常结束、被超时上限截断（ETIMEDOUT）与启动失败（只在 ar agents list 传入 tracePrefix 时使用）。
+const subprocessOutcome = r => r.error
+  ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : `error=${r.error.code ?? 'unknown'}`)
+  : r.signal ? `signal=${r.signal}` : `status=${r.status}`;
 
 const missing = '找不到 Codex CLI。确认 codex --version 能运行；非标准安装可在 config.json 的 profiles.codex.path 写 Codex 的绝对路径（或运行 ar config path=<路径>）。';
 const launcherFor = file => resolveFile(file, { missing,
@@ -66,11 +72,17 @@ export const codex = {
   writesReport: true,
   // 执行者环境是白名单（../lib/env.mjs）；Codex 还要读自己的配置目录与自定义接口地址（都不是密钥）。
   isolate: () => ({ keep: ['CODEX_HOME', 'OPENAI_BASE_URL'] }),
-  detect({ env = process.env, settings = {} } = {}) {
+  detect({ env = process.env, settings = {}, tracePrefix } = {}) {
     try {
-      const launcher = resolveLauncher(env, process.platform, settings.path);
-      const result = spawnSync(launcher.executable, [...launcher.args, '--version'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 10000 });
-      return { installed: !result.error && result.status === 0, version: result.status === 0 ? result.stdout.trim() || null : null, launcher };
+      const run = () => {
+        const launcher = resolveLauncher(env, process.platform, settings.path);
+        const result = spawnSync(launcher.executable, [...launcher.args, '--version'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 10000 });
+        return { launcher, r: result };
+      };
+      // tracePrefix 只有 ar agents list 会传；其他调用不增加追踪与开销。
+      const { launcher, r } = tracePrefix ? traced(`${tracePrefix} detect --version`, run) : run();
+      if (tracePrefix) trace(`${tracePrefix} detect --version 子进程 ${subprocessOutcome(r)}`);
+      return { installed: !r.error && r.status === 0, version: r.status === 0 ? r.stdout.trim() || null : null, launcher };
     } catch (error) { return { installed: false, version: null, error: error.message }; }
   },
   command({ root, report, prompt, settings, detection, env = process.env }) {
@@ -85,9 +97,12 @@ export const codex = {
   },
   mapLine,
   // 订阅登录（auth: login）的状态：codex login status 的输出（与软件 Agent 页同一判断）。
-  loginStatus({ env = process.env, detection } = {}) {
+  loginStatus({ env = process.env, detection, tracePrefix } = {}) {
     if (!detection?.launcher) return 'unknown';
-    const r = spawnSync(detection.launcher.executable, [...detection.launcher.args, 'login', 'status'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 10000, maxBuffer: 65536 });
+    const run = () => spawnSync(detection.launcher.executable, [...detection.launcher.args, 'login', 'status'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 10000, maxBuffer: 65536 });
+    // tracePrefix 只有 ar agents list 会传；其他调用不增加追踪与开销。
+    const r = tracePrefix ? traced(`${tracePrefix} login status`, run) : run();
+    if (tracePrefix) trace(`${tracePrefix} login status 子进程 ${subprocessOutcome(r)}`);
     if (r.error || r.signal) return 'unknown';
     const text = `${r.stdout || ''}\n${r.stderr || ''}`;
     if (r.status === 0 && /^Logged in\b/im.test(text)) return 'in';

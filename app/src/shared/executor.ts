@@ -7,7 +7,7 @@ export const executorAdapter = (t: Task) => t.adapter ?? t.agent ?? 'codex';
 export const executorLabel = (t: Task) => t.label ?? adapterNames[executorAdapter(t)] ?? t.profile ?? executorAdapter(t);
 export const isCodexTask = (t: Task) => executorAdapter(t) === 'codex';
 
-// 列表行的执行者标签（VisualSpec 4.3：2～3 个字母）：名字第一个词里的大写字母（如 "ExampleAgent" → EA），不足两个时取前两个字母。
+// 列表行的执行者标签（2～3 个字母）：名字第一个词里的大写字母（如 "ExampleAgent" → EA），不足两个时取前两个字母。
 export function executorTag(label: string) {
     const first = label.trim().split(/[\s（(·]/)[0] ?? '';
     const caps = first.replace(/[^A-Z]/g, '');

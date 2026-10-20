@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { main } from '../../core/lib/cli.mjs';
 import { loadPreset } from '../../core/lib/agents.mjs';
 
@@ -214,4 +216,75 @@ test('agents list --detect：给每项加 installed/version；不带 --detect �
   assert.equal(detected[0].installed, true); assert.equal(detected[0].version, 'fake-agent 1.0');
   const plain = (await call(['agents', 'list', '--json'])).json.agents;
   assert.ok(!('installed' in plain[0]) && !('version' in plain[0]), '不带 --detect 不加这两项');
+});
+
+// 028：AR_CORE_TRACE=1 时 agents list 按顺序记录各阶段；未开启时不产生标准错误，标准输出逐字节相同。
+// trace 模块在加载时读取环境变量，所以这里用子进程运行（与应用里的真实调用方式一致）。
+test('agents list 阶段追踪：开启时按顺序记录配置、detect、secretStatus、loginStatus，关闭时标准错误为空且输出相同', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ar agents 追踪 '));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  const home = path.join(base, 'home');
+  fs.mkdirSync(home);
+  // 一个已设置的密钥（值只放在子进程环境里）、一个必定缺失的密钥（Windows 上会查注册表）、一个 Codex 登录执行者。
+  const SECRET = 'sk-test-trace-028-0f7c';
+  const setKey = 'AR_TRACE_SET_KEY_028', missingKey = 'AR_TEST_SURELY_MISSING_KEY_028';
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'deepseek', profiles: {
+    deepseek: { ...loadPreset('deepseek').profile, secrets: { ANTHROPIC_AUTH_TOKEN: setKey } },
+    mimo: { ...loadPreset('mimo').profile, secrets: { ANTHROPIC_AUTH_TOKEN: missingKey } },
+    codex: loadPreset('codex').profile,
+  } }));
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (/^(AR_|CODEX_|ANTHROPIC_|CLAUDE)/i.test(key)) delete env[key];
+  Object.assign(env, {
+    AGENT_ROUTER_HOME: home,
+    AR_TEST_AGENT: fileURLToPath(new URL('../fixtures/fake-claude-code.mjs', import.meta.url)),
+    [setKey]: SECRET,
+  });
+  const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+  const run = tracing => spawnSync(process.execPath, [entry, 'agents', 'list', '--detect', '--json'], {
+    cwd: base, env: { ...env, ...(tracing ? { AR_CORE_TRACE: '1' } : {}) }, encoding: 'utf8', timeout: 30000, windowsHide: true, shell: false });
+  const traced = run(true), plain = run(false);
+  assert.equal(traced.status, 0, traced.stderr);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(plain.stderr, '', '未开启追踪时标准错误为空');
+  assert.equal(plain.stdout, traced.stdout, '开启追踪不改变标准输出');
+  assert.ok(!traced.stderr.includes(SECRET) && !traced.stdout.includes(SECRET), '追踪或输出里出现了密钥值');
+
+  const expected = [
+    'agents list 读配置 开始', 'agents list 读配置 结束',
+    'agents list 确定默认执行者 开始', 'agents list 确定默认执行者 结束',
+    'agents list 读测试结果 开始', 'agents list 读测试结果 结束',
+    'agents list deepseek claude-code detect --version 开始',
+    'agents list deepseek claude-code detect --version 结束',
+    'agents list deepseek claude-code detect --version 子进程 status=0',
+    'agents list deepseek secretStatus（1 个变量） 开始',
+    'agents list deepseek secretStatus（1 个变量） 结束',
+    'agents list mimo claude-code detect --version 开始',
+    'agents list mimo claude-code detect --version 结束',
+    'agents list mimo claude-code detect --version 子进程 status=0',
+    'agents list mimo secretStatus（1 个变量） 开始',
+  ];
+  // 缺失的密钥在 Windows 上会启动 reg.exe 查询：标出变量个数与子进程退出状态（注册表里没有这一项，退出码 1）。
+  if (process.platform === 'win32') {
+    const query = `agents list mimo claude-code secretStatus reg query ${missingKey}（1 个变量）`;
+    expected.push(`${query} 开始`, `${query} 结束`, `${query} 子进程 status=1`);
+  }
+  expected.push(
+    'agents list mimo secretStatus（1 个变量） 结束',
+    'agents list codex detect --version 开始',
+    'agents list codex detect --version 结束',
+    'agents list codex detect --version 子进程 status=0',
+    'agents list codex login status 开始',
+    'agents list codex login status 结束',
+    'agents list codex login status 子进程 status=0',
+    'agents list 结果写出前（3 项）',
+    '写出标准输出',
+    '命令结束 exit=0');
+  const lines = traced.stderr.split('\n');
+  let cursor = 0;
+  for (const label of expected) {
+    const at = lines.findIndex((line, i) => i >= cursor && line.includes(label));
+    assert.ok(at >= cursor, `追踪缺少或顺序不对：${label}\n实际追踪：\n${traced.stderr}`);
+    cursor = at + 1;
+  }
 });

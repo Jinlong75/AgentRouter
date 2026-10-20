@@ -191,7 +191,7 @@ export const nt = {
     text: '任务文字', textHelp: '直接交给执行者，不生成任务说明文件；适合一次性的小事',
     titleField: '标题', titleHelp: '会成为文件名：NNN-标题.md', goal: '目标', goalHelp: '做完后是什么样子', type: '类型', types: ['code', 'test', 'fix', 'research', 'docs'],
     allowed: '允许改动的文件', allowedHelp: '每行一个通配符；默认取项目配置，Stage04 起由门禁检查', verify: '验收命令', verifyHelp: '每行一条；默认取项目配置',
-    nonGoals: '不做什么', refs: '参照', refsHelp: '相关文件、已有实现、界面稿', refsPlaceholder: '例如：docs/design.md', questions: '汇报要回答的问题', questionsPlaceholder: '例如：哪些步骤你没法实际验证？',
+    nonGoals: '不做什么', refs: '参照', refsHelp: '相关文件、已有实现、界面稿', refsPlaceholder: '例如：docs/architecture.md', questions: '汇报要回答的问题', questionsPlaceholder: '例如：哪些步骤你没法实际验证？',
     required: (name: string) => `请填写${name}`,
     worker: '执行者', auto: (label: string) => `自动（默认：${label}）`, noWorker: '还没有可用的执行者，先到 Agent 页导入',
     commitSpec: '先提交任务说明', commitSpecHelp: '推荐：执行者从干净的基线开始，改动和说明分得清',

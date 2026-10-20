@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 export const sizes = [16,20,24,32,40,48,64,128,256];
-// ≤20px 用 mark-small 的图形（去掉中间短横、节点放大、线宽 2.6），底板与颜色和 app.svg 相同（VisualSpec 1.1）。
+// ≤20px 用 mark-small 的图形（去掉中间短横、节点放大、线宽 2.6），底板与颜色和 app.svg 相同。
 export function smallAppSvg(app, small) {
   const ink = app.match(/stroke="(#[0-9A-Fa-f]{6})"/)[1];
   const shapes = small.match(/<g transform="translate\(0 0\.25\)">([\s\S]*)<\/g>/)[1]

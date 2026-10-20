@@ -25,6 +25,12 @@ on:
         description: '环境诊断实验组：baseline / storsvc / compattel；留空不做'
         required: false
         default: ''
+      # H1 隔离实验（诊断用，只手动触发，不计入稳定性验收；工具见 tools/h1-sampler.mjs）：
+      # quiet = 单独跑安静条件采样；load = 界面验收期间带负载采样。留空不跑。
+      h1:
+        description: 'H1 实验：quiet / load；留空不跑'
+        required: false
+        default: ''
 jobs:
   windows:
     if: github.event_name != 'workflow_dispatch'
@@ -41,15 +47,32 @@ jobs:
       - run: npm ci
       - run: npm run lint:tree
       - run: npm run verify
-  # VisualSpec 6.7：界面验收（真实输入、每页通用检查、UI 基线）。验收窗口不显示，不需要桌面会话。
+  # H1 隔离实验的安静条件：只手动触发（workflow_dispatch 且 h1=quiet），不挂在 push / pull_request 上。
+  # 独立 Node 固定 24.21.0，与 Electron 43.7.5 内置的 Node 版本一致；不一致时采样器会在输出里醒目标出。
+  # 诊断用，不计入稳定性验收。
+  h1:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.h1 == 'quiet'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - run: npm ci
+      - run: node tools/h1-sampler.mjs --quiet
+  # 界面验收（真实输入、每页通用检查、UI 基线）。验收窗口不显示，不需要桌面会话。
   gui:
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.h1 != 'quiet'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          # 只有 H1 负载实验要用与 Electron 内置 Node 相同的版本（24.21.0），其余情况仍是 24。
+          node-version: ${{ github.event.inputs.h1 == 'load' && '24.21.0' || '24' }}
           cache: npm
       - run: npm ci
       # 字体缓存：MiSans 全量包（约 20 MB，hyperos.mi.com）在托管运行器上下载曾超时。键取 tools/fonts.mjs 的哈希
@@ -67,6 +90,22 @@ jobs:
         env:
           ENVTEST: ${{ github.event.inputs.envtest }}
         run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase before
+      # H1 负载条件（h1=load）：界面验收运行期间后台采样，并发度 1、每 5 秒一个样本。
+      # 带负载、诊断用，不计入稳定性验收。
+      - name: H1 负载实验：后台启动采样器（带负载、诊断用，不计入稳定性验收）
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.h1 == 'load'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'h1-load.jsonl'
+          $stop = Join-Path $env:RUNNER_TEMP 'h1-load.stop'
+          $log = Join-Path $env:RUNNER_TEMP 'h1-load.log'
+          $err = Join-Path $env:RUNNER_TEMP 'h1-load.err.log'
+          Remove-Item $out, $stop, $log, $err -ErrorAction SilentlyContinue
+          $samplerArgs = @('tools/h1-sampler.mjs', '--load', '--interval', '5000',
+            '--out', "`"$out`"", '--stop-file', "`"$stop`"")
+          $sampler = Start-Process -FilePath node -PassThru -NoNewWindow `
+            -ArgumentList $samplerArgs -RedirectStandardOutput $log -RedirectStandardError $err
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'h1-load.pid') -Value $sampler.Id -Encoding utf8
       - run: npm run shots
         env:
           AR_SHOTS_FOCUS: ${{ github.event.inputs.focus }}
@@ -78,6 +117,29 @@ jobs:
         env:
           ENVTEST: ${{ github.event.inputs.envtest }}
         run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase after
+      # H1 负载条件：界面验收结束后（即使失败）写停止文件，等采样器退出，再打印日志与汇总。
+      - name: H1 负载实验：停止采样并汇总（带负载、诊断用，不计入稳定性验收）
+        if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.h1 == 'load'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'h1-load.jsonl'
+          $stop = Join-Path $env:RUNNER_TEMP 'h1-load.stop'
+          $pidFile = Join-Path $env:RUNNER_TEMP 'h1-load.pid'
+          Set-Content -Path $stop -Value 'stop' -Encoding utf8
+          if (Test-Path $pidFile) {
+            $samplerId = [int](Get-Content $pidFile -Raw)
+            $sampler = Get-Process -Id $samplerId -ErrorAction SilentlyContinue
+            if ($sampler) { [void]$sampler.WaitForExit(120000) }
+          }
+          $log = Join-Path $env:RUNNER_TEMP 'h1-load.log'
+          if (Test-Path $log) { Get-Content $log }
+          $err = Join-Path $env:RUNNER_TEMP 'h1-load.err.log'
+          if (Test-Path $err) { Get-Content $err }
+          if (Test-Path $out) {
+            node tools/h1-sampler.mjs --summarize $out
+          } else {
+            Write-Output 'H1：没有采样输出（采样器未启动或提前退出）'
+          }
       - if: failure()
         uses: actions/upload-artifact@v4
         with:

@@ -67,7 +67,7 @@ function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="word
 let navHtml = '';
 function nav() {
     const runningTasks = state.tasks.filter(t => t.status === 'run'), running = runningTasks.length, box = root.querySelector('.nav')!;
-    // 状态行第一行按执行者显示名统计正在运行的任务（VisualSpec 4.2）；没有任务时保留原来的说明。
+    // 状态行第一行按执行者显示名统计正在运行的任务；没有任务时保留原来的说明。
     const groups = new Map<string, number>();
     for (const t of runningTasks) {
         const label = executorLabel(t);

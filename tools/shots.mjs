@@ -34,50 +34,75 @@ try {
     // 进程不在时再核对 PID 现在是谁（是否被复用）并附等待者日志尾部。只打印，不改判断、不加等待。
     const rowsOf=async id=>{const text=await readFile(path.join(fixture.home,'runs.jsonl'),'utf8');return text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(l=>{try{return JSON.parse(l);}catch{return null;}}).filter(r=>r&&r.id===id);};
     // 中文输出不依赖控制台代码页：命令里先把输出编码固定为 UTF-8，Node 再按 UTF-8 读。
-    const who=pid=>{if(process.platform!=='win32')return '（非 Windows，不查）';try{return execFileSync('powershell.exe',['-NoProfile','-Command',`[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}"; if($p){"$($p.Name) 创建于 $($p.CreationDate.ToUniversalTime().ToString('o'))"}else{'不存在'}`],{encoding:'utf8',windowsHide:true,timeout:30000}).trim();}catch(e){return `查询失败（${e.code??e.message}）`;}};
-    for(const item of pending) {
-      const t0=item.readyAt,rel=at=>Number.isFinite(at)?`+${at-t0}ms`:'—';
-      const events=(await rowsOf(item.id)).map(r=>`${r.event}${r.exit!==undefined?' exit='+r.exit:''} ${rel(r.at??r.started)}`).join('、')||'（没有记录）';
-      const ex=alive(item.executor),ag=alive(item.agent);
-      console.log(`退出后实测时间线（${item.label}，就绪 ${new Date(t0).toISOString()}）：写出待查 ${rel(item.pendingAt)}，Electron 退出 ${rel(appExitAt)}，检查 ${rel(Date.now())}；记录事件 ${events}；执行者 ${item.executor} ${ex?'存活':'不在'}，假 agent ${item.agent} ${ag?'存活':'不在'}`);
-      if(!ex||!ag) {
-        const before=pid=>{const p=(item.processes??[]).find(x=>x.pid===pid);return p?`${p.name} 创建于 ${new Date(p.created).toISOString()}`:'（就绪时没查到）';};
-        const log=await readFile(path.join(fixture.home,item.waiterLog),'utf8').then(t=>t.trimEnd().split(/\r?\n/).slice(-5).join(' | '),()=>'（读不到）');
-        console.log(`退出后实测进程核对（${item.label}）：执行者 ${item.executor} 就绪时 ${before(item.executor)}，现在 ${who(item.executor)}；假 agent ${item.agent} 就绪时 ${before(item.agent)}，现在 ${who(item.agent)}；等待者日志尾部 ${log}`);
+    // 024：进程身份（名字 + 创建时间）——PID 可能被复用，退出后要与就绪时记下的一致才算"同一个进程"。
+    // 用与软件进程查询（app/src/main/platform.ts）相同的 API 和毫秒单位，便于直接比较。
+    const identity=pid=>{if(process.platform!=='win32')return null;const text=execFileSync('powershell.exe',['-NoProfile','-Command',`[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}";if($p){@{name=$p.Name;created=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress}`],{encoding:'utf8',windowsHide:true,timeout:30000}).trim();return text?JSON.parse(text):null;};
+    const describe=p=>p?`${p.name} 创建于 ${new Date(p.created).toISOString()}`:'（查不到）';
+    const who=pid=>{if(process.platform!=='win32')return '（非 Windows，不查）';try{const p=identity(pid);return p?describe(p):'不存在';}catch(e){return `查询失败（${e.code??e.message}）`;}};
+    // 就绪时记下的身份与现在的身份比对；查不到或对不上都按"不是同一个进程"处理（断言失败）。
+    const sameProcess=(item,pid)=>{const before=(item.processes??[]).find(x=>x.pid===pid);if(!before)return {same:false,before:null,now:null};try{const now=identity(pid);return {same:!!now&&now.name===before.name&&now.created===before.created,before,now};}catch{return {same:false,before,now:null};}};
+    // 失败时也要等进程退出（放行后它们会在正常清理里结束）；与成功路径共用。
+    const waitExit=async()=>{for(const item of pending) for(const [kind,pid] of [['执行者',item.executor],['假 agent',item.agent]]) {
+      let waited=0;
+      while(alive(pid)&&waited<20000) { await delay(100);waited+=100; }
+      if(alive(pid)) console.log(`注意：${item.label}的${kind}（pid=${pid}）在重置前仍未退出`);
+    }};
+    let failure=null;
+    try {
+      for(const item of pending) {
+        const t0=item.readyAt,rel=at=>Number.isFinite(at)?`+${at-t0}ms`:'—';
+        const events=(await rowsOf(item.id)).map(r=>`${r.event}${r.exit!==undefined?' exit='+r.exit:''} ${rel(r.at??r.started)}`).join('、')||'（没有记录）';
+        const ex=alive(item.executor),ag=alive(item.agent);
+        console.log(`退出后实测时间线（${item.label}，就绪 ${new Date(t0).toISOString()}）：写出待查 ${rel(item.pendingAt)}，Electron 退出 ${rel(appExitAt)}，检查 ${rel(Date.now())}；记录事件 ${events}；执行者 ${item.executor} ${ex?'存活':'不在'}，假 agent ${item.agent} ${ag?'存活':'不在'}`);
+        if(!ex||!ag) {
+          const before=pid=>{const p=(item.processes??[]).find(x=>x.pid===pid);return p?`${p.name} 创建于 ${new Date(p.created).toISOString()}`:'（就绪时没查到）';};
+          const log=await readFile(path.join(fixture.home,item.waiterLog),'utf8').then(t=>t.trimEnd().split(/\r?\n/).slice(-5).join(' | '),()=>'（读不到）');
+          console.log(`退出后实测进程核对（${item.label}）：执行者 ${item.executor} 就绪时 ${before(item.executor)}，现在 ${who(item.executor)}；假 agent ${item.agent} 就绪时 ${before(item.agent)}，现在 ${who(item.agent)}；等待者日志尾部 ${log}`);
+        }
+        assert.equal(alive(item.executor),true,`真实 Electron 退出后${item.label}的执行者仍存活`);
+        assert.equal(alive(item.agent),true,`真实 Electron 退出后${item.label}的假 agent 仍存活`);
+        // 024：仍是就绪时的同一个进程（PID 存活且创建时间一致）。托管与脱离两项都查；查不到或对不上都按"不是同一个进程"让断言失败。
+        for(const [kind,pid] of [['执行者',item.executor],['假 agent',item.agent]]) {
+          if(process.platform!=='win32') { console.log(`退出后实测进程身份（${item.label}的${kind}）：非 Windows，不查创建时间`);continue; }
+          const same=sameProcess(item,pid);
+          console.log(`退出后实测进程身份（${item.label}的${kind}）：${same.same?'与就绪时是同一个进程':'不是同一个进程'}；就绪时 ${describe(same.before)}，现在 ${describe(same.now)}`);
+          assert.equal(same.same,true,`真实 Electron 退出后${item.label}的${kind}仍是就绪时的同一个进程`);
+        }
+        // 托管与脱离任务的假 agent 都等到这里才被放行：上面的存活与身份断言之后、等 end 之前写出放行文件（顺序与上限都不变）。
+        if(item.release) { await writeFile(item.release,'1'); console.log(`退出后实测：已放行${item.label}的假 agent`); }
+        let end;
+        // 单调时钟真实截止（原来按 150 次 × 100 ms 轮询计）：上限 15 秒。
+        for(const until=performance.now()+15000;performance.now()<until;) {
+          const text=await readFile(path.join(fixture.home,'runs.jsonl'),'utf8');
+          const rows=text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(JSON.parse);
+          end=rows.find(r=>r.id===item.id&&r.event==='end');
+          if(end) { assert.equal(rows.filter(r=>r.id===item.id&&r.event==='start').length,1,`${item.label}的 start 应该只有一条`);break; }
+          await delay(100);
+        }
+        assert.equal(end?.exit,0,`真实软件退出后${item.label}正常结束`);
+        let waiterFinished=false;
+        // 上限 2.5 秒（原来按 50 次 × 50 ms 轮询计）。
+        for(const until=performance.now()+2500;!waiterFinished;) {
+          const output=await readFile(path.join(fixture.home,item.waiterLog),'utf8');
+          if(output.includes('exit=0 report=')&&performance.now()<=until) { waiterFinished=true;break; }
+          assert.ok(performance.now()<until,`${item.label}的等待者没有正常打印结束行`);await delay(50);
+        }
+        results.push({label:item.label,id:item.id,executorAliveAfterAppExit:true,agentAliveAfterAppExit:true,taskExit:end.exit,waiterFinished});
+        console.log(`Windows 实测：真实 Electron 退出后，${item.label}的执行者与假 agent 仍存活，任务 end.exit=0，等待者正常结束。`);
       }
-      assert.equal(alive(item.executor),true,`真实 Electron 退出后${item.label}的执行者仍存活`);
-      assert.equal(alive(item.agent),true,`真实 Electron 退出后${item.label}的假 agent 仍存活`);
-      // 托管任务的假 agent 等到这里才被放行：上面的存活断言之后、等 end 之前写出放行文件（顺序与上限都不变）。
-      if(item.release) { await writeFile(item.release,'1'); console.log(`退出后实测：已放行${item.label}的假 agent`); }
-      let end;
-      // 单调时钟真实截止（原来按 150 次 × 100 ms 轮询计）：上限 15 秒。
-      for(const until=performance.now()+15000;performance.now()<until;) {
-        const text=await readFile(path.join(fixture.home,'runs.jsonl'),'utf8');
-        const rows=text.slice(0,text.lastIndexOf('\n')).split('\n').filter(Boolean).map(JSON.parse);
-        end=rows.find(r=>r.id===item.id&&r.event==='end');
-        if(end) { assert.equal(rows.filter(r=>r.id===item.id&&r.event==='start').length,1,`${item.label}的 start 应该只有一条`);break; }
-        await delay(100);
-      }
-      assert.equal(end?.exit,0,`真实软件退出后${item.label}正常结束`);
-      let waiterFinished=false;
-      // 上限 2.5 秒（原来按 50 次 × 50 ms 轮询计）。
-      for(const until=performance.now()+2500;!waiterFinished;) {
-        const output=await readFile(path.join(fixture.home,item.waiterLog),'utf8');
-        if(output.includes('exit=0 report=')&&performance.now()<=until) { waiterFinished=true;break; }
-        assert.ok(performance.now()<until,`${item.label}的等待者没有正常打印结束行`);await delay(50);
-      }
-      results.push({label:item.label,id:item.id,executorAliveAfterAppExit:true,agentAliveAfterAppExit:true,taskExit:end.exit,waiterFinished});
-      console.log(`Windows 实测：真实 Electron 退出后，${item.label}的执行者与假 agent 仍存活，任务 end.exit=0，等待者正常结束。`);
+    } catch(error) { failure=error; }
+    finally {
+      // 024：无论检查通过还是失败，都放行所有项的假 agent，失败时不能留下一直在等放行的进程
+      //（它们最多等到 releaseTimeoutMs 就会以非 0 退出，正常清理应当在这之前放行）。
+      for(const item of pending) if(item.release) await writeFile(item.release,'1').catch(error=>console.log(`注意：放行${item.label}的假 agent 失败：${error.message}`));
     }
+    // 失败时也等它们退出（放行后会在正常清理里结束），再把原来的断言错误抛出去。
+    if(failure) { await waitExit();throw failure; }
     await writeFile(path.join(out,'managed-exit.json'),JSON.stringify({platform:process.platform,appExit:0,tasks:results},null,2));
     await unlink(path.join(out,'exit-pending.json'));
     // 重置前等这些进程真的退出：它们的工作目录与打开的文件都在公共目录里，Windows 上会挡住删除。
     // 不这样等，重置验收就会去删一个"任务已经结束但进程还在收尾"的目录，和用户实际能点重置的时机不一致。
-    for(const item of pending) for(const [kind,pid] of [['执行者',item.executor],['假 agent',item.agent]]) {
-      let waited=0;
-      while(alive(pid)&&waited<20000) { await delay(100);waited+=100; }
-      if(alive(pid)) console.log(`注意：${item.label}的${kind}（pid=${pid}）在重置前仍未退出`);
-    }
+    await waitExit();
 
     // 第二轮（012 B）：在隔离公共目录上真实重置一次。第一轮会改写配置、切换技能版本，所以这里重新准备一份
     // 带密钥来源的配置与测试密钥文件；重置的密钥来自测试文件，绝不会碰本机真实的用户环境变量。

@@ -16,6 +16,22 @@
 
 Stage07 加 `generic`。启动器解析（npm `.cmd` 包装 → Node 入口、PATH 查找）在 `../lib/launcher.mjs`，所有适配器共用。
 
+## fake
+
+只用于测试与演示，不访问任何真实 Agent。profile 字段都可选：
+
+| 字段 | 说明 |
+|---|---|
+| `events` | 回放的统一事件数组，默认一条"假执行者已完成。" |
+| `report` | 写进汇报文件的正文，默认 `OK\n` |
+| `exit` | 结束时的退出码，默认 0 |
+| `delayMs` | 每条事件之间的间隔，默认 0 |
+| `version` | `detect` 报出的版本 |
+| `releaseFile` | 只用于测试与演示：设置后回放完全部事件先等这个文件出现（短间隔轮询），再写汇报、按 `exit` 结束；用于"软件退出后任务仍在运行"这类检查 |
+| `releaseTimeoutMs` | 等 `releaseFile` 的上限（毫秒，正整数，默认 120000）；超时往 stderr 写一行说明、以非 0 退出且不写汇报，不会无限挂着 |
+
+`releaseFile` / `releaseTimeoutMs` 随执行者快照带给托管与脱离派发的执行者进程（见 `snapshotKeys`）；没有设置 `releaseFile` 时行为与之前一致。
+
 ## 接口
 
 | 成员 | 约定 |
@@ -37,7 +53,7 @@ Stage07 加 `generic`。启动器解析（npm `.cmd` 包装 → Node 入口、PA
 
 `root`、`report` 是绝对路径。`settings` 包含 `model/effort/tier/sandbox/path/watchWindow`；`profile` 是配置里该执行者的整段设置。模型、强度、档位为 `null` 时不得拼入参数。stdout 会同时存入 `raw.log`，JSON 对象补 `_at`；stderr 原文写入；非 0 退出时末尾几行另作 `error` 事件。后台运行（非交互）且退出码非 0 时，所有 `error` 事件在 `exit=` 行之前逐条打印为"出错：…"，托管时由等待者从事件文件读出后打印。命令退出等待 `close`，确保所有输出读取完毕后才写 `end`。
 
-统一事件以文件协议为准（完整格式见开发文档 `docs/protocol.md`，开发完成后公开）。`say/think` 保留完整换行；命令 `start/end` 用同一个 `id`；命令结果按前 200 行且最多 16384 字节截断；文件路径相对 `root`，使用 `/` 分隔。`progress.log` 只调用公共 `formatProgress`，不能再解析原始事件。
+统一事件的格式以核心实现（`core/lib/` 与本目录各适配器的 `mapLine`）为准。`say/think` 保留完整换行；命令 `start/end` 用同一个 `id`；命令结果按前 200 行且最多 16384 字节截断；文件路径相对 `root`，使用 `/` 分隔。`progress.log` 只调用公共 `formatProgress`，不能再解析原始事件。
 
 ## 最小模板
 

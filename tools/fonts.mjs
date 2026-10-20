@@ -86,7 +86,7 @@ export async function prepareFont() {
   await writeFile(fontFile, bytes);
   console.log(JSON.stringify({ source: String(url), version: '4.003', sha256: fontHash, bytes: bytes.length }));
 }
-// 字标字体 Space Grotesk（SIL OFL 1.1，VisualSpec 3）：从 Google Fonts 官方仓库的固定提交下载，核对 SHA-256；仓库里不放字体文件。
+// 字标字体 Space Grotesk（SIL OFL 1.1）：从 Google Fonts 官方仓库的固定提交下载，核对 SHA-256；仓库里不放字体文件。
 export const brandFontFile = 'build/fonts/SpaceGrotesk.ttf';
 export const brandFontHash = 'acad6de1fc93436f5c0f1f4137751ef04f1aea3063e7036535970ffcfbd79f72';
 export const brandFontSource = 'https://raw.githubusercontent.com/google/fonts/00a38a53f92aef923b9353f40128e8f4552ddae4/ofl/spacegrotesk/SpaceGrotesk%5Bwght%5D.ttf';

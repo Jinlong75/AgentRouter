@@ -65,17 +65,33 @@ for (const [f, s] of corpus) {
   if (line >= 0) report('R5 隐私路径', f, `第 ${line + 1} 行`);
 }
 
-// R6 禁用词（已删除功能的残留）；方案与交接文档可以提及
-// VisualSpec 1.3：不再出现 DispatchDock 的回环标记配色（克莱因蓝）与旧字体别名。
+// R6 禁用词（已删除功能的残留）；开发仓库里的方案与交接文档可以提及。
+// 不再出现 DispatchDock 的回环标记配色（克莱因蓝）与旧字体别名。
 const banned = [/devin/i, /docs\/internal\.md/, /现有的查看器/, /export-public/, /DispatchDock MiSans/, /#002FA7/i, /#6684FF/i];
-const bannedAllowed = f => /^docs\/plan\//.test(f) || f === 'CHECKPOINT.md' || f === 'tools/lint-tree.mjs';
+// 内部文件的放行规则放在私有配置（不导出），由开发仓库自己维护；公开快照里没有这个文件，放行项为空
+// （这些内部文件本来也不在快照里，检查结果不变）。格式：
+// { "bannedAllowed": { "prefixes": ["目录/"], "files": ["文件"] },
+//   "renamedAllowed": { "prefixes": ["目录/"], "files": ["文件"] } }
+// 每一项按"完整文件名相等"或"路径前缀"匹配，不支持通配。
+const internalAllowed = (() => {
+  const file = path.join(root, '.agent-router/lint-internal.json');
+  if (!existsSync(file)) return {};
+  const data = JSON.parse(readFileSync(file, 'utf8'));
+  const normalize = rule => ({
+    prefixes: Array.isArray(rule?.prefixes) ? rule.prefixes.map(String) : [],
+    files: Array.isArray(rule?.files) ? rule.files.map(String) : [],
+  });
+  return { bannedAllowed: normalize(data?.bannedAllowed), renamedAllowed: normalize(data?.renamedAllowed) };
+})();
+const allowedIn = (rule, f) => !!rule && (rule.files.includes(f) || rule.prefixes.some(prefix => f.startsWith(prefix)));
+const bannedAllowed = f => allowedIn(internalAllowed.bannedAllowed, f) || f === 'tools/lint-tree.mjs';
 for (const [f, s] of corpus) {
   if (bannedAllowed(f)) continue;
   for (const r of banned) if (r.test(s)) report('R6 禁用词', f, String(r));
 }
-// Stage01 改名后的旧名称：只允许出现在兼容层、协议文档（兼容附录）、测试（兼容用例）、.gitignore 与方案/交接文档。
+// Stage01 改名后的旧名称：只允许出现在兼容层、测试（兼容用例）、.gitignore，以及开发仓库内部文档（由私有配置放行）。
 const renamed = [/codex-task/, /CODEX_DISPATCH_HOME/, /\.codex-runs/];
-const renamedAllowed = f => bannedAllowed(f) || /^core\/lib\/compat\.(mjs|d\.mts)$/.test(f) || f === 'docs/protocol.md' || /^tests\//.test(f) || f === '.gitignore';
+const renamedAllowed = f => bannedAllowed(f) || /^core\/lib\/compat\.(mjs|d\.mts)$/.test(f) || allowedIn(internalAllowed.renamedAllowed, f) || /^tests\//.test(f) || f === '.gitignore';
 for (const [f, s] of corpus) {
   if (renamedAllowed(f)) continue;
   for (const r of renamed) if (r.test(s)) report('R6 旧名称', f, String(r));

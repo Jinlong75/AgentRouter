@@ -5,6 +5,13 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { trace, traced } from './trace.mjs';
+
+// 追踪里子进程的结束状态：区分正常结束、被超时上限截断（ETIMEDOUT）与启动失败（只在 ar agents list 传入 tracePrefix 时使用）。
+const subprocessOutcome = r => !r
+  ? 'status=unknown'
+  : r.error ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : `error=${r.error.code ?? 'unknown'}`)
+    : r.signal ? `signal=${r.signal}` : `status=${r.status}`;
 
 const validName = name => typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 const checkName = name => { if (!validName(name)) throw Error(`变量名无效：${String(name).slice(0, 64)}`); };
@@ -61,12 +68,16 @@ export function lookup(env, name, platform = process.platform) {
 const runReg = name => spawnSync('reg.exe', ['query', 'HKCU\\Environment', '/v', name], { encoding: 'utf8', windowsHide: true, shell: false, timeout: 5000 });
 
 // 读 Windows 用户环境变量；不是 Windows、没有这个变量或读失败都返回 undefined。
-export function queryUserEnv(name, { platform = process.platform, env = process.env, run = runReg } = {}) {
+// tracePrefix：ar agents list 的阶段追踪前缀（每次查询只查一个变量，标签里标出个数；不含变量值）。
+export function queryUserEnv(name, { platform = process.platform, env = process.env, run = runReg, tracePrefix } = {}) {
   checkName(name);
-  // 隔离模式：只读测试密钥文件，不碰注册表。
+  // 隔离模式：只读测试密钥文件，不碰注册表（没有子进程，不记追踪）。
   if (env.AR_TEST_SECRETS_FILE) return readTestSecret(env.AR_TEST_SECRETS_FILE, name, platform);
   if (platform !== 'win32') return undefined;
-  const r = run(name);
+  const label = tracePrefix ? `${tracePrefix} secretStatus reg query ${name}（1 个变量）` : null;
+  // 其他命令不传 tracePrefix，行为与原来一致。
+  const r = label ? traced(label, () => run(name)) : run(name);
+  if (label) trace(`${label} 子进程 ${subprocessOutcome(r)}`);
   if (!r || r.status !== 0 || typeof r.stdout !== 'string') return undefined;
   const m = r.stdout.match(new RegExp(`^\\s*${name}\\s+(REG_SZ|REG_EXPAND_SZ)\\s+(.*?)\\s*$`, 'mi'));
   if (!m) return undefined;
@@ -74,7 +85,7 @@ export function queryUserEnv(name, { platform = process.platform, env = process.
   return m[2].replace(/%([^%]+)%/g, (all, v) => lookup(env, v, platform) ?? all);
 }
 
-export function resolveSecret(name, { env = process.env, platform = process.platform, query = n => queryUserEnv(n, { platform, env }) } = {}) {
+export function resolveSecret(name, { env = process.env, platform = process.platform, tracePrefix, query = n => queryUserEnv(n, { platform, env, tracePrefix }) } = {}) {
   checkName(name);
   const value = (lookup(env, name, platform) || query(name) || '').trim();
   if (!value) throw Error(`未设置密钥 ${name}：在软件的 Agent 页设置，或设置 Windows 用户环境变量 ${name}`);

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 
 // 有外部副作用的系统调用：打开文件/文件夹/链接、写剪贴板、系统通知。
 // 正常运行时直接调用系统；界面验收（npm run shots）时换成只记录参数的桩：
-// 证明按钮真的触发了调用，又不在用户桌面上打开资源管理器、改写剪贴板或弹出通知（VisualSpec 6.3、UI18 同一做法）。
+// 证明按钮真的触发了调用，又不在用户桌面上打开资源管理器、改写剪贴板或弹出通知（与 UI18 同一做法）。
 export interface Notice { title: string; body: string; click: () => void }
 // 验收桩里的托盘：不创建真实图标（不在用户任务栏里多一个图标），只记录状态供检查。
 export interface StubTray {

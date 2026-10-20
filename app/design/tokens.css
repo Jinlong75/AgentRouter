@@ -1,6 +1,6 @@
-/* AgentRouter 设计令牌（主导维护；数值以 docs/plan/VisualSpec.md 第 2 节为准）
+/* AgentRouter 设计令牌（主导维护；颜色取值与最低对比度见 tests/fixtures/visualspec-colors.json，由令牌测试逐项核对）
  * 主题由应用在 <html data-theme="dark|light"> 上设置，默认跟随系统。
- * 视觉方向（VisualSpec V3"控制台"）：深色优先、冷灰中性色、等宽数据、少粗体。
+ * 视觉方向（"控制台"风格）：深色优先、冷灰中性色、等宽数据、少粗体。
  * 品牌色琥珀（V4）只用于：品牌标记、主操作按钮、键盘焦点环、"待验收"（轮到人做决定）。
  * 原"琥珀 = 中断/警告"语义取消（V5）：中断用 --stale，TODO/推断清单与注意用 --brand-soft，环境变量覆盖说明用 --run。
  * 应用图标的颜色写在 icons/app.svg 里，不随主题变。
@@ -96,7 +96,7 @@
   --todo: #3A3F46;
   --track: #2A2E34;
 
-  /* 辅助层（VisualSpec 未单列，由上面的底色推得） */
+  /* 辅助层（颜色表未单列，由上面的底色推得） */
   --scrim: rgba(0, 0, 0, 0.55);
   --material: rgba(13, 14, 16, 0.72);
   --material-edge: rgba(255, 255, 255, 0.06);
@@ -135,7 +135,7 @@
   --todo: #C9CBD0;
   --track: #DCDDE0;
 
-  /* 辅助层（VisualSpec 未单列，由上面的底色推得） */
+  /* 辅助层（颜色表未单列，由上面的底色推得） */
   --scrim: rgba(20, 21, 24, 0.30);
   --material: rgba(252, 252, 251, 0.74);
   --material-edge: rgba(0, 0, 0, 0.07);

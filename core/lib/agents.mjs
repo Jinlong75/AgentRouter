@@ -11,6 +11,7 @@ import { secretStatus, setUserSecret } from './secrets.mjs';
 import { authOf } from './env.mjs';
 import { adapters } from '../adapters/index.mjs';
 import { killProcessTree } from './process.mjs';
+import { trace, traced } from './trace.mjs';
 
 const presetDir = fileURLToPath(new URL('../templates/agents/', import.meta.url));
 const validProfileName = name => typeof name === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(name);
@@ -58,23 +59,33 @@ function modelOf(adapter, profile) {
 }
 
 // 只读：不触发迁移写入；没有配置或配置损坏时显示内置默认。--detect 时才给每项补 installed / version。
-export function listAgents(home, { env = process.env, query, detect = false } = {}) {
-  const state = readConfig(home);
+// traceSteps：只有 ar agents list 打开阶段追踪（AR_CORE_TRACE=1 时才有输出）；其他调用者保持原样。
+export function listAgents(home, { env = process.env, query, detect = false, traceSteps = false } = {}) {
+  const step = (label, run) => traceSteps ? traced(label, run) : run();
+  const state = step('agents list 读配置', () => readConfig(home));
   const config = state.exists && !state.reason ? state.config : state.legacy?.config ?? builtinConfig();
   let selected = null;
-  try { selected = loadConfig(home, {}, {}).profileName; } catch { /* 没有可用执行者时不标默认。 */ }
-  const lastTests = readTestResults(home);
-  return Object.entries(config.profiles ?? {}).map(([name, p]) => {
+  try { selected = step('agents list 确定默认执行者', () => loadConfig(home, {}, {}).profileName); } catch { /* 没有可用执行者时不标默认。 */ }
+  const lastTests = step('agents list 读测试结果', () => readTestResults(home));
+  const rows = Object.entries(config.profiles ?? {}).map(([name, p]) => {
     const adapter = adapters[p.adapter], auth = authOf(p);
+    // 子进程步骤的追踪前缀：标签里有执行者名与适配器名（同名时只写一次）。
+    const tracePrefix = traceSteps ? `agents list ${name}${name === p.adapter ? '' : ` ${p.adapter}`}` : undefined;
+    // tracePrefix 只用于追踪标签，适配器忽略没有的字段；不改变 detect / loginStatus 的行为。
+    const detectOptions = { env, settings: p, profile: p, ...(tracePrefix ? { tracePrefix } : {}) };
     const row = { name, adapter: p.adapter, label: p.label ?? adapter?.label ?? p.adapter, enabled: p.enabled !== false, supported: !!adapter, default: name === selected, auth,
       model: modelOf(adapter, p), lastTest: lastTests[name] ?? null };
-    const detection = detect && adapter?.detect ? adapter.detect({ env, settings: p, profile: p }) : null;
+    const detection = detect && adapter?.detect ? adapter.detect(detectOptions) : null;
+    const secretNames = Object.values(p.secrets ?? {});
     // token：各个密钥变量是否已设置（只有 set / missing）；login：适配器能检测时显示是否已登录。
-    row.secrets = auth === 'token' ? secretStatus(Object.values(p.secrets ?? {}), { env, ...(query ? { query } : {}) }) : {};
-    row.login = auth === 'login' && adapter?.loginStatus ? adapter.loginStatus({ env, detection: detection ?? adapter.detect({ env, settings: p, profile: p }) }) : null;
+    row.secrets = auth === 'token' ? step(`agents list ${name} secretStatus（${secretNames.length} 个变量）`,
+      () => secretStatus(secretNames, { env, ...(query ? { query } : {}), ...(tracePrefix ? { tracePrefix } : {}) })) : {};
+    row.login = auth === 'login' && adapter?.loginStatus ? adapter.loginStatus({ env, detection: detection ?? adapter.detect(detectOptions), ...(tracePrefix ? { tracePrefix } : {}) }) : null;
     if (detect) { row.installed = detection?.installed ?? false; row.version = detection?.version ?? null; }
     return row;
   });
+  if (traceSteps) trace(`agents list 结果写出前（${rows.length} 项）`);
+  return rows;
 }
 
 // D2（修订）：Codex 不当默认执行者。加入别的执行者时，如果当前默认是 Codex 或没有默认，就改用新加入的。
@@ -295,7 +306,7 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath 
     case 'list': {
       const detect = args.includes('--detect');
       if (args.length !== (detect ? 1 : 0)) throw new Error(`用法：${usageAgents}`);
-      const agents = listAgents(home, { env, detect });
+      const agents = listAgents(home, { env, detect, traceSteps: true });
       return { result: { ok: true, agents }, text: formatList(agents) };
     }
     case 'presets': {

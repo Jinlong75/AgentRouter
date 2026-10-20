@@ -2,9 +2,9 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：开发中（v0.3.0）。本仓库只包含运行、构建与测试所需的文件；设计文档与开发过程文件在开发完成后公开。
+> 状态：开发中（v0.3.0）。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: in development (v0.3.0). This repository contains only the files needed to run, build and test the project; design documents and development records will be published when development is complete.
+> Status: in development (v0.3.0). This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 

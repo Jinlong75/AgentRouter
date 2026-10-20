@@ -26,7 +26,7 @@ import { reportRich } from '../../../tools/demo/data.mjs';
 const appEnv = appEnvironment(process.env);
 
 /*
- * 界面功能基线（VisualSpec 6.5）与检查的对应；每条检查的标签以编号开头，CHECKPOINT 直接引用：
+ * 界面功能基线与检查的对应；每条检查的标签以编号开头，交接记录直接引用：
  * UI01 侧栏导航到每个已交付页面，当前页高亮，键盘可切换 ——「UI01 …」（本文件）
  * UI02 任务列表：分组、筛选、项目下拉 ——「UI02 …」（本文件）
  * UI03 选中任务显示详情；标签切换；时间线跟随最新进展 ——「UI03 …」（本文件）
@@ -47,7 +47,7 @@ const appEnv = appEnvironment(process.env);
  * UI19 关闭询问与托盘（012 A）：点 × 的三种行为、记住选择、"窗口"设置、托盘状态与提示 ——「UI19 …」（本文件）
  * UI20 设置页"数据"一节（012 B）：清除缓存、重置确认框；真正的重置在隔离目录的第二次启动里执行 ——「UI20 …」（本文件、tools/shots.mjs）
  * UI21 进程查询失败（W4）：注入失败后横幅、"状态未知"、停止 / 隐藏 / 批量删除禁用且主进程拒绝、不推断结束；恢复后横幅消失、操作恢复 ——「UI21 …」（本文件）
- * 「通用 …」是 VisualSpec 6.4 的每页通用检查、真实输入自测与环境检查。
+ * 「通用 …」是每页通用检查、真实输入自测与环境检查。
  * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
  */
 // 运行期对照探针（AR_SHOTS_PROBE=1，见 shots-probe.ts）：默认不开；开了就在整个验收期间运行，失败退出前也打印汇总。
@@ -586,10 +586,10 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // UI17 再派一次沿用新建任务页留下的临时仓库与假执行者配置。
     await captureRedispatch(h, saveNow, pressNow, registry, win);
 
-    // 每页通用检查（VisualSpec 6.4）与 UI11：深浅两主题 × 1160×720 / 960×600。
+    // 每页通用检查与 UI11：深浅两主题 × 1160×720 / 960×600。
     await audit('任务页', async () => { await press('[data-page=tasks]'); await press('[data-task=t3]'); });
     // 项目页加载：从点侧栏"项目"之前算起（含点击后固定 300 ms），到列表行与详情标题都出现；上限 10 秒，即原验收标准（默认等待上限）。
-    // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复（见 CHECKPOINT）；用时按单调时钟计。
+    // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复；用时按单调时钟计。
     // 每次都打印这段时间里的核心调用与核心进程各阶段，慢的那次能看出卡在哪个调用、哪个进程的哪一步。
     await audit('项目页', async () => { const started = clock(), ipcFrom = ipcSeq(), coreFrom = coreSeq(); await press('[data-page=projects]'); await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '项目页列表与详情'); console.log(`项目页加载用时：${Math.round(clock() - started)}ms；核心调用：${ipcReport(ipcFrom)}；核心进程：${coreReport(coreFrom)}`); });
     await audit('Agent 页', async () => { await press('[data-page=connect]'); await wait('!!document.querySelector("[data-host-card]") && !document.querySelector("[data-pref=detect]").disabled'); });
@@ -667,23 +667,28 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     const exitTasks = [await prepareManagedExit(registry), await prepareRedispatchExit(h, registry)];
     const pendingAt = Date.now();
     await writeFile(path.join(out, 'exit-pending.json'), JSON.stringify(exitTasks.map(t => ({ ...t, pendingAt }))));
-    // 确定性专项验证（AR_SHOTS_EXPERIMENT=exit-delay；不是正式回归）：写出待查后再等 4 秒才退出，
-    // 验证托管任务（020 起假 agent 等放行才结束）在软件退出后仍存活；旧实现约 5 秒就自己结束，4 秒延迟足以让退出后实测失败。
-    // 原实验是 7000 ms；脱离任务的假执行者约 8 秒，7000 ms 会让它在退出前自然结束（同一机制，020 未改脱离任务），
-    // 退出后实测会改由脱离任务失败。4000 ms 既保留对托管任务旧实现的复现能力，也给脱离任务留出余量（主导确认）。
-    if ((process.env.AR_SHOTS_EXPERIMENT ?? '').split(',').includes('exit-delay')) { console.log('实验 exit-delay：写出待查后延迟 4000 ms 再退出'); await new Promise(resolve => setTimeout(resolve, 4000)); }
+    // 确定性专项验证（AR_SHOTS_EXPERIMENT=exit-delay；不是正式回归）：写出待查后延迟一段时间再退出，
+    // 验证托管任务与脱离任务（024 起两者的假执行者都等放行才结束）在软件退出后仍存活；旧实现约 5 / 8 秒就自己结束。
+    // 延迟默认 4000 ms，可用 AR_SHOTS_EXIT_DELAY_MS 指定（例如 9000 ms：超过脱离任务原来约 8 秒的寿命）。
+    if ((process.env.AR_SHOTS_EXPERIMENT ?? '').split(',').includes('exit-delay')) {
+        const exitDelayMs = Number(process.env.AR_SHOTS_EXIT_DELAY_MS) > 0 ? Number(process.env.AR_SHOTS_EXIT_DELAY_MS) : 4000;
+        console.log(`实验 exit-delay：写出待查后延迟 ${exitDelayMs} ms 再退出`);
+        await new Promise(resolve => setTimeout(resolve, exitDelayMs));
+    }
 }
 
 // 再派一次用的临时仓库由新建任务页准备；源任务与记录名固定，便于退出前再派一次。
 const redispatchRepo = () => path.join(appEnv.AGENT_ROUTER_HOME!, 'shots-newtask', 'sample');
 const REDISPATCH_SOURCE = 'redispatch-source';
 // 假执行者配置：delayMs 是每条事件的间隔，也是任务持续时间的来源。
-function redispatchConfig(delayMs: number) {
+// releaseFile（只用于退出前再派一次的检查）让假执行者回放完事件后等放行文件，不会在软件退出前自己结束。
+function redispatchConfig(delayMs: number, releaseFile?: string) {
     return {
         v: 2, defaultProfile: 'fake', managed: false, watchWindow: 'never', profiles: {
             fake: {
                 adapter: 'fake', label: '假执行者', enabled: true, events: [{ kind: 'say', text: '再派一次：假执行者正在运行。' }],
                 report: '再派一次完成\n', exit: 0, delayMs, version: 'fake-agent 1.0',
+                ...(releaseFile ? { releaseFile } : {}),
             },
         },
     };
@@ -870,15 +875,30 @@ interface ExitCheck { label: string; id: string; executor: number; agent: number
 // 诊断（PR #5 CI 退出后实测）：就绪那一刻两个进程的身份（名字、创建时间），外部启动器据此判断事后是否同一进程、是否 PID 被复用。
 const exitProcesses = async (registry: Registry, pids: number[]) => (await registry.platform.processes(pids).catch(() => [])).map(p => ({ pid: p.pid, name: p.name, created: p.created }));
 
+// 024：退出前确认任务确实还在运行——记录里有 start、没有 end，执行者与假 agent 进程都存活，并记下它们的进程身份。
+// 外部启动器在 Electron 退出后用这份身份核对"还是同一个进程"（PID 可能被复用）。
+async function runningExitProcesses(registry: Registry, label: string, id: string, pids: number[]) {
+    const rows = await readRows(registry);
+    assert.ok(rows.some(row => row.event === 'start' && row.id === id), `${label}退出前应有 start 记录`);
+    assert.ok(!rows.some(row => row.event === 'end' && row.id === id), `${label}退出前不应该已经结束`);
+    const processes = await exitProcesses(registry, pids);
+    assert.deepEqual(processes.map(p => p.pid).sort((a, b) => a - b), [...pids].sort((a, b) => a - b), `${label}退出前执行者与假 agent 都应在运行`);
+    return processes;
+}
+
 // 退出前的最后一次「再派一次」：派一个持续几秒的假任务，把执行者与假 agent 的 pid 交给外部启动器，
 // Electron 退出后它会检查两个进程仍存活、任务 end.exit=0，以及等待者打印的结束行。
+// 024：假执行者也等放行文件才结束（同托管任务），"就绪 → Electron 退出"再久也不会在检查前自然结束。
 async function prepareRedispatchExit(h: Harness, registry: Registry): Promise<ExitCheck> {
     const home = appEnv.AGENT_ROUTER_HOME!, repo = redispatchRepo(), configFile = path.join(home, 'config.json');
+    // 放行文件放在隔离公共目录里；派发前先删掉上一次留下的。
+    const release = path.join(home, 'redispatch-exit-release');
+    await rm(release, { force: true });
     const originalConfig = await readFile(configFile, 'utf8').catch(() => null);
     const source = (await readRows(registry)).find(row => row.event === 'start' && row.name === REDISPATCH_SOURCE);
     assert.ok(source, '找不到再派一次用的临时任务');
     const before = new Set((await readRows(registry)).filter(row => row.event === 'start').map(row => row.id));
-    await writeFile(configFile, JSON.stringify(redispatchConfig(8000), null, 2) + '\n');
+    await writeFile(configFile, JSON.stringify(redispatchConfig(8000, release), null, 2) + '\n');
     try {
         await h.press('[data-page=tasks]');
         await h.wait(`!!document.querySelector("[data-task=${source.id}]")`, '退出前的临时任务行', 20000);
@@ -888,6 +908,8 @@ async function prepareRedispatchExit(h: Harness, registry: Registry): Promise<Ex
         const start = await untilRow(async () => (await readRows(registry)).find(row => row.event === 'start' && !before.has(row.id) && row.repo === repo), '退出前的再派发 start', 20000);
         const spawned = await untilRow(async () => (await readRows(registry)).find(row => row.event === 'spawned' && row.id === start.id && Number.isInteger(row.agentPid)), '退出前的假执行者进程', 20000);
         assert.ok(!(await readRows(registry)).some(row => row.event === 'end' && row.id === start.id), '退出前的任务应该还在运行');
+        // 写 exit-pending.json 之前确认两项都还在运行，并记下进程身份（名字 + 创建时间）。
+        const processes = await runningExitProcesses(registry, '脱离任务', start.id, [start.pid, spawned.agentPid]);
         const node = process.env.AR_TEST_NODE!;
         assert.ok(path.isAbsolute(node) && /^node(?:\.exe)?$/i.test(path.basename(node)));
         const waiterLog = 'redispatch-exit-waiter.log';
@@ -898,7 +920,7 @@ async function prepareRedispatchExit(h: Harness, registry: Registry): Promise<Ex
             waiter.unref();
         }
         finally { await output.close(); }
-        return { label: '脱离任务', id: start.id, executor: start.pid, agent: spawned.agentPid, waiterLog, readyAt: Date.now(), processes: await exitProcesses(registry, [start.pid, spawned.agentPid]) };
+        return { label: '脱离任务', id: start.id, executor: start.pid, agent: spawned.agentPid, waiterLog, readyAt: Date.now(), processes, release };
     }
     finally {
         // 请求里已经带上了执行者快照，退出前恢复配置不影响已在运行的任务。
@@ -1429,7 +1451,8 @@ async function prepareManagedExit(registry: Registry): Promise<ExitCheck> {
         const task = registry.tasks.find(t => t.name === 'managed-exit');
         const running = await readFile(ready, 'utf8').then(JSON.parse).catch(() => null);
         if (task?.managed && task.status === 'run' && running?.pid) {
-            return { label: '托管任务', id: task.id, executor: task.pid, agent: running.pid, waiterLog, readyAt: Date.now(), processes: await exitProcesses(registry, [task.pid, running.pid]), release };
+            // 写 exit-pending.json 之前确认两项都还在运行，并记下进程身份（名字 + 创建时间）。
+            return { label: '托管任务', id: task.id, executor: task.pid, agent: running.pid, waiterLog, readyAt: Date.now(), processes: await runningExitProcesses(registry, '托管任务', task.id, [task.pid, running.pid]), release };
         }
         await new Promise(resolve => setTimeout(resolve, 50));
     }

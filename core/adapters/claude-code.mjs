@@ -1,12 +1,18 @@
 // Claude Code 适配器：以非交互模式（-p --output-format stream-json）启动 Claude Code CLI，把它的事件映射为统一事件。
 // 不绑定任何模型或服务商：用哪个后端（兼容接口的第三方服务、Claude 官方……）完全由 profile 的 env / secrets 决定（D17、O10）。
-// 事件结构以 Claude Code 2.1.302 的真实输出为准（tests/fixtures/claude-code-sample.jsonl，见 CHECKPOINT【核实】）。
+// 事件结构以 Claude Code 2.1.302 的真实输出为准（tests/fixtures/claude-code-sample.jsonl）。
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { launcherFor as resolveFile, findOnPath } from '../lib/launcher.mjs';
 import { limitOutput } from '../lib/output.mjs';
 import { testAgent } from '../lib/compat.mjs';
+import { trace, traced } from '../lib/trace.mjs';
+
+// 追踪里子进程的结束状态：区分正常结束、被超时上限截断（ETIMEDOUT）与启动失败（只在 ar agents list 传入 tracePrefix 时使用）。
+const subprocessOutcome = r => r.error
+  ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : `error=${r.error.code ?? 'unknown'}`)
+  : r.signal ? `signal=${r.signal}` : `status=${r.status}`;
 
 // 本版本在 Windows 上用 PowerShell 工具运行命令，其他版本或平台可能是 Bash：两者都当命令。
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
@@ -120,10 +126,16 @@ export const claudeCode = {
   label: 'Claude Code',
   writesReport: false,
   capabilities: { readOnly: true, usage: true, cost: false, reportFile: false },
-  detect({ env = process.env, settings = {} } = {}) {
+  detect({ env = process.env, settings = {}, tracePrefix } = {}) {
     try {
-      const launcher = resolveLauncher(env, process.platform, settings.path);
-      const r = spawnSync(launcher.executable, [...launcher.args, '--version'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 15000 });
+      const run = () => {
+        const launcher = resolveLauncher(env, process.platform, settings.path);
+        const r = spawnSync(launcher.executable, [...launcher.args, '--version'], { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 15000 });
+        return { launcher, r };
+      };
+      // tracePrefix 只有 ar agents list 会传；其他调用不增加追踪与开销。
+      const { launcher, r } = tracePrefix ? traced(`${tracePrefix} detect --version`, run) : run();
+      if (tracePrefix) trace(`${tracePrefix} detect --version 子进程 ${subprocessOutcome(r)}`);
       return { installed: !r.error && r.status === 0, version: r.status === 0 ? r.stdout.trim() || null : null, launcher };
     } catch (error) { return { installed: false, version: null, error: error.message }; }
   },

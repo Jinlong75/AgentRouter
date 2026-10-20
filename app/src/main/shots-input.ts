@@ -96,7 +96,7 @@ export function coreReport(afterSeq: number, now = Date.now()) {
         : `#${e.seq} ar ${e.args}：${(e.exited ?? now) - e.requested} ms code=${e.code}`).join('；');
 }
 
-// 界面验收的真实输入助手（VisualSpec 6.2）：先做命中测试，再用 webContents.sendInputEvent 发系统级鼠标/键盘事件，
+// 界面验收的真实输入助手：先做命中测试，再用 webContents.sendInputEvent 发系统级鼠标/键盘事件，
 // 与人手操作走同一条路。被遮挡、不可见、已禁用、键盘到不了的控件都会让检查失败。
 export interface Harness {
     pause: (ms?: number) => Promise<void>;
@@ -264,7 +264,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         await pause(250);
     };
 
-    // 每页通用检查（VisualSpec 6.4）：深浅两种主题 × 1160×720 与 960×600。
+    // 每页通用检查：深浅两种主题 × 1160×720 与 960×600。
     // ① 所有可操作元素都能用 Tab 到达且焦点环可见 ② 没有横向溢出 ③ 显示出来的图标按钮都有 aria-label ④ 没有控制台错误 ⑤ 减少动态效果时没有动画
     const audit = async (page: string, prepare: () => Promise<void>) => {
         for (const [width, height] of [[1160, 720], [960, 600]]) for (const theme of ['dark', 'light'] as const) {
