@@ -10,7 +10,7 @@ import { readConfig, builtinConfig, loadConfig, updateConfig } from './config.mj
 import { secretStatus, setUserSecret } from './secrets.mjs';
 import { authOf } from './env.mjs';
 import { adapters } from '../adapters/index.mjs';
-import { killProcessTree } from './process.mjs';
+import { killProcessTree, redactPaths } from './process.mjs';
 import { trace, traced } from './trace.mjs';
 
 const presetDir = fileURLToPath(new URL('../templates/agents/', import.meta.url));
@@ -217,25 +217,46 @@ function writeTestResult(home, name, entry) {
 }
 
 // 用子进程跑一次派发（真实调用执行者），超时后 killProcessTree 结束整棵进程树。
+// 各阶段只写追踪（AR_CORE_TRACE=1 时）；不改变结束方式与返回值。
 function runOnce({ scriptPath, repo, testHome, env, timeoutMs }) {
   return new Promise(resolve => {
     let settled = false;
     const done = value => { if (!settled) { settled = true; resolve(value); } };
     let child;
+    const started = Date.now();
+    const elapsed = () => Date.now() - started;
     try {
       child = spawn(process.execPath, [scriptPath, 'dispatch', '只回复 OK，不要修改任何文件', '--name', 'agent-test'],
         { cwd: repo, env: { ...env, AGENT_ROUTER_HOME: testHome, AR_NO_WATCH: '1' }, shell: false, windowsHide: true });
-    } catch (error) { done({ exit: null, timedOut: false, spawnError: error.message }); return; }
+    } catch (error) {
+      trace(`agents test 等待结束：启动失败（${elapsed()}ms）：${error.message}`);
+      done({ exit: null, timedOut: false, spawnError: error.message });
+      return;
+    }
+    trace(`agents test 派发子进程已启动 pid=${child.pid ?? '（无）'}（${redactPaths(scriptPath)}）`);
     let timedOut = false;
     // 排空输出，避免子进程因管道缓冲区写满而卡住。
     child.stdout.setEncoding('utf8'); child.stdout.on('data', () => {});
     child.stderr.setEncoding('utf8'); child.stderr.on('data', () => {});
     const timer = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child.pid).catch(() => { /* 结束失败由 close 兜底；不退就按超时结算。 */ }).finally(() => done({ exit: null, timedOut: true }));
+      trace(`agents test 等待结束：超时（${elapsed()}ms，上限 ${timeoutMs}ms），开始结束进程树 pid=${child.pid}`);
+      killProcessTree(child.pid)
+        .then(() => trace(`agents test 结束进程树完成 pid=${child.pid}（${elapsed()}ms）`))
+        // 结束失败由 close 兜底；不退就按超时结算。
+        .catch(error => trace(`agents test 结束进程树失败 pid=${child.pid}：${error.message}`))
+        .finally(() => done({ exit: null, timedOut: true }));
     }, timeoutMs);
-    child.on('error', error => { clearTimeout(timer); done({ exit: null, timedOut, spawnError: error.message }); });
-    child.on('close', code => { clearTimeout(timer); done({ exit: code, timedOut }); });
+    child.on('error', error => {
+      clearTimeout(timer);
+      trace(`agents test 等待结束：启动失败（${elapsed()}ms）：${error.message}`);
+      done({ exit: null, timedOut, spawnError: error.message });
+    });
+    child.on('close', code => {
+      clearTimeout(timer);
+      trace(`agents test 等待结束：${timedOut ? '超时后子进程关闭' : '正常退出'} exit=${code}（${elapsed()}ms）`);
+      done({ exit: code, timedOut });
+    });
   });
 }
 
@@ -246,15 +267,19 @@ export async function testAgent(home, name, { env = process.env, scriptPath, tim
   const config = state.exists && !state.reason ? state.config : builtinConfig();
   const profile = config.profiles?.[name];
   if (!profile) throw new Error(`找不到执行者：${name}`);
-  const base = mkdtempSync(path.join(tmpdir(), 'ar-agent-test-'));
+  trace(`agents test ${name} 开始（超时 ${timeoutSeconds} 秒）`);
+  const base = traced('agents test 创建临时目录', () => mkdtempSync(path.join(tmpdir(), 'ar-agent-test-')));
+  trace(`agents test 临时目录：${redactPaths(base, [base])}`);
   const started = Date.now();
   try {
     const repo = path.join(base, 'repo'), testHome = path.join(base, 'home');
-    mkdirSync(repo); mkdirSync(testHome);
-    const git = args => execFileSync('git', args, { cwd: repo, stdio: 'ignore', windowsHide: true });
-    git(['init', '-q']); writeFileSync(path.join(repo, 'README.md'), '# test\n'); git(['add', 'README.md']);
-    git(['-c', 'user.name=agent-router', '-c', 'user.email=agent-router@example.invalid', 'commit', '-q', '-m', 'init']);
-    writeFileSync(path.join(testHome, 'config.json'), JSON.stringify({ v: 2, defaultProfile: name, profiles: { [name]: { ...profile, enabled: true } }, managed: false, watchWindow: 'never' }));
+    traced('agents test 创建临时仓库与公共目录', () => { mkdirSync(repo); mkdirSync(testHome); });
+    const git = (label, args) => traced(`agents test 临时仓库 ${label}`, () => execFileSync('git', args, { cwd: repo, stdio: 'ignore', windowsHide: true }));
+    git('git init', ['init', '-q']);
+    traced('agents test 临时仓库写 README.md', () => writeFileSync(path.join(repo, 'README.md'), '# test\n'));
+    git('git add', ['add', 'README.md']);
+    git('git commit', ['-c', 'user.name=agent-router', '-c', 'user.email=agent-router@example.invalid', 'commit', '-q', '-m', 'init']);
+    traced('agents test 临时公共目录写 config.json', () => writeFileSync(path.join(testHome, 'config.json'), JSON.stringify({ v: 2, defaultProfile: name, profiles: { [name]: { ...profile, enabled: true } }, managed: false, watchWindow: 'never' })));
     const child = await runOnce({ scriptPath, repo, testHome, env, timeoutMs: timeoutSeconds * 1000 });
     const dir = path.join(repo, '.agent-runs', 'agent-test');
     const report = existsSync(path.join(dir, 'report.md')) ? readFileSync(path.join(dir, 'report.md'), 'utf8').trim() : null;
@@ -272,7 +297,18 @@ export async function testAgent(home, name, { env = process.env, scriptPath, tim
     return result;
   } finally {
     // Windows 上刚结束的子进程（软件里用 Electron 运行时还有它的崩溃报告进程）可能还占着目录（EPERM）：短暂重试；仍删不掉就留在系统临时目录，不影响测试结果。
-    try { rmSync(base, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 }); } catch { /* 留给系统清理临时目录 */ }
+    const removing = Date.now();
+    try {
+      rmSync(base, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 });
+      trace(`agents test 临时目录删除成功（${Date.now() - removing}ms）`);
+    } catch (error) {
+      // 原行为不变：留给系统清理临时目录；这里只把错误码与剩余文件记下来。
+      trace(`agents test 临时目录删除失败 code=${error.code ?? '（无）'}：${redactPaths(error.message, [base])}`);
+      let remaining = [];
+      try { remaining = readdirSync(base, { recursive: true }).map(String).slice(0, 20); }
+      catch (readError) { trace(`agents test 临时目录剩余文件读取失败：${readError.code ?? readError.message}`); }
+      trace(`agents test 临时目录剩余文件（最多 20 项，相对路径）：${remaining.join('、') || '（无）'}`);
+    }
   }
 }
 

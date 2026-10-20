@@ -8,6 +8,7 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { validRequest } from '../../core/lib/managed.mjs';
+import { processList, redactPaths } from '../../core/lib/process.mjs';
 
 const script = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
 const execute = promisify(execFile);
@@ -17,6 +18,20 @@ async function until(fn, timeout = 10000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const result = fn(); if (result) return result; await delay(25); }
   throw Error('隔离测试等待超时');
+}
+
+// 失败现场：用一次完整进程快照记录每个进程的完整身份（命令行脱敏，不写环境变量值与密钥）。
+async function identities(pids, label) {
+  let snapshot = [];
+  let failure = null;
+  try { snapshot = await processList(); } catch (error) { failure = error.code ?? error.message; }
+  const byPid = new Map(snapshot.map(p => [p.pid, p]));
+  const lines = pids.map(pid => {
+    const p = byPid.get(pid);
+    return `pid=${pid} 父 PID=${p?.parent ?? '（未知）'} 可执行文件=${p?.name ?? '（未知）'} 创建时间=${p?.created ?? '（未知）'}`
+      + ` 命令行=${redactPaths(p?.command ?? '') || '（空）'} 在快照中=${p ? '是' : '否'} pidAlive=${alive(pid)}`;
+  });
+  return `${label}：${lines.join('；')}${failure ? `；进程快照查询失败（${failure}）` : ''}`;
 }
 
 function fixture(t, { delayMs = 4000, exit = 0, secret = false } = {}) {
@@ -124,7 +139,12 @@ test('--detach 的任务能被 ar stop 结束，进程树随之退出', async t 
   const spawned = await until(() => rows(f.home).find(r => r.event === 'spawned'));
   t.after(() => { for (const pid of [start.pid, spawned.agentPid]) if (alive(pid)) process.kill(pid); });
   assert.ok(alive(start.pid) && alive(spawned.agentPid), '停止前执行者与假 agent 都在运行');
+  // 失败现场：停止前 / 停止后各记一次完整身份，连同 ar stop 的输出与核对明细（标准错误）一起给出。
+  const before = await identities([start.pid, spawned.agentPid], '停止前');
   const stop = await f.command(['stop', 'detach-stop']).done;
+  const after = await identities([start.pid, spawned.agentPid], '停止后');
+  t.diagnostic([before, after, `ar stop 退出码：${stop.code}`, `ar stop 标准输出：${stop.stdout.trim() || '（空）'}`,
+    `ar stop 标准错误：${stop.stderr.trim() || '（空）'}`].join('\n'));
   assert.equal(stop.code, 0, stop.stderr + stop.stdout);
   assert.match(stop.stdout, /停止：detach-stop 已停止，工作区里没提交的改动还在/);
   assert.equal(alive(start.pid), false, '执行者进程已退出');

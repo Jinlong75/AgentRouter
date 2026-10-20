@@ -1,6 +1,9 @@
 import { execFile } from 'node:child_process';
+import { basename, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { trace } from './trace.mjs';
 
 const execute = promisify(execFile);
 export function pidAlive(pid) {
@@ -9,13 +12,33 @@ export function pidAlive(pid) {
   catch (error) { return error.code === 'EPERM'; }
 }
 
-// 单次平台查询同时取得创建时间和命令行；可由调用方替换以隔离测试。
+// 诊断输出脱敏：临时目录写成 <TEMP>、用户目录写成 <HOME>；额外给出的路径（如某次测试的临时目录）也按 <TEMP> 处理。
+// 只处理路径；环境变量值与密钥本来就不会出现在这些记录里。
+export function redactPaths(text, extra = []) {
+  let out = String(text ?? '');
+  if (!out) return out;
+  const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const swap = (from, to) => {
+    if (!from) return;
+    // 同一路径可能以反斜杠或正斜杠出现（命令行里两种都见过）。
+    for (const variant of new Set([from, from.replace(/\\/g, '/'), from.replace(/\//g, '\\')])) {
+      out = out.replace(new RegExp(escape(variant), 'gi'), to);
+    }
+  };
+  // 系统临时目录可能以短路径（TEMP）或长路径（命令行里）出现，两种都按 <TEMP> 处理；用户目录最后替换。
+  const temps = [tmpdir(), process.env.TEMP, process.env.TMP, ...(process.platform === 'win32' ? [join(homedir(), 'AppData', 'Local', 'Temp')] : [])];
+  for (const value of [...extra, ...temps]) swap(value, '<TEMP>');
+  for (const value of [homedir(), process.env.USERPROFILE, process.env.HOME]) swap(value, '<HOME>');
+  return out;
+}
+
+// 单次平台查询同时取得创建时间、可执行文件名与命令行；可由调用方替换以隔离测试。
 export async function processList(pid, platform = process.platform, timeout = 5000) {
   if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0)) return [];
   const options = { windowsHide: true, shell: false, timeout, maxBuffer: 8 * 1024 * 1024 };
   if (platform === 'win32') {
     const filter = pid === undefined ? '' : ` -Filter 'ProcessId = ${pid}'`;
-    const script = `$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process${filter} | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();command=$_.CommandLine} }) | ConvertTo-Json -Compress`;
+    const script = `$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process${filter} | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();name=$_.Name;command=$_.CommandLine} }) | ConvertTo-Json -Compress`;
     const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], options);
     const value = JSON.parse(stdout.trim() || '[]');
     return (Array.isArray(value) ? value : [value]).map(p => ({ ...p, command: p.command ?? '' }));
@@ -23,11 +46,22 @@ export async function processList(pid, platform = process.platform, timeout = 50
   const { stdout } = await execute('ps', [...(pid === undefined ? ['-A'] : ['-p', String(pid)]), '-o', 'pid=,ppid=,stat=,lstart=,args='], { ...options, env: { ...process.env, LC_ALL: 'C' } });
   return stdout.split('\n').flatMap(line => {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/);
-    return m && !m[3].startsWith('Z') ? [{ pid: +m[1], parent: +m[2], created: Date.parse(m[4]), command: m[5] }] : [];
+    if (!m || m[3].startsWith('Z')) return [];
+    const name = basename((m[5].match(/^\S+/) ?? [''])[0]);
+    return [{ pid: +m[1], parent: +m[2], created: Date.parse(m[4]), name: name || null, command: m[5] }];
   });
 }
-export async function processInfo(pid, platform = process.platform) {
-  try { return (await processList(pid, platform))[0] ?? null; } catch { return null; }
+// observe 只是把同一次查询的成功/失败与用时交给调用方做诊断；返回值与原来一样（失败仍返回 null）。
+export async function processInfo(pid, platform = process.platform, observe) {
+  const started = Date.now();
+  try {
+    const value = (await processList(pid, platform))[0] ?? null;
+    observe?.({ ok: true, ms: Date.now() - started });
+    return value;
+  } catch (error) {
+    observe?.({ ok: false, ms: Date.now() - started, error: error.message });
+    return null;
+  }
 }
 export async function processCreated(pid, platform = process.platform) {
   const info = await processInfo(pid, platform);
@@ -39,23 +73,51 @@ export async function taskAlive(start, { alive = pidAlive, created = processCrea
   return alive(start.pid) && (time === null || time <= start.started);
 }
 
+// 诊断用的进程身份：只做记录，不参与判断。AR_CORE_TRACE=1 时才真的写出。
+const describeProcess = p => `pid=${p.pid} parent=${p.parent ?? '（未知）'} name=${p.name ?? '（未知）'} created=${p.created ?? '（未知）'}`;
+const traceNoneAlive = (pid, tree) => {
+  for (const p of tree) trace(`进程树结束 目标 pid=${pid} 结束结果 ${describeProcess(p)} 终止结果=已退出 终止后仍存活=否`);
+  trace(`进程树结束 目标 pid=${pid} 结束后仍存活的进程：无（初次快照树上 ${tree.length} 个进程都已退出）`);
+};
+const traceStillAlive = (pid, tree, surviving) => {
+  for (const p of tree) {
+    const stillThere = surviving.some(q => q.pid === p.pid && q.created === p.created);
+    trace(`进程树结束 目标 pid=${pid} 结束结果 ${describeProcess(p)} 终止结果=${stillThere ? '未能结束' : '已退出'} 终止后仍存活=${stillThere ? '是' : '否'}`);
+  }
+  for (const p of surviving) trace(`进程树结束 目标 pid=${pid} 结束后仍存活的进程 ${describeProcess(p)}`);
+};
+
 // 先保留整棵树的身份，再结束并等到全部退出；总时限包括平台查询。
 export async function killProcessTree(pid, { platform = process.platform, list = processList, executeFile = execute, alive = pidAlive, timeout = 10000, expectedCreated } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) throw Error('无效的目标进程');
   const deadline = Date.now() + timeout;
   const remaining = () => Math.max(1, deadline - Date.now());
   const snapshot = await list(undefined, platform, remaining());
+  trace(`进程树结束 目标 pid=${pid} 初次快照 ${snapshot.length} 项`);
   const root = snapshot.find(p => p.pid === pid);
-  if (!root) { if (alive(pid)) throw Error('无法核对进程树'); return; }
-  if (expectedCreated !== undefined && root.created !== expectedCreated) throw Error('进程身份已经变化');
+  if (!root) {
+    // 只查一次存活（原来的判断），结果同时用于记录。
+    const targetAlive = alive(pid);
+    trace(`进程树结束 目标 pid=${pid} 初次快照里没有目标，目标${targetAlive ? '仍存活（无法核对进程树）' : '已退出'}`);
+    if (targetAlive) throw Error('无法核对进程树');
+    return;
+  }
+  if (expectedCreated !== undefined && root.created !== expectedCreated) {
+    trace(`进程树结束 目标 pid=${pid} 进程身份已经变化（期望 created=${expectedCreated}，实际 ${describeProcess(root)}）`);
+    throw Error('进程身份已经变化');
+  }
   const tree = [root], seen = new Set([pid]);
   for (let i = 0; i < tree.length; i++) for (const p of snapshot) {
     if (p.parent === tree[i].pid && !seen.has(p.pid) && p.created >= tree[i].created) { tree.push(p); seen.add(p.pid); }
   }
+  trace(`进程树结束 目标 pid=${pid} 初次快照里的进程树 ${tree.length} 项`);
+  for (const p of tree) trace(`进程树结束 目标 pid=${pid} 初次快照里的进程树 ${describeProcess(p)}`);
   let failure;
   try {
-    if (platform === 'win32') await executeFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, shell: false, timeout: remaining() });
-    else {
+    if (platform === 'win32') {
+      await executeFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, shell: false, timeout: remaining() });
+      trace(`进程树结束 目标 pid=${pid} taskkill.exe /T /F 返回成功`);
+    } else {
       // 先逐层暂停并重新扫描，纳入初次快照之后刚派生的子孙。
       try {
         for (let i = 0; i < tree.length; i++) {
@@ -66,21 +128,31 @@ export async function killProcessTree(pid, { platform = process.platform, list =
             if (q.parent === p.pid && !seen.has(q.pid) && q.created >= p.created) { tree.push(q); seen.add(q.pid); }
           }
         }
-        for (const p of [...tree].reverse()) { try { process.kill(p.pid, 'SIGKILL'); } catch (e) { if (e.code !== 'ESRCH') failure ??= e; } }
+        for (const p of [...tree].reverse()) {
+          try { process.kill(p.pid, 'SIGKILL'); trace(`进程树结束 目标 pid=${pid} SIGKILL ${describeProcess(p)} 结果=已发送`); }
+          catch (e) {
+            trace(`进程树结束 目标 pid=${pid} SIGKILL ${describeProcess(p)} 结果=${e.code === 'ESRCH' ? '进程已退出' : `失败（${e.message}）`}`);
+            if (e.code !== 'ESRCH') failure ??= e;
+          }
+        }
       } finally {
         // 权限或查询失败也不能让仍存活的进程永久暂停。
         for (const p of tree) { try { process.kill(p.pid, 'SIGCONT'); } catch { /* 已退出。 */ } }
       }
     }
-  } catch (error) { failure = error; }
+  } catch (error) { failure = error; trace(`进程树结束 目标 pid=${pid} 终止过程出错：${error.message}`); }
+  // 判断与时限不变：全部退出就返回；到时限仍未退出就抛错。survivors 只是同一轮检查的结果，用于记录。
+  let survivors = [];
   do {
-    if (platform === 'win32') { if (tree.every(p => !alive(p.pid))) return; }
+    if (platform === 'win32') survivors = tree.filter(p => alive(p.pid));
     else {
       const current = await list(undefined, platform, remaining());
-      if (tree.every(p => !current.some(q => q.pid === p.pid && q.created === p.created))) return;
+      survivors = tree.filter(p => current.some(q => q.pid === p.pid && q.created === p.created));
     }
+    if (!survivors.length) { traceNoneAlive(pid, tree); return; }
     if (Date.now() >= deadline) break;
     await delay(Math.min(50, remaining()));
   } while (Date.now() < deadline);
+  traceStillAlive(pid, tree, survivors);
   throw Error(failure?.message ?? '等待进程退出超时');
 }
