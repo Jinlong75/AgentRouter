@@ -62,6 +62,7 @@ git clone https://github.com/Jinlong75/AgentRouter.git
 cd AgentRouter
 npm ci
 npm run demo      # 用演示数据打开软件，不碰你真实的任务和技能；首次运行会下载 Electron
+npm run fonts     # 打安装包前先取界面字体（需联网）
 npm run dist      # 打 NSIS 安装包到 release/
 ```
 
@@ -148,6 +149,7 @@ git clone https://github.com/Jinlong75/AgentRouter.git
 cd AgentRouter
 npm ci
 npm run demo      # opens the app with demo data, without touching your real tasks or skills; downloads Electron on first run
+npm run fonts     # fetch the interface fonts before building the installer (needs network)
 npm run dist      # builds the NSIS installer into release/
 ```
 
