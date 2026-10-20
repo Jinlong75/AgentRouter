@@ -31,6 +31,12 @@ on:
         description: 'H1 实验：quiet / load；留空不跑'
         required: false
         default: ''
+      # 单项连续重复运行（诊断用，只手动触发，不计入完整回归；工具见 tools/repeat-test.mjs）。
+      # 目前可填 agents-test-timeout；留空不跑。次数沿用上面的 repeat 输入（默认 30）。
+      nodetest:
+        description: '单独连续重复跑一条 node:test 用例（诊断用，目前可填 agents-test-timeout；留空不跑）'
+        required: false
+        default: ''
 jobs:
   windows:
     if: github.event_name != 'workflow_dispatch'
@@ -47,6 +53,24 @@ jobs:
       - run: npm ci
       - run: npm run lint:tree
       - run: npm run verify
+  # 单项连续重复运行（诊断用）：只手动触发（workflow_dispatch 且 nodetest 非空），不挂 push / pull_request。
+  # 只重复跑一个 node:test 用例，次数沿用 repeat 输入（默认 30）；输入经 env 传入，不直接拼进脚本。
+  # 诊断用，不替代三连续完整回归。
+  nodetest:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.nodetest != ''
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      NODETEST: ${{ github.event.inputs.nodetest }}
+      REPEAT: ${{ github.event.inputs.repeat }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: node tools/repeat-test.mjs $env:NODETEST $env:REPEAT
   # H1 隔离实验的安静条件：只手动触发（workflow_dispatch 且 h1=quiet），不挂在 push / pull_request 上。
   # 独立 Node 固定 24.21.0，与 Electron 43.7.5 内置的 Node 版本一致；不一致时采样器会在输出里醒目标出。
   # 诊断用，不计入稳定性验收。
@@ -64,7 +88,8 @@ jobs:
       - run: node tools/h1-sampler.mjs --quiet
   # 界面验收（真实输入、每页通用检查、UI 基线）。验收窗口不显示，不需要桌面会话。
   gui:
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.h1 != 'quiet'
+    # 手动触发且开了单项重复运行（nodetest 非空）时只跑 nodetest，不跑界面验收。
+    if: github.event_name != 'workflow_dispatch' || (github.event.inputs.h1 != 'quiet' && github.event.inputs.nodetest == '')
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

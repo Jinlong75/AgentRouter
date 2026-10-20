@@ -288,3 +288,44 @@ test('agents list 阶段追踪：开启时按顺序记录配置、detect、secre
     cursor = at + 1;
   }
 });
+
+// 032：AR_CORE_TRACE=1 时 agents test 记下子进程 exit 事件、命令结束后的活动资源与进程退出；
+// 关闭时标准错误为空，标准输出与退出码与正常路径一致（用时会变，单独剔除比较）。
+test('agents test 阶段追踪：关闭时标准错误为空且输出一致；开启时能看到 exit 事件、活动资源与进程退出', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ar agents test 追踪 '));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  const home = path.join(base, 'home');
+  fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'ok', profiles: {
+    ok: { adapter: 'fake', label: '假执行者', events: [{ kind: 'say', text: 'OK' }], report: 'OK\n' },
+  } }));
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (/^(AR_|ANTHROPIC_|CODEX_|CLAUDE)/i.test(key)) delete env[key];
+  // 系统临时目录也指向隔离目录：ar agents test 会建 ar-agent-test-*，与其他并行测试文件
+  // （超时用例扫描系统临时目录找残留）互相看见会干扰它们；本用例只关心追踪输出。
+  const tmp = path.join(base, 'tmp');
+  fs.mkdirSync(tmp);
+  Object.assign(env, { AGENT_ROUTER_HOME: home, PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: tmp, TMP: tmp });
+  const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+  const run = tracing => spawnSync(process.execPath, [entry, 'agents', 'test', 'ok', '--json'], {
+    cwd: base, env: { ...env, ...(tracing ? { AR_CORE_TRACE: '1' } : {}) }, encoding: 'utf8', timeout: 60000, windowsHide: true, shell: false });
+  const traced = run(true), plain = run(false);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.equal(plain.stderr, '', '未开启追踪时标准错误为空');
+  assert.equal(traced.status, plain.status, traced.stderr);
+  assert.equal(plain.stdout.trim().split('\n').length, 1, '标准输出只有一个 JSON 对象');
+  const strip = text => { const { seconds, ...rest } = JSON.parse(text); assert.equal(typeof seconds, 'number'); return rest; };
+  assert.deepEqual(strip(traced.stdout), strip(plain.stdout), '开启追踪不改变标准输出（用时除外）');
+
+  // 追踪行按发生顺序：子进程 exit 事件 → 命令结束 → 活动资源计数 → 进程退出。
+  const lines = traced.stderr.split('\n');
+  const index = (pattern, from = 0) => {
+    const at = lines.findIndex((line, i) => i >= from && pattern.test(line));
+    assert.ok(at >= from, `追踪里缺少或顺序不对：${pattern}\n实际追踪：\n${traced.stderr}`);
+    return at;
+  };
+  const exitAt = index(/agents test 子进程 exit 事件 exit=0/);
+  const endAt = index(/命令结束 exit=0/, exitAt);
+  const resourcesAt = index(/命令结束后活动资源：/, endAt);
+  index(/进程退出 code=0 距命令结束 \d+ms/, resourcesAt);
+});

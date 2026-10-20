@@ -10,8 +10,8 @@ import { readConfig, builtinConfig, loadConfig, updateConfig } from './config.mj
 import { secretStatus, setUserSecret } from './secrets.mjs';
 import { authOf } from './env.mjs';
 import { adapters } from '../adapters/index.mjs';
-import { killProcessTree, redactPaths } from './process.mjs';
-import { trace, traced } from './trace.mjs';
+import { killProcessTree, pidAlive, redactPaths } from './process.mjs';
+import { trace, traced, tracing } from './trace.mjs';
 
 const presetDir = fileURLToPath(new URL('../templates/agents/', import.meta.url));
 const validProfileName = name => typeof name === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(name);
@@ -221,16 +221,38 @@ function writeTestResult(home, name, entry) {
 function runOnce({ scriptPath, repo, testHome, env, timeoutMs }) {
   return new Promise(resolve => {
     let settled = false;
-    const done = value => { if (!settled) { settled = true; resolve(value); } };
+    let closeSeen = false;
+    let waitTimer = null;
+    let waitLines = 0;
+    let stdoutEnded = false, stderrEnded = false;
+    let timedOutAt = 0;
     let child;
     const started = Date.now();
     const elapsed = () => Date.now() - started;
+    // 记下实际结算的时刻与原因：close 先到就不必再等；超时后 killProcessTree 返回也按原样结算。
+    const done = (value, reason) => {
+      if (settled) return;
+      settled = true;
+      trace(`agents test 结算：${reason}（${elapsed()}ms）`);
+      resolve(value);
+    };
+    // 超时结算后若子进程还没关闭：每秒记一行，说明进程是否还活着、管道是否已结束。不阻止进程退出。
+    const watchClose = () => {
+      if (!tracing || closeSeen || waitTimer) return;
+      waitTimer = setInterval(() => {
+        if (closeSeen) { clearInterval(waitTimer); waitTimer = null; return; }
+        waitLines += 1;
+        trace(`agents test 等待子进程关闭：pid=${child.pid} pidAlive=${pidAlive(child.pid) ? '是' : '否'} stdout已结束=${stdoutEnded ? '是' : '否'} stderr已结束=${stderrEnded ? '是' : '否'} 距超时已过 ${Date.now() - timedOutAt}ms`);
+        if (waitLines >= 60) { clearInterval(waitTimer); waitTimer = null; }
+      }, 1000);
+      waitTimer.unref();
+    };
     try {
       child = spawn(process.execPath, [scriptPath, 'dispatch', '只回复 OK，不要修改任何文件', '--name', 'agent-test'],
         { cwd: repo, env: { ...env, AGENT_ROUTER_HOME: testHome, AR_NO_WATCH: '1' }, shell: false, windowsHide: true });
     } catch (error) {
       trace(`agents test 等待结束：启动失败（${elapsed()}ms）：${error.message}`);
-      done({ exit: null, timedOut: false, spawnError: error.message });
+      done({ exit: null, timedOut: false, spawnError: error.message }, '启动失败');
       return;
     }
     trace(`agents test 派发子进程已启动 pid=${child.pid ?? '（无）'}（${redactPaths(scriptPath)}）`);
@@ -238,24 +260,37 @@ function runOnce({ scriptPath, repo, testHome, env, timeoutMs }) {
     // 排空输出，避免子进程因管道缓冲区写满而卡住。
     child.stdout.setEncoding('utf8'); child.stdout.on('data', () => {});
     child.stderr.setEncoding('utf8'); child.stderr.on('data', () => {});
+    // 单独记 exit 事件与两条管道的 end / close：区分"进程已退出但管道没关"。
+    child.on('exit', (code, signal) => trace(`agents test 子进程 exit 事件 exit=${code} signal=${signal ?? '（无）'}（${elapsed()}ms）`));
+    child.stdout.on('end', () => { stdoutEnded = true; trace(`agents test 子进程 stdout end（${elapsed()}ms）`); });
+    child.stdout.on('close', () => trace(`agents test 子进程 stdout close（${elapsed()}ms）`));
+    child.stderr.on('end', () => { stderrEnded = true; trace(`agents test 子进程 stderr end（${elapsed()}ms）`); });
+    child.stderr.on('close', () => trace(`agents test 子进程 stderr close（${elapsed()}ms）`));
     const timer = setTimeout(() => {
       timedOut = true;
+      timedOutAt = Date.now();
       trace(`agents test 等待结束：超时（${elapsed()}ms，上限 ${timeoutMs}ms），开始结束进程树 pid=${child.pid}`);
       killProcessTree(child.pid)
         .then(() => trace(`agents test 结束进程树完成 pid=${child.pid}（${elapsed()}ms）`))
         // 结束失败由 close 兜底；不退就按超时结算。
         .catch(error => trace(`agents test 结束进程树失败 pid=${child.pid}：${error.message}`))
-        .finally(() => done({ exit: null, timedOut: true }));
+        .finally(() => {
+          done({ exit: null, timedOut: true }, '超时后 killProcessTree 返回');
+          watchClose();
+        });
     }, timeoutMs);
     child.on('error', error => {
       clearTimeout(timer);
+      if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
       trace(`agents test 等待结束：启动失败（${elapsed()}ms）：${error.message}`);
-      done({ exit: null, timedOut, spawnError: error.message });
+      done({ exit: null, timedOut, spawnError: error.message }, '启动失败');
     });
     child.on('close', code => {
+      closeSeen = true;
       clearTimeout(timer);
+      if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
       trace(`agents test 等待结束：${timedOut ? '超时后子进程关闭' : '正常退出'} exit=${code}（${elapsed()}ms）`);
-      done({ exit: code, timedOut });
+      done({ exit: code, timedOut }, timedOut ? '超时后子进程 close' : '正常 close');
     });
   });
 }
