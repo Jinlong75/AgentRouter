@@ -1,0 +1,163 @@
+{
+  "codex-real-sample.jsonl": [
+    {
+      "line": 3,
+      "events": [
+        {
+          "kind": "say",
+          "text": "我会先确认 README.md 的位置和末尾内容，然后只追加这一行，不创建提交。"
+        }
+      ]
+    },
+    {
+      "line": 4,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_003",
+          "phase": "start",
+          "command": "Get-Location; Get-Content -LiteralPath README.md -Tail 5; git status --short"
+        }
+      ]
+    },
+    {
+      "line": 5,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_003",
+          "phase": "end",
+          "command": "Get-Location; Get-Content -LiteralPath README.md -Tail 5; git status --short",
+          "exit": 1,
+          "output": "对路径“D:\\demo\\repo”的访问被拒绝。\r\n所在位置 行:2 字符: 1\r\n+ Get-Location; Get-Content -LiteralPath README.md -Tail 5; git status  ...\r\n+ ~~~~~~~~~~~~\r\n    + CategoryInfo          : OperationStopped: (:) [], UnauthorizedAccessException\r\n    + FullyQualifiedErrorId : System.UnauthorizedAccessException\r\n \r\n对路径“D:\\demo\\repo”的访问被拒绝。\r\n所在位置 行:2 字符: 15\r\n+ Get-Location; Get-Content -LiteralPath README.md -Tail 5; git status  ...\r\n+               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : OperationStopped: (:) [], UnauthorizedAccessException\r\n    + FullyQualifiedErrorId : System.UnauthorizedAccessException\r\n \r\n对路径“D:\\demo\\repo”的访问被拒绝。\r\n所在位置 行:2 字符: 59\r\n+ ... ation; Get-Content -LiteralPath README.md -Tail 5; git status --short\r\n+                                                        ~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : OperationStopped: (:) [], UnauthorizedAccessException\r\n    + FullyQualifiedErrorId : System.UnauthorizedAccessException\r\n \r\n",
+          "truncated": false
+        }
+      ]
+    },
+    {
+      "line": 6,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_004",
+          "phase": "start",
+          "command": "Get-ChildItem -Force"
+        }
+      ]
+    },
+    {
+      "line": 7,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_004",
+          "phase": "end",
+          "command": "Get-ChildItem -Force",
+          "exit": 0,
+          "output": "\r\n\r\n    目录: D:\\demo\\repo\r\n\r\n\r\nMode                 LastWriteTime         Length Name                                                                 \r\n----                 -------------         ------ ----                                                                 \r\nd-----        2026/10/18     18:21                .agent-runs                                                          \r\nd--h--        2026/10/18     18:21                .git                                                                 \r\n-a----        2026/10/18     18:21             13 .gitignore                                                           \r\n-a----        2026/10/18     18:21              7 README.md                                                            \r\n\r\n\r\n",
+          "truncated": false
+        }
+      ]
+    },
+    {
+      "line": 8,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_005",
+          "phase": "start",
+          "command": "Get-Content -LiteralPath README.md -Raw; git status --short; Add-Content -LiteralPath README.md -Value '由 Codex 添加' -Encoding utf8; Get-Content -LiteralPath README.md -Raw; git status --short"
+        }
+      ]
+    },
+    {
+      "line": 9,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_005",
+          "phase": "end",
+          "command": "Get-Content -LiteralPath README.md -Raw; git status --short; Add-Content -LiteralPath README.md -Value '由 Codex 添加' -Encoding utf8; Get-Content -LiteralPath README.md -Raw; git status --short",
+          "exit": 0,
+          "output": "# demo\n\r\nwarning: unable to access 'D:\\demo\\home/.config/git/ignore': Permission denied\nwarning: unable to access 'D:\\demo\\home/.config/git/ignore': Permission denied\n# demo\n鐢?Codex 娣诲姞\r\n\r\nwarning: unable to access 'D:\\demo\\home/.config/git/ignore': Permission denied\nwarning: unable to access 'D:\\demo\\home/.config/git/ignore': Permission denied\n M README.md\n",
+          "truncated": false
+        }
+      ]
+    },
+    {
+      "line": 10,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_006",
+          "phase": "start",
+          "command": "Format-Hex -LiteralPath README.md"
+        }
+      ]
+    },
+    {
+      "line": 11,
+      "events": [
+        {
+          "kind": "cmd",
+          "id": "msg_006",
+          "phase": "end",
+          "command": "Format-Hex -LiteralPath README.md",
+          "exit": 0,
+          "output": "\r\n\r\n           路径: D:\\demo\\repo\\README.md\r\n\r\n           00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F\r\n\r\n00000000   23 20 64 65 6D 6F 0A E7 94 B1 20 43 6F 64 65 78  # demo.ç± Codex\r\n00000010   20 E6 B7 BB E5 8A A0 0D 0A                        æ·»å ..       \r\n\r\n\r\n",
+          "truncated": false
+        }
+      ]
+    },
+    {
+      "line": 12,
+      "events": [
+        {
+          "kind": "say",
+          "text": "已在 [README.md](D:/demo/repo/README.md) 末尾添加“由 Codex 添加”。只修改了这个文件，没有提交。"
+        }
+      ]
+    },
+    {
+      "line": 13,
+      "events": [
+        {
+          "kind": "turn",
+          "usage": {
+            "input": 1200,
+            "output": 300
+          }
+        }
+      ]
+    }
+  ],
+  "codex-real-error.jsonl": [
+    {
+      "line": 2,
+      "events": [
+        {
+          "kind": "error",
+          "text": "Model metadata for `gpt-6-astra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."
+        }
+      ]
+    },
+    {
+      "line": 4,
+      "events": [
+        {
+          "kind": "error",
+          "text": "400 The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."
+        }
+      ]
+    },
+    {
+      "line": 5,
+      "events": [
+        {
+          "kind": "error",
+          "text": "400 The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+out/
+release/
+*.log
+logs/
+.codex-runs/
+.agent-runs/
+.agent-worktrees/
+.env
+.playwright-mcp/
+
+build/fonts/
+build/icons/
+.tmp/

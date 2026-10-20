@@ -1,0 +1,57 @@
+// 组装执行者环境（白名单，O7）：只从基础环境里挑系统必需变量、代理变量、适配器声明要保留的变量，
+// 再写入 profile.env、解析后的 secrets、隔离项（隔离项最后写，profile 不能改掉它）。
+// 其他变量（别的密钥、令牌、个人配置）一律不传；任何 profile 的密钥来源变量都不原样传下去。
+// 返回的对象只交给 spawn，调用方绝不打印或写盘。
+import { resolveSecret } from './secrets.mjs';
+import { testAgent, testAgentEnv } from './compat.mjs';
+
+// 认证方式（D18）：login 沿用 CLI 自己的登录，不注入任何凭据；token 从 secrets 指向的环境变量注入。
+// 没写 auth 时：有 secrets 就是 token，否则 login（旧配置里的 codex 就是 login）。
+export const authOf = profile => profile?.auth ?? (Object.keys(profile?.secrets ?? {}).length ? 'token' : 'login');
+
+// 系统必需变量：Windows 进程、命令行、git、PowerShell 正常运行需要的；POSIX 上的对应项一并列出（不写死只有 Windows）。
+const SYSTEM = [
+  'SystemRoot', 'windir', 'ComSpec', 'PATH', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+  'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'SystemDrive', 'NUMBER_OF_PROCESSORS', 'OS', 'LANG',
+  /^ProgramFiles/i, /^ProgramW6432$/i, /^CommonProgramFiles/i, /^PROCESSOR_/i, /^LC_/i,
+  // Node（libuv）在 Windows 上启动子进程时总会补上 USERNAME、USERDOMAIN、LOGONSERVER 等几个必需变量，这里如实列出。
+  'PSModulePath', 'USERNAME', 'USERDOMAIN', 'LOGONSERVER', 'COMPUTERNAME',
+  'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'TZ',
+  // 软件里核心用 Electron 自带的 Node 运行（process.execPath 是 AgentRouter.exe / electron.exe）：执行者若是 Node 脚本
+  //（npm 装的 CLI、fake 执行者）也用它启动，必须保留这个开关，否则会被当成图形程序打开而一直不结束。
+  'ELECTRON_RUN_AS_NODE',
+];
+// 网络：代理与证书（大小写都认）。
+const NETWORK = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
+// 测试专用：设置了测试执行者（AR_TEST_AGENT 或旧名）时，把它与测试控制变量传给假执行者。真实使用时不会设置它。
+const TEST = [...testAgentEnv, /^AR_TEST_/i, /^FAKE_/i];
+export const ALLOWED = [...SYSTEM, ...NETWORK];
+
+const matches = (pattern, key) => pattern instanceof RegExp ? pattern.test(key) : key.toLowerCase() === String(pattern).toLowerCase();
+
+// 只按白名单挑选，不含任何密钥。缺密钥导致 buildEnv 失败时，检测执行者版本也用它。
+export function allowedEnv({ base = process.env, adapter, home, profileName, sources = [] } = {}) {
+  const keep = [...ALLOWED, ...(adapter?.isolate?.({ home, profileName })?.keep ?? []), ...(testAgent(base) ? TEST : [])];
+  const env = Object.fromEntries(Object.entries(base).filter(([k, v]) => typeof v === 'string' && keep.some(p => matches(p, k))));
+  for (const name of sources) for (const k of Object.keys(env)) if (matches(name, k)) delete env[k];
+  return env;
+}
+
+// sources：配置里所有 profile 的密钥来源变量名，即使撞上白名单也不传。
+export function buildEnv({ base = process.env, profile = {}, adapter, home, profileName, resolve, sources = [] }) {
+  // 密钥先从原始环境里取：白名单与清除项都不含它的来源变量。
+  const lookup = resolve ?? (name => resolveSecret(name, { env: base }));
+  const pairs = authOf(profile) === 'token' ? Object.entries(profile.secrets ?? {}) : [];
+  const secrets = pairs.map(([key, from]) => [key, lookup(from)]);
+  const iso = adapter?.isolate?.({ home, profileName }) ?? {};
+  const env = allowedEnv({ base, adapter, home, profileName, sources: [...sources, ...pairs.map(([, from]) => from)] });
+  const del = pattern => { for (const k of Object.keys(env)) if (matches(pattern, k)) delete env[k]; };
+  for (const pattern of iso.clear ?? []) del(pattern);
+  for (const [k, v] of Object.entries(profile.env ?? {})) { del(k); env[k] = String(v); }
+  for (const [k, v] of secrets) { del(k); env[k] = v; }
+  for (const [k, v] of Object.entries(iso.set ?? {})) { del(k); env[k] = String(v); }
+  return env;
+}
+
+// 配置里所有 profile 的密钥来源变量名。
+export const secretSources = config => Object.values(config?.profiles ?? {}).flatMap(p => Object.values(p?.secrets ?? {})).filter(v => typeof v === 'string');

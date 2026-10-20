@@ -1,0 +1,255 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp,writeFile,readFile,appendFile,mkdir,symlink,readdir } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { parseRegistry, RegistryReader, statusOf, Registry, importTasks, validRecordName } from '../../app/src/main/registry';
+import { dispatchMatches } from '../../app/src/main/platform';
+import { parseEvent,readEvents,PAGE_BYTES } from '../../app/src/main/events';
+import { commitFrom,markdown } from '../../app/src/shared/markdown';
+import { combine } from '../../app/src/renderer/timeline';
+import { appDataDir, migrateAppData } from '../../app/src/main/app-data';
+import { executorTag, executorLabel, isCodexTask } from '../../app/src/shared/executor';
+const row=(extra={})=>({v:1,event:'start',id:'sample',repo:path.resolve('/demo/project'),name:'task',title:'演示',spec:null,role:null,pid:42,started:100000,progress:path.resolve('/demo/project/task.progress.log'),report:path.resolve('/demo/project/task.md'),model:null,effort:null,tier:null,...extra});
+const lines=(...rows:unknown[])=>rows.map(r=>JSON.stringify(r)).join('\n')+'\n';
+const ps={pid:42,name:'node.exe',command:'node "C:\\demo\\codex-task.mjs"',created:99000};
+const fixture=async()=>{const home=await mkdtemp(path.join(os.tmpdir(),'dispatchdock-test-'));await mkdir(path.join(home,'monitor'));const entry=row({repo:home,progress:path.join(home,'task.progress.log'),report:path.join(home,'task.md'),events:path.join(home,'task.events.jsonl')});await writeFile(path.join(home,'runs.jsonl'),lines(entry));return {home,entry,task:parseRegistry(lines(entry))[0]};};
+test('清单合并、半行、坏行、未知字段，end 始终优先于 interrupted',()=>{
+  const end={v:1,event:'end',id:'sample',exit:0,at:110000,minutes:1},stop={v:1,event:'interrupted',id:'sample',at:105000,signal:'stopped-by-app'};
+  for(const middle of [[stop,end],[end,stop]]){const parsed=parseRegistry(lines(row({future:'ignore'}))+'broken\n'+lines(...middle)+JSON.stringify(row({id:'half'})));assert.equal(parsed.length,1);assert.equal(parsed[0].status,'done');assert.equal('future' in parsed[0],false);}
+  assert.equal(parseRegistry(lines(row(),stop))[0].status,'stop');assert.equal(parseRegistry(lines(row(),{...end,exit:null}))[0].status,'fail');
+});
+test('进程核对拒绝复用 PID、错误进程、未来创建时间与超过 60 秒',()=>{const t=parseRegistry(lines(row()))[0];assert.equal(statusOf(t,[ps]),'run');for(const p of [{...ps,name:'cmd.exe'},{...ps,command:'node unrelated.mjs'},{...ps,created:100001},{...ps,created:40000},{...ps,pid:43}])assert.equal(statusOf(t,[p]),'stop');assert.equal(dispatchMatches(ps,100000),true);});
+test('清单增量与截断恢复',async()=>{const {home,entry}=await fixture(),file=path.join(home,'runs.jsonl'),reader=new RegistryReader();assert.equal((await reader.read(file)).length,1);await appendFile(file,JSON.stringify({v:1,event:'end',id:'sample',exit:0,at:2}));assert.equal((await reader.read(file))[0].status,'run');await appendFile(file,'\n');assert.equal((await reader.read(file))[0].status,'done');await writeFile(file,lines({...entry,id:'new'}));assert.equal((await reader.read(file))[0].id,'new');});
+test('事件尾页、增量半行与前向翻页按字节限制，未知事件忽略',async()=>{const {task}=await fixture();const make=(seq:number)=>({v:1,seq,at:seq,kind:'say',text:'中文'.repeat(60)});const source=Array.from({length:9000},(_,i)=>make(i+1));await writeFile(task.events!,lines(...source));const page=await readEvents(task);assert.ok(page.cursor.start>0);assert.ok(page.cursor.end-page.cursor.start<=PAGE_BYTES);assert.equal(page.events.at(-1)?.seq,9000);const before=await readEvents(task,page.cursor,true);assert.ok(before.events.length>0);assert.ok(before.events.at(-1)!.seq<page.events[0].seq);assert.equal(before.cursor.end,page.cursor.end);const next=make(9001);await appendFile(task.events!,JSON.stringify(next));assert.equal((await readEvents(task,page.cursor)).events.length,0);await appendFile(task.events!,'\n'+lines({v:1,seq:9002,at:0,kind:'future'}));const update=await readEvents(task,page.cursor);assert.equal(update.events.length,1);assert.equal(update.events[0].text,next.text);await writeFile(task.events!,lines(make(1)));assert.equal((await readEvents(task,update.cursor)).reset,true);});
+test('旧进度解析包括错误、计划、命令失败与统一文件事件；不读取原始 log',async()=>{assert.equal(parseEvent('[12:00:00] 错误：失败',0,true)?.kind,'error');assert.equal(parseEvent('[12:00:00] 出错：失败',0,true)?.kind,'error');assert.deepEqual(parseEvent('[12:00:00] 计划：[x] 第一步 [ ] 第二步',0,true)?.items,[{text:'第一步',done:true},{text:'第二步',done:false}]);assert.equal(parseEvent('[12:00:00]   命令失败（exit 1）：npm test',0,true)?.exit,1);assert.equal(parseEvent('[12:00:00] 新增文件：src/demo.ts',0,true)?.files?.[0].kind,'add');const {task}=await fixture();task.raw=task.progress.replace('.progress.log','.log');await writeFile(task.raw,'private raw');await writeFile(task.progress,'[12:00:00] 说：进度\n');assert.equal((await readEvents(task)).events[0].text,'进度');});
+test('提交号与安全 Markdown，只允许 http(s) 链接，无 HTML 执行',()=>{assert.equal(commitFrom('`123456` `4f2a9c1` `b81e0d2`'),'4f2a9c1');assert.equal(commitFrom('`1234567890123`'),undefined);const html=markdown('# 汇报\n<script>alert(1)</script>\n[bad](javascript:alert)\n[ok](https://example.org/)\n## TODO(design) 1 条\n- 待定\n## 推断清单\n1. 一项\n```html\n<img src=x onerror=alert(1)>\n```');assert.ok(!html.includes('<script>'));assert.ok(!html.includes('<img'));assert.ok(!html.includes('href="javascript:'));assert.ok(html.includes('href="https://example.org/"'));assert.equal((html.match(/class="hl brand"/g)??[]).length,2);assert.equal((markdown('## TODO(lead) 1 条\n- 待定').match(/class="hl brand"/g)??[]).length,1);});
+test('命令开始和结束按 id 合并，跨页保留顺序',()=>{const start=parseEvent(JSON.stringify({v:1,seq:1,at:1,kind:'cmd',id:'c',phase:'start',command:'npm test'}),10)!,end=parseEvent(JSON.stringify({v:1,seq:2,at:2,kind:'cmd',id:'c',phase:'end',command:'npm test',exit:1,output:'failed'}),200)!;const combined=combine([end,start]);assert.equal(combined.length,1);assert.equal(combined[0].offset,10);assert.equal(combined[0].exit,1);});
+test('停止核对后调用假的 kill，半行隔开、通知只在状态转换时发送、隐藏不改清单',async()=>{const {home}=await fixture();let alive=true,killed=0,finished=0;const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>alive?[ps]:[],killTree:async()=>{killed++;alive=false;},open:async()=>{}},()=>{},()=>finished++,e=>{throw e;});try{await registry.start();assert.equal(finished,0);await assert.rejects(registry.hide('sample'));await appendFile(registry.file,'broken half');await registry.stop('sample');assert.equal(killed,1);assert.equal(finished,1);const text=await readFile(registry.file,'utf8');assert.ok(text.includes('broken half\n{"v":1,"event":"interrupted"'));assert.equal(registry.tasks[0].signal,'stopped-by-app');await registry.hide('sample');assert.equal(registry.tasks.length,0);assert.equal(await readFile(registry.file,'utf8'),text);}finally{await registry.close();}});
+test('确认后身份变化时不 kill、不写 interrupted',async()=>{const {home}=await fixture();let calls=0,killed=0;const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>++calls<=2?[ps]:[{...ps,created:101000}],killTree:async()=>{killed++;},open:async()=>{}},()=>{},()=>{},()=>{});try{await registry.start();await assert.rejects(registry.stop('sample'),/任务状态已经变了/);assert.equal(killed,0);assert.ok(!(await readFile(registry.file,'utf8')).includes('interrupted'));}finally{await registry.close();}});
+test('导入旧任务只在本地存储；viewer 退出只删除自己的 pid',async()=>{const {home}=await fixture();const dir=path.join(home,'.codex-runs');await mkdir(dir);await writeFile(path.join(dir,'old.progress.log'),'=== Codex 开始：旧任务（角色：工程负责人）  2026/10/8 10:05:00 ===\n[10:06:00] 说：完成\n=== Codex 结束：exit=0，用时 1.0 分钟，汇报在 demo.md ===\n');const imported=await importTasks(home);assert.equal(imported[0].title,'旧任务');assert.equal(imported[0].status,'done');assert.equal(imported[0].imported,true);const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});await registry.start();const original=await readFile(registry.file,'utf8');await registry.import(home);assert.equal(await readFile(registry.file,'utf8'),original);const viewer=JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8'));assert.equal(viewer.suppressWatchWindow,true);assert.equal(viewer.acceptsManaged,true);await writeFile(path.join(home,'viewer.json'),JSON.stringify({pid:99999}));await registry.close();assert.equal(JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8')).pid,99999);});
+test('无效日期与数值不进入渲染 DTO，持久化导入记录重新验证',async()=>{assert.equal(parseRegistry(lines(row({started:1e100}))).length,0);const parsed=parseRegistry(lines(row(),{v:1,event:'end',id:'sample',exit:0,minutes:'<img src=x>',at:'bad'}))[0];assert.equal(parsed.minutes,undefined);assert.equal(parsed.ended,undefined);assert.equal(parseEvent(JSON.stringify({v:1,seq:1,at:1e100,kind:'say',text:'bad'}),0),null);const {home,task}=await fixture();await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[{...task,id:'import-safe',imported:true,status:'done',minutes:'<img src=x>'},{id:'invalid',imported:true,status:'done'}],hidden:[{},1]}));const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});try{await registry.start();assert.ok(!registry.tasks.some(t=>t.id==='invalid'));assert.equal(registry.tasks.find(t=>t.id==='import-safe')?.minutes,undefined);}finally{await registry.close();}});
+
+// 018 清空任务列表：一次把所有已结束任务的键加入 hidden 并保存一次；进行中的与派发进程仍存活的不动；不改 runs.jsonl。
+test('清空任务列表一次隐藏全部已结束任务（含导入的旧任务），进行中的与派发进程仍存活的不动，不改清单文件',async()=>{
+  const {home,entry}=await fixture(),file=path.join(home,'runs.jsonl');
+  const done=row({id:'done',pid:43,repo:home,progress:path.join(home,'done.progress.log'),report:path.join(home,'done.md')});
+  const live=row({id:'live',pid:44,repo:home,progress:path.join(home,'live.progress.log'),report:path.join(home,'live.md')});
+  await appendFile(file,lines(done,{v:1,event:'end',id:'done',exit:0,at:110000,minutes:1},live,{v:1,event:'interrupted',id:'live',at:105000,signal:'stopped-by-command'}));
+  const base=parseRegistry(lines(entry))[0];
+  await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[{...base,id:'import-old',name:'旧任务',imported:true,status:'done'}],hidden:[]}));
+  const platform={processes:async(pids:number[])=>pids.filter(pid=>pid===42||pid===44).map(pid=>({pid,name:'node.exe',command:'node "C:\\demo\\codex-task.mjs"',created:99000})),killTree:async()=>assert.fail('清空任务列表不该杀进程'),open:async()=>{}};
+  const registry=new Registry(home,path.join(home,'monitor'),platform,()=>{},()=>{},e=>{throw e;});
+  try{
+    await registry.start();
+    assert.deepEqual(registry.tasks.map(t=>[t.id,t.status]).sort(),[['done','done'],['import-old','done'],['live','stop'],['sample','run']]);
+    const before=await readFile(registry.file,'utf8');
+    const result=await registry.hideFinished();
+    assert.equal(result.removed,2);
+    assert.deepEqual(registry.tasks.map(t=>t.id).sort(),['live','sample']);
+    const saved=JSON.parse(await readFile(path.join(home,'monitor','tasks.json'),'utf8'));
+    assert.deepEqual([...saved.hidden].sort(),['done:100000','import-old:100000']);
+    assert.equal(await readFile(registry.file,'utf8'),before);
+    // 再清一次：没有可清的，保存的 hidden 不变。
+    assert.equal((await registry.hideFinished()).removed,0);
+    assert.deepEqual(JSON.parse(await readFile(path.join(home,'monitor','tasks.json'),'utf8')).hidden.sort(),['done:100000','import-old:100000']);
+  }finally{await registry.close();}
+});
+
+test('进程消失先宽限三秒并重读命令停止记录，不提前通知',async()=>{
+  const {home}=await fixture();let present=true,finished=0;
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>present?[ps]:[],killTree:async()=>{},open:async()=>{}},()=>{},()=>finished++,e=>{throw e;});
+  try {
+    await registry.start();present=false;await registry.refresh();assert.equal(registry.tasks[0].status,'run');assert.equal(finished,0);
+    await appendFile(registry.file,lines({v:1,event:'interrupted',id:'sample',signal:'stopped-by-command',at:Date.now()}));
+    await registry.refresh();assert.equal(registry.tasks[0].signal,'stopped-by-command');assert.equal(finished,1);
+  } finally {await registry.close();}
+});
+test('消失超过三秒仍无结束记录才判为中断',async()=>{
+  const {home}=await fixture();
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>{},open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+  try {await registry.start();assert.equal(registry.tasks[0].status,'run');await new Promise(r=>setTimeout(r,3100));await registry.refresh();assert.equal(registry.tasks[0].status,'stop');}
+  finally {await registry.close();}
+});
+test('进程核对：新入口 ar.mjs、软件内置 Node（AgentRouter.exe / 开发时 electron.exe）都算派发进程',()=>{
+  for(const p of [{...ps,command:'node "C:\\技能\\agent-router\\core\\ar.mjs" dispatch 任务'},{...ps,name:'AgentRouter.exe',command:'"C:\\Program Files\\AgentRouter\\AgentRouter.exe" "C:\\Program Files\\AgentRouter\\resources\\app\\core\\ar.mjs" dispatch'},{...ps,name:'electron.exe',command:'electron.exe C:\\repo\\core\\ar.mjs'}])assert.equal(dispatchMatches(p,100000),true,p.command);
+  for(const p of [{...ps,command:'node far.mjs'},{...ps,command:'node ar.mjs.bak'},{...ps,name:'notepad.exe',command:'notepad ar.mjs'}])assert.equal(dispatchMatches(p,100000),false,p.command);
+});
+test('看板同时读新旧两份清单：v2 新任务与 v1 旧任务都显示，旧任务带 legacy 标记；停止旧任务写回旧清单',async()=>{
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-test-')),home=path.join(base,'agent-router'),legacy=path.join(base,'codex-dispatch');await mkdir(home);await mkdir(legacy);
+  const dir=path.join(base,'.agent-runs','新任务');
+  const fresh=row({v:2,id:'new',repo:base,name:'新任务',dir,progress:path.join(dir,'progress.log'),report:path.join(dir,'report.md'),profile:'codex',started:200000,pid:0});
+  const old=row({id:'old',repo:base,progress:path.join(base,'old.progress.log'),report:path.join(base,'old.md'),started:100000});
+  await writeFile(path.join(home,'runs.jsonl'),lines(fresh,{v:1,event:'end',id:'new',exit:0,at:210000,minutes:1}));
+  await writeFile(path.join(legacy,'runs.jsonl'),lines(old));
+  let alive=true;const killed:number[]=[];
+  const platform={processes:async(pids:number[])=>alive?pids.filter(p=>p===42).map(()=>ps):[],killTree:async(pid:number)=>{killed.push(pid);alive=false;},open:async()=>{}};
+  const registry=new Registry(home,path.join(base,'monitor'),platform,()=>{},()=>{},e=>{throw e;},legacy);
+  await registry.start();
+  try{
+    assert.deepEqual(registry.tasks.map(t=>[t.id,t.status,!!t.legacy,t.profile??null]),[['new','done',false,'codex'],['old','run',true,null]]);
+    await registry.stop('old');assert.deepEqual(killed,[42]);
+    assert.match(await readFile(path.join(legacy,'runs.jsonl'),'utf8'),/"event":"interrupted","id":"old","signal":"stopped-by-app"/);
+    assert.doesNotMatch(await readFile(path.join(home,'runs.jsonl'),'utf8'),/interrupted/);
+    assert.equal(registry.tasks.find(t=>t.id==='old')!.status,'stop');
+    assert.equal(JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8')).app,'AgentRouter');
+  }finally{await registry.close();}
+});
+test('刷新进行中再次请求刷新：排一次后续读取，调用之后写入的结束行一定会被读到',async()=>{const {home}=await fixture();let hold:Promise<void>|undefined,release:(()=>void)|undefined,finished=0;const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>{if(hold)await hold;return [ps];},killTree:async()=>{},open:async()=>{}},()=>{},()=>finished++,e=>{throw e;});try{await registry.start();hold=new Promise<void>(r=>{release=r;});const first=registry.refresh();await new Promise(r=>setTimeout(r,20));await appendFile(registry.file,lines({v:1,event:'end',id:'sample',exit:0,at:2}));const second=registry.refresh();assert.notEqual(second,first);hold=undefined;release();await second;assert.equal(registry.tasks[0].status,'done');assert.equal(finished,1);}finally{hold=undefined;release?.();await registry.close();}});
+test('汇报是否存在按文件实际存在判断：进行中没有汇报时为 false，写出后为 true',async()=>{const {home,entry}=await fixture();const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[ps],killTree:async()=>{},open:async()=>{}},()=>{},()=>{},e=>{throw e;});try{await registry.start();assert.equal(registry.tasks[0].status,'run');assert.equal(registry.tasks[0].hasReport,false);await writeFile(entry.report,'# 汇报');await registry.refresh();assert.equal(registry.tasks[0].hasReport,true);}finally{await registry.close();}});
+test('软件数据放在公共目录下的 monitor：旧位置的三份文件只复制不删除，新位置已有的不覆盖',async()=>{const home=await mkdtemp(path.join(os.tmpdir(),'dispatchdock-test-'));assert.equal(appDataDir(home),path.join(home,'monitor'));assert.deepEqual(migrateAppData(home),[]);await writeFile(path.join(home,'preferences.json'),'{"old":1}');await writeFile(path.join(home,'window.json'),'{"w":1}');await mkdir(path.join(home,'monitor'));await writeFile(path.join(home,'monitor','window.json'),'{"w":2}');assert.deepEqual(migrateAppData(home),['preferences.json']);assert.equal(await readFile(path.join(home,'monitor','preferences.json'),'utf8'),'{"old":1}');assert.equal(await readFile(path.join(home,'monitor','window.json'),'utf8'),'{"w":2}','新位置已有的不覆盖');assert.equal(await readFile(path.join(home,'preferences.json'),'utf8'),'{"old":1}','旧文件不删除');assert.deepEqual(migrateAppData(home),[],'再次启动不重复复制');});
+test('执行者显示：清单读出 adapter 与 label；标签取名字首词的大写字母，旧任务按 Codex',()=>{const [t]=parseRegistry(lines(row({v:2,adapter:'claude-code',label:'ExampleAgent Pro',profile:'example'})));assert.equal(t.adapter,'claude-code');assert.equal(t.label,'ExampleAgent Pro');assert.equal(executorLabel(t),'ExampleAgent Pro');assert.equal(isCodexTask(t),false);const [old]=parseRegistry(lines(row()));assert.equal(executorLabel(old),'Codex');assert.equal(isCodexTask(old),true);assert.equal(executorTag('ExampleAgent Pro'),'EA');assert.equal(executorTag('Codex'),'CO');assert.equal(executorTag('Claude（API Key）'),'CL');assert.equal(executorTag('ABCD Agent'),'ABC');});
+
+// ---- 017 批量删除（全部在临时目录里做，绝不碰真实项目的 .agent-runs） ----
+// 两个已结束任务，各有一个真实记录目录；仓库根上另有一个文件，用来确认只删目标目录。
+const deleteFixture=async()=>{
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-delete-'));
+  const repo=path.join(base,'repo'),home=path.join(base,'home'),data=path.join(base,'data');
+  await mkdir(path.join(repo,'.agent-runs'),{recursive:true});await mkdir(home);await mkdir(data);
+  await writeFile(path.join(repo,'keep.txt'),'keep');
+  const entries:any[]=[];
+  for(const [id,name,started] of [['del-a','task-a',100000],['del-b','task-b',200000]] as const){
+    const dir=path.join(repo,'.agent-runs',name);await mkdir(dir);await writeFile(path.join(dir,'progress.log'),'x');
+    entries.push(row({v:2,id,repo,name,started,pid:0,progress:path.join(dir,'progress.log'),report:path.join(dir,'report.md'),events:path.join(dir,'events.jsonl')}));
+  }
+  await writeFile(path.join(home,'runs.jsonl'),lines(...entries,...entries.map(e=>({v:2,event:'end',id:e.id,exit:0,at:e.started+1000,minutes:1}))));
+  return {base,repo,home,data,entries};
+};
+const deleteRegistry=(home:string,data:string,processes:(pids:number[])=>Promise<any[]>)=>new Registry(home,data,{processes,killTree:async()=>assert.fail('删除不应结束进程'),open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+test('017 批量删除：记录名校验，目录穿越、绝对路径与无效名字全部拒绝',async()=>{
+  assert.equal(validRecordName('task-a'),true);
+  for(const name of ['','.','..','.agent-runs','..\\outside','../outside','sub/name','sub\\name','C:\\evil','\\\\server\\share','a..b'])
+    assert.equal(validRecordName(name),false,name);
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-delete-')),repo=path.join(base,'repo'),home=path.join(base,'home'),data=path.join(base,'data');
+  await mkdir(path.join(repo,'.agent-runs'),{recursive:true});await mkdir(home);await mkdir(data);
+  const outside=path.join(base,'outside');await mkdir(outside);await writeFile(path.join(outside,'keep.txt'),'keep');
+  const names=['','.','..','.agent-runs','..\\outside','../outside','sub/name','C:\\evil'];
+  const rows=names.map((name,i)=>row({v:2,id:`bad-${i}`,repo,name,started:100000+i*1000,pid:0,progress:path.join(repo,'p.log'),report:path.join(repo,'r.md')}));
+  await writeFile(path.join(home,'runs.jsonl'),lines(...rows,...rows.map(r=>({v:2,event:'end',id:r.id,exit:0,at:r.started+1}))));
+  const registry=deleteRegistry(home,data,async()=>[]);
+  try{
+    await registry.start();
+    const result=await registry.deleteTasks(rows.map(r=>r.id),true);
+    assert.deepEqual(result,{deleted:names.length,failed:0,filesLeft:names.length});
+    assert.equal(await readFile(path.join(outside,'keep.txt'),'utf8'),'keep');
+    assert.deepEqual(await readdir(path.join(repo,'.agent-runs')),[]);
+  }finally{await registry.close();}
+});
+test('017 批量删除：记录目录或 .agent-runs 本身是指向仓库外的链接时拒绝',async t=>{
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-delete-')),repo=path.join(base,'repo'),repo2=path.join(base,'repo2'),home=path.join(base,'home'),data=path.join(base,'data');
+  await mkdir(path.join(repo,'.agent-runs'),{recursive:true});await mkdir(repo2);await mkdir(home);await mkdir(data);
+  const outside=path.join(base,'outside');await mkdir(outside);await writeFile(path.join(outside,'keep.txt'),'keep');
+  const stolen=path.join(base,'stolen');await mkdir(path.join(stolen,'stolen-task'),{recursive:true});await writeFile(path.join(stolen,'stolen-task','keep.txt'),'keep');
+  try{
+    await symlink(outside,path.join(repo,'.agent-runs','linked-task'),'junction');
+    await symlink(stolen,path.join(repo2,'.agent-runs'),'junction');
+  }catch(e){t.skip('当前环境不能创建目录链接');return;}
+  const rows=[
+    row({v:2,id:'linked',repo,name:'linked-task',started:100000,pid:0,progress:path.join(repo,'p.log'),report:path.join(repo,'r.md')}),
+    row({v:2,id:'stolen',repo:repo2,name:'stolen-task',started:200000,pid:0,progress:path.join(repo2,'p.log'),report:path.join(repo2,'r.md')}),
+  ];
+  await writeFile(path.join(home,'runs.jsonl'),lines(...rows,...rows.map(r=>({v:2,event:'end',id:r.id,exit:0,at:r.started+1}))));
+  const registry=deleteRegistry(home,data,async()=>[]);
+  try{
+    await registry.start();
+    const result=await registry.deleteTasks(rows.map(r=>r.id),true);
+    assert.deepEqual(result,{deleted:2,failed:0,filesLeft:2});
+    assert.equal(await readFile(path.join(outside,'keep.txt'),'utf8'),'keep');
+    assert.equal(await readFile(path.join(stolen,'stolen-task','keep.txt'),'utf8'),'keep');
+  }finally{await registry.close();}
+});
+test('017 批量删除：files=false 只从列表移除；files=true 只删目标目录，hidden 一次写入',async()=>{
+  const f=await deleteFixture();
+  const registry=deleteRegistry(f.home,f.data,async()=>[]);
+  try{
+    await registry.start();
+    const before=await readFile(path.join(f.home,'runs.jsonl'),'utf8');
+    let saves=0;const original=(registry as any).save.bind(registry);(registry as any).save=async()=>{saves++;await original();};
+    const result=await registry.deleteTasks(['del-a','del-b'],false);
+    assert.deepEqual(result,{deleted:2,failed:0,filesLeft:0});
+    assert.equal(saves,1,'两条任务只保存一次');
+    for(const name of ['task-a','task-b'])assert.equal(await readFile(path.join(f.repo,'.agent-runs',name,'progress.log'),'utf8'),'x');
+    assert.equal(await readFile(path.join(f.home,'runs.jsonl'),'utf8'),before,'runs.jsonl 不改');
+    assert.deepEqual(JSON.parse(await readFile(path.join(f.data,'tasks.json'),'utf8')).hidden.sort(),['del-a:100000','del-b:200000']);
+    assert.equal(registry.tasks.length,0);
+  }finally{await registry.close();}
+  const g=await deleteFixture();
+  const two=deleteRegistry(g.home,g.data,async()=>[]);
+  try{
+    await two.start();
+    const result=await two.deleteTasks(['del-a'],true);
+    assert.deepEqual(result,{deleted:1,failed:0,filesLeft:0});
+    await assert.rejects(readFile(path.join(g.repo,'.agent-runs','task-a','progress.log')),{code:'ENOENT'});
+    assert.equal(await readFile(path.join(g.repo,'.agent-runs','task-b','progress.log'),'utf8'),'x');
+    assert.equal(await readFile(path.join(g.repo,'keep.txt'),'utf8'),'keep');
+    assert.ok(!two.tasks.some(t=>t.id==='del-a'));
+    assert.ok(two.tasks.some(t=>t.id==='del-b'));
+  }finally{await two.close();}
+});
+test('017 批量删除：进行中或派发进程仍存活的任务跳过并计入失败',async()=>{
+  const {home}=await fixture();
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[ps],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+  try{
+    await registry.start();
+    assert.equal(registry.tasks[0].status,'run');
+    const result=await registry.deleteTasks(['sample'],false);
+    assert.deepEqual(result,{deleted:0,failed:1,filesLeft:0});
+    assert.ok(registry.tasks.some(t=>t.id==='sample'));
+    assert.equal(await readFile(path.join(home,'monitor','tasks.json'),'utf8').catch(()=>''),'');
+  }finally{await registry.close();}
+});
+test('017 批量删除：导入的旧任务只从列表移除，不删目录也不算失败',async()=>{
+  const {home,task}=await fixture();
+  await mkdir(path.join(home,'.agent-runs','old'),{recursive:true});
+  await writeFile(path.join(home,'.agent-runs','old','progress.log'),'x');
+  await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[{...task,id:'import-safe',name:'old',started:90000,imported:true,status:'done',exit:0}],hidden:[]}));
+  const registry=deleteRegistry(home,path.join(home,'monitor'),async()=>[]);
+  try{
+    await registry.start();
+    assert.ok(registry.tasks.some(t=>t.id==='import-safe'));
+    const result=await registry.deleteTasks(['import-safe'],true);
+    assert.deepEqual(result,{deleted:1,failed:0,filesLeft:0});
+    assert.equal(await readFile(path.join(home,'.agent-runs','old','progress.log'),'utf8'),'x');
+    assert.ok(!registry.tasks.some(t=>t.id==='import-safe'));
+  }finally{await registry.close();}
+});
+test('进程查询失败：启动不抛出，进行中任务标未知、不推断结束，保留错误与首次失败时刻；每次刷新最多试 3 次；恢复后清除',async()=>{
+  const {home}=await fixture();let calls=0,fail=true,finished=0;
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>{calls++;if(fail)throw Error('WMI 暂时不可用');return [ps];},killTree:async()=>{throw Error('不该结束进程');},open:async()=>{}},()=>{},()=>finished++,e=>{throw e;});
+  try {
+    await registry.start();
+    assert.equal(calls,3,'一次刷新最多试 3 次');
+    assert.equal(registry.tasks[0].status,'run');assert.equal(registry.tasks[0].processState,'unknown');
+    assert.equal(registry.processCheck.ok,false);assert.equal(registry.processCheck.failures,1);assert.match(registry.processCheck.error!,/WMI 暂时不可用/);
+    const since=registry.processCheck.since;assert.ok(Number.isFinite(since));
+    await new Promise(resolve=>setTimeout(resolve,3200));await registry.refresh();
+    assert.equal(registry.tasks[0].status,'run','查询失败期间即使超过 3 秒宽限也不推断结束');assert.equal(registry.tasks[0].processState,'unknown');
+    assert.ok(registry.processCheck.failures>=2,'连续失败次数累加');assert.equal(registry.processCheck.since,since,'首次失败时刻保留');assert.equal(finished,0,'不发结束通知');
+    fail=false;await registry.refresh();
+    assert.deepEqual(registry.processCheck,{ok:true,failures:0});assert.equal(registry.tasks[0].processState,undefined);assert.equal(registry.tasks[0].status,'run');
+  } finally {await registry.close();}
+});
+test('进程查询失败：之前已确认停止的任务保留最后已知状态，不改回进行中',async()=>{
+  const {home}=await fixture();let fail=false;
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>{if(fail)throw Error('查询失败');return [];},killTree:async()=>{},open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+  try {
+    await registry.start();await new Promise(resolve=>setTimeout(resolve,3200));await registry.refresh();
+    assert.equal(registry.tasks[0].status,'stop','进程消失超过宽限期判为中断');
+    fail=true;await registry.refresh();
+    assert.equal(registry.tasks[0].status,'stop','查询失败时保留最后已知的"已中断"');assert.equal(registry.tasks[0].processState,undefined);assert.equal(registry.processCheck.ok,false);
+  } finally {await registry.close();}
+});
+test('进程查询失败时依赖进程状态的操作受保护：停止不结束进程，隐藏 / 删除 / 清空任务列表都拒绝且不改列表',async()=>{
+  const {home}=await fixture();let killed=0;
+  await appendFile(path.join(home,'runs.jsonl'),lines(row({id:'done1',name:'task2',repo:home,pid:43,started:200000}),{v:1,event:'end',id:'done1',exit:0,at:210000,minutes:1}));
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>{throw Error('查询失败');},killTree:async()=>{killed++;},open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+  try {
+    await registry.start();
+    const before=registry.tasks.map(t=>t.id).sort();
+    await assert.rejects(registry.stop('sample'));assert.equal(killed,0,'查询失败时不结束进程树');
+    await assert.rejects(registry.hide('sample'),'进行中（状态未知）的任务不能隐藏');
+    await assert.rejects(registry.deleteTasks(['done1'],false),'已结束但需要核对进程的任务，查询失败时拒绝删除');
+    await assert.rejects(registry.hideFinished(),'清空任务列表在查询失败时拒绝');
+    await registry.refresh();assert.deepEqual(registry.tasks.map(t=>t.id).sort(),before,'列表没有变化');
+  } finally {await registry.close();}
+});

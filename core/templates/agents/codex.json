@@ -1,0 +1,11 @@
+{
+  "name": "codex",
+  "adapter": "codex",
+  "label": "Codex",
+  "auth": "login",
+  "enabled": true,
+  "title": "Codex",
+  "description": "用 ChatGPT 登录或 OpenAI API Key",
+  "recommended": false,
+  "order": 7
+}

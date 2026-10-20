@@ -1,0 +1,359 @@
+{
+  "claude-code-sample.jsonl": {
+    "lastResult": "完成",
+    "events": [
+      {
+        "line": 1,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "init",
+            "detail": "deepseek-v4-pro"
+          }
+        ]
+      },
+      {
+        "line": 5,
+        "events": [
+          {
+            "kind": "think",
+            "text": "The user wants me to follow specific steps. Note: they mention TodoWrite and Bash tools, but I don't have those exact tools. I have Write, Read, Edit, PowerShell, etc. There's no TodoWrite or Bash tool. The environment is PowerShell on Windows.\n\nThe user says \"严格按步骤做\" but I don't have TodoWrite or Bash tools. I should use the closest equivalents: for TodoWrite, I don't have a todo tool. For Bash, I use PowerShell.\n\nActually, let me just do the steps with what I have. The final response should be just \"完成\".\n\nLet me interpret: \n1. TodoWrite - not available. I'll skip or use a plan? There's no TodoWrite tool. I'll just proceed.\n2. Write hello.txt with \"你好\"\n3. Bash git status --short → PowerShell git status --short\n4. Read hello.txt, then Edit append \"完成\"\n5. Reply \"完成\"\n\nThe user wants me to keep it short and only reply \"完成\" at the end. Let me do the actions.\n\nFor step 1, since TodoWrite doesn't exist, I could skip it but they said strictly follow. However there's no such tool. I'll just proceed with the actual file operations. Actually I shouldn't fabricate. Let me just do steps 2-4 and reply 完成.\n\nLet me write hello.txt, then run git status, then read + edit.\n\nI can do Write and PowerShell in parallel? Write creates the file, git status depends on file existing. The Read+Edit needs Write done first. Let me sequence: Write first, then PowerShell git status, then Read, then Edit.\n\nActually step 3 git status should run after file created. Step 4 read then edit. Let me do Write, then in parallel PowerShell and... no, Read then Edit sequential.\n\nLet me just do it efficiently. First Write hello.txt. Then PowerShell git status --short. Then Read. Then Edit.\n\nI can batch Write + nothing else. Then after Write completes, run PowerShell and Read in parallel. Then Edit.\n\nActually Read before Edit is required by Edit tool (must Read in conversation first). So: Write → (PowerShell, Read) → Edit → final reply.\n\nLet me proceed."
+          }
+        ]
+      },
+      {
+        "line": 7,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "add",
+                "path": "hello.txt"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 8,
+        "events": [
+          {
+            "kind": "think",
+            "text": "Continue. Run PowerShell git status --short and Read hello.txt in parallel."
+          }
+        ]
+      },
+      {
+        "line": 9,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_002",
+            "phase": "start",
+            "command": "git status --short"
+          }
+        ]
+      },
+      {
+        "line": 10,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "Read",
+            "detail": "Read hello.txt"
+          }
+        ]
+      },
+      {
+        "line": 11,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_002",
+            "phase": "end",
+            "command": "git status --short",
+            "exit": 0,
+            "output": "?? hello.txt\nShell cwd was reset to D:\\demo\\repo",
+            "truncated": false
+          }
+        ]
+      },
+      {
+        "line": 15,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "update",
+                "path": "hello.txt"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 17,
+        "events": [
+          {
+            "kind": "say",
+            "text": "完成"
+          }
+        ]
+      },
+      {
+        "line": 18,
+        "events": [
+          {
+            "kind": "turn",
+            "usage": {
+              "input": 1200,
+              "output": 300
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "claude-code-extra.jsonl": {
+    "lastResult": null,
+    "events": [
+      {
+        "line": 1,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "init",
+            "detail": "example-model"
+          }
+        ]
+      },
+      {
+        "line": 3,
+        "events": [
+          {
+            "kind": "think",
+            "text": "先看看测试为什么失败"
+          }
+        ]
+      },
+      {
+        "line": 6,
+        "events": [
+          {
+            "kind": "plan",
+            "items": [
+              {
+                "text": "写测试",
+                "done": true
+              },
+              {
+                "text": "修复缺陷",
+                "done": false
+              },
+              {
+                "text": "提交",
+                "done": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 8,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_102",
+            "phase": "start",
+            "command": "npm test"
+          }
+        ]
+      },
+      {
+        "line": 9,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_102",
+            "phase": "end",
+            "command": "npm test",
+            "exit": 1,
+            "output": "1 failing\n  断言失败",
+            "truncated": false
+          }
+        ]
+      },
+      {
+        "line": 10,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_103",
+            "phase": "start",
+            "command": "node print-lines.js"
+          }
+        ]
+      },
+      {
+        "line": 11,
+        "events": [
+          {
+            "kind": "cmd",
+            "id": "toolu_103",
+            "phase": "end",
+            "command": "node print-lines.js",
+            "exit": 0,
+            "output": "第 1 行输出\n第 2 行输出\n第 3 行输出\n第 4 行输出\n第 5 行输出\n第 6 行输出\n第 7 行输出\n第 8 行输出\n第 9 行输出\n第 10 行输出\n第 11 行输出\n第 12 行输出\n第 13 行输出\n第 14 行输出\n第 15 行输出\n第 16 行输出\n第 17 行输出\n第 18 行输出\n第 19 行输出\n第 20 行输出\n第 21 行输出\n第 22 行输出\n第 23 行输出\n第 24 行输出\n第 25 行输出\n第 26 行输出\n第 27 行输出\n第 28 行输出\n第 29 行输出\n第 30 行输出\n第 31 行输出\n第 32 行输出\n第 33 行输出\n第 34 行输出\n第 35 行输出\n第 36 行输出\n第 37 行输出\n第 38 行输出\n第 39 行输出\n第 40 行输出\n第 41 行输出\n第 42 行输出\n第 43 行输出\n第 44 行输出\n第 45 行输出\n第 46 行输出\n第 47 行输出\n第 48 行输出\n第 49 行输出\n第 50 行输出\n第 51 行输出\n第 52 行输出\n第 53 行输出\n第 54 行输出\n第 55 行输出\n第 56 行输出\n第 57 行输出\n第 58 行输出\n第 59 行输出\n第 60 行输出\n第 61 行输出\n第 62 行输出\n第 63 行输出\n第 64 行输出\n第 65 行输出\n第 66 行输出\n第 67 行输出\n第 68 行输出\n第 69 行输出\n第 70 行输出\n第 71 行输出\n第 72 行输出\n第 73 行输出\n第 74 行输出\n第 75 行输出\n第 76 行输出\n第 77 行输出\n第 78 行输出\n第 79 行输出\n第 80 行输出\n第 81 行输出\n第 82 行输出\n第 83 行输出\n第 84 行输出\n第 85 行输出\n第 86 行输出\n第 87 行输出\n第 88 行输出\n第 89 行输出\n第 90 行输出\n第 91 行输出\n第 92 行输出\n第 93 行输出\n第 94 行输出\n第 95 行输出\n第 96 行输出\n第 97 行输出\n第 98 行输出\n第 99 行输出\n第 100 行输出\n第 101 行输出\n第 102 行输出\n第 103 行输出\n第 104 行输出\n第 105 行输出\n第 106 行输出\n第 107 行输出\n第 108 行输出\n第 109 行输出\n第 110 行输出\n第 111 行输出\n第 112 行输出\n第 113 行输出\n第 114 行输出\n第 115 行输出\n第 116 行输出\n第 117 行输出\n第 118 行输出\n第 119 行输出\n第 120 行输出\n第 121 行输出\n第 122 行输出\n第 123 行输出\n第 124 行输出\n第 125 行输出\n第 126 行输出\n第 127 行输出\n第 128 行输出\n第 129 行输出\n第 130 行输出\n第 131 行输出\n第 132 行输出\n第 133 行输出\n第 134 行输出\n第 135 行输出\n第 136 行输出\n第 137 行输出\n第 138 行输出\n第 139 行输出\n第 140 行输出\n第 141 行输出\n第 142 行输出\n第 143 行输出\n第 144 行输出\n第 145 行输出\n第 146 行输出\n第 147 行输出\n第 148 行输出\n第 149 行输出\n第 150 行输出\n第 151 行输出\n第 152 行输出\n第 153 行输出\n第 154 行输出\n第 155 行输出\n第 156 行输出\n第 157 行输出\n第 158 行输出\n第 159 行输出\n第 160 行输出\n第 161 行输出\n第 162 行输出\n第 163 行输出\n第 164 行输出\n第 165 行输出\n第 166 行输出\n第 167 行输出\n第 168 行输出\n第 169 行输出\n第 170 行输出\n第 171 行输出\n第 172 行输出\n第 173 行输出\n第 174 行输出\n第 175 行输出\n第 176 行输出\n第 177 行输出\n第 178 行输出\n第 179 行输出\n第 180 行输出\n第 181 行输出\n第 182 行输出\n第 183 行输出\n第 184 行输出\n第 185 行输出\n第 186 行输出\n第 187 行输出\n第 188 行输出\n第 189 行输出\n第 190 行输出\n第 191 行输出\n第 192 行输出\n第 193 行输出\n第 194 行输出\n第 195 行输出\n第 196 行输出\n第 197 行输出\n第 198 行输出\n第 199 行输出\n第 200 行输出",
+            "truncated": true
+          }
+        ]
+      },
+      {
+        "line": 13,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "update",
+                "path": "src/a.ts"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 15,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "update",
+                "path": "notes/analysis.ipynb"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 17,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "update",
+                "path": "README.md"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 19,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "add",
+                "path": "docs/new-guide.md"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 23,
+        "events": [
+          {
+            "kind": "file",
+            "files": [
+              {
+                "kind": "update",
+                "path": "D:/other/notes.md"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "line": 24,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "Grep",
+            "detail": "Grep src TODO"
+          }
+        ]
+      },
+      {
+        "line": 26,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "Glob",
+            "detail": "Glob **/*.ts"
+          }
+        ]
+      },
+      {
+        "line": 27,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "WebFetch",
+            "detail": "WebFetch https://example.org/docs"
+          }
+        ]
+      },
+      {
+        "line": 28,
+        "events": [
+          {
+            "kind": "tool",
+            "name": "Task",
+            "detail": "Task 调研依赖"
+          }
+        ]
+      },
+      {
+        "line": 32,
+        "events": [
+          {
+            "kind": "text",
+            "text": "Warning: 这是一行非 JSON 的输出"
+          }
+        ]
+      },
+      {
+        "line": 34,
+        "events": [
+          {
+            "kind": "say",
+            "text": "测试仍有 1 个失败，已达到轮数上限。"
+          }
+        ]
+      },
+      {
+        "line": 35,
+        "events": [
+          {
+            "kind": "turn",
+            "usage": {
+              "input": 500,
+              "output": 50
+            }
+          },
+          {
+            "kind": "error",
+            "text": "达到最大轮数仍未完成（error_max_turns）"
+          }
+        ]
+      }
+    ]
+  }
+}

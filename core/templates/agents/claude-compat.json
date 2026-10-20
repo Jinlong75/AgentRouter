@@ -1,0 +1,15 @@
+{
+  "name": "compat",
+  "adapter": "claude-code",
+  "label": "兼容后端",
+  "auth": "token",
+  "env": {
+    "ANTHROPIC_BASE_URL": "",
+    "ANTHROPIC_MODEL": ""
+  },
+  "secrets": { "ANTHROPIC_AUTH_TOKEN": "COMPAT_API_KEY" },
+  "title": "Claude Code 兼容后端",
+  "description": "自定义接口地址和模型",
+  "recommended": false,
+  "order": 6
+}

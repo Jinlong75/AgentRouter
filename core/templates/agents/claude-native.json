@@ -1,0 +1,15 @@
+{
+  "name": "claude-native",
+  "adapter": "claude-code",
+  "label": "Claude（API Key）",
+  "enabled": true,
+  "env": {},
+  "auth": "token",
+  "secrets": { "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY" },
+  "maxTurns": null,
+  "price": { "inputPer1M": null, "outputPer1M": null, "currency": "USD" },
+  "title": "Claude Code",
+  "description": "用 Claude API Key",
+  "recommended": false,
+  "order": 4
+}

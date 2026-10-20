@@ -1,0 +1,85 @@
+name: verify
+on:
+  push:
+    branches: [main, 'stage/**']
+  pull_request:
+  # 手动触发：单独复现某项界面检查（例如 focus=UI05、repeat=30），或开运行期探针跑完整界面验收（probe=1）；只跑 gui 作业。
+  # 这两种都是专项实验，不计作完整界面回归（完整回归看 push / pull_request 触发的运行）。
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: '只跑这一项（UI05、UI17-fail、newtask-load、core-spawn）；留空跑完整界面验收'
+        required: false
+        default: ''
+      repeat:
+        description: '单独复现时重复的轮数'
+        required: false
+        default: '30'
+      probe:
+        description: '1 = 完整界面验收期间开运行期对照探针（Electron-as-Node / node.exe 交替启动，见 shots-probe.ts）'
+        required: false
+        default: ''
+      # 环境诊断实验（PR #5 CI）：baseline 只记录；storsvc 只停存储服务；compattel 只停启动 CompatTelRunner 的计划任务与进程。
+      # 只在这台一次性运行器上临时生效，不是修复、不计作正式回归（见 tools/ci-env-experiment.ps1）。
+      envtest:
+        description: '环境诊断实验组：baseline / storsvc / compattel；留空不做'
+        required: false
+        default: ''
+jobs:
+  windows:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # verify 不启动 Electron，省下载时间
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint:tree
+      - run: npm run verify
+  # VisualSpec 6.7：界面验收（真实输入、每页通用检查、UI 基线）。验收窗口不显示，不需要桌面会话。
+  gui:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      # 字体缓存：MiSans 全量包（约 20 MB，hyperos.mi.com）在托管运行器上下载曾超时。键取 tools/fonts.mjs 的哈希
+      # （其中固定了字体版本与 SHA-256），换字体自动失效；命中时跳过下载，build 复制时仍逐个核对 SHA-256。
+      - id: fonts-cache
+        uses: actions/cache@v4
+        with:
+          path: build/fonts
+          key: fonts-${{ hashFiles('tools/fonts.mjs') }}
+      - if: steps.fonts-cache.outputs.cache-hit != 'true'
+        run: npm run fonts
+      - name: 环境诊断实验：记录、临时干预并核对是否生效
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.envtest != ''
+        shell: pwsh
+        env:
+          ENVTEST: ${{ github.event.inputs.envtest }}
+        run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase before
+      - run: npm run shots
+        env:
+          AR_SHOTS_FOCUS: ${{ github.event.inputs.focus }}
+          AR_SHOTS_REPEAT: ${{ github.event.inputs.repeat }}
+          AR_SHOTS_PROBE: ${{ github.event.inputs.probe }}
+      - name: 环境诊断实验：结束时核对干预是否仍生效
+        if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.envtest != ''
+        shell: pwsh
+        env:
+          ENVTEST: ${{ github.event.inputs.envtest }}
+        run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase after
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shots
+          path: app/dist/shots/

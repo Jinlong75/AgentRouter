@@ -1,0 +1,145 @@
+/* AgentRouter 设计令牌（主导维护；数值以 docs/plan/VisualSpec.md 第 2 节为准）
+ * 主题由应用在 <html data-theme="dark|light"> 上设置，默认跟随系统。
+ * 视觉方向（VisualSpec V3"控制台"）：深色优先、冷灰中性色、等宽数据、少粗体。
+ * 品牌色琥珀（V4）只用于：品牌标记、主操作按钮、键盘焦点环、"待验收"（轮到人做决定）。
+ * 原"琥珀 = 中断/警告"语义取消（V5）：中断用 --stale，TODO/推断清单与注意用 --brand-soft，环境变量覆盖说明用 --run。
+ * 应用图标的颜色写在 icons/app.svg 里，不随主题变。
+ * 这里是渲染层唯一允许出现颜色字面量的地方（lint:tree R7）；对比度由 tests/unit/tokens.test.mjs 校验。
+ */
+
+:root {
+  /* 字体：界面文字 MiSans（随包注册的别名 AgentRouter MiSans）；等宽 Cascadia Mono → Consolas；字标 Space Grotesk */
+  --font-ui: "AgentRouter MiSans", "MiSans VF", "MiSans", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "MiSans VF", "MiSans", "Microsoft YaHei UI", monospace;
+  --font-brand: "AgentRouter Space Grotesk", "Space Grotesk", "Segoe UI", sans-serif;
+
+  /* 字号 / 字重 / 行高：全部 500 以下（字标 700 除外），不用粗体；行高用整数像素 */
+  --fs-page: 22px;
+  --fs-title: 14px;
+  --fs-body: 13px;
+  --fs-small: 12px;
+  --fs-mono: 12px;
+  --fw-strong: 500;
+  --lh: 20px;
+  --lh-small: 18px;
+
+  /* 间距 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* 圆角 */
+  --r-card: 12px;
+  --r-ctl: 8px;
+  --r-inner: 6px;
+  --r-pill: 999px;
+
+  /* 尺寸 */
+  --ctl: 32px;         /* 默认按钮、输入框、下拉框、分段控件 */
+  --ctl-sm: 28px;      /* 小按钮、图标按钮、卡片头和工具条里的控件 */
+  --row: 52px;         /* 任务列表行 */
+  --mark: 16px;        /* 状态标记 */
+  --titlebar-h: 44px;
+  --page-h: 64px;      /* 页面标题行 */
+  --nav-w: 200px;
+  --list-w: 320px;     /* 任务页列表栏 */
+
+  /* 窗口：默认 1160×720，最小 960×600 */
+  --win-w: 1160px;
+  --win-h: 720px;
+  --win-min-w: 960px;
+  --win-min-h: 600px;
+
+  /* 动效：只用来说明"什么变了"；后台刷新不产生动效；系统减少动态效果时全关 */
+  --dur-1: 120ms;  /* 悬停、按下、收起 */
+  --dur-2: 160ms;  /* 进入：页面、菜单、详情 */
+  --dur-3: 220ms;  /* 状态变化、指示条滑动 */
+  --dur-flash: 1600ms; /* 新出现的一条底色淡出 */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-move: cubic-bezier(0.3, 0, 0, 1);
+
+  --material-blur: blur(24px) saturate(180%);
+}
+
+[data-theme="dark"] {
+  --bg: #0D0E10;
+  --nav-bg: #0A0B0C;
+  --surface: #15171A;
+  --surface-2: #24282D;
+  --selected: #1D2024;
+  --border: #262A30;
+  --divider: #1C1F23;
+  --chip: #2E333A;
+  --text: #ECEEF1;
+  --text-2: #9BA1AB;
+  --text-3: #8A909A;
+
+  --brand: #FFB52E;
+  --brand-fill: #F5A30A;
+  --brand-fill-hover: #FFB52E;
+  --on-brand: #1A1408;
+  --brand-soft: rgba(255, 181, 46, 0.14);
+  --focus: #FFB52E;
+
+  --ok: #3DD68C;
+  --ok-soft: #16241D;
+  --fail: #F0645A;
+  --fail-bg: rgba(240, 100, 90, 0.10);
+  --run: #5AA9FF;
+  --run-bg: rgba(90, 169, 255, 0.10);
+  --stale: #8A8F98;
+  --todo: #3A3F46;
+  --track: #2A2E34;
+
+  /* 辅助层（VisualSpec 未单列，由上面的底色推得） */
+  --scrim: rgba(0, 0, 0, 0.55);
+  --material: rgba(13, 14, 16, 0.72);
+  --material-edge: rgba(255, 255, 255, 0.06);
+  --toggle-on: #ECEEF1;
+  --toggle-knob-on: #0D0E10;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--border);
+}
+
+[data-theme="light"] {
+  --bg: #FCFCFB;
+  --nav-bg: #F6F6F4;
+  --surface: #F2F2EF;
+  --surface-2: #FFFFFF;
+  --selected: #EAEAE6;
+  --border: #E4E4E0;
+  --divider: #EDEDEA;
+  --chip: #D9DADD;
+  --text: #141518;
+  --text-2: #50545C;
+  --text-3: #63676F;
+
+  --brand: #8F5F00;
+  --brand-fill: #F5A30A;
+  --brand-fill-hover: #E89A06;
+  --on-brand: #1A1408;
+  --brand-soft: rgba(245, 163, 10, 0.16);
+  --focus: #B57800;
+
+  --ok: #17784A;
+  --ok-soft: #E3F3EA;
+  --fail: #B4302A;
+  --fail-bg: rgba(180, 48, 42, 0.07);
+  --run: #2560B8;
+  --run-bg: rgba(37, 96, 184, 0.07);
+  --stale: #65696F;
+  --todo: #C9CBD0;
+  --track: #DCDDE0;
+
+  /* 辅助层（VisualSpec 未单列，由上面的底色推得） */
+  --scrim: rgba(20, 21, 24, 0.30);
+  --material: rgba(252, 252, 251, 0.74);
+  --material-edge: rgba(0, 0, 0, 0.07);
+  --toggle-on: #141518;
+  --toggle-knob-on: #FFFFFF;
+  --shadow-pop: 0 8px 24px rgba(20, 21, 24, 0.12), 0 0 0 1px var(--border);
+}

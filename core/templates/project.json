@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "name": "{name}",
+  "baseBranch": "{baseBranch}",
+  "specsDir": "docs/specs",
+  "setup": [],
+  "verify": [],
+  "allowedPaths": ["**"],
+  "routing": { "rules": [] },
+  "worktree": true
+}

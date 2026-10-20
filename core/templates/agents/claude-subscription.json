@@ -1,0 +1,15 @@
+{
+  "name": "claude-subscription",
+  "adapter": "claude-code",
+  "label": "Claude（订阅令牌）",
+  "enabled": true,
+  "env": {},
+  "auth": "token",
+  "secrets": { "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_OAUTH_TOKEN" },
+  "maxTurns": null,
+  "price": { "inputPer1M": null, "outputPer1M": null, "currency": "USD" },
+  "title": "Claude Code（订阅）",
+  "description": "用 Claude 订阅令牌（在终端运行 claude setup-token 获取）",
+  "recommended": false,
+  "order": 5
+}

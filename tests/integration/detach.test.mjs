@@ -1,0 +1,134 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
+import { validRequest } from '../../core/lib/managed.mjs';
+
+const script = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+const execute = promisify(execFile);
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const rows = home => { try { const s = fs.readFileSync(path.join(home, 'runs.jsonl'), 'utf8'); return s.trim().split('\n').filter(Boolean).map(JSON.parse); } catch { return []; } };
+async function until(fn, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) { const result = fn(); if (result) return result; await delay(25); }
+  throw Error('隔离测试等待超时');
+}
+
+function fixture(t, { delayMs = 4000, exit = 0, secret = false } = {}) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-detach-'));
+  const home = path.join(base, 'home'), repo = path.join(base, 'repo');
+  for (const dir of [home, repo]) fs.mkdirSync(dir);
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, AR_NO_WATCH: '1' };
+  for (const key of ['AR_DRY_RUN', 'CODEX_DRY_RUN', 'NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE', 'AR_TEST_AGENT', 'CODEX_DISPATCH_TEST_AGENT']) delete env[key];
+  const profile = { adapter: 'fake', label: '假执行者', enabled: true, events: [{ kind: 'say', text: '正在做' }, { kind: 'say', text: '做完了' }], report: '假汇报\n', exit, delayMs };
+  if (secret) { profile.secrets = { OPENAI_API_KEY: 'FAKE_SECRET_SOURCE' }; env.FAKE_SECRET_SOURCE = '假密钥值-不可出现在请求文件'; }
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake', profiles: { fake: profile } }));
+  const children = new Set();
+  function dispatch(name, extra = []) {
+    const child = spawn(process.execPath, [script, 'dispatch', '隔离任务', '--name', name, '--detach', '--json', ...extra], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false });
+    children.add(child);
+    let stdout = '', stderr = '';
+    child.stdout.on('data', b => stdout += b); child.stderr.on('data', b => stderr += b);
+    child.done = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr })); });
+    return child;
+  }
+  function command(args) {
+    const child = spawn(process.execPath, [script, ...args], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false });
+    children.add(child);
+    let stdout = '', stderr = '';
+    child.stdout.on('data', b => stdout += b); child.stderr.on('data', b => stderr += b);
+    child.done = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', code => resolve({ code, stdout, stderr })); });
+    return child;
+  }
+  t.after(async () => {
+    for (const child of children) if (child.exitCode === null && child.signalCode === null && alive(child.pid)) child.kill();
+    // 只清理本 fixture 记录的执行者进程，绝不按进程名终止。
+    for (const r of rows(home).filter(r => r.event === 'start')) if (alive(r.pid)) {
+      if (process.platform === 'win32') await execute('taskkill.exe', ['/PID', String(r.pid), '/T', '/F'], { windowsHide: true }).catch(() => {});
+      else process.kill(r.pid);
+    }
+    assert.ok(path.relative(os.tmpdir(), base).startsWith('ar-detach-'));
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  return { base, home, repo, env, dispatch, command };
+}
+
+test('--detach：调用者先返回，执行者在调用者退出后完成，pid 与调用者不同', async t => {
+  const f = fixture(t, { delayMs: 2000 });
+  const caller = f.dispatch('detach-test');
+  const before = Date.now();
+  const result = await caller.done;
+  const elapsed = Date.now() - before;
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(elapsed < 2500, `调用者应在任务结束前返回（用时 ${elapsed}ms）`);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.ok, true); assert.equal(value.exit, 0); assert.equal(value.detached, true);
+  assert.ok(value.id); assert.equal(value.name, 'detach-test');
+  assert.match(value.lines.join('\n'), /^记录名：detach-test/);
+  assert.equal(rows(f.home).filter(r => r.event === 'end').length, 0, '调用者返回时任务还没结束');
+  const start = await until(() => rows(f.home).find(r => r.event === 'start'));
+  assert.equal(start.id, value.id, '返回的 id 与清单 start 行一致');
+  assert.notEqual(start.pid, caller.pid, '执行者进程不是调用者进程');
+  assert.ok(alive(start.pid), '执行者在调用者退出后仍存活');
+  const end = await until(() => rows(f.home).find(r => r.event === 'end'), 15000);
+  assert.equal(end.exit, 0);
+  assert.equal(fs.readFileSync(start.report, 'utf8'), '假汇报\n');
+});
+
+test('--detach：请求文件不含密钥值，仍是合法托管请求', async t => {
+  const f = fixture(t, { delayMs: 2000, secret: true });
+  const caller = f.dispatch('detach-secret');
+  const result = await caller.done;
+  assert.equal(result.code, 0, result.stderr);
+  const id = JSON.parse(result.stdout).id;
+  const managedDir = path.join(f.home, 'managed');
+  await until(() => fs.readdirSync(managedDir).some(n => n === `${id}.claimed.json` || n === `${id}.running.json`));
+  const read = suffix => { const p = path.join(managedDir, `${id}${suffix}`); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; };
+  const text = `${read('.claimed.json')}${read('.running.json')}`;
+  assert.ok(text.length > 0, '读到至少一份请求文件');
+  assert.ok(!text.includes('假密钥值-不可出现在请求文件'), '请求文件不含密钥值');
+  const request = JSON.parse(read('.running.json') || read('.claimed.json'));
+  assert.equal(validRequest(request), true, '脱离请求是合法托管请求');
+  assert.equal(request.app, 'AgentRouter');
+  assert.equal(request.profileConfig.secrets.OPENAI_API_KEY, 'FAKE_SECRET_SOURCE', '请求里只有密钥来源变量名');
+  assert.ok(!Object.hasOwn(request.env, 'FAKE_SECRET_SOURCE') && !Object.hasOwn(request.env, 'OPENAI_API_KEY'), '请求环境不含密钥来源或密钥本身');
+});
+
+// 015：软件派发（--host agentrouter）的脱离请求仍是合法托管请求，派活方记 agentrouter。
+test('--detach --host agentrouter：请求合法，start.dispatcher 记 agentrouter', async t => {
+  const f = fixture(t, { delayMs: 2000 });
+  const caller = f.dispatch('detach-agentrouter', ['--host', 'agentrouter']);
+  const result = await caller.done;
+  assert.equal(result.code, 0, result.stderr);
+  const id = JSON.parse(result.stdout).id;
+  const managedDir = path.join(f.home, 'managed');
+  await until(() => fs.readdirSync(managedDir).some(n => n === `${id}.claimed.json` || n === `${id}.running.json`));
+  const read = suffix => { const p = path.join(managedDir, `${id}${suffix}`); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; };
+  const request = JSON.parse(read('.running.json') || read('.claimed.json'));
+  assert.equal(validRequest(request), true, 'agentrouter 脱离请求是合法托管请求');
+  assert.deepEqual(request.dispatcher, { host: 'agentrouter', session: null });
+  const start = await until(() => rows(f.home).find(r => r.event === 'start'));
+  assert.deepEqual(start.dispatcher, { host: 'agentrouter', session: null });
+});
+
+test('--detach 的任务能被 ar stop 结束，进程树随之退出', async t => {
+  const f = fixture(t, { delayMs: 60000 });
+  const caller = f.dispatch('detach-stop');
+  assert.equal((await caller.done).code, 0);
+  const start = await until(() => rows(f.home).find(r => r.event === 'start'));
+  const spawned = await until(() => rows(f.home).find(r => r.event === 'spawned'));
+  t.after(() => { for (const pid of [start.pid, spawned.agentPid]) if (alive(pid)) process.kill(pid); });
+  assert.ok(alive(start.pid) && alive(spawned.agentPid), '停止前执行者与假 agent 都在运行');
+  const stop = await f.command(['stop', 'detach-stop']).done;
+  assert.equal(stop.code, 0, stop.stderr + stop.stdout);
+  assert.match(stop.stdout, /停止：detach-stop 已停止，工作区里没提交的改动还在/);
+  assert.equal(alive(start.pid), false, '执行者进程已退出');
+  assert.equal(alive(spawned.agentPid), false, '假 agent 进程已退出');
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start', 'spawned', 'interrupted']);
+  assert.equal(rows(f.home).at(-1).signal, 'stopped-by-command');
+});

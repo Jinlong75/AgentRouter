@@ -1,0 +1,18 @@
+{
+  "name": "deepseek",
+  "adapter": "claude-code",
+  "label": "DeepSeek V4 Pro",
+  "enabled": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro"
+  },
+  "auth": "token",
+  "secrets": { "ANTHROPIC_AUTH_TOKEN": "DEEPSEEK_API_KEY" },
+  "maxTurns": null,
+  "price": { "inputPer1M": null, "outputPer1M": null, "currency": "CNY" },
+  "title": "DeepSeek",
+  "description": "经 Claude Code 外壳运行，按量付费，用 API Key",
+  "recommended": true,
+  "order": 1
+}

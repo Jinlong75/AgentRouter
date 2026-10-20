@@ -1,0 +1,655 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { join, dirname, resolve, relative, isAbsolute } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { composeSkill } from '../../installer/lib/compose.mjs';
+import { createPlan, executePlan, installationStatus, detectHosts, getStatus, rollback, uninstall, readTree, project, version } from '../../installer/lib/install.mjs';
+import { runInstaller } from '../../installer/cli.mjs';
+import { readCodexConfig } from '../../installer/lib/codex-config.mjs';
+import { readConfig, writeConfig, loadConfig, formatConfig } from '../../core/lib/config.mjs';
+import { resolveLauncher, codex } from '../../core/adapters/codex.mjs';
+
+const snapshot = root => [...readTree(root)].map(([name, item]) => [name, item?.data.toString('base64') ?? null]);
+function setup(t) {
+  const base = fs.mkdtempSync(join(tmpdir(), '安装 测试 '));
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (/^CODEX_|^CLAUDE|^FAKE_/.test(key)) delete env[key];
+  Object.assign(env, { USERPROFILE: join(base, '用户'), HOME: join(base, '用户'), APPDATA: join(base, '应用 数据'),
+    CLAUDE_CONFIG_DIR: join(base, 'Claude 配置'), CODEX_HOME: join(base, 'Codex 配置'), CODEX_DISPATCH_HOME: join(base, '派发 配置'), XDG_CONFIG_HOME: join(base, 'XDG 配置') });
+  for (const key of ['USERPROFILE', 'HOME', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEX_DISPATCH_HOME', 'XDG_CONFIG_HOME']) {
+    const rel = relative(resolve(tmpdir()), resolve(env[key]));
+    assert.ok(rel && !rel.startsWith('..') && !isAbsolute(rel), key);
+    fs.mkdirSync(env[key], { recursive: true });
+  }
+  t.after(() => { assert.equal(dirname(base), resolve(tmpdir())); fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  const options = { env, platform: 'win32' }, target = (host = 'claude-code', skill = 'agent-router') => join(detectHosts(options).find(h => h.host === host).root, skill);
+  const cli = (args = [], script = join(project, 'installer/install.mjs')) => spawnSync(process.execPath, [script, ...args], { env, cwd: base, encoding: 'utf8', windowsHide: true, shell: false, timeout: 15000 });
+  return { base, env, options, target, cli, home: env.CODEX_DISPATCH_HOME };
+}
+function install(s, extra = {}) { return executePlan(createPlan({ ...s.options, ...extra }), s.options); }
+const write = (file, text) => { fs.mkdirSync(dirname(file), { recursive: true }); fs.writeFileSync(file, text); };
+
+function blockRename(t, predicate, code) {
+  const rename = mutableFs.renameSync;
+  t.mock.method(mutableFs, 'renameSync', (from, to) => {
+    if (predicate(from, to)) throw Object.assign(new Error(`模拟改名失败：${code}`), { code });
+    return rename(from, to);
+  });
+}
+function noTemporary(s) {
+  assert.ok(![...readTree(s.base).keys()].some(name => /\.agent-router-(new|old)-|\.pending-/.test(name)));
+  assert.deepEqual(fs.readdirSync(join(s.home, 'staging')), []);
+}
+
+function onlySkillDirectories(s) {
+  for (const { root } of detectHosts(s.options)) {
+    if (fs.existsSync(root)) assert.ok(fs.readdirSync(root).every(name => ['agent-router', 'lead-workflow'].includes(name)));
+  }
+}
+
+test('正常及 EXDEV 就地更新全程只在技能根目录放目标目录', t => {
+  const s = setup(t); install(s);
+  const rename = mutableFs.renameSync;
+  let crossVolume = false, blocked = 0, commits = 0;
+  t.mock.method(mutableFs, 'renameSync', (from, to) => {
+    onlySkillDirectories(s);
+    if (from.includes('.agent-router-new-') || to.includes('.agent-router-old-')) {
+      const staged = from.includes('.agent-router-new-') ? from : to;
+      assert.equal(dirname(dirname(staged)), join(s.home, 'staging'));
+      if (crossVolume) { blocked++; throw Object.assign(new Error('模拟跨卷'), { code: 'EXDEV' }); }
+    }
+    const result = rename(from, to);
+    onlySkillDirectories(s);
+    return result;
+  });
+  for (const inPlace of [false, true]) {
+    crossVolume = inPlace;
+    const plan = createPlan(s.options);
+    for (const item of plan.items) item.files.set('更新.txt', { data: Buffer.from(String(inPlace)) });
+    const result = executePlan(plan, { ...s.options, onWrite() { onlySkillDirectories(s); }, onCommit() { commits++; onlySkillDirectories(s); } });
+    assert.deepEqual(result.leftovers, []);
+    for (const item of result.changed) {
+      assert.equal(installationStatus(item.target, item.host, item.skill).state, 'owned');
+      assert.equal(fs.readFileSync(join(item.target, '更新.txt'), 'utf8'), String(inPlace));
+    }
+    onlySkillDirectories(s); noTemporary(s);
+  }
+  assert.equal(commits, 4); assert.equal(blocked, 2);
+});
+
+test('就地更新后的暂存清理失败保留更新，返回残留并在命令行摘要后提示', async t => {
+  const s = setup(t); install(s);
+  for (const item of createPlan(s.options).items) write(join(item.target, '旧版.txt'), '旧版内容');
+  blockRename(t, from => detectHosts(s.options).some(h => dirname(from) === h.root), 'EPERM');
+  const remove = mutableFs.rmSync, blocked = [];
+  t.mock.method(mutableFs, 'rmSync', (file, options) => {
+    onlySkillDirectories(s);
+    if (file.includes('.agent-router-new-') && fs.existsSync(file)) {
+      assert.equal(dirname(dirname(file)), join(s.home, 'staging'));
+      blocked.push(file); throw Object.assign(new Error('模拟暂存占用'), { code: 'EBUSY' });
+    }
+    return remove(file, options);
+  });
+  const output = [];
+  const result = await runInstaller(['--yes', '--no-config', '--replace-existing'], { ...s.options, output: line => output.push(line) });
+  assert.equal(blocked.length, 2); assert.deepEqual(result.leftovers, blocked);
+  assert.equal(output.at(-1), `有临时文件没能删除，可以手动删掉：${blocked.join('；')}`);
+  assert.match(output.at(-2), /要撤销这次安装/);
+  for (const item of result.changed) {
+    assert.equal(installationStatus(item.target, item.host, item.skill).state, 'owned');
+    assert.ok(!fs.existsSync(join(item.target, '旧版.txt')));
+  }
+  assert.ok(blocked.every(file => fs.existsSync(file)));
+  assert.ok(fs.existsSync(result.backup));
+  t.mock.restoreAll();
+});
+
+test('开始时清理十分钟前的 staging 子目录，保留新目录并跳过删除失败', t => {
+  const s = setup(t), staging = join(s.home, 'staging');
+  const old = join(staging, '旧残留'), recent = join(staging, '新残留'), locked = join(staging, '被占用');
+  for (const dir of [old, recent, locked]) write(join(dir, '内容.txt'), '内容');
+  const past = new Date(Date.now() - 11 * 60 * 1000);
+  for (const dir of [old, locked]) fs.utimesSync(dir, past, past);
+  const remove = mutableFs.rmSync;
+  t.mock.method(mutableFs, 'rmSync', (file, options) => {
+    if (file === locked) throw Object.assign(new Error('模拟旧目录占用'), { code: 'EPERM' });
+    return remove(file, options);
+  });
+  const result = install(s);
+  assert.deepEqual(result.leftovers, []);
+  assert.ok(!fs.existsSync(old)); assert.ok(fs.existsSync(recent)); assert.ok(fs.existsSync(locked));
+  assert.deepEqual(fs.readdirSync(staging).sort(), ['新残留', '被占用'].sort());
+  fs.utimesSync(recent, past, past);
+  assert.deepEqual(executePlan({ items: [] }, s.options), { changed: [], backup: null, leftovers: [] });
+  assert.ok(!fs.existsSync(recent));
+  t.mock.restoreAll();
+});
+
+test('完成后旧目录和多余备份清理失败均不回退且继续清理其他项', t => {
+  const s = setup(t); install(s);
+  for (let i = 0; i < 4; i++) install(s);
+  const oldest = join(s.home, 'backups', fs.readdirSync(join(s.home, 'backups')).sort()[0]);
+  const remove = mutableFs.rmSync;
+  let blockedOld;
+  t.mock.method(mutableFs, 'rmSync', (file, options) => {
+    if (file.includes('.agent-router-old-') && fs.existsSync(file) && !blockedOld) blockedOld = file;
+    if (file === blockedOld || file === oldest) throw Object.assign(new Error('模拟清理失败'), { code: 'EPERM' });
+    return remove(file, options);
+  });
+  const plan = createPlan(s.options);
+  for (const item of plan.items) item.files.set('新内容.txt', { data: Buffer.from('新内容') });
+  const result = executePlan(plan, s.options);
+  assert.deepEqual(result.leftovers, [blockedOld, oldest]);
+  for (const item of result.changed) {
+    assert.equal(installationStatus(item.target, item.host, item.skill).state, 'owned');
+    assert.equal(fs.readFileSync(join(item.target, '新内容.txt'), 'utf8'), '新内容');
+  }
+  assert.deepEqual(fs.readdirSync(dirname(blockedOld)), [blockedOld.split(/[\\/]/).at(-1)]);
+  t.mock.restoreAll();
+});
+
+test('EPERM 就地升级清理旧文件和类型冲突，标记最后写，回退恢复旧版本', t => {
+  const s = setup(t), plan = createPlan(s.options);
+  const first = plan.items[0];
+  first.files.set('过期/', null);
+  first.files.set('过期/旧.txt', { data: Buffer.from('旧内容') });
+  first.files.set('类型', { data: Buffer.from('原文件') });
+  executePlan(plan, s.options);
+  const markerPath = join(s.target(), '.agent-router.json');
+  const record = JSON.parse(fs.readFileSync(markerPath)); record.version = '0.0.9';
+  write(markerPath, JSON.stringify(record));
+  const before = snapshot(s.target());
+  const writes = [], writeFile = mutableFs.writeFileSync;
+  t.mock.method(mutableFs, 'writeFileSync', (file, ...args) => { if (dirname(file) === s.target()) writes.push(file); return writeFile(file, ...args); });
+  blockRename(t, from => from === s.target(), 'EPERM');
+  const next = createPlan(s.options);
+  next.items[0].files.set('类型/', null);
+  next.items[0].files.set('类型/新.txt', { data: Buffer.from('新内容') });
+  executePlan(next, s.options);
+  assert.equal(writes.at(-1), markerPath);
+  assert.equal(installationStatus(s.target(), 'claude-code', 'agent-router').state, 'owned');
+  const installed = JSON.parse(fs.readFileSync(markerPath)); assert.equal(installed.version, version);
+  for (const [name, digest] of Object.entries(installed.files)) assert.equal(createHash('sha256').update(fs.readFileSync(join(s.target(), name))).digest('hex'), digest);
+  assert.ok(!fs.existsSync(join(s.target(), '过期'))); noTemporary(s);
+  rollback(s.options); assert.deepEqual(snapshot(s.target()), before); noTemporary(s);
+});
+
+test('首次安装暂存目录 EBUSY 和已有目录移走后 EBUSY 均可就地完成', t => {
+  const s = setup(t);
+  blockRename(t, from => from.includes('.agent-router-new-'), 'EBUSY');
+  for (let i = 0; i < 2; i++) {
+    const result = install(s);
+    for (const item of result.changed) assert.equal(installationStatus(item.target, item.host, item.skill).state, 'owned');
+    noTemporary(s);
+  }
+});
+
+test('卸载改名 EPERM 时删除内容及目录', t => {
+  const s = setup(t); install(s);
+  blockRename(t, from => from === s.target(), 'EPERM');
+  uninstall(s.options); assert.ok(!fs.existsSync(s.target())); noTemporary(s);
+});
+
+test('就地写入中途失败恢复所有目标并删除本批备份，保留原始异常', t => {
+  const s = setup(t); install(s);
+  const before = snapshot(s.base), target = s.target('claude-code', 'lead-workflow');
+  blockRename(t, from => from === target, 'EPERM');
+  const original = new Error('模拟中途写入失败'), writeFile = mutableFs.writeFileSync;
+  let count = 0;
+  t.mock.method(mutableFs, 'writeFileSync', (file, ...args) => {
+    if (file.startsWith(target) && ++count === 2) throw original;
+    return writeFile(file, ...args);
+  });
+  assert.throws(() => install(s), error => error === original);
+  assert.deepEqual(snapshot(s.base), before); noTemporary(s);
+});
+
+test('旧目录移入 staging 后替换和恢复均失败时保留备份及旧目录', t => {
+  const s = setup(t); install(s);
+  const plan = createPlan(s.options), target = s.target('claude-code', 'lead-workflow');
+  const before = new Map(plan.items.map(item => [item.target, snapshot(item.target)]));
+  const backupRoot = join(s.home, 'backups'), batches = fs.readdirSync(backupRoot);
+  const original = Object.assign(new Error('模拟移走旧目录后替换失败'), { code: 'EACCES' });
+  const rename = mutableFs.renameSync, writeFile = mutableFs.writeFileSync;
+  let old, recoveryFailed = false;
+  t.mock.method(mutableFs, 'renameSync', (from, to) => {
+    if (to === target && from.includes('.agent-router-new-')) throw original;
+    const result = rename(from, to);
+    if (from === target && to.includes('.agent-router-old-')) old = to;
+    return result;
+  });
+  t.mock.method(mutableFs, 'writeFileSync', (file, ...args) => {
+    if (dirname(file) === target) {
+      recoveryFailed = true;
+      throw new Error('模拟恢复失败');
+    }
+    return writeFile(file, ...args);
+  });
+  assert.throws(() => executePlan(plan, s.options), error => error === original);
+  assert.ok(recoveryFailed); assert.ok(old);
+  const added = fs.readdirSync(backupRoot).filter(name => !batches.includes(name));
+  assert.equal(added.length, 1);
+  const backup = join(backupRoot, added[0]);
+  assert.ok(fs.existsSync(join(backup, 'backup.json')));
+  for (const item of plan.items) {
+    assert.deepEqual(snapshot(join(backup, item.host, item.skill)), before.get(item.target));
+    if (item.target !== target) assert.deepEqual(snapshot(item.target), before.get(item.target));
+  }
+  assert.deepEqual(snapshot(old), before.get(target));
+  assert.deepEqual(fs.readdirSync(dirname(old)), [old.split(/[\\/]/).at(-1)]);
+  assert.equal(original.code, 'EACCES');
+  assert.ok(original.message.startsWith('模拟移走旧目录后替换失败'));
+  assert.ok(original.message.includes(`未能恢复或清理：${target}`));
+  assert.ok(original.message.includes(`原来的版本保留在备份 ${backup}，可用 node installer/install.mjs --rollback 撤销。`));
+  t.mock.restoreAll();
+});
+
+test('回退清理失败附加路径，其他目标与备份仍恢复和清理', t => {
+  const s = setup(t); install(s);
+  const before = new Map(createPlan(s.options).items.map(item => [item.target, snapshot(item.target)]));
+  const batches = fs.readdirSync(join(s.home, 'backups'));
+  const original = new Error('原始提交错误'), remove = mutableFs.rmSync;
+  let blocked, commits = 0;
+  t.mock.method(mutableFs, 'rmSync', (file, options) => {
+    if (file.includes('.agent-router-new-') && fs.existsSync(file) && (!blocked || file === blocked)) {
+      blocked = file; assert.equal(options.maxRetries, 8); assert.equal(options.retryDelay, 150);
+      throw Object.assign(new Error('模拟清理失败'), { code: 'EPERM' });
+    }
+    return remove(file, options);
+  });
+  assert.throws(() => executePlan(createPlan(s.options), { ...s.options, onCommit() { if (++commits === 2) throw original; } }), error => error === original && error.message.startsWith('原始提交错误') && error.message.includes(blocked));
+  for (const [target, content] of before) assert.deepEqual(snapshot(target), content);
+  assert.deepEqual(fs.readdirSync(join(s.home, 'backups')), batches);
+  const remaining = [...readTree(s.base).keys()].filter(name => /\.agent-router-(new|old)-[^/]+\/$/.test(name));
+  assert.equal(remaining.length, 1);
+  t.mock.restoreAll();
+});
+
+test('EACCES 不触发就地覆盖，原样抛错并清理', t => {
+  const s = setup(t); install(s); const before = snapshot(s.base);
+  blockRename(t, from => from === s.target(), 'EACCES');
+  assert.throws(() => install(s), error => error.code === 'EACCES');
+  assert.deepEqual(snapshot(s.base), before);
+});
+
+test('Windows 不共享删除权限的目录句柄实际触发受支持的改名错误', { skip: process.platform !== 'win32' }, t => {
+  const s = setup(t), target = join(s.base, '句柄测试');
+  fs.mkdirSync(target);
+  const probe = join(s.base, 'rename-probe.cjs');
+  write(probe, 'try { require("node:fs").renameSync(process.env.DISPATCH_TEST_LOCK, process.env.DISPATCH_TEST_LOCK + "-renamed"); console.log("renamed"); } catch (error) { console.log(error.code); }');
+  // 仅锁定隔离目录，实测当前 Node 对 Windows 共享冲突的错误码。
+  const script = `
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class DirectoryLock {
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+}
+'@
+$handle = [DirectoryLock]::CreateFile($env:DISPATCH_TEST_LOCK, 2147483648, 3, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+if ($handle.IsInvalid) { throw '无法创建测试句柄' }
+try {
+  & $env:DISPATCH_TEST_NODE $env:DISPATCH_TEST_PROBE
+} finally { $handle.Dispose() }
+`;
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+    env: { ...s.env, DISPATCH_TEST_LOCK: target, DISPATCH_TEST_NODE: process.execPath, DISPATCH_TEST_PROBE: probe }, encoding: 'utf8', windowsHide: true, shell: false, timeout: 15000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const code = result.stdout.trim();
+  t.diagnostic(`目录句柄冲突实测错误码：${code}`);
+  assert.ok(['EPERM', 'EBUSY'].includes(code), code);
+});
+
+test('首次安装可撤销和重做，卸载可恢复并再次撤销，每批记录缺失状态', t => {
+  const s = setup(t), first = install(s);
+  const record = result => JSON.parse(fs.readFileSync(join(result.backup, 'backup.json')));
+  assert.ok(record(first).items.every(i => i.existed === false));
+  assert.deepEqual(fs.readdirSync(first.backup), ['backup.json']);
+  const installed = snapshot(s.target());
+  const undone = rollback(s.options);
+  assert.equal(record(undone).reason, 'rollback');
+  assert.ok(record(undone).items.every(i => i.existed === true));
+  for (const item of first.changed) assert.ok(!fs.existsSync(item.target));
+  const redone = rollback(s.options);
+  assert.ok(record(redone).items.every(i => i.existed === false));
+  assert.deepEqual(snapshot(s.target()), installed);
+  const removed = uninstall(s.options);
+  assert.equal(record(removed).reason, 'uninstall');
+  assert.ok(record(removed).items.every(i => i.existed === true));
+  rollback(s.options); assert.deepEqual(snapshot(s.target()), installed);
+  rollback(s.options);
+  for (const item of removed.changed) assert.ok(!fs.existsSync(item.target));
+});
+
+test('兼容无 existed 的旧备份，声明存在却缺少目录时拒绝且不改文件', t => {
+  const s = setup(t); install(s);
+  const original = snapshot(s.target()), result = install(s);
+  const file = join(result.backup, 'backup.json'), record = JSON.parse(fs.readFileSync(file));
+  for (const item of record.items) delete item.existed;
+  write(file, JSON.stringify(record));
+  rollback(s.options); assert.deepEqual(snapshot(s.target()), original);
+  const latest = fs.readdirSync(join(s.home, 'backups')).sort().at(-1);
+  const latestRoot = join(s.home, 'backups', latest);
+  const source = join(latestRoot, 'claude-code', 'agent-router');
+  assert.ok(relative(s.base, source) && !relative(s.base, source).startsWith('..'));
+  fs.rmSync(source, { recursive: true });
+  const before = snapshot(s.base);
+  assert.throws(() => rollback(s.options), /备份技能目录缺失/);
+  assert.deepEqual(snapshot(s.base), before);
+});
+
+test('完成摘要包含实际数量、备份和撤销命令，无改动不打印撤销命令', async t => {
+  const s = setup(t); write(join(s.target(), '自用.txt'), '保留');
+  for (const [args, summary, action] of [
+    [[], '已安装 1 个，跳过 1 个。', '安装'],
+    [['--rollback'], '已回退 1 个。', '回退'],
+    [['--rollback'], '已回退 1 个。', '回退'],
+    [['--uninstall'], '已卸载 1 个。', '卸载'],
+  ]) {
+    const output = [];
+    const result = await runInstaller(args, { ...s.options, output: line => output.push(line) });
+    assert.equal(output.at(-2), summary);
+    assert.equal(output.at(-1), `${action === '安装' ? '' : `原来的版本已备份到 ${result.backup}。`}要撤销这次${action}：node installer/install.mjs --rollback`);
+  }
+  const before = snapshot(s.base), output = [];
+  await runInstaller(['--uninstall'], { ...s.options, output: line => output.push(line) });
+  assert.deepEqual(output.slice(1), ['没有需要改动的技能。']);
+  assert.deepEqual(snapshot(s.base), before);
+});
+
+test('卸载确认默认否且仅接受 y 或 yes，回退确认显示备份时间且默认是', async t => {
+  const s = setup(t); install(s);
+  for (const answer of ['', 'n', 'ok', 'yep']) {
+    const before = snapshot(s.base);
+    await runInstaller(['--uninstall'], { ...s.options, interactive: true, output() {}, ask: async prompt => {
+      assert.equal(prompt, '卸载上面列出的技能？卸载前会备份，可以用 --rollback 恢复。[y/N] ');
+      return answer;
+    } });
+    assert.deepEqual(snapshot(s.base), before);
+  }
+  for (const answer of ['y', ' YES ']) {
+    const result = await runInstaller(['--uninstall'], { ...s.options, interactive: true, output() {}, ask: async () => answer });
+    assert.equal(result.changed.length, 2);
+    const at = JSON.parse(fs.readFileSync(join(result.backup, 'backup.json'))).at;
+    const date = new Date(at), pad = n => String(n).padStart(2, '0');
+    const restored = await runInstaller(['--rollback'], { ...s.options, interactive: true, output() {}, ask: async prompt => {
+      assert.equal(prompt, `回退到 ${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())} 之前的状态？当前版本会先备份，之后还能再回退。[Y/n] `);
+      return '';
+    } });
+    assert.equal(restored.changed.length, 2); assert.ok(fs.existsSync(s.target()));
+  }
+});
+
+test('配置表的中英文值按显示宽度对齐来源列', t => {
+  const s = setup(t);
+  assert.deepEqual(formatConfig(s.home, {}).split('\n').slice(1), [
+    'model        跟随 Codex            内置默认',
+    'effort       跟随 Codex            内置默认',
+    'tier         跟随 Codex            内置默认',
+    'sandbox      workspace-write       内置默认',
+    'path         自动查找              内置默认',
+    'watchWindow  auto                  内置默认',
+  ]);
+  writeConfig(s.home, { model: '中文模型' });
+  assert.equal(formatConfig(s.home, {}).split('\n')[1], 'model        中文模型              config.json');
+});
+
+// 预期合成独立按正文的固定段名替换；不调用被测合成器生成答案。
+function expected(skill) {
+  const source = fs.readFileSync(join(project, 'skills', skill, 'SKILL.md'), 'utf8');
+  return source.replace(/^[ \t]*<!-- \/?host:[a-z0-9-]+ -->\r?\n/gm, '');
+}
+
+test('两个技能在 Claude Code 下的合成与独立预期完全相同', t => {
+  const s = setup(t), plan = createPlan(s.options);
+  assert.equal(plan.items.length, 2);
+  for (const item of plan.items) assert.equal(item.files.get('SKILL.md').data.toString(), expected(item.skill));
+  assert.equal(composeSkill('---\nname: example\nvalue:\n  nested: old\n---\n<!-- host:a -->\nA\n<!-- /host:a -->\n', '---\nvalue:\n  nested: new\n---\n'), '---\nname: example\nvalue:\n  nested: new\n---\nA\n');
+});
+
+test('合成违规全部在写入前失败', t => {
+  const s = setup(t), base = '---\nname: example\n---\n<!-- host:a -->\nA\n<!-- /host:a -->\n';
+  const before = snapshot(s.base);
+  for (const [source, overlay] of [[base, '<!-- host:b -->\nB\n<!-- /host:b -->\n'], [base, '---\nname: changed\n---\n'], [base.replace('<!-- /host:a -->',''), ''], [base + '<!-- host:a -->\n<!-- /host:a -->\n', ''], [base.replace('A\n', '<!-- host:b -->\n'), ''], [base, 'prefix <!-- host:bad -->'], [base.replace('host:a','host:UPPER'), '']]) assert.throws(() => composeSkill(source, overlay));
+  assert.deepEqual(snapshot(s.base), before);
+  // 后一个技能出错时，前一个技能也不能安装。
+  const sourceRoot = join(s.base, '损坏源');
+  write(join(sourceRoot, 'agent-router', 'SKILL.md'), base);
+  write(join(sourceRoot, 'lead-workflow', 'SKILL.md'), base.replace('<!-- /host:a -->', ''));
+  assert.throws(() => createPlan({ ...s.options, sourceRoot }));
+  assert.ok(!fs.existsSync(s.target()));
+});
+
+test('安装记录版本和每个哈希正确，升级备份完整并可回退及再次回退', t => {
+  const s = setup(t);
+  assert.equal(install(s).changed.length, 2);
+  const target = s.target(), record = JSON.parse(fs.readFileSync(join(target, '.agent-router.json')));
+  assert.equal(record.version, version); assert.equal(record.v, 1); assert.equal(record.host, 'claude-code'); assert.ok(record.installedAt > 0);
+  for (const [name, digest] of Object.entries(record.files)) assert.equal(createHash('sha256').update(fs.readFileSync(join(target, name))).digest('hex'), digest);
+  assert.ok(!Object.hasOwn(record.files, '.agent-router.json'));
+  record.version = '0.0.9'; write(join(target, '.agent-router.json'), JSON.stringify(record));
+  const old = snapshot(target), result = install(s);
+  assert.deepEqual(snapshot(join(result.backup, 'claude-code/agent-router')), old);
+  assert.equal(JSON.parse(fs.readFileSync(join(result.backup, 'backup.json'))).reason, 'install');
+  const newer = snapshot(target);
+  rollback(s.options); assert.deepEqual(snapshot(target), old);
+  rollback(s.options); assert.deepEqual(snapshot(target), newer);
+});
+
+test('改过和别人的版本默认跳过，强制替换和卸载均先备份', t => {
+  const s = setup(t); install(s);
+  write(join(s.target(), '用户 文件.txt'), '保留');
+  const foreign = s.target('claude-code', 'lead-workflow'); fs.unlinkSync(join(foreign, '.agent-router.json'));
+  fs.mkdirSync(join(foreign, '空目录'));
+  assert.equal(installationStatus(s.target(), 'claude-code', 'agent-router').state, 'modified');
+  assert.equal(installationStatus(foreign, 'claude-code', 'lead-workflow').state, 'foreign');
+  const before = snapshot(s.target()), foreignBefore = snapshot(foreign);
+  install(s); assert.deepEqual(snapshot(s.target()), before); assert.deepEqual(snapshot(foreign), foreignBefore);
+  uninstall(s.options); assert.deepEqual(snapshot(s.target()), before); assert.deepEqual(snapshot(foreign), foreignBefore);
+  const replacement = install(s, { replaceExisting: true });
+  assert.deepEqual(snapshot(join(replacement.backup, 'claude-code/lead-workflow')), foreignBefore);
+  write(join(s.target(), 'changed.txt'), '新文件');
+  const removed = uninstall({ ...s.options, replaceExisting: true });
+  assert.ok(removed.backup); assert.ok(!fs.existsSync(s.target()));
+  rollback(s.options); assert.equal(fs.readFileSync(join(s.target(), 'changed.txt'), 'utf8'), '新文件');
+});
+
+test('只保留最近五批备份；复制失败保留全部原目录且清理暂存', t => {
+  const s = setup(t); install(s);
+  for (let n = 0; n < 7; n++) install(s);
+  assert.equal(fs.readdirSync(join(s.home, 'backups')).length, 5);
+  const before = snapshot(s.base);
+  let writes = 0;
+  assert.throws(() => executePlan(createPlan(s.options), { ...s.options, onWrite: () => { if (++writes === 8) throw new Error('模拟复制出错'); } }), /模拟复制出错/);
+  assert.deepEqual(snapshot(s.base), before);
+  let commits = 0;
+  assert.throws(() => executePlan(createPlan(s.options), { ...s.options, onCommit: () => { if (++commits === 2) throw new Error('模拟替换出错'); } }), /模拟替换出错/);
+  assert.deepEqual(snapshot(s.base), before);
+});
+
+test('status 与 dry-run 前后目录快照不变，命令行非交互不写配置', t => {
+  const s = setup(t), before = snapshot(s.base);
+  for (const flag of ['--status', '--dry-run']) { const result = s.cli([flag]); assert.equal(result.status, 0, result.stderr); assert.deepEqual(snapshot(s.base), before); }
+  const result = s.cli(['--yes']); assert.equal(result.status, 0, result.stderr);
+  assert.ok(!readConfig(s.home).exists);
+});
+
+test('交互默认不替换，逐个允许替换，首次配置写入及已有配置不再问', async t => {
+  const s = setup(t); write(join(s.target(), '自用.txt'), '不要覆盖');
+  const questions = [], output = [], answers = ['', '', 'demo-model', 'high', 'demo-tier', 'read-only'];
+  await runInstaller([], { ...s.options, interactive: true, ask: async q => { questions.push(q); return answers.shift(); }, output: line => output.push(line) });
+  assert.equal(fs.readFileSync(join(s.target(), '自用.txt'), 'utf8'), '不要覆盖');
+  assert.equal(questions[0], 'claude-code / agent-router：备份后替换？[y/N] ');
+  assert.deepEqual(readConfig(s.home).config.profiles.codex, { adapter: 'codex', label: 'Codex', enabled: true, model: 'demo-model', effort: 'high', tier: 'demo-tier', sandbox: 'read-only' });
+  const nextQuestions = [];
+  await runInstaller(['--host', 'claude-code', '--skill', 'agent-router'], { ...s.options, interactive: true, ask: async q => { nextQuestions.push(q); return 'y'; }, output() {} });
+  assert.equal(nextQuestions.length, 2); assert.ok(!fs.existsSync(join(s.target(), '自用.txt')));
+});
+
+test('全部回车仍写默认配置；yes 和 no-config 不询问配置；拒绝安装不写', async t => {
+  for (const mode of ['default', 'yes', 'no-config', 'decline']) {
+    const s = setup(t), questions = [];
+    await runInstaller(mode === 'yes' ? ['--yes'] : mode === 'no-config' ? ['--no-config'] : [], { ...s.options, interactive: true, ask: async q => { questions.push(q); return mode === 'decline' ? 'n' : ''; }, output() {} });
+    assert.equal(readConfig(s.home).exists, mode === 'default');
+    assert.equal(questions.length, mode === 'default' ? 5 : mode === 'yes' ? 0 : 1);
+    if (mode === 'default') assert.deepEqual(readConfig(s.home).config.profiles.codex, { adapter: 'codex', label: 'Codex', enabled: true, model: null, effort: null, tier: null, sandbox: 'workspace-write' });
+    if (mode === 'decline') assert.ok(!fs.existsSync(s.target()));
+  }
+});
+
+test('安装后的技能直接派发，假 agent 清单识别宿主', t => {
+  const s = setup(t); install(s);
+  const fake = join(s.base, '假 agent.mjs'); fs.copyFileSync(join(project, 'tests/fixtures/fake-agent.txt'), fake);
+  Object.assign(s.env, { CODEX_DISPATCH_TEST_AGENT: fake, CODEX_NO_WATCH: '1', FAKE_FIXTURES: JSON.stringify([join(project, 'tests/fixtures/codex-sample.jsonl')]), FAKE_ECHO: join(s.base, '参数.json') });
+  for (const host of ['claude-code', 'unknown']) {
+    if (host === 'claude-code') s.env.CLAUDECODE = '1'; else delete s.env.CLAUDECODE;
+    const result = s.cli(['测试任务', '--name', host], join(s.target(), 'core', 'ar.mjs'));
+    assert.equal(result.status, 0, result.stderr);
+    const rows = fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(rows.filter(r => r.event === 'start').at(-1).dispatcher.host, host);
+    assert.match(result.stdout, new RegExp(`^记录名：${host}\\r?\\n进度：`));
+    assert.match(result.stdout, /配置：未找到 config.json，模型、强度、档位跟随 Codex 自己的配置/);
+  }
+});
+
+test('配置命令：查看、来源、修改、清空、init、未知键、拒写坏文件、保留未知字段', t => {
+  const s = setup(t), entry = join(project, 'core/ar.mjs'), invoke = args => s.cli(['--config', ...args], entry);
+  let result = invoke([]); assert.equal(result.status, 0); assert.match(result.stdout, /不存在/); assert.match(result.stdout, /自动查找/); assert.match(result.stdout, /内置默认/);
+  assert.ok(!fs.existsSync(join(s.base, '.agent-runs')));
+  assert.equal(invoke(['init']).status, 0); const initial = fs.readFileSync(join(s.home, 'config.json'));
+  assert.match(invoke(['init']).stdout, /已存在/); assert.deepEqual(fs.readFileSync(join(s.home, 'config.json')), initial);
+  write(join(s.home, 'config.json'), JSON.stringify({ v: 1, unknown: { keep: true }, agents: { future: { keep: true }, codex: { unknown: 7 } } }));
+  assert.equal(invoke(['model=test-model', 'effort=high', 'watchWindow=never', `path=${process.execPath}`]).status, 0);
+  assert.equal(readConfig(s.home).config.unknown.keep, true); assert.equal(readConfig(s.home).config.profiles.codex.unknown, 7); assert.equal(readConfig(s.home).config.agents.future.keep, true);
+  s.env.CODEX_MODEL = 'env-model'; assert.match(invoke([]).stdout, /env-model\s+环境变量 CODEX_MODEL/); delete s.env.CODEX_MODEL;
+  assert.match(invoke([]).stdout, /test-model\s+config.json/);
+  assert.equal(invoke(['model=-', 'path=-']).status, 0); assert.equal(readConfig(s.home).config.profiles.codex.model, null);
+  for (const arg of ['unknown=x', 'watchWindow=invalid', 'path=relative', 'init', 'model']) {
+    const before = fs.readFileSync(join(s.home, 'config.json'));
+    if (arg !== 'init') assert.notEqual(invoke([arg]).status, 0);
+    else assert.equal(invoke([arg]).status, 0);
+    assert.deepEqual(fs.readFileSync(join(s.home, 'config.json')), before);
+  }
+  for (const [bad, reason] of [['{', '不是有效的 JSON'], ['{"v":3}', 'v 不是 1 或 2']]) {
+    write(join(s.home, 'config.json'), bad);
+    assert.match(invoke([]).stdout, new RegExp(`无法读取（${reason}）`));
+    assert.notEqual(invoke(['model=new']).status, 0); assert.equal(fs.readFileSync(join(s.home, 'config.json'), 'utf8'), bad);
+  }
+});
+
+test('配置类型错误标明字段和来源，空环境变量不能遮住文件', t => {
+  const s = setup(t);
+  writeConfig(s.home, { model: 'file-model' });
+  assert.equal(loadConfig(s.home, {}, { CODEX_MODEL: '' }).settings.model, 'file-model');
+  assert.throws(() => loadConfig(s.home, { model: 1 }, {}), /命令行.*model/);
+  assert.throws(() => loadConfig(s.home, {}, { CODEX_MODEL: 1 }), /环境变量 CODEX_MODEL.*model/);
+  assert.throws(() => loadConfig(s.home, { 'watch-window': 'bad' }, {}), /命令行.*watchWindow/);
+  write(join(s.home, 'config.json'), '{"v":1,"watchWindow":"bad"}');
+  assert.throws(() => loadConfig(s.home, {}, {}), /config.json.*watchWindow/);
+  write(join(s.home, 'config.json'), '{"v":1,"agents":{"codex":{"model":42}}}');
+  assert.throws(() => loadConfig(s.home, {}, {}), /config.json.*model/);
+});
+
+test('指定入口优先于 PATH：js/mjs/cjs、exe、cmd/bat 和不存在的路径', t => {
+  const s = setup(t);
+  for (const extension of ['js', 'mjs', 'cjs']) {
+    const file = join(s.base, `假入口.${extension}`); write(file, "console.log('codex-cli fake');");
+    assert.deepEqual(resolveLauncher({ PATH: '' }, 'win32', file), { executable: process.execPath, args: [file] });
+    assert.equal(codex.detect({ env: s.env, settings: { path: file } }).version, 'codex-cli fake');
+  }
+  assert.deepEqual(resolveLauncher({}, 'win32', process.execPath), { executable: process.execPath, args: [] });
+  for (const extension of ['cmd', 'bat']) {
+    const file = join(s.base, `包装.${extension}`); write(file, '"%_prog%" "%dp0%\\假入口.mjs" %*');
+    assert.equal(resolveLauncher({}, 'win32', file).args[0], join(s.base, '假入口.mjs'));
+    write(file, 'not npm'); assert.throws(() => resolveLauncher({}, 'win32', file), /无法解析 Codex 的启动包装：.*profiles.codex.path/);
+  }
+  assert.throws(() => resolveLauncher({}, 'win32', join(s.base, 'missing.exe')), /找不到 Codex CLI。确认 codex --version 能运行/);
+});
+
+test('宿主路径注入、显式指定未安装宿主、仅装工作流提示依赖、最小 TOML 解析', async t => {
+  const s = setup(t);
+  assert.equal(detectHosts(s.options)[0].root, join(s.env.CLAUDE_CONFIG_DIR, 'skills'));
+  assert.equal(detectHosts(s.options).length, 1);
+  const absent = { ...s.options, claudeDir: join(s.base, '没有 Claude') };
+  assert.equal(createPlan(absent).items.length, 0);
+  assert.equal(createPlan({ ...absent, host: 'claude-code' }).items.length, 2);
+  assert.equal(createPlan({ ...s.options, skill: 'lead-workflow' }).warnings.length, 1);
+  assert.equal(readCodexConfig(s.env), null);
+  write(join(s.env.CODEX_HOME, 'config.toml'), 'model = "示例模型" # 注释\nmodel_reasoning_effort = \'high\'\nservice_tier = "example"\n[profile]\nmodel = "忽略"\n');
+  assert.deepEqual(readCodexConfig(s.env).values, { model: '示例模型', model_reasoning_effort: 'high', service_tier: 'example' });
+});
+test('清单 spec 和进度文件路径统一为 /，无效配置提示文案及错误前缀完整', t => {
+  const s = setup(t), fake = join(s.base, '假 agent.mjs');
+  fs.copyFileSync(join(project, 'tests/fixtures/fake-agent.txt'), fake);
+  const samples = join(s.base, '事件.jsonl');
+  write(samples, JSON.stringify({ type: 'item.completed', item: { type: 'error', message: '示例条目错误' } }) + '\n' + JSON.stringify({ type: 'item.completed', item: { type: 'file_change', changes: [{ kind: 'add', path: join(s.base, 'src/new.ts') }] } }) + '\n');
+  write(join(s.base, 'docs/任务.md'), '任务');
+  Object.assign(s.env, { CODEX_NO_WATCH: '1', FAKE_FIXTURES: JSON.stringify([samples]), FAKE_ECHO: join(s.base, '参数.json') });
+  const entry = join(project, 'core/ar.mjs');
+  // 执行者环境是白名单：经 path 配置的假执行者要的测试变量写进 profile.env 才会传下去。
+  write(join(s.home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'codex', profiles: { codex: { adapter: 'codex', path: fake, env: { FAKE_FIXTURES: s.env.FAKE_FIXTURES, FAKE_ECHO: s.env.FAKE_ECHO } } } }));
+  let result = s.cli([join(s.base, 'docs/任务.md')], entry); assert.equal(result.status, 0, result.stderr);
+  let row = fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)[0];
+  assert.equal(row.spec, 'docs/任务.md');
+  assert.match(fs.readFileSync(row.progress, 'utf8'), /新增文件：src\/new.ts/);
+  assert.match(fs.readFileSync(row.progress, 'utf8'), /出错：示例条目错误/);
+  for (const [invalid, reason] of [['{', '不是有效的 JSON'], ['{"v":3}', 'v 不是 1 或 2']]) {
+    write(join(s.home, 'config.json'), invalid); s.env.CODEX_DISPATCH_TEST_AGENT = fake;
+    result = s.cli(['任务'], entry); assert.equal(result.status, 0, result.stderr);
+    const warning = `配置：config.json 无法读取（${reason}），本次按内置默认运行`;
+    assert.ok(result.stdout.includes(warning));
+    row = fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(r => r.event === 'start').at(-1);
+    assert.ok(fs.readFileSync(row.progress, 'utf8').split('\n')[1].endsWith(warning));
+  }
+});
+
+test('限定回退仅恢复指定项；损坏的备份拒绝写入；无宿主不创建配置', async t => {
+  const s = setup(t); install(s);
+  const old = snapshot(s.target()); install(s);
+  const other = snapshot(s.target('claude-code', 'lead-workflow'));
+  rollback({ ...s.options, host: 'claude-code', skill: 'agent-router' });
+  assert.deepEqual(snapshot(s.target()), old); assert.deepEqual(snapshot(s.target('claude-code', 'lead-workflow')), other);
+  const latest = fs.readdirSync(join(s.home, 'backups')).sort().at(-1), file = join(s.home, 'backups', latest, 'backup.json');
+  const record = JSON.parse(fs.readFileSync(file)); record.items[0].from = join(s.base, '其他 目录'); write(file, JSON.stringify(record));
+  const before = snapshot(s.base); assert.throws(() => rollback(s.options), /不一致/); assert.deepEqual(snapshot(s.base), before);
+  const s2 = setup(t); let asked = false;
+  await runInstaller(['--claude-dir', join(s2.base, '不存在1')], { ...s2.options, interactive: true, ask: () => { asked = true; return ''; }, output() {} });
+  assert.equal(asked, false); assert.equal(readConfig(s2.home).exists, false);
+});
+
+test('技能目录 = SKILL.md + core/：core 与仓库核心逐字节相同，安装记录哈希覆盖全部文件', t => {
+  const s = setup(t); install(s);
+  const target = s.target(), tree = readTree(target), core = readTree(join(project, 'core'));
+  const expected = new Set(['SKILL.md', '.agent-router.json', 'core/', ...[...core.keys()].map(name => `core/${name}`)]);
+  assert.deepEqual(new Set(tree.keys()), expected);
+  for (const [name, entry] of core) if (entry) assert.deepEqual(tree.get(`core/${name}`).data, entry.data, name);
+  const record = JSON.parse(fs.readFileSync(join(target, '.agent-router.json'), 'utf8'));
+  assert.equal(record.skill, 'agent-router'); assert.equal(record.version, version);
+  assert.deepEqual(Object.keys(record.files).sort(), [...tree].filter(([name, entry]) => entry && name !== '.agent-router.json').map(([name]) => name).sort());
+  assert.deepEqual(new Set(readTree(s.target('claude-code', 'lead-workflow')).keys()), new Set(['SKILL.md', '.agent-router.json']));
+  const result = s.cli(['version'], join(target, 'core', 'ar.mjs'));
+  assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, new RegExp(`AgentRouter 核心 ${version.replaceAll('.', '\\.')}（Node `));
+});
+
+test('旧版 DispatchDock 技能：识别并显示，安装、卸载都不改动', async t => {
+  const s = setup(t), root = detectHosts(s.options)[0].root;
+  write(join(root, 'codex-dispatch', 'SKILL.md'), '旧技能'); write(join(root, 'codex-dispatch', '.dispatchdock.json'), JSON.stringify({ v: 1, version: '0.1.5' }));
+  write(join(root, 'dual-role-workflow', 'SKILL.md'), '手装的旧技能');
+  const before = snapshot(root);
+  assert.deepEqual(getStatus(s.options)[0].legacy, [{ skill: 'codex-dispatch', target: join(root, 'codex-dispatch'), version: '0.1.5' }, { skill: 'dual-role-workflow', target: join(root, 'dual-role-workflow'), version: null }]);
+  const output = [];
+  await runInstaller(['--yes', '--no-config'], { ...s.options, output: line => output.push(line) });
+  assert.ok(output.join('\n').split('\n').some(line => line.startsWith('检测到旧版 DispatchDock 技能：codex-dispatch、dual-role-workflow（安装器不会改动')));
+  uninstall(s.options);
+  const after = snapshot(root).filter(([name]) => name.startsWith('codex-dispatch') || name.startsWith('dual-role-workflow'));
+  assert.deepEqual(after, before);
+});
