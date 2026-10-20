@@ -90,23 +90,86 @@ jobs:
         env:
           ENVTEST: ${{ github.event.inputs.envtest }}
         run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase before
-      # H1 负载条件（h1=load）：界面验收运行期间后台采样，并发度 1、每 5 秒一个样本。
-      # 带负载、诊断用，不计入稳定性验收。
-      - name: H1 负载实验：后台启动采样器（带负载、诊断用，不计入稳定性验收）
+      # H1 负载条件（h1=load）：启动采样器、界面验收、停止与汇总必须在同一个步骤里完成。
+      # GitHub Actions 会在步骤结束时结束该步骤启动的进程，跨步骤的后台采样器活不过启动它的步骤
+      # （029 的三次运行只采到 0～1 个样本）。带负载、诊断用，不计入稳定性验收；
+      # 采样或汇总出错只打印，步骤退出码始终等于界面验收（npm run shots）。
+      - name: H1 负载实验：界面验收期间采样并汇总（带负载、诊断用，不计入稳定性验收）
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.h1 == 'load'
         shell: pwsh
+        env:
+          AR_SHOTS_FOCUS: ${{ github.event.inputs.focus }}
+          AR_SHOTS_REPEAT: ${{ github.event.inputs.repeat }}
+          AR_SHOTS_PROBE: ${{ github.event.inputs.probe }}
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'h1-load.jsonl'
           $stop = Join-Path $env:RUNNER_TEMP 'h1-load.stop'
           $log = Join-Path $env:RUNNER_TEMP 'h1-load.log'
           $err = Join-Path $env:RUNNER_TEMP 'h1-load.err.log'
           Remove-Item $out, $stop, $log, $err -ErrorAction SilentlyContinue
-          $samplerArgs = @('tools/h1-sampler.mjs', '--load', '--interval', '5000',
-            '--out', "`"$out`"", '--stop-file', "`"$stop`"")
-          $sampler = Start-Process -FilePath node -PassThru -NoNewWindow `
-            -ArgumentList $samplerArgs -RedirectStandardOutput $log -RedirectStandardError $err
-          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'h1-load.pid') -Value $sampler.Id -Encoding utf8
-      - run: npm run shots
+
+          # 1. 后台启动采样器（并发度 1，每 5 秒一个样本）。启动失败只打印，界面验收照常跑。
+          $sampler = $null
+          try {
+            $samplerArgs = @('tools/h1-sampler.mjs', '--load', '--interval', '5000',
+              '--out', "`"$out`"", '--stop-file', "`"$stop`"")
+            $sampler = Start-Process -FilePath node -PassThru -NoNewWindow `
+              -ArgumentList $samplerArgs -RedirectStandardOutput $log -RedirectStandardError $err -ErrorAction Stop
+            Write-Output "H1：采样器已启动（PID $($sampler.Id)）"
+          } catch {
+            Write-Output "H1：采样器启动失败：$($_.Exception.Message)"
+          }
+
+          # 2. 前台跑界面验收，记下它的退出码；本步骤最后用它退出。
+          npm run shots
+          $shotsExit = $LASTEXITCODE
+          if ($null -eq $shotsExit) { $shotsExit = 1 }
+
+          # 3. 写停止文件，等采样器退出（上限 120 秒）；写不了停止文件或超时就结束它的进程树。
+          $stopWritten = $false
+          try {
+            Set-Content -Path $stop -Value 'stop' -Encoding utf8
+            $stopWritten = $true
+          } catch {
+            Write-Output "H1：写停止文件失败：$($_.Exception.Message)"
+          }
+          try {
+            if ($sampler -and -not $sampler.HasExited) {
+              if (-not $stopWritten) {
+                Write-Output "H1：无法写停止文件，直接结束采样器的进程树（PID $($sampler.Id)）"
+                & taskkill /PID $sampler.Id /T /F
+                [void]$sampler.WaitForExit(30000)
+              } elseif (-not $sampler.WaitForExit(120000)) {
+                Write-Output "H1：采样器 120 秒内未退出，结束它的进程树（PID $($sampler.Id)）"
+                & taskkill /PID $sampler.Id /T /F
+                [void]$sampler.WaitForExit(30000)
+              }
+            }
+          } catch {
+            Write-Output "H1：等待或结束采样器时出错：$($_.Exception.Message)"
+          }
+
+          # 4. 打印采样器日志与汇总；样本数为 0 时醒目提示。任何错误都只打印，不改变退出码。
+          try {
+            if (Test-Path $log) { Get-Content $log }
+            if (Test-Path $err) { Get-Content $err }
+            if (Test-Path $out) {
+              node tools/h1-sampler.mjs --summarize $out
+              $sampleCount = @(Get-Content $out | Where-Object { $_.Trim() }).Count
+              if ($sampleCount -eq 0) { Write-Output '::warning::H1：没有采样输出' }
+            } else {
+              Write-Output '::warning::H1：没有采样输出'
+            }
+          } catch {
+            Write-Output "H1：打印日志或汇总时出错：$($_.Exception.Message)"
+          }
+
+          exit $shotsExit
+      # 界面验收：H1 负载实验时已经在上一步里跑过，不再重复；其余情况（含 push / pull_request、
+      # h1 为空或 quiet）照常运行。
+      # h1 不是 load 时，上面的 H1 步骤显示为跳过、不执行（工作流是静态的，步骤不能按输入消失）。
+      - if: github.event.inputs.h1 != 'load'
+        run: npm run shots
         env:
           AR_SHOTS_FOCUS: ${{ github.event.inputs.focus }}
           AR_SHOTS_REPEAT: ${{ github.event.inputs.repeat }}
@@ -117,29 +180,6 @@ jobs:
         env:
           ENVTEST: ${{ github.event.inputs.envtest }}
         run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase after
-      # H1 负载条件：界面验收结束后（即使失败）写停止文件，等采样器退出，再打印日志与汇总。
-      - name: H1 负载实验：停止采样并汇总（带负载、诊断用，不计入稳定性验收）
-        if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.h1 == 'load'
-        shell: pwsh
-        run: |
-          $out = Join-Path $env:RUNNER_TEMP 'h1-load.jsonl'
-          $stop = Join-Path $env:RUNNER_TEMP 'h1-load.stop'
-          $pidFile = Join-Path $env:RUNNER_TEMP 'h1-load.pid'
-          Set-Content -Path $stop -Value 'stop' -Encoding utf8
-          if (Test-Path $pidFile) {
-            $samplerId = [int](Get-Content $pidFile -Raw)
-            $sampler = Get-Process -Id $samplerId -ErrorAction SilentlyContinue
-            if ($sampler) { [void]$sampler.WaitForExit(120000) }
-          }
-          $log = Join-Path $env:RUNNER_TEMP 'h1-load.log'
-          if (Test-Path $log) { Get-Content $log }
-          $err = Join-Path $env:RUNNER_TEMP 'h1-load.err.log'
-          if (Test-Path $err) { Get-Content $err }
-          if (Test-Path $out) {
-            node tools/h1-sampler.mjs --summarize $out
-          } else {
-            Write-Output 'H1：没有采样输出（采样器未启动或提前退出）'
-          }
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
