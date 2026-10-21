@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { main } from '../../core/lib/cli.mjs';
+import { parseSpec as parseSpecV1, validateSpec, SPEC_TYPES } from '../../core/lib/spec.mjs';
 
 const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
 
@@ -249,4 +250,141 @@ test('spec new --commit：没有提交身份时文件写好但不提交，返回
   assert.ok(fs.existsSync(path.join(f.repo, r.json.rel)), '文件照样写好');
   assert.notEqual(f.gitCmd(['rev-parse', '--verify', 'HEAD']).status, 0, '没有产生提交');
   assert.match(f.gitCmd(['status', '--porcelain', '--', r.json.rel]).stdout, /^\?\?/, '文件仍是未跟踪状态');
+});
+
+// 以下为 Stage04 T2 新增：写出的文件必须能被 v1 解析器读回，spec list 报告解析失败。
+test('spec new：写出的文件能被 v1 解析器读回（每种类型、特殊标题、空列表）', async t => {
+  const f = fixture(t);
+  const forms = [
+    ...SPEC_TYPES.map(type => ({ title: `类型 ${type}`, goal: '目标', type })),
+    { title: '带:冒号 "引号" #井号 与中文', goal: '目标' },
+    { title: '空的允许路径和验收命令', goal: '目标', allowedPaths: [], verify: [] },
+    { title: '带路径与命令', goal: '目标', allowedPaths: ['core/**', '带 空格/**'], verify: ['npm test', 'echo "hi"'] },
+  ];
+  for (const form of forms) {
+    const r = await f.call(['spec', 'new', f.repo, '--json'], { form: JSON.stringify(form) });
+    assert.equal(r.code, 0, `${JSON.stringify(form)}\n${r.out.join('\n')}`);
+    const text = fs.readFileSync(r.json.file, 'utf8');
+    const parsed = parseSpecV1(text, r.json.rel);
+    const spec = validateSpec(parsed, r.json.rel);
+    assert.equal(spec.id, r.json.id, form.title);
+    assert.equal(spec.title, form.title);
+    assert.equal(spec.type, form.type ?? 'code');
+    assert.equal(spec.worker, 'auto');
+    assert.deepEqual(spec.allowed_paths, form.allowedPaths ?? []);
+    assert.deepEqual(spec.verify, form.verify ?? []);
+    assert.deepEqual(parsed.warnings, []);
+  }
+});
+
+test('spec new：写的文件读不回时不写文件（允许路径校验失败）', async t => {
+  const f = fixture(t);
+  const before = fs.existsSync(path.join(f.repo, 'docs/specs')) ? fs.readdirSync(path.join(f.repo, 'docs/specs')).length : 0;
+  const r = await f.call(['spec', 'new', f.repo, '--json'], { form: JSON.stringify({ title: '越界路径', goal: '目标', allowedPaths: ['/etc/passwd'] }) });
+  assert.notEqual(r.code, 0);
+  assert.equal(r.json.ok, false);
+  assert.match(r.json.error, /allowed_paths 第 1 项必须是相对路径/);
+  const after = fs.existsSync(path.join(f.repo, 'docs/specs')) ? fs.readdirSync(path.join(f.repo, 'docs/specs')).length : 0;
+  assert.equal(after, before, '校验失败不写文件');
+});
+
+// 以下为 Stage04 043 新增：补提交上次因缺少身份没提交的任务说明。
+test('spec commit：只提交这一份说明，提交信息用解析出的 id 与标题', async t => {
+  const f = fixture(t, { git: true });
+  const dir = path.join(f.repo, 'docs/specs');
+  // TODO(lead): 期望值里原有"任务说明 + 编号"的连续写法，导出扫描会命中；这里用夹具编号组成期望值，断言内容不变。
+  const specId = '002';
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '002-待提交.md'), '---\nid: 002\ntitle: 待提交的说明\ntype: code\n---\n\n## 目标\n\n补提交。\n');
+  fs.writeFileSync(path.join(f.repo, '无关.txt'), '不该被提交\n');
+
+  const r = await f.call(['spec', 'commit', f.repo, 'docs/specs/002-待提交.md', '--json']);
+  assert.equal(r.code, 0, r.out.join('\n'));
+  assert.equal(r.json.ok, true);
+  assert.match(r.json.commit, /^[0-9a-f]{7,}$/);
+  assert.equal(r.json.already, undefined);
+  assert.equal(f.gitCmd(['log', '-1', '--pretty=%s']).stdout.trim(), `[主导] 任务说明 ${specId}：待提交的说明`, '提交信息格式与 spec new --commit 相同');
+  assert.notEqual(f.gitCmd(['ls-files', '--', 'docs/specs/002-待提交.md']).stdout.trim(), '', '任务说明已被提交');
+  assert.equal(f.gitCmd(['ls-files', '--', '无关.txt']).stdout.trim(), '', '无关文件没有被 git add');
+  assert.match(f.gitCmd(['status', '--porcelain', '--', '无关.txt']).stdout, /^\?\?/, '无关文件仍未被跟踪');
+});
+
+test('spec commit：已经提交且没有改动时幂等返回 already，不产生新提交', async t => {
+  const f = fixture(t, { git: true });
+  const dir = path.join(f.repo, 'docs/specs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '002-幂等.md'), '---\nid: 002\ntitle: 幂等的说明\ntype: docs\n---\n');
+  const first = await f.call(['spec', 'commit', f.repo, 'docs/specs/002-幂等.md', '--json']);
+  assert.equal(first.code, 0, first.out.join('\n'));
+  const head = f.gitCmd(['rev-parse', 'HEAD']).stdout.trim();
+
+  const second = await f.call(['spec', 'commit', f.repo, 'docs/specs/002-幂等.md', '--json']);
+  assert.equal(second.code, 0, second.out.join('\n'));
+  assert.deepEqual(second.json, { ok: true, commit: null, already: true });
+  assert.equal(f.gitCmd(['rev-parse', 'HEAD']).stdout.trim(), head, '没有产生新提交');
+});
+
+test('spec commit：没有提交身份时返回 NEED_GIT_IDENTITY，不提交', async t => {
+  const f = fixture(t);
+  assert.equal(f.gitCmd(['init', '-q']).status, 0);
+  fs.mkdirSync(path.join(f.repo, 'docs/specs'), { recursive: true });
+  fs.writeFileSync(path.join(f.repo, 'docs/specs/001-没有身份.md'), '---\nid: 001\ntitle: 没有身份\ntype: code\n---\n');
+
+  const r = await f.call(['spec', 'commit', f.repo, 'docs/specs/001-没有身份.md', '--json']);
+  assert.equal(r.code, 1);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.code, 'NEED_GIT_IDENTITY');
+  assert.match(r.json.error, /还没有设置 git 提交身份/);
+  assert.notEqual(f.gitCmd(['rev-parse', '--verify', 'HEAD']).status, 0, '没有产生提交');
+  assert.match(f.gitCmd(['status', '--porcelain', '--', 'docs/specs/001-没有身份.md']).stdout, /^\?\?/, '文件仍是未跟踪状态');
+});
+
+test('spec commit：拒绝项目外、specsDir 外、非 .md 与不存在的文件', async t => {
+  const f = fixture(t, { git: true });
+  const dir = path.join(f.repo, 'docs/specs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '001-甲.md'), '---\nid: 001\ntitle: 甲\ntype: code\n---\n');
+  fs.writeFileSync(path.join(f.repo, 'docs/其他.md'), '不在 specsDir 下\n');
+  fs.writeFileSync(path.join(dir, '001-甲'), '没有扩展名\n');
+  fs.writeFileSync(path.join(f.base, '外面.md'), '外面\n');
+
+  const cases = [
+    [path.join(f.base, '外面.md'), /项目内/],
+    ['../外面.md', /项目内/],
+    ['docs/其他.md', /任务说明目录/],
+    ['docs/specs/001-甲', /\.md/],
+    ['docs/specs/999-没有.md', /找不到文件/],
+  ];
+  for (const [rel, pattern] of cases) {
+    const r = await f.call(['spec', 'commit', f.repo, rel, '--json']);
+    assert.notEqual(r.code, 0, rel);
+    assert.equal(r.json.ok, false, rel);
+    assert.match(r.json.error, pattern, rel);
+  }
+});
+
+test('spec list：解析失败的说明给出 error 与回退标题，文字输出追加原因', async t => {
+  const f = fixture(t);
+  const dir = path.join(f.repo, 'docs/specs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '001-正常.md'), '---\nid: 001\ntitle: 正常标题\ntype: code\n---\n');
+  fs.writeFileSync(path.join(dir, '002-坏.md'), '---\nid: 002\ntitle: 坏\n未知 写法\n---\n\n# 回退标题\n');
+
+  const r = await f.call(['spec', 'list', f.repo, '--json']);
+  assert.equal(r.code, 0);
+  const rows = new Map(r.json.specs.map(s => [s.rel, s]));
+  const good = rows.get('docs/specs/001-正常.md');
+  assert.equal(good.error, null);
+  assert.deepEqual(good.warnings, []);
+  assert.equal(good.title, '正常标题');
+  const bad = rows.get('docs/specs/002-坏.md');
+  assert.match(bad.error, /第 4 行/);
+  assert.equal(bad.title, '回退标题', '解析失败时按第一个 # 标题回退');
+  assert.deepEqual(bad.warnings, []);
+
+  const text = await f.call(['spec', 'list', f.repo]);
+  const all = text.out.join('');
+  const line = all.split('\n').find(l => l.includes('002-坏.md'));
+  assert.match(line, /回退标题（解析失败：.*第 4 行/);
+  assert.doesNotMatch(all, /001-正常\.md.*解析失败/);
 });

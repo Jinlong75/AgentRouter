@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { scriptNames } from '../../../core/lib/compat.mjs';
+import { killProcessTree } from '../../../core/lib/process.mjs';
 export interface ProcessInfo {
     pid: number;
     name: string;
@@ -36,8 +37,9 @@ export function windowsPlatform(openFile: (file: string) => Promise<string>): Pl
             const value = JSON.parse(stdout.trim() || '[]');
             return (Array.isArray(value) ? value : [value]).map(p => ({ ...p, command: p.command ?? '' }));
         },
+        // 与 ar stop 走同一套结束顺序：先结束派发进程，再结束其余子孙（core/lib/process.mjs）。
         async killTree(pid) { if (!Number.isSafeInteger(pid) || pid <= 0)
-            throw Error('Invalid PID'); await run('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 15000 }); },
+            throw Error('Invalid PID'); await killProcessTree(pid, { timeout: 15000 }); },
         async open(file) { const error = await openFile(file); if (error)
             throw Error(error); },
     };

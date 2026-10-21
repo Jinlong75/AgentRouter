@@ -18,6 +18,9 @@ function fixture(t) {
   const file = join(home, 'runs.jsonl');
   const env = { ...process.env, CODEX_DISPATCH_HOME: home };
   for (const key of Object.keys(env)) if (/^CODEX_/.test(key) && key !== 'CODEX_DISPATCH_HOME') delete env[key];
+  // 本用例只设旧名；终端里设着新名时新名优先（协议 1），会盖掉隔离目录。
+  // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
+  for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   const append = row => fs.appendFileSync(file, JSON.stringify({ v: 1, ...row }) + '\n');
   const start = (overrides = {}) => ({ event: 'start', id: 'sample', repo, name: '中文任务', pid: 2147483647,
     started: Date.now(), report: join(repo, 'report.md'), events: join(repo, 'events.jsonl'), ...overrides });

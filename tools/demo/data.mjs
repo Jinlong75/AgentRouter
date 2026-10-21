@@ -1,9 +1,12 @@
+import { summarizeGate } from '../../core/lib/gate.mjs';
+
 const tasks = [
   { id: 't1', day: 'run', name: '012-背包拖拽与堆叠', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'run', start: '15:21', dur: '18:42', last: '运行：npm test -- inventory', sandbox: 'workspace-write' },
   { id: 't2', day: 'run', name: '007-搜索结果分页', project: 'notes-web', host: 'Claude Code', role: '执行者', state: 'run', start: '15:36', dur: '4:05', last: '修改文件：src/search/Results.tsx', sandbox: 'workspace-write' },
   { id: 't3', day: 'today', name: '011-存档版本迁移', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'done', start: '14:02', dur: '22.4 分钟', commit: '4f2a9c1', sandbox: 'workspace-write' },
   { id: 't4', day: 'today', name: '排查启动时白屏', record: 'task-20261008-1310', project: 'notes-web', host: 'Claude Code', role: null, state: 'done', start: '13:10', dur: '6.1 分钟', sandbox: 'read-only' },
-  { id: 't5', day: 'today', name: '006-导出 PDF', project: 'notes-web', host: 'Claude Code', role: '执行者', executor: { profile: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', agentVersion: '2.1.302 (Claude Code)' }, state: 'fail', exit: 1, start: '11:47', dur: '9.8 分钟', sandbox: 'workspace-write' },
+  // Stage04：执行者自己失败、但说明本来会跑门禁的任务——执行节点异常退出，门禁节点"未运行"。
+  { id: 't5', day: 'today', name: '006-导出 PDF', project: 'notes-web', host: 'Claude Code', role: '执行者', executor: { profile: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', agentVersion: '2.1.302 (Claude Code)' }, state: 'fail', exit: 1, start: '11:47', dur: '9.8 分钟', sandbox: 'workspace-write', gate: true, base: 'main' },
   { id: 't6', day: 'today', name: '010-粒子特效对象池', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'stop', start: '10:05', dur: '3.2 分钟', sandbox: 'workspace-write' },
   { id: 't10', day: 'today', name: '013-粒子对象池重构', project: 'notes-web', host: 'Claude Code', role: '执行者', state: 'stop', signal: 'stopped-by-app', start: '10:15', dur: '3.2 分钟', sandbox: 'workspace-write' },
   { id: 't7', day: 'yesterday', name: '009-地图分块加载', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'done', start: '17:40', dur: '31.0 分钟', commit: 'b81e0d2', sandbox: 'workspace-write' },
@@ -15,7 +18,37 @@ const tasks = [
   // 015：软件派发的任务（派活方字段 dispatcher 写 agentrouter，生成器写进 runs.jsonl 的 dispatcher.host）。
   // 没写这个字段的任务仍是 claude-code，原有演示任务的显示不变。
   { id: 't13', day: 'today', name: '014-批量重命名标签', project: 'notes-web', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', state: 'done', start: '13:22', dur: '6.8 分钟', commit: '7c3d15e', sandbox: 'workspace-write' },
+  // Stage04 门禁演示（单独的 reader-app 项目，不影响原有任务数量）：
+  // t20 门禁通过；t21 门禁未通过（越界文件 + 失败的截断命令，任务 exit=3 而执行者 agentExit=0）；
+  // t22 说明派发但没启用门禁（gate:false）。
+  { id: 't20', day: 'today', name: '020-导出书签', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'done', start: '09:20', dur: '7.4 分钟', commit: '7f0c9de', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't21', day: 'today', name: '021-导出筛选', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'fail', exit: 3, agentExit: 0, start: '09:05', dur: '6.1 分钟', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't22', day: 'today', name: '022-整理导出文档', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'done', start: '08:50', dur: '3.5 分钟', commit: '5b7e2c0', sandbox: 'workspace-write', gate: false, base: 'a1b2c3d' },
 ];
+
+// 门禁结果（文件协议 12.3，写入任务记录目录的 gate.json）。at 由生成器按任务开始时间补。
+const gates = {
+  t20: {
+    v: 1, attempt: 1, ms: 12400, ok: true, base: 'a1b2c3d', head: '7f0c9de',
+    commit: { required: true, ok: true }, uncommitted: [],
+    scope: { allowed: ['src/export/**', 'tests/export-*'], changed: ['src/export/bookmarks.ts', 'tests/export-bookmarks.test.ts'], outside: [] },
+    commands: [
+      { line: 'npm test -- export', argv: ['npm', 'test', '--', 'export'], exit: 0, ms: 8400, output: '✓ 导出书签为 JSON\n✓ 空书签导出\n\n2 passed', truncated: false, error: null },
+      { line: 'npm run lint', argv: ['npm', 'run', 'lint'], exit: 0, ms: 3200, output: '检查了 18 个文件，没有发现问题。', truncated: false, error: null },
+    ],
+  },
+  t21: {
+    v: 1, attempt: 1, ms: 9100, ok: false, base: 'a1b2c3d', head: '2e91b40',
+    commit: { required: true, ok: true }, uncommitted: [],
+    scope: { allowed: ['src/export/**', 'tests/export-*'], changed: ['src/export/filter.ts', 'tests/export-filter.test.ts', 'src/legacy/report.ts'], outside: ['src/legacy/report.ts'] },
+    commands: [
+      { line: 'npm test -- export', argv: ['npm', 'test', '--', 'export'], exit: 0, ms: 6100, output: '✓ 按标签筛选导出\n✓ 空结果\n\n2 passed', truncated: false, error: null },
+      { line: 'node tools/check-scope.mjs', argv: ['node', 'tools/check-scope.mjs'], exit: 1, ms: 2400, output: '读取允许范围：src/export/**、tests/export-*\n检查改动文件……\n发现越界文件：src/legacy/report.ts\n……（更早的输出省略）', truncated: true, error: null },
+    ],
+  },
+};
+// summary 不手写：用核心的 summarizeGate 按协议 12.3 生成，演示数据与真实门禁同一种写法。
+for (const gate of Object.values(gates)) gate.summary = summarizeGate(gate);
 const GROUPS = { run: '进行中', today: '今天', yesterday: '昨天' };
 const GROUP_DATE = { today: '10-08', yesterday: '10-07' };
 
@@ -105,4 +138,4 @@ const reportRich = [
   '无。',
 ].join('\n');
 
-export { tasks, plan1, ev1, ev5, ev6, files3, reportRich };
+export { tasks, gates, plan1, ev1, ev5, ev6, files3, reportRich };

@@ -63,6 +63,16 @@ export function findTerminal(file, id) {
   return interrupted;
 }
 
+// 同一任务最近一次门禁结果（gate 事件总在 end 之前，协议第 2 节）；没跑过门禁返回 null。
+export function findGate(file, id) {
+  for (const row of reverseRows(file)) {
+    if (row.id !== id) continue;
+    if (row.event === 'gate') return row;
+    if (row.event === 'start') break;
+  }
+  return null;
+}
+
 // 在新旧公共目录的清单里找记录：v2 写在新目录，v1 旧任务可能还在旧目录；两边都有时取最近开始的。
 export function locateStart(homes, root, name) {
   let found = null;
@@ -73,7 +83,7 @@ export function locateStart(homes, root, name) {
   return found;
 }
 
-export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log } = {}) {
+export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log, onGate } = {}) {
   const found = locateStart(homes, root, name), file = found?.file, start = found?.start;
   if (!start) {
     // 未指定记录名且仓库无记录时省略记录名（设计 2026-10-13 定稿）。
@@ -85,8 +95,17 @@ export async function waitForTask(homes, root, name, { alive = taskAlive, log = 
   // 查询进程时任务可能恰好结束，输出和中断判定前再次检查清单。
   terminal ??= findTerminal(file, start.id);
   log(`等待：${start.name}（${terminal || !running ? '已结束' : '进行中'}）`);
+  // 门禁结果来自同一任务的 gate 事件，打印在结果行之前（协议 13）。
+  const finishWait = done => {
+    const gate = done.event === 'end' ? findGate(file, start.id) : null;
+    if (gate) {
+      onGate?.({ ok: gate.ok === true, summary: gate.summary });
+      log(gate.ok === true ? '门禁通过' : `门禁未通过：${gate.summary}`);
+    }
+    return printCompletion(done.event === 'end' ? done.exit ?? 1 : 1, start, log);
+  };
   while (true) {
-    if (terminal) return printCompletion(terminal.event === 'end' ? terminal.exit ?? 1 : 1, start, log);
+    if (terminal) return finishWait(terminal);
     if (!running) {
       log('等待：任务进程已经不在了，没有结束记录，按中断处理');
       return 1;

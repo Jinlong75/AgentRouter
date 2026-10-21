@@ -43,11 +43,15 @@ async function fixtures() {
     git(repo, ['add', '--', 'README.md', 'docs/specs/001-已有说明.md']);
     git(repo, ['commit', '-m', '初始提交', '--', 'README.md', 'docs/specs/001-已有说明.md']);
     // 初始化会写模板文件；之后换成固定的项目配置，新建说明页默认值才有可断言的来源。
-    await core(['init', repo]);
+    const init = await core(['init', repo]);
     await writeFile(path.join(repo, '.agent-router', 'project.json'), JSON.stringify({
         v: 1, name: 'sample', baseBranch: 'main', specsDir: 'docs/specs', setup: [],
-        verify: ['npm test'], allowedPaths: ['README.md'], routing: { rules: [] }, worktree: true,
+        verify: ['node --version'], allowedPaths: ['README.md'], routing: { rules: [] }, worktree: true,
     }, null, 2) + '\n');
+    // 门禁要求派发时工作区干净（文件协议 11.4）：初始化写出的文件和改过的项目配置一起提交。
+    const initFiles = [...new Set([...init.changes.map((c: { path: string }) => c.path), '.agent-router/project.json'])];
+    git(repo, ['add', '--', ...initFiles]);
+    git(repo, ['commit', '-m', '初始化项目配置', '--', ...initFiles]);
     await core(['projects', 'add', repo]);
     // 没有提交身份的项目：初始提交用一次性的 -c 身份，不写任何 git 配置。
     const noid = path.join(home, 'shots-newtask', 'noidentity'), noidSpecs = path.join(noid, 'docs', 'specs');
@@ -215,7 +219,7 @@ export async function captureNewtask(h: Harness) {
 
         // 新建任务说明：默认值来自项目配置；真实输入标题与目标，预览，再派发。
         await goto('new');
-        await check('UI16 新建说明默认取项目配置的允许路径与验收命令', `document.querySelector('[data-nt-f=allowed]')?.value === 'README.md' && document.querySelector('[data-nt-f=verify]')?.value === 'npm test'`);
+        await check('UI16 新建说明默认取项目配置的允许路径与验收命令', `document.querySelector('[data-nt-f=allowed]')?.value === 'README.md' && document.querySelector('[data-nt-f=verify]')?.value === 'node --version'`);
         await check('UI16 新建说明默认勾选"先提交任务说明"，有预览按钮', `document.querySelector('[data-nt-commit]')?.getAttribute('aria-checked') === 'true' && !!document.querySelector('[data-nt-preview]')`);
         await type('[data-nt-f=title]', 'README usage notes');
         await type('[data-nt-f=goal]', 'Add an install section to README.');
@@ -238,7 +242,7 @@ export async function captureNewtask(h: Harness) {
             const shown = await evaluate(`document.querySelector('.sheet.wide .mdsrc.selectable').textContent`);
             const form = {
                 title: 'README usage notes', goal: 'Add an install section to README.', type: 'docs',
-                allowedPaths: ['README.md'], verify: ['npm test'],
+                allowedPaths: ['README.md'], verify: ['node --version'],
                 nonGoals: '', refs: '', acceptance: '', questions: '', worker: 'auto',
             };
             // 与界面走的 specs:new 同一条核心命令：coreRun 自己补 --json，表单经标准输入传入。
@@ -282,7 +286,7 @@ export async function captureNewtask(h: Harness) {
         // 015：派发成功后表单回到初始状态——文本字段清空、类型与来源回默认、已有说明选择与草稿标记清掉；
         // 保留项目与执行者；允许改动的文件 / 验收命令的初始状态是项目配置默认值，下次进入时重新取。
         await goto('new');
-        await check('UI16 派发成功后回到新建任务页是空白表单（项目保留、来源回默认）', `(() => { const v = f => document.querySelector('[data-nt-f=' + f + ']')?.value ?? ''; return v('title') === '' && v('goal') === '' && v('nonGoals') === '' && v('refs') === '' && v('questions') === '' && v('text') === '' && document.querySelector('[data-nt-type=code]')?.classList.contains('on') && document.querySelector('[data-nt-source=new]')?.classList.contains('on') && document.querySelector('[data-nt-project]')?.textContent.includes('sample') && document.querySelector('[data-nt-commit]')?.getAttribute('aria-checked') === 'true' && v('allowed') === 'README.md' && v('verify') === 'npm test'; })()`);
+        await check('UI16 派发成功后回到新建任务页是空白表单（项目保留、来源回默认）', `(() => { const v = f => document.querySelector('[data-nt-f=' + f + ']')?.value ?? ''; return v('title') === '' && v('goal') === '' && v('nonGoals') === '' && v('refs') === '' && v('questions') === '' && v('text') === '' && document.querySelector('[data-nt-type=code]')?.classList.contains('on') && document.querySelector('[data-nt-source=new]')?.classList.contains('on') && document.querySelector('[data-nt-project]')?.textContent.includes('sample') && document.querySelector('[data-nt-commit]')?.getAttribute('aria-checked') === 'true' && v('allowed') === 'README.md' && v('verify') === 'node --version'; })()`);
 
         // 直接写任务文字：不生成文件、不提交，start 行的 spec 为空。
         await goto('text');
@@ -342,6 +346,13 @@ export async function captureNewtask(h: Harness) {
             const start = (await runs()).find(r => r.event === 'start' && r.id === retryId);
             assert.ok(start, `runs.jsonl 里没有 ${retryId} 的 start 行`);
             assert.equal(start.spec, `docs/specs/${files[0]}`);
+        });
+        // 043：补好身份后派发前先补提交；说明文件在最近一次提交里，派发记录也存在。
+        await verify('UI16 补好身份后再派发：说明文件已在最近一次提交里，派发记录存在', async () => {
+            const files = await specFilesIn(noidSpecs);
+            const committed = git(noid, ['show', '--name-only', '--pretty=format:', 'HEAD']).split('\n').filter(Boolean);
+            assert.deepEqual(committed, [`docs/specs/${files[0]}`]);
+            assert.ok((await runs()).some(r => r.event === 'start' && r.id === retryId), `runs.jsonl 里没有 ${retryId} 的 start 行`);
         });
         await until(async () => (await runs()).some(r => r.event === 'end' && r.id === retryId), '假执行者结束');
         // 切回原来的项目，后面的检查仍按 sample 的默认值走。

@@ -36,12 +36,26 @@ export function validRequest(r) {
     && typeof r.name === 'string' && !!r.name && !/[<>:"/\\|?*\x00-\x1f]/.test(r.name) && !/[. ]$/.test(r.name)
     && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(r.name)
     && object(r.args) && typeof r.args.task === 'string' && !!r.args.task && typeof r.args.extra === 'string' && nullable(r.args.role) && nullable(r.args.spec)
+    && (r.args.gate === undefined || validGate(r.args.gate))
     && object(r.settings) && ['model','effort','tier','path'].every(k => nullable(r.settings[k])) && typeof r.settings.sandbox === 'string'
     && (r.settings.path === null || isAbsolute(r.settings.path))
     && object(r.dispatcher) && ['claude-code','unknown','agentrouter'].includes(r.dispatcher.host) && nullable(r.dispatcher.session)
     && object(r.env) && Object.entries(r.env).every(([key,value]) => environmentKeys.includes(key) && typeof value === 'string' && !value.includes('\0'))
     && ['profile', 'adapter'].every(k => r[k] === undefined || (typeof r[k] === 'string' && !!r[k]))
     && (r.profileConfig === undefined || validProfileConfig(r.profileConfig));
+}
+// 门禁快照（Stage04，可选）：派发进程已经解析并检查过任务说明，执行者进程不再重读、不重新取 base。
+// 缺省等于"没有门禁"，旧请求照常有效；merged 只含门禁用到的字段。
+function validGate(gate) {
+  const object = x => x && typeof x === 'object' && !Array.isArray(x);
+  const strings = x => Array.isArray(x) && x.every(item => typeof item === 'string');
+  if (!object(gate) || typeof gate.enabled !== 'boolean') return false;
+  if (!(gate.base === null || (typeof gate.base === 'string' && /^[0-9a-f]{40,64}$/.test(gate.base)))) return false;
+  if (gate.enabled && gate.base === null) return false;
+  const merged = gate.merged;
+  return object(merged) && strings(merged.allowed_paths) && strings(merged.verify)
+    && typeof merged.expect_commit === 'boolean'
+    && Number.isInteger(merged.verify_timeout_min) && merged.verify_timeout_min > 0;
 }
 // 执行者配置快照（Stage02 起）：env 是字符串映射；secrets 只能是"变量名 → 变量名"，不可能夹带密钥值。
 function validProfileConfig(p) {
@@ -59,11 +73,13 @@ export const existingPaths = taskPaths;
 // 只处理完整行，保留尾部半行；轮询时不重复读取整个清单。
 export function terminalReader(home, id, onStart = () => {}) {
   let offset = 0, pending = Buffer.alloc(0);
+  // 同一任务的 gate 事件总在 end 之前；读到 end 时把它一并交给等待方（协议 13）。
+  let gate = null;
   return () => {
     let fd;
     try {
       const file = join(home, 'runs.jsonl'), size = statSync(file).size;
-      if (size < offset) { offset = 0; pending = Buffer.alloc(0); }
+      if (size < offset) { offset = 0; pending = Buffer.alloc(0); gate = null; }
       fd = openSync(file, 'r');
       while (offset < size) {
         const chunk = Buffer.alloc(Math.min(65536, size - offset));
@@ -76,7 +92,8 @@ export function terminalReader(home, id, onStart = () => {}) {
             const e = JSON.parse(line);
             if ((e.v === 1 || e.v === 2) && e.id === id) {
               if (e.event === 'start') onStart(e);
-              if (['end','interrupted'].includes(e.event)) return e;
+              if (e.event === 'gate') gate = { ok: e.ok === true, summary: e.summary };
+              if (['end','interrupted'].includes(e.event)) return gate ? { ...e, gate } : e;
             }
           } catch { /* 忽略损坏行。 */ }
         }
@@ -103,7 +120,7 @@ export async function handoff(home, request, announce, { timeout = 5000, startTi
     if (!accepted && (existsSync(base + '.claimed.json') || existsSync(base + '.running.json') || started || ended)) {
       accepted = true; startDeadline = Date.now() + startTimeout; announce(managedMessage(request.app));
     }
-    if (accepted && ended) return { exit: ended.event === 'end' ? ended.exit ?? 1 : 1 };
+    if (accepted && ended) return { exit: ended.event === 'end' ? ended.exit ?? 1 : 1, ...(ended.gate ? { gate: ended.gate } : {}) };
     if (accepted && !started && Date.now() >= startDeadline) {
       try { renameSync(base + '.claimed.json', base + '.withdrawn.json'); return { reason: '软件没有启动任务' }; }
       catch (error) { if (error.code !== 'ENOENT') throw error; /* 执行者或拒绝者已经接手，继续等待。 */ }

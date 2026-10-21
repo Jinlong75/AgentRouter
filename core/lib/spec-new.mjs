@@ -2,14 +2,17 @@
 // 全部结果走 cli.mjs 的约定：--json 时输出 { ok:true, … }；失败抛中文错误（由 cli.mjs 转成 { ok:false, error }），
 // 或直接返回 { ok:false, error, … }（spec new --commit 提交失败时文件保留）。
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, statSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { requireGitIdentity } from './project.mjs';
+import { parseSpec, validateSpec, SPEC_TYPES, SpecError } from './spec.mjs';
 import { traced } from './trace.mjs';
 
-const SPEC_TYPES = ['code', 'test', 'fix', 'research', 'docs'];
 const MAX_BYTES = 256 * 1024;
-const usageSpec = '用法：ar spec list <项目路径> | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit]';
+// 错误提示沿用原有五种类型的顺序，后加的类型排在后面（已有测试断言了前半段）。
+const LEGACY_TYPES = ['code', 'test', 'fix', 'research', 'docs'];
+const TYPE_TEXT = [...LEGACY_TYPES.filter(t => SPEC_TYPES.includes(t)), ...SPEC_TYPES.filter(t => !LEGACY_TYPES.includes(t))].join('、');
+const usageSpec = '用法：ar spec list <项目路径> | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径>';
 
 // 从标准输入读完整内容（spec new 的表单 JSON），与 cli.mjs 里读密钥的 readSecretValue 互不影响。
 export async function readSpecForm({ input = process.stdin } = {}) {
@@ -28,7 +31,7 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
       const dir = specsDirPath(root);
       const specs = listSpecs(root, dir, home);
       const text = specs.length
-        ? [`任务说明（${dir}）：`, ...specs.map(s => `  ${s.rel}  ${s.title}${s.dispatched ? `（已派发 ${s.dispatched} 次）` : ''}`)].join('\n')
+        ? [`任务说明（${dir}）：`, ...specs.map(s => `  ${s.rel}  ${s.title}${s.dispatched ? `（已派发 ${s.dispatched} 次）` : ''}${s.error ? `（解析失败：${s.error}）` : ''}`)].join('\n')
         : `还没有任务说明：${dir}`;
       return { result: { ok: true, dir, specs }, text };
     }
@@ -51,6 +54,16 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
         ? `${dryRun ? '将创建' : '已创建'}任务说明 ${created.rel}${created.commit ? `（已提交 ${created.commit}）` : ''}`
         : `任务说明已写入但没有提交：${created.error}`;
       return { result: created, text, code: created.ok ? 0 : 1 };
+    }
+    case 'commit': {
+      if (args.length !== 2 || args.some(a => !a || a.startsWith('--'))) throw new Error(usageSpec);
+      const root = resolve(cwd, args[0]);
+      const rel = args[1];
+      const committed = commitExistingSpec(root, rel);
+      const text = committed.ok
+        ? (committed.already ? `任务说明已经提交：${rel}` : `已提交任务说明 ${rel}（${committed.commit}）`)
+        : `任务说明没有提交：${committed.error}`;
+      return { result: committed, text, code: committed.ok ? 0 : 1 };
     }
     default: throw new Error(usageSpec);
   }
@@ -85,30 +98,30 @@ function listSpecs(root, dir, home) {
     let mtime;
     try { mtime = statSync(full).mtimeMs; } catch { continue; }
     const rel = relative(root, full).split(sep).join('/');
-    rows.push({ file, rel, id: /^(\d{3})-/.exec(file)?.[1] ?? null, title: specTitle(full, file), mtime, dispatched: dispatchedCount(home, root, rel) });
+    const info = readSpecMeta(full, file);
+    rows.push({ file, rel, id: /^(\d{3})-/.exec(file)?.[1] ?? null, title: info.title, mtime, dispatched: dispatchedCount(home, root, rel), error: info.error, warnings: info.warnings });
   }
   rows.sort((a, b) => b.mtime - a.mtime);
   return rows;
 }
 
-function specTitle(full, file) {
+// 用 v1 解析器读标题；解析失败时按原回退规则（第一个 "# " 标题，再不行用文件名），并把原因带给调用方。
+function readSpecMeta(full, file) {
   let text;
-  try { text = readFileSync(full, 'utf8'); } catch { return file; }
-  if (text.startsWith('---')) {
-    const end = text.indexOf('\n---', 3);
-    if (end >= 0) {
-      const m = /^title:\s*([^\r\n]*)$/m.exec(text.slice(3, end));
-      if (m) return parseYamlScalar(m[1]);
-    }
+  try { text = readFileSync(full, 'utf8'); } catch { return { title: file, error: null, warnings: [] }; }
+  try {
+    const parsed = parseSpec(text, file);
+    const title = typeof parsed.meta.title === 'string' ? parsed.meta.title : fallbackTitle(text, file);
+    return { title, error: null, warnings: parsed.warnings };
+  } catch (error) {
+    if (!(error instanceof SpecError)) throw error;
+    return { title: fallbackTitle(text, file), error: error.message, warnings: [] };
   }
-  const heading = text.split(/\r?\n/).find(line => line.startsWith('# '));
-  return heading ? heading.slice(2).trim() : file;
 }
 
-function parseYamlScalar(raw) {
-  const s = raw.trim();
-  if (s.startsWith('"')) { try { return JSON.parse(s); } catch { return s; } }
-  return s;
+function fallbackTitle(text, file) {
+  const heading = text.split(/\r?\n/).find(line => line.startsWith('# '));
+  return heading ? heading.slice(2).trim() : file;
 }
 
 function dispatchedCount(home, root, rel) {
@@ -151,7 +164,7 @@ function newSpec(root, form, { dryRun, commit, home }) {
   const goal = typeof form.goal === 'string' ? form.goal.trim() : '';
   if (!goal) throw new Error('请填写目标');
   const type = form.type ?? 'code';
-  if (!SPEC_TYPES.includes(type)) throw new Error('类型只能是 code、test、fix、research、docs');
+  if (!SPEC_TYPES.includes(type)) throw new Error(`类型只能是 ${TYPE_TEXT}`);
   const fields = {
     title, goal, type,
     allowedPaths: stringArray(form.allowedPaths),
@@ -190,6 +203,8 @@ function renderSpecFile(dir, fields, dryRun) {
     const id = String(max + 1 + attempt).padStart(3, '0');
     const file = join(dir, `${id}-${slug}.md`);
     const content = renderSpec(id, fields);
+    // 写文件前先读回：确保 renderSpec 改坏时不会写出解析器读不回的任务说明（--dry-run 也检查）。
+    validateSpec(parseSpec(content, `${id}-${slug}.md`), `${id}-${slug}.md`);
     if (dryRun) return { id, file, content };
     try {
       mkdirSync(dir, { recursive: true });
@@ -242,8 +257,9 @@ function yamlScalar(value) {
 }
 
 const tail = text => String(text ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-6).join('；');
+const gitIn = root => args => traced(`git ${args.slice(0, 2).join(' ')}`, () => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', shell: false, windowsHide: true }));
 function commitSpec(root, rel, id, title) {
-  const git = args => traced(`git ${args.slice(0, 2).join(' ')}`, () => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', shell: false, windowsHide: true }));
+  const git = gitIn(root);
   try { requireGitIdentity(root); }
   catch (error) { return { ok: false, error: error.message, code: error.arCode }; }
   const message = `[主导] 任务说明 ${id}：${title}`;
@@ -252,4 +268,44 @@ function commitSpec(root, rel, id, title) {
   const commit = git(['commit', '-m', message, '--', rel]);
   if (commit.status !== 0) return { ok: false, error: `git commit 失败：${tail(commit.stderr)}` };
   return { ok: true, commit: git(['rev-parse', '--short', 'HEAD']).stdout.trim() };
+}
+
+// ar spec commit：把上次 spec new 已写好、但因为缺少提交身份没提交的任务说明补提交上去。
+// 只接受项目内 specsDir 下的 .md（路径校验复用 readSpec）；已经提交且没有改动时幂等返回 already。
+function commitExistingSpec(root, rel) {
+  root = resolve(root);
+  const dir = specsDirPath(root);
+  const abs = resolve(root, rel);
+  // 先按 spec read 的规则校验：项目内、.md、存在、不超过 256 KB。
+  readSpec(root, rel);
+  if (!isInside(dir, abs)) {
+    const shown = relative(root, dir).split(sep).join('/') || '.';
+    throw new Error(`只能提交任务说明目录（${shown}）下的文件`);
+  }
+  const file = basename(abs);
+  const { id, title } = specIdentity(abs, file);
+  const git = gitIn(root);
+  try { requireGitIdentity(root); }
+  catch (error) { return { ok: false, error: error.message, ...(error.arCode ? { code: error.arCode } : {}) }; }
+  // 已跟踪、且工作区与 HEAD 没有差异（git diff 退出码 0）时不重复提交。
+  const tracked = git(['ls-files', '--error-unmatch', '--', rel]).status === 0;
+  if (tracked && git(['diff', '--quiet', 'HEAD', '--', rel]).status === 0) return { ok: true, commit: null, already: true };
+  return commitSpec(root, rel, id, title);
+}
+
+// 提交信息里的 id 与标题：用 v1 解析器从文件读，读不到时按文件名回退（与 spec list 的回退规则一致）。
+function specIdentity(full, file) {
+  const stem = file.replace(/\.md$/i, '');
+  const fallbackId = /^(\d{3})-/.exec(file)?.[1] ?? stem;
+  let text;
+  try { text = readFileSync(full, 'utf8'); } catch { return { id: fallbackId, title: stem }; }
+  try {
+    const parsed = parseSpec(text, file);
+    const id = typeof parsed.meta.id === 'string' && parsed.meta.id ? parsed.meta.id : fallbackId;
+    const title = typeof parsed.meta.title === 'string' && parsed.meta.title ? parsed.meta.title : fallbackTitle(text, file);
+    return { id, title };
+  } catch (error) {
+    if (!(error instanceof SpecError)) throw error;
+    return { id: fallbackId, title: fallbackTitle(text, file) };
+  }
 }

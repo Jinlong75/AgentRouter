@@ -26,6 +26,11 @@ const validRecord = v => typeof v === 'string' && v.length > 0 && v.length <= 20
 const normPath = p => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
 const samePath = (a, b) => normPath(a) === normPath(b);
 
+// 验收钩子（041）：AR_SHOTS_EXPERIMENT=projects-show-delay 时，每次处理 projects:show 先等 2 秒再调用核心，
+// 确定性地复现"项目页刷新期间点击被丢掉"。只在界面验收（AR_SHOTS，由 tools/shots.mjs 设置）里生效；
+// 平时不设这个环境变量，行为与性能完全不变。
+const PROJECTS_SHOW_DELAY_MS = process.env.AR_SHOTS && (process.env.AR_SHOTS_EXPERIMENT ?? '').split(',').includes('projects-show-delay') ? 2000 : 0;
+
 // 在项目目录打开 Claude Code（Stage03 第 7 节）：有 Windows Terminal 时 wt.exe -d <目录> claude；
 // 否则 cmd.exe /c start "<标题>" /D <目录> cmd.exe /k claude。参数用数组；目录必须是绝对路径且不含引号。
 export function claudeLaunch({ dir, name, wt }) {
@@ -122,7 +127,13 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
     async 'projects:choose'() { return chooseFolder(); },
     async 'projects:add'(p) { if (!validAbsPath(p?.path)) invalid(); return run(['projects', 'add', p.path, '--allow-non-git'], { timeoutMs: 60000 }); },
     async 'projects:remove'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'remove', p.path], { timeoutMs: 60000 }); },
-    async 'projects:show'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'show', p.path], { timeoutMs: 60000 }); },
+    async 'projects:show'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      await registeredProject(p.path);
+      // 验收钩子：先等再调用核心（平时为 0，不等待）。
+      if (PROJECTS_SHOW_DELAY_MS) await new Promise(resolve => setTimeout(resolve, PROJECTS_SHOW_DELAY_MS));
+      return run(['projects', 'show', p.path], { timeoutMs: 60000 });
+    },
     async 'projects:git-init'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'git-init', p.path], { timeoutMs: 60000 }); },
     async 'projects:commit-init'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'commit-init', p.path], { timeoutMs: 60000 }); },
     async 'projects:git-identity'(p) {
@@ -169,6 +180,12 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       if (p.commit === true) args.push('--commit');
       await registeredProject(p.project);
       return run(args, { input: JSON.stringify(p.form), timeoutMs: 60000 });
+    },
+    // 补好提交身份后，把上次已写好但没提交的任务说明补提交（新建任务页在派发前调用）。
+    async 'specs:commit'(p) {
+      if (!validAbsPath(p?.project) || !validSpecRel(p?.rel)) invalid();
+      await registeredProject(p.project);
+      return run(['spec', 'commit', p.project, p.rel], { timeoutMs: 60000 });
     },
     // 打开文件夹 / 在此项目打开 Claude Code：只接受已登记的项目；启动交给注入的函数（验收时是记录参数的桩）。
     async 'shell:open-folder'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); await openFolder(p.path); return { ok: true }; },

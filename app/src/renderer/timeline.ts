@@ -31,6 +31,8 @@ export class Timeline {
     cursor?: Page['cursor'];
     think = false;
     follow = true;
+    // 时间线末尾的附加行（Stage04：门禁开始的分隔行）；为空时不占位置。
+    footer = '';
     private heights = new Map<number, number>();
     private open = new Set<number>();
     private fresh = new Set<number>();
@@ -38,6 +40,7 @@ export class Timeline {
     private renderedRows = new WeakMap<HTMLElement, string>();
     private topSpacer = document.createElement('div');
     private bottomSpacer = document.createElement('div');
+    private footerEl = document.createElement('div');
     constructor(private host: HTMLElement, private viewport: HTMLElement) {
         host.onclick = e => { const b = (e.target as Element).closest<HTMLElement>('[data-cmd]'); if (!b)
             return; const key = +b.dataset.cmd!; this.open.has(key) ? this.open.delete(key) : this.open.add(key); this.signature = ''; this.render(); };
@@ -68,7 +71,7 @@ export class Timeline {
             end = rows.length;
             start = Math.max(0, end - 150);
         }
-        const signature = `${start}:${end}:${this.think}:${rows.length}`;
+        const signature = `${start}:${end}:${this.think}:${rows.length}:${this.footer}`;
         if (signature === this.signature)
             return;
         this.signature = signature;
@@ -92,6 +95,11 @@ export class Timeline {
         }
         this.bottomSpacer.style.height = `${sizes.slice(end).reduce((a, b) => a + b, 0)}px`;
         nodes.push(this.bottomSpacer);
+        if (this.footer) {
+            if (this.footerEl.innerHTML !== this.footer)
+                this.footerEl.innerHTML = this.footer;
+            nodes.push(this.footerEl);
+        }
         // 已有行保留节点身份；追加进展不能打断输出选择或键盘焦点。
         const keep = new Set(nodes);
         for (const child of [...this.host.children])

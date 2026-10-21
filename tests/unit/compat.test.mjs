@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
-import { homeDirectory, legacyHomeDirectory, userDirectory, dryRun, noWatch, testAgent, testStartTimeout, pickName, scriptNames, installMarkers, legacyRunsDir } from '../../core/lib/compat.mjs';
+import { homeDirectory, legacyHomeDirectory, userDirectory, dryRun, noWatch, testAgent, testStartTimeout, pickName, scriptNames, installMarkers, legacyRunsDir, unsafeHome } from '../../core/lib/compat.mjs';
 import { resolveSettings } from '../../core/lib/config.mjs';
 
 const base = path.resolve('/示例/用户');
@@ -49,4 +49,45 @@ test('停止核对的入口名、安装记录名、旧记录目录', () => {
   assert.deepEqual(scriptNames, ['ar.mjs', 'codex-task.mjs']);
   assert.deepEqual(installMarkers, ['.agent-router.json', '.dispatchdock.json']);
   assert.equal(legacyRunsDir(base), path.join(base, '.codex-runs'));
+});
+
+test('公共目录保护：用户目录的三种来源、末尾分隔符、大小写、根目录与子目录', () => {
+  const win = path.win32;
+  const userDir = win.resolve('C:\\Users\\示例');
+  const otherUser = win.resolve('C:\\Users\\别处');
+  const root = win.parse(process.cwd()).root;
+  // USERPROFILE / HOME / os.homedir() 三种来源各一；空值来源跳过。
+  const hits = [
+    unsafeHome(userDir, { env: { USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }),
+    unsafeHome(userDir, { env: { HOME: userDir }, platform: 'win32', homedir: otherUser }),
+    unsafeHome(userDir, { env: {}, platform: 'win32', homedir: userDir }),
+  ];
+  for (const reason of hits) {
+    assert.equal(typeof reason, 'string');
+    assert.match(reason, /^公共目录不能设为用户目录或磁盘根目录：/);
+    assert.match(reason, /请把 AGENT_ROUTER_HOME 设为一个专用的文件夹/);
+  }
+  // 末尾分隔符：resolve 规范化后仍命中。
+  assert.ok(unsafeHome(`${userDir}\\`, { env: { USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }));
+  assert.ok(unsafeHome(`${userDir}/`, { env: { USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }));
+  // Windows 不区分大小写；同一条路径在 linux 规则下不命中。
+  assert.ok(unsafeHome(win.resolve('C:\\USERS\\示例'), { env: { USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }));
+  assert.equal(unsafeHome('/home/Example', { env: { HOME: '/home/example' }, platform: 'linux', homedir: '/home/other' }), null);
+  // 盘符根与 UNC 共享根。
+  assert.ok(unsafeHome('C:\\', { env: {}, platform: 'win32', homedir: otherUser }));
+  assert.ok(unsafeHome('\\\\server\\share', { env: {}, platform: 'win32', homedir: otherUser }));
+  // 只有盘符的 C: 按 resolve 结果判断（Windows 上它指向该盘当前目录，不一定是根）。
+  const resolvedC = win.resolve('C:');
+  assert.equal(unsafeHome('C:', { env: {}, platform: 'win32', homedir: otherUser }) !== null, win.parse(resolvedC).root === resolvedC);
+  // posix 的 /。
+  assert.ok(unsafeHome('/', { env: {}, platform: 'linux', homedir: '/home/example' }));
+  // 用户目录的子目录、默认公共目录（%APPDATA%\agent-router）都安全。
+  assert.equal(unsafeHome(win.join(userDir, 'agent-router'), { env: { USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }), null);
+  const appData = win.join(userDir, 'AppData', 'Roaming');
+  assert.equal(unsafeHome(win.join(appData, 'agent-router'), { env: { APPDATA: appData, USERPROFILE: userDir }, platform: 'win32', homedir: otherUser }), null);
+  // USERPROFILE 为空时不误判（空值跳过，不当作当前目录）。
+  assert.equal(unsafeHome(userDir, { env: { USERPROFILE: '', HOME: '' }, platform: 'win32', homedir: otherUser }), null);
+  assert.equal(unsafeHome(win.resolve(''), { env: { USERPROFILE: '' }, platform: 'win32', homedir: otherUser }), null);
+  // 本机真实根目录也命中（不访问文件）。
+  assert.ok(unsafeHome(root, { env: {}, platform: process.platform, homedir: otherUser }));
 });

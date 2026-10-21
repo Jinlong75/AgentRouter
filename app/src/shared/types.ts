@@ -40,8 +40,45 @@ export interface Task {
     hasReport?: boolean;
     // 进程查询失败时，记录里仍是"进行中"的任务标为 unknown：保留最后已知状态，不推断它已结束。
     processState?: 'unknown';
+    // 门禁（Stage04，协议第 2 节）：只有用任务说明派发、start 行里有 gate 字段的任务才带；
+    // 没有这个字段的旧任务与直接文字任务显示与以前完全一样。
+    gate?: boolean;
+    base?: string;
+    // 收到 gating 事件的时刻（界面在进展里画"执行者结束 · 门禁开始"分隔用）。
+    gatingAt?: number;
+    gateOk?: boolean;
+    gateSummary?: string;
+    // 执行者进程自己的退出码（end.agentExit）：门禁只在它为 0 时运行。
+    agentExit?: number;
     last: string;
 }
+// 任务记录目录里的 gate.json（文件协议 12.3）；软件只读展示，不写入。
+export interface GateCommand {
+    line: string;
+    argv?: string[];
+    exit: number | null;
+    ms?: number;
+    timedOut?: boolean;
+    output?: string;
+    truncated?: boolean;
+    error?: string | null;
+}
+export interface GateFile {
+    v?: number;
+    attempt?: number;
+    at?: number;
+    ms?: number;
+    ok: boolean;
+    base?: string | null;
+    head?: string | null;
+    commit?: { required: boolean; ok: boolean };
+    uncommitted?: string[];
+    scope?: { allowed?: string[]; changed?: string[]; outside?: string[] };
+    commands?: GateCommand[];
+    summary?: string;
+}
+// detail 通道里的门禁结果：文件不存在为 null，解析失败为 { error }。
+export type GateResult = GateFile | { error: string } | null;
 export interface Event {
     v: 1;
     seq: number;
@@ -152,14 +189,28 @@ export interface SpecRow {
     title: string;
     mtime: number;
     dispatched: number;
+    // 034：说明解析 / 校验出错时核心给出的原因与警告，界面照实显示。
+    error?: string;
+    warnings?: string[];
 }
 export interface SpecsList { ok: true; dir: string; specs: SpecRow[] }
+// 任务列表与新建任务页的"今天 / 昨天"分组（纯函数，输入任务开始时刻与"现在"，见 037）：
+// "现在"在验收 / 演示模式可以被 AR_DEMO_NOW 固定（preload 经 window.dock.demoNow 暴露），跨午夜截图才不会把"今天"并进"昨天"。
+export function dayGroup(started: number, now: number): 'today' | 'yesterday' | 'earlier' {
+    const day = new Date(now);
+    const today = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+    const yesterday = new Date(day.getFullYear(), day.getMonth(), day.getDate() - 1).getTime();
+    return started >= today ? 'today' : started >= yesterday ? 'yesterday' : 'earlier';
+}
 export interface API {
+    // 验收 / 演示模式下固定的"现在"（毫秒，AR_DEMO_NOW 经主进程 additionalArguments 传给 preload）：正常启动没有这个值。
+    demoNow?: number;
     preferences(action: string, payload?: Record<string, unknown>): Promise<any>;
     console(action: string, payload?: Record<string, unknown>): Promise<any>;
     snapshot(): Promise<Snapshot>;
     detail(id: string): Promise<{
         report: string;
+        gate: GateResult;
     }>;
     events(id: string, cursor?: Cursor, before?: boolean): Promise<Page>;
     action(id: string, action: string, value?: string): Promise<void>;

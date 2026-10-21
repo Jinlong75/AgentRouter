@@ -1,7 +1,7 @@
 {
   "name": "agent-router",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "description": "A strong lead agent routes clearly specified work to cheaper worker agents, with a Windows dispatch console. Based on DispatchDock.",
   "repository": "https://github.com/Jinlong75/AgentRouter",

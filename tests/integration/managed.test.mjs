@@ -190,6 +190,8 @@ async function fixture(t, { exit = 0, duration = 150, stderr = '', tree = false 
   const env = { ...process.env, CODEX_DISPATCH_HOME: home, USERPROFILE: base, HOME: base, APPDATA: path.join(base, 'appdata'),
     CLAUDE_CONFIG_DIR: host, CODEX_HOME: path.join(base, 'codex'), XDG_CONFIG_HOME: path.join(base, 'xdg'), CODEX_NO_WATCH: '1' };
   for (const key of ['CODEX_DRY_RUN','CODEX_MODEL','CODEX_EFFORT','CODEX_TIER','CODEX_SANDBOX','CODEX_DISPATCH_TEST_AGENT','NODE_OPTIONS','ELECTRON_RUN_AS_NODE']) delete env[key];
+  // 本用例只设旧名，终端里设着新名时新名优先（协议 1），必须删掉；复制出来的是普通对象，Windows 上按不区分大小写删。
+  for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   const agent = path.join(base, 'fake-agent.cjs');
   if (tree) fs.writeFileSync(path.join(base, 'descendant.cjs'), `require('node:fs').writeFileSync(require('node:path').join(__dirname,'descendant.json'),JSON.stringify({pid:process.pid}));setInterval(()=>{},1000);`);
   fs.writeFileSync(path.join(base, 'agent.json'), JSON.stringify({ exit, duration, stderr }));

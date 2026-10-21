@@ -29,8 +29,10 @@ Stage07 加 `generic`。启动器解析（npm `.cmd` 包装 → Node 入口、PA
 | `version` | `detect` 报出的版本 |
 | `releaseFile` | 只用于测试与演示：设置后回放完全部事件先等这个文件出现（短间隔轮询），再写汇报、按 `exit` 结束；用于"软件退出后任务仍在运行"这类检查 |
 | `releaseTimeoutMs` | 等 `releaseFile` 的上限（毫秒，正整数，默认 120000）；超时往 stderr 写一行说明、以非 0 退出且不写汇报，不会无限挂着 |
+| `writes` | 只用于测试与演示：`[{ path, content }]`，在放行之后、写汇报之前按顺序写入；路径相对项目根、用 `/` 分隔，不接受绝对路径与 `..`，目录不存在时自动创建；默认 `[]` |
+| `commit` | 只用于测试与演示：写完文件后的提交信息（非空字符串），只 `git add` / `git commit` `writes` 里的路径（参数数组、不经 shell）；`null`（默认）表示不提交。提交失败时往 stderr 写一行说明、以 1 退出且不写汇报 |
 
-`releaseFile` / `releaseTimeoutMs` 随执行者快照带给托管与脱离派发的执行者进程（见 `snapshotKeys`）；没有设置 `releaseFile` 时行为与之前一致。
+`releaseFile` / `releaseTimeoutMs` / `writes` / `commit` 随执行者快照带给托管与脱离派发的执行者进程（见 `snapshotKeys`）；没有设置时回放说明与之前逐字节一致。
 
 ## 接口
 

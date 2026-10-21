@@ -4,7 +4,7 @@ import { trace, tracing } from './trace.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { run } from './run.mjs';
-import { homeDirectory, legacyHomeDirectory } from './compat.mjs';
+import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from './compat.mjs';
 import { configCommand, readConfig } from './config.mjs';
 import { waitForTask } from './wait.mjs';
 import { stopTask } from './stop.mjs';
@@ -25,7 +25,7 @@ export const usage = [
   '  ar init [项目路径] [--dry-run]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径>|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
   '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--base-url …] [--secret-var …] [--auth login|token]|update <名> […|--max-turns <正整数>|-]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
   '  ar secrets status [变量名 …]|set <变量名>（值从标准输入读入，不回显）|unset <变量名>（删除 Windows 用户环境变量）',
-  '  ar spec list <项目路径>|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）',
+  '  ar spec list <项目路径>|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>',
   '  加 --json 时只输出一个 JSON 对象（供软件调用）',
 ].join('\n');
 
@@ -51,6 +51,14 @@ function arity(rest, max, text) {
   if (rest.length > max || rest.some(a => !a || a.startsWith('--'))) throw new Error(`用法：${text}`);
 }
 
+// 公共目录保护（协议第 1 节）：只检查显式设置的新名 / 旧名环境变量，默认公共目录不检查。
+// 不安全时不读写任何文件、不启动进程：--json 由调用方输出 JSON，否则由 ar.mjs 打到标准错误，退出码 2。
+function assertSafeHome(env) {
+  if (!homeEnv.some(key => env[key])) return;
+  const reason = unsafeHome(homeDirectory(env), { env });
+  if (reason) throw Object.assign(new Error(reason), { arCode: 'UNSAFE_HOME' });
+}
+
 export async function main(argv, { scriptPath, env = process.env, cwd = process.cwd(), out = console.log, readSecret = readSecretValue, setSecret, unsetSecret = unsetUserSecret, readForm = readSpecForm } = {}) {
   const { command, rest, json } = normalizeArgs(argv);
   const homes = [homeDirectory(env), legacyHomeDirectory(env)];
@@ -67,9 +75,11 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
     try { return await action(); } finally { console.log = original; }
   };
   try {
+    // ar version 与用法帮助不碰公共目录，可以不检查（任务 047）。
+    if (command !== 'version') assertSafeHome(env);
     switch (command) {
       case 'dispatch': case 'redispatch': case '--run-request': {
-        let detach = null;
+        let detach = null, gate = null;
         let runArgs;
         if (command === 'redispatch') {
           // 记录名允许中文、空格等，所以只校验个数与开关，不套用 dispatch 的记录名校验。
@@ -93,16 +103,17 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           runArgs = [saved.task, ...(saved.extra ? [saved.extra] : []), '--name', saved.name, '--profile', saved.profile,
             ...(saved.role ? ['--role', saved.role] : []), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
         } else runArgs = command === 'dispatch' ? rest : ['--run-request', ...rest];
-        const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, onDetach: id => { detach = id; } }));
+        const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, onDetach: id => { detach = id; }, onGate: value => { gate = value; } }));
         const name = lines.find(l => l.startsWith('记录名：'))?.slice(4), progress = lines.find(l => l.startsWith('进度：'))?.slice(3);
-        emit({ ok: code === 0, exit: code, name: name ?? null, progress: progress ?? null, ...(detach ? { id: detach, detached: true } : {}), lines, ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '派发失败' }) });
+        emit({ ok: code === 0, exit: code, name: name ?? null, progress: progress ?? null, ...(detach ? { id: detach, detached: true } : {}), ...(gate ? { gate } : {}), lines, ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '派发失败' }) });
         return code;
       }
       case 'wait': {
         arity(rest, 1, 'ar wait [记录名]');
-        const code = await waitForTask(homes, cwd, rest[0], { log });
+        let gate = null;
+        const code = await waitForTask(homes, cwd, rest[0], { log, onGate: value => { gate = value; } });
         if (code === 2 && lines[0]?.startsWith('等待：在当前仓库找不到记录')) { emit({ ok: false, error: lines[0], lines }); return 2; }
-        emit({ ok: true, exit: code, report: lines.findLast(l => l.startsWith('exit='))?.replace(/^exit=\S+ report=/, '') ?? null, lines });
+        emit({ ok: true, exit: code, report: lines.findLast(l => l.startsWith('exit='))?.replace(/^exit=\S+ report=/, '') ?? null, ...(gate ? { gate } : {}), lines });
         return code;
       }
       case 'stop': {

@@ -26,6 +26,10 @@ export async function preferenceFixture(home, { install = true } = {}) {
   await writeFile(path.join(env.CODEX_HOME,'config.toml'),'model = "gpt-x"\nmodel_reasoning_effort = "medium"\nservice_tier = "default"\n');
   await writeFile(env.AR_TEST_AGENT,`const fs=require('node:fs');const path=require('node:path');const state=JSON.parse(fs.readFileSync(path.join(__dirname,'fake-codex.json'),'utf8'));if(state.missing)process.exit(1);if(process.argv.includes('--version')){console.log(state.version);process.exit(0);}if(process.argv.slice(-2).join(' ')==='login status'){console.error(state.loggedIn?'Logged in using ChatGPT':'Not logged in');process.exit(state.loggedIn?0:1);}if(process.argv.includes('-p')&&process.argv.includes('stream-json')){process.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'OK'}));process.exit(0);});return;}process.exit(2);\n`);
   await writeFile(path.join(home,'fake-codex.json'),JSON.stringify({version:'codex-cli 0.156.1',loggedIn:true}));
+  // 假 Claude Code（037 第 4 项）：AR_TEST_AGENT 这个假脚本对所有适配器跑同一份、版本是 codex 的，
+  // claude-code 执行者的版本会串成 codex-cli。真实安装没有这个问题（detect 跑的是真 claude --version）。
+  // 给 claude-code 的 profile 配上 path 指向这里（path 优先于 AR_TEST_AGENT，见 core/adapters 的 resolveLauncher），版本就是 Claude Code 风格。
+  await writeFile(path.join(home,'fake-claude.cjs'),`const VERSION='2.1.302 (Claude Code)';if(process.argv.includes('--version')){console.log(VERSION);process.exit(0);}if(process.argv.includes('-p')&&process.argv.includes('stream-json')){process.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'OK'}));process.exit(0);});return;}process.exit(2);\n`);
   if (install === true) executePlan(createPlan({env,host:'claude-code'}),{env});
   else if (Array.isArray(install)) for (const skill of install.filter(s => skills.includes(s))) executePlan(createPlan({env,host:'claude-code',skill}),{env});
   return env;

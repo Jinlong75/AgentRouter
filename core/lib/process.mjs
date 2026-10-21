@@ -113,10 +113,34 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   trace(`进程树结束 目标 pid=${pid} 初次快照里的进程树 ${tree.length} 项`);
   for (const p of tree) trace(`进程树结束 目标 pid=${pid} 初次快照里的进程树 ${describeProcess(p)}`);
   let failure;
+  // "第一次快照之后才出现"按 PID 判断：初次快照里没有、父进程在树里的进程才补杀。
+  const initialPids = new Set(snapshot.map(p => p.pid));
+  const taskkill = (pids, label) => {
+    const args = [...pids.flatMap(p => ['/PID', String(p.pid)]), '/F'];
+    return executeFile('taskkill.exe', args, { windowsHide: true, shell: false, timeout: remaining() })
+      .then(() => trace(`进程树结束 目标 pid=${pid} ${label} ${pids.length} 个`))
+      .catch(error => { failure ??= error; trace(`进程树结束 目标 pid=${pid} ${label} ${pids.length} 个出错：${error.message}`); });
+  };
   try {
     if (platform === 'win32') {
-      await executeFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, shell: false, timeout: remaining() });
-      trace(`进程树结束 目标 pid=${pid} taskkill.exe /T /F 返回成功`);
+      // 先只结束根：派发进程收不到信号，就不会在执行者先退出后补写 end。
+      if (alive(pid)) await taskkill([root], '结束根');
+      // 根结束不了也要继续结束子孙，最后按时限抛错（对外行为与原来一致）。
+      while (alive(pid) && Date.now() < deadline) await delay(Math.min(50, remaining()));
+      if (alive(pid)) trace(`进程树结束 目标 pid=${pid} 根在时限内没有退出，继续结束子孙`);
+      else trace(`进程树结束 目标 pid=${pid} 根已结束`);
+      // 再结束初次快照里的其余子孙；每个 /PID 都不带 /T。
+      const descendants = tree.filter(p => p.pid !== pid);
+      if (descendants.length) await taskkill(descendants, '结束子孙');
+      // 补充轮：根结束前刚派生的进程不在初次快照里，重新取快照后一并结束（最多 2 轮）。
+      for (let round = 0; round < 2 && Date.now() < deadline; round++) {
+        const current = await list(undefined, platform, remaining());
+        const fresh = current.filter(p => !initialPids.has(p.pid) && !seen.has(p.pid)
+          && tree.some(t => t.pid === p.parent && p.created >= t.created));
+        if (!fresh.length) break;
+        for (const p of fresh) { tree.push(p); seen.add(p.pid); }
+        await taskkill(fresh, '补充结束');
+      }
     } else {
       // 先逐层暂停并重新扫描，纳入初次快照之后刚派生的子孙。
       try {
@@ -128,13 +152,16 @@ export async function killProcessTree(pid, { platform = process.platform, list =
             if (q.parent === p.pid && !seen.has(q.pid) && q.created >= p.created) { tree.push(q); seen.add(q.pid); }
           }
         }
-        for (const p of [...tree].reverse()) {
+        // 同样先结束根，再按叶到根结束其余子孙（派发进程来不及补写 end）。
+        const kill = p => {
           try { process.kill(p.pid, 'SIGKILL'); trace(`进程树结束 目标 pid=${pid} SIGKILL ${describeProcess(p)} 结果=已发送`); }
           catch (e) {
             trace(`进程树结束 目标 pid=${pid} SIGKILL ${describeProcess(p)} 结果=${e.code === 'ESRCH' ? '进程已退出' : `失败（${e.message}）`}`);
             if (e.code !== 'ESRCH') failure ??= e;
           }
-        }
+        };
+        kill(root);
+        for (const p of [...tree].reverse()) if (p.pid !== root.pid) kill(p);
       } finally {
         // 权限或查询失败也不能让仍存活的进程永久暂停。
         for (const p of tree) { try { process.kill(p.pid, 'SIGCONT'); } catch { /* 已退出。 */ } }

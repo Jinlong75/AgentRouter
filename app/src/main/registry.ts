@@ -28,6 +28,10 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
             if (typeof e.profile === 'string') t.profile = e.profile;
             if (typeof e.adapter === 'string') t.adapter = e.adapter;
             if (typeof e.label === 'string') t.label = e.label;
+            // 门禁（协议第 2 节）：gate 是布尔；base 是执行者开始时的提交。
+            // 老记录没有这两个字段，任务对象保持与以前一致。
+            if (typeof e.gate === 'boolean') t.gate = e.gate;
+            if (typeof e.base === 'string') t.base = e.base;
             tasks.set(t.id, t);
         }
         else {
@@ -36,10 +40,20 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 return;
             if (e.event === 'spawned')
                 t.agentPid = e.agentPid ?? e.codexPid;
+            // 门禁开始：执行者结束后核心写 gating，随后写 gate 结果，最后才写 end。
+            if (e.event === 'gating' && Number.isFinite(e.at))
+                t.gatingAt = e.at;
+            if (e.event === 'gate') {
+                t.gateOk = e.ok === true;
+                if (typeof e.summary === 'string')
+                    t.gateSummary = e.summary;
+            }
             if (e.event === 'end') {
                 t.exit = Number.isInteger(e.exit) ? e.exit : null;
                 t.ended = Number.isFinite(e.at) ? e.at : undefined;
                 t.minutes = Number.isFinite(e.minutes) && e.minutes >= 0 ? e.minutes : undefined;
+                if (Number.isInteger(e.agentExit))
+                    t.agentExit = e.agentExit;
                 t.status = t.exit === 0 ? 'done' : 'fail';
             }
             if (e.event === 'interrupted' && t.exit === undefined) {

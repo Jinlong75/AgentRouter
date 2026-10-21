@@ -8,6 +8,12 @@ import { existsSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 import { isolatedEnvKey, isolationOverrides } from '../app/src/main/app-env.mjs';
+// 界面验收可能跨午夜（037 第 2 项）：演示数据生成与软件里的"今天 / 昨天"分组用同一个"现在"——
+// AR_DEMO_NOW（毫秒时间戳）。这里在生成演示数据之前设好；外部已设时沿用不覆盖（负向验证要指定时刻）。
+process.env.AR_DEMO_NOW ||= String(Date.now());
+// Stage04 门禁演示任务（reader-app 的 t20～t22）默认隐藏：原有列表计数与检查不变，
+// UI22 在验收里临时显示它们，检查完再恢复 hidden。
+process.env.AR_DEMO_HIDDEN_IDS ||= 't20,t21,t22';
 const fixture=await demo();
 try {
   const out=path.resolve('app/dist/shots');

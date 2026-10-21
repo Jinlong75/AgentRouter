@@ -1,8 +1,10 @@
 import { c, cx, nt, pj } from '../shared/copy';
 import { esc, markdown } from '../shared/markdown';
+import { dayGroup } from '../shared/types';
 import type { AgentRow, ProjectRow, ProjectShow, SpecRow, Task } from '../shared/types';
 import { field, icon, menu, openSheet } from './ui';
 import { openIdentitySheet } from './projects';
+import { mergeSpec } from '../../../core/lib/spec.mjs';
 
 // 新建任务页：选项目 → 选来源（已有说明 / 新建说明 / 直接写文字）→ 选执行者 → 派发。
 // 派发走核心的分离进程（console 的 tasks:dispatch 会加 --detach），成功后切回任务页并选中新任务。
@@ -35,14 +37,15 @@ const lines = (value: unknown) => Array.isArray(value) ? value.filter((x): x is 
 const requiredHint = (name: string) => `<span class="fhint fail" data-nt-required role="alert">${esc(nt.required(name))}</span>`;
 const emptyForm = (): FormState => ({ title: '', goal: '', type: 'code', allowed: '', verify: '', nonGoals: '', refs: '', questions: '', text: '' });
 
-// 任务说明的修改时间：今天、昨天显示时分，更早显示日期（与任务列表的分组口径一致）。
+// 任务说明的修改时间：今天、昨天显示时分，更早显示日期（与任务列表的分组口径一致，037 第 2 项的同一个纯函数）。
+// 验收 / 演示模式下"现在"由 preload 送来（AR_DEMO_NOW 固定），平时用当前时间。
 function formatMtime(value: number) {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return '—';
-    const now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const group = dayGroup(value, window.dock.demoNow ?? Date.now());
     const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-    if (date.getTime() >= today) return `${c.today} ${time}`;
-    if (date.getTime() >= today - 86400000) return `${c.yesterday} ${time}`;
+    if (group === 'today') return `${c.today} ${time}`;
+    if (group === 'yesterday') return `${c.yesterday} ${time}`;
     return date.toLocaleDateString('zh-CN');
 }
 
@@ -127,6 +130,25 @@ export class NewTaskView {
         return typeof dir === 'string' && dir ? dir : 'docs/specs';
     }
 
+    // 这份新说明派发后会不会跑门禁：直接用核心的 mergeSpec（任务说明 > 项目配置 > 默认），
+    // 与派发时的判断同一份代码；只有新建说明才显示"先提交任务说明"。
+    // 051：锁定时还要说明为什么跑门禁，原因按 类型 → 验收命令 → 允许路径 的顺序收集；
+    // 条数与是否成立都取合并结果，"来自表单还是项目配置"只看表单那一栏解析后是否为空。
+    private gatePlan() {
+        if (this.source !== 'new') return { gate: false, commands: 0, reasons: [] as string[] };
+        const config = (this.show?.config ?? {}) as { allowedPaths?: string[]; verify?: string[] };
+        const formAllowed = lines(this.form.allowed.split(/\r?\n/)), formVerify = lines(this.form.verify.split(/\r?\n/));
+        const merged = mergeSpec({ type: this.form.type, allowed_paths: formAllowed, verify: formVerify }, config);
+        const paths = merged.allowed_paths, limited = !(paths.length === 1 && paths[0] === '**');
+        const reasons: string[] = [];
+        if (merged.gate) {
+            if (merged.expect_commit) reasons.push(nt.gateWhyType(this.form.type));
+            if (merged.verify.length) reasons.push(formVerify.length ? nt.gateWhyVerify(merged.verify.length) : nt.gateWhyVerifyProject(merged.verify.length));
+            if (limited) reasons.push(formAllowed.length ? nt.gateWhyPaths : nt.gateWhyPathsProject);
+        }
+        return { gate: merged.gate === true, commands: merged.verify.length, reasons };
+    }
+
     private note() {
         if (this.busy) return nt.dispatchingNote;
         if (!this.enabledAgents().length) return '';
@@ -134,7 +156,27 @@ export class NewTaskView {
         if (!label) return '';
         if (this.source === 'text') return nt.conseqText(label);
         if (this.source === 'existing') return this.selectedSpec ? nt.conseqExisting(this.selectedSpec, label) : '';
-        return nt.conseqNew(this.dry?.rel || FALLBACK_SPEC, label, this.commit);
+        const plan = this.gatePlan(), text = nt.conseqNew(this.dry?.rel || FALLBACK_SPEC, label, this.commit || plan.gate);
+        // 会跑门禁时说明后果：结束时由核心跑验收命令，条数用合并后的结果（后缀文案在 copy.ts 的 nt.conseqGate）。
+        return plan.gate ? `${text}${nt.conseqGate(plan.commands)}` : text;
+    }
+
+    // 输入允许改动 / 验收命令时只同步"先提交任务说明"与后果说明，不重建表单（不打断输入和光标）。
+    private updateCommit() {
+        const button = this.container?.querySelector<HTMLButtonElement>('[data-nt-commit]');
+        if (!button) return;
+        const plan = this.gatePlan(), on = this.commit || plan.gate;
+        button.setAttribute('aria-checked', String(on));
+        button.disabled = plan.gate;
+        // 050：会跑门禁时整行变灰、带锁形图标，与 disabled 一起切换。
+        button.classList.toggle('off', plan.gate);
+        if (plan.gate) button.setAttribute('aria-disabled', 'true');
+        else button.removeAttribute('aria-disabled');
+        button.querySelector('.cb')?.classList.toggle('on', on);
+        const cb = button.querySelector('.cb');
+        if (cb) cb.innerHTML = on ? icon('check-line') : '';
+        const help = button.querySelector('.ct span');
+        if (help) help.innerHTML = `${plan.gate ? icon('lock-line') : ''}${esc(plan.gate ? nt.commitSpecForcedWhy(plan.reasons) : nt.commitSpecHelp)}`;
     }
 
     private canDispatch() {
@@ -297,7 +339,9 @@ export class NewTaskView {
             ? `<button class="sel" disabled><span class="ph">${esc(nt.noWorker)}</span></button>`
             : `<button class="sel" data-nt-worker ${disabled} aria-haspopup="listbox" aria-expanded="false"><span>${esc(this.worker ? this.workerLabel() : auto ? nt.auto(auto.label) : this.workerLabel())}</span>${icon('arrow-down-s-line')}</button>`;
         // "先提交任务说明"只对新建的说明有意义：已有说明本来就在仓库里，直接写文字不生成文件。
-        const commitCtl = this.source !== 'new' ? '' : field('', '', `<button class="choice" data-nt-commit role="checkbox" aria-checked="${this.commit}" ${disabled}><span class="cb ${this.commit ? 'on' : ''}">${this.commit ? icon('check-line') : ''}</span><span class="ct">${esc(nt.commitSpec)}<span>${esc(nt.commitSpecHelp)}</span></span></button>`);
+        // 会跑门禁时必须先提交说明（门禁从干净的基线比较改动）：勾选并禁用，整行变灰、说明前带锁形图标，说明文字换成原因。
+        const plan = this.gatePlan(), commitOn = this.commit || plan.gate;
+        const commitCtl = this.source !== 'new' ? '' : field('', '', `<button class="choice${plan.gate ? ' off' : ''}" data-nt-commit role="checkbox" aria-checked="${commitOn}"${plan.gate ? ' aria-disabled="true"' : ''} ${disabled}${plan.gate ? ' disabled' : ''}><span class="cb ${commitOn ? 'on' : ''}">${commitOn ? icon('check-line') : ''}</span><span class="ct">${esc(nt.commitSpec)}<span>${plan.gate ? icon('lock-line') : ''}${esc(plan.gate ? nt.commitSpecForcedWhy(plan.reasons) : nt.commitSpecHelp)}</span></span></button>`);
         const dispatch = this.busy
             ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(nt.dispatching)}`
             : `${icon('send-plane-line')}${esc(nt.dispatch)}`;
@@ -449,6 +493,7 @@ export class NewTaskView {
         }
         if (this.source === 'new') this.scheduleDry();
         this.updateNote();
+        if (key === 'allowed' || key === 'verify') this.updateCommit();
     }
 
     private keys(e: KeyboardEvent) {
@@ -605,7 +650,8 @@ export class NewTaskView {
         if (!this.canDispatch()) return;
         const missing = this.missing();
         if (missing) { this.failValidation(missing.key, missing.name); return; }
-        const project = this.project, source = this.source, form = this.formPayload(), commit = this.commit;
+        // 会跑门禁时无论勾选状态如何都先提交说明：与表单上被固定为勾选的复选框一致。
+        const project = this.project, source = this.source, form = this.formPayload(), commit = this.commit || this.gatePlan().gate;
         // 表单指纹：只有内容没变时才沿用上次已经写好的任务说明，避免派发到旧文件。
         const key = JSON.stringify([form, commit]);
         let planned = '';
@@ -628,6 +674,8 @@ export class NewTaskView {
                         content = String(read?.content ?? '');
                     }
                     catch { this.pendingSpec = null; }
+                    // 补好身份后，先补提交这份说明再派发（门禁要求说明已提交）；提交失败不派发。
+                    if (rel) await window.dock.console('specs:commit', { project, rel });
                 }
                 if (!rel) {
                     // 先预览一次拿到将要写入的文件名（只读，不写文件）：提交失败时用它记录已写好的文件。

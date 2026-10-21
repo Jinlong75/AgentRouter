@@ -102,7 +102,7 @@ export interface Harness {
     pause: (ms?: number) => Promise<void>;
     evaluate: (expression: string) => Promise<any>;
     wait: (expression: string, label?: string, timeoutMs?: number) => Promise<void>;
-    check: (label: string, expression: string) => Promise<void>;
+    check: (label: string, expression: string, diagnose?: () => Promise<string>) => Promise<void>;
     within: (label: string, expression: string, limitMs: number) => Promise<number>;
     happened: (label: string, fn: () => boolean, limitMs: number) => Promise<number>;
     verify: (label: string, fn: () => Promise<void> | void) => Promise<void>;
@@ -153,9 +153,14 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // check：当下就必须成立（不重试）。"某状态不应出现"一类的负向检查一律用它，不给短暂出现的错误留余地。
     // 失败现场：最近 30 秒的核心调用与核心进程、此刻的 CPU（只在失败时采，不影响通过的检查）。
     const scene = async () => `${recentReport()}\n此刻的 CPU（1 秒采样）：${await cpuNow()}`;
-    const check = async (label: string, expression: string) => {
+    // diagnose（可选）：不成立时立刻采集的专项现场，在采 CPU（约 1.5 秒）之前调用，尽量贴近检查那一刻；
+    // 通过时不调用，不改判断、不重试、不等待。
+    const check = async (label: string, expression: string, diagnose?: () => Promise<string>) => {
         const value = await evaluate(expression);
-        if (value !== true) console.log(`检查不成立：${label}（实际 ${JSON.stringify(value)}）\n${await scene()}`);
+        if (value !== true) {
+            const extra = diagnose ? await diagnose().catch(error => `专项诊断失败：${(error as Error).message}`) : '';
+            console.log(`检查不成立：${label}（实际 ${JSON.stringify(value)}）\n${extra ? extra + '\n' : ''}${await scene()}`);
+        }
         assert.equal(value, true, label);
         checks.push(label);
     };

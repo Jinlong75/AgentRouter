@@ -1,5 +1,6 @@
-import { c, cx, p } from '../shared/copy';
-import type { Task, Snapshot, Event as TaskEvent } from '../shared/types';
+import { c, cx, gt, p } from '../shared/copy';
+import { dayGroup } from '../shared/types';
+import type { Task, Snapshot, Event as TaskEvent, GateResult } from '../shared/types';
 import { esc, markdown } from '../shared/markdown';
 import { icon, menu, confirmStop, tooltips, notice, openSheet, toast, trace } from './ui';
 import { executorAdapter, executorLabel, executorTag, isCodexTask } from '../shared/executor';
@@ -8,6 +9,7 @@ import { Timeline } from './timeline';
 import { PreferencesView } from './preferences';
 import { ProjectsView } from './projects';
 import { NewTaskView } from './newtask';
+import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack } from './gate';
 import brandSVG from '../../design/icons/mark.svg';
 const root = document.querySelector<HTMLElement>('#app')!;
 const brand = brandSVG.replace('<svg ', '<svg aria-hidden="true" ');
@@ -28,6 +30,8 @@ function attemptOf(t: Task): number | null {
 const attemptTag = (t: Task) => { const n = attemptOf(t); return n ? `<span class="tag" title="${esc(c.attemptTip(t.name))}">${esc(c.attempt(n))}</span>` : ''; };
 const taskTitle = (t: Task) => `<span class="ttl">${esc(t.title)}</span>${attemptTag(t)}`;
 let state: Snapshot = { tasks: [], theme: 'dark', version: '0.1.0' }, page = 'tasks', filter = 'all', repo = '', selected = '', tab = 'flow', think = false, timeline: Timeline | undefined, report = '', generation = 0, loading = false, queued = false, detailSignature = '';
+// 当前任务的门禁结果（detail 通道读 gate.json）：null 是文件不存在，{ error } 是读不出来，原样展示。
+let gateResult: GateResult = null;
 // 再派一次：正在派发的任务、失败原因（只显示在触发它的那个任务详情上）。
 let redispatchFor = '', redispatchBusy = false, redispatchError = '', redispatchErrorFor = '';
 // 017：批量选择与删除。checked 只存 id；筛选后不可见的勾选保留，计数照实。
@@ -60,7 +64,7 @@ const projectsHost = { tasks: () => state.tasks, openTask: showTask };
 let projectsView = new ProjectsView(projectsHost);
 const newTaskView = new NewTaskView({ tasks: () => state.tasks, openTask: showTask });
 const current = () => state.tasks.find(t => t.id === selected);
-const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t)]);
+const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit]);
 const action = (name: string, value?: string) => { trace('action-send', { task: selected, name }); return window.dock.action(selected, name, value).then(() => trace('action-done', { name }), error => { trace('action-error', { name, error: String((error as Error)?.message ?? error) }); notice(error); }); };
 function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="wordmark">${c.app}</span></div><div class="tb-r"></div><nav class="nav"></nav><section class="content"></section>`; nav(); pageView(); }
 // 侧栏只在内容变化时重建：异步刷新晚到时不替换按钮，避免吞掉正在进行的点击；重建后焦点放回同一个导航按钮。
@@ -199,13 +203,16 @@ function list() {
         detail();
     }
     const groups = new Map<string, Task[]>();
-    const now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(), yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+    // "今天 / 昨天"按纯函数分组（037 第 2 项）：验收 / 演示模式下 preload 送来固定的"现在"（AR_DEMO_NOW），
+    // 跨午夜截图时与演示数据同一口径；正常运行没有这个值，用当前时间，行为不变。
+    const now = window.dock.demoNow ?? Date.now();
+    const dayName = (started: number) => { const g = dayGroup(started, now); return g === 'today' ? c.today : g === 'yesterday' ? c.yesterday : new Date(started).toLocaleDateString('zh-CN'); };
     for (const t of [...tasks].sort((a, b) => Number(b.status === 'run') - Number(a.status === 'run') || b.started - a.started)) {
-        const day = t.status === 'run' ? c.status.run : t.started >= today ? c.today : t.started >= yesterday ? c.yesterday : new Date(t.started).toLocaleDateString('zh-CN');
+        const day = t.status === 'run' ? c.status.run : dayName(t.started);
         groups.set(day, [...(groups.get(day) ?? []), t]);
     }
     const box = root.querySelector<HTMLElement>('.tlist')!, scroll = box.scrollTop;
-    box.innerHTML = tasks.length ? [...groups].map(([day, rows]) => `<div class="tgroup">${day}<span class="mono">${day === c.status.run ? rows.length : new Date(rows[0].started).toLocaleDateString('en-CA', { month: '2-digit', day: '2-digit' })}</span></div>${rows.map(t => { const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : mark(t.status); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t)}</b><span class="${t.status === 'run' ? 'live' : ''}"><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${esc(project(t))}${tail ? ' · ' + esc(tail) : ''}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`;
+    box.innerHTML = tasks.length ? [...groups].map(([day, rows]) => `<div class="tgroup">${day}<span class="mono">${day === c.status.run ? rows.length : new Date(rows[0].started).toLocaleDateString('en-CA', { month: '2-digit', day: '2-digit' })}</span></div>${rows.map(t => { const gateFail = t.status === 'fail' && gateState(t) === 'fail'; const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : gateFail ? '' : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : mark(t.status); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t)}</b><span class="${t.status === 'run' ? 'live' : ''}"><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${gateBadge(t)}${esc(project(t))}${tail ? ' · ' + esc(tail) : ''}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`;
     box.scrollTop = scroll;
     restoreFocus(focus);
 }
@@ -217,12 +224,16 @@ function detail() {
     timeline = undefined;
     loading = false;
     report = '';
+    gateResult = null;
     const t = current();
     if (!t) {
         box.innerHTML = `<div class="empty">${icon('file-list-3-line')}<b>${state.tasks.length ? c.select : c.emptyDetail}</b><p>${c.detailHelp}</p></div>`;
         return;
     }
-    box.innerHTML = '<div class="dh"></div><div class="dtabs"></div><div class="banner-holder"></div><div class="dbody edge"><div class="scroll" tabindex="0"><div class="tab-body"></div></div><button class="plan-compact plan-h" data-plan-top hidden></button><button class="btn sm follow" data-latest hidden></button></div>';
+    // 切到没有门禁的任务时，"门禁"标签不存在，回到进展。
+    if (tab === 'gate' && !gateEnabled(t))
+        tab = 'flow';
+    box.innerHTML = '<div class="dh"></div><div class="track-holder"></div><div class="dtabs"></div><div class="banner-holder"></div><div class="dbody edge"><div class="scroll" tabindex="0"><div class="tab-body"></div></div><button class="plan-compact plan-h" data-plan-top hidden></button><button class="btn sm follow" data-latest hidden></button></div>';
     header();
     const viewport = box.querySelector<HTMLElement>('.dbody > .scroll')!;
     viewport.addEventListener('scroll', () => { if (!timeline || tab !== 'flow')
@@ -289,19 +300,46 @@ function header() {
     detailSignature = headerKey(t);
     const busy = redispatchBusy && redispatchFor === t.id;
     const finished = ['done', 'fail', 'stop'].includes(t.status);
+    const gate = gateState(t), gateFail = t.status === 'fail' && gate === 'fail';
     const redispatch = finished ? `<button class="btn sm" data-redispatch data-tip="${esc(c.redispatchHelp)}" aria-label="${esc(c.redispatch)}" ${busy ? 'disabled' : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.redispatching)}` : `${icon('refresh-line')}${esc(c.redispatch)}`}</button>` : '';
-    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2"><span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${t.status === 'run' ? ` · <span data-elapsed="${esc(t.id)}">${elapsed(t)}</span>` : t.status === 'done' ? ` · ${c.elapsed} ${t.minutes ?? '—'} ${c.minutes}` : t.status === 'fail' ? ` · exit=${t.exit}` : ''}</span><span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
-    // 再派一次失败用页面横幅显示原因。
-    const failed = redispatchError && redispatchErrorFor === t.id ? `<div class="banner fail" role="alert">${mark('fail')}<div class="rt"><b>${esc(c.redispatchFailed)}</b><span>${esc(redispatchError)}</span></div></div>` : '';
-    trace('header', { task: t.id, banner: !!failed, busy, errorFor: redispatchErrorFor });
-    // 只找详情里的横幅区：任务页顶部还有一个进程状态横幅区（W4），不能写到那里。
-    root.querySelector('.detail .banner-holder')!.innerHTML = failed + (['fail', 'stop'].includes(t.status) ? `<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
+    // 失败且门禁没过时，状态行第二段说明是门禁没过（不再是笼统的 exit=3）。
+    const stateTail = t.status === 'run' ? ` · <span data-elapsed="${esc(t.id)}">${elapsed(t)}</span>` : t.status === 'done' ? ` · ${c.elapsed} ${t.minutes ?? '—'} ${c.minutes}` : t.status === 'fail' ? gateFail ? ` · ${esc(gt.badge.fail)}` : ` · exit=${t.exit}` : '';
+    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2"><span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span><span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
+    // 流水线轨道（B3）：只给带 gate 字段的任务画；放在标题区下面、标签栏上面。
+    const track = root.querySelector<HTMLElement>('.track-holder');
+    if (track) track.innerHTML = gateTrack(t, gateFile(gateResult));
+    // 再派失败、门禁、执行者失败 / 中断的横幅都在 banners() 里；门禁标签里有自己的横幅，不再重复。
+    const gateBanner = tab !== 'gate' && (gateFail || (t.status === 'run' && gate === 'running'));
+    trace('header', { task: t.id, banner: !!(redispatchError && redispatchErrorFor === t.id || gateBanner), busy, errorFor: redispatchErrorFor });
+    banners(t);
     tabs();
 }
+// 详情顶部的横幅：门禁横幅只在进展等其它标签显示；"门禁"标签里已有自己的横幅（界面稿 gateTab()），
+// 两条叠在一起会重复提示，"查看门禁"按钮也没有意义。
+function banners(t: Task) {
+    const holder = root.querySelector<HTMLElement>('.detail .banner-holder');
+    if (!holder)
+        return;
+    const gate = gateState(t), gateFail = t.status === 'fail' && gate === 'fail';
+    // 再派一次失败用页面横幅显示原因。
+    const failed = redispatchError && redispatchErrorFor === t.id ? `<div class="banner fail" role="alert">${mark('fail')}<div class="rt"><b>${esc(c.redispatchFailed)}</b><span>${esc(redispatchError)}</span></div></div>` : '';
+    // 门禁未过：横幅用核心写的 summary，主按钮是"查看门禁"；门禁进行中：提示横幅。
+    const gateBanner = tab === 'gate' ? ''
+        : gateFail
+            ? `<div class="banner fail" role="alert">${mark('fail')}<div class="rt"><b>${esc(gt.failTitle)}</b><span>${esc(t.gateSummary ?? gateFile(gateResult)?.summary ?? '')}</span></div><button class="btn sm" data-tab="gate">${esc(gt.viewGate)}</button></div>`
+            : t.status === 'run' && gate === 'running'
+                ? `<div class="banner info" role="status">${mark('run')}<div class="rt"><b>${esc(gt.runningTitle)}</b><span>${esc(gt.runningHelp(gateFile(gateResult)?.commands?.length ?? 0))}</span></div><button class="btn sm" data-tab="gate">${esc(gt.viewGate)}</button></div>`
+                : '';
+    // 只找详情里的横幅区：任务页顶部还有一个进程状态横幅区（W4），不能写到那里。
+    holder.innerHTML = failed + gateBanner + ((['fail', 'stop'].includes(t.status) && !gateFail) ? `<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
+}
 function tabs() {
-    const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!;
-    if (!bar.children.length)
-        bar.innerHTML = `<div class="segm sm">${[['flow', c.flow], ['report', c.report], ['files', c.files], ['params', c.params]].map(([key, label]) => `<button data-tab="${key}">${label}</button>`).join('')}</div><span class="sp"></span><span class="hint">${c.think}<button class="toggle" data-think role="switch" aria-label="${c.think}"></button></span>`;
+    const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!, t = current();
+    if (!bar.children.length) {
+        // "门禁"插在"汇报"后面；其它标签顺序与选中逻辑不变，只有启用了门禁的任务才有。
+        const items: [string, string][] = [['flow', c.flow], ['report', c.report], ...(t && gateEnabled(t) ? [['gate', gt.tab] as [string, string]] : []), ['files', c.files], ['params', c.params]];
+        bar.innerHTML = `<div class="segm sm">${items.map(([key, label]) => `<button data-tab="${key}">${label}</button>`).join('')}</div><span class="sp"></span><span class="hint">${c.think}<button class="toggle" data-think role="switch" aria-label="${c.think}"></button></span>`;
+    }
     for (const button of bar.querySelectorAll<HTMLButtonElement>('[data-tab]')) {
         button.classList.toggle('on', button.dataset.tab === tab);
         button.setAttribute('aria-pressed', String(button.dataset.tab === tab));
@@ -334,6 +372,8 @@ function renderTab() {
     }
     else if (tab === 'report')
         body.innerHTML = report ? `<div class="sum">${t.commit ? `<span>${icon('git-commit-line')}<em>${c.commit}</em><span class="mono">${t.commit}</span></span>` : ''}<span>${icon('time-line')}<em>${c.elapsed}</em>${t.minutes ?? '—'} ${c.minutes}</span><span class="sp"></span><button class="btn icon quiet" data-open="report" data-tip="${c.openReport}" aria-label="${c.openReport}">${icon('external-link-line')}</button></div><div class="md selectable">${markdown(report)}</div>` : `<div class="empty">${icon('file-text-line')}<b>${t.status === 'run' ? c.reportLater : c.noReport}</b>${t.status === 'run' ? '' : `<p>${t.status === 'done' ? c.noReportDone(executorLabel(t)) : c.noReportHelp(executorLabel(t))}</p>`}</div>`;
+    else if (tab === 'gate')
+        body.innerHTML = gateTab(t, gateFile(gateResult), gateResult);
     else if (tab === 'files') {
         const files = [...changedFiles().values()];
         body.innerHTML = files.length ? `<div class="sec-t">${c.filesHelp}${t.status === 'run' ? c.filesLive : ''}</div><div class="rows">${files.map(f => `<div class="r ${f.kind}">${icon(f.kind === 'add' ? 'add-line' : f.kind === 'delete' ? 'delete-bin-line' : 'edit-line')}<span class="muted">${c.kinds[f.kind]}</span><span class="v mono">${esc(f.path)}</span><button class="btn sm quiet" data-file="${esc(f.path)}">${c.open}</button></div>`).join('')}</div>` : `<div class="empty">${icon('file-copy-line')}<b>${c.noFiles}</b></div>`;
@@ -366,6 +406,9 @@ function renderFlow() {
     if (!items.length)
         compact.hidden = true;
     timeline.think = think;
+    // 门禁开始时在进展末尾插一行分隔（B6）：时刻取 gating 事件，执行者这时已经以 0 退出。
+    const t = current();
+    timeline.footer = t?.gatingAt ? `<div class="tl k-turn gate-sep"><span class="t mono">${clock(t.gatingAt)}</span><div class="c">执行者结束（exit=${t.agentExit ?? 0}）· 门禁开始</div></div>` : '';
     timeline.render();
     const earlier = root.querySelector<HTMLButtonElement>('[data-earlier]')!;
     earlier.hidden = !timeline.cursor?.start;
@@ -390,7 +433,10 @@ async function refreshDetail(before = false) {
         const [data, eventPage] = await Promise.all([window.dock.detail(id), window.dock.events(id, timeline?.cursor, before)]);
         if (gen !== generation || id !== selected)
             return;
+        const oldGate = JSON.stringify(gateResult);
         report = data.report;
+        gateResult = data.gate;
+        const gateChanged = oldGate !== JSON.stringify(gateResult);
         // 未打开进展标签时同样保留事件模型，改动页因此得到完整汇总。
         if (!timeline) {
             const detached = document.createElement('div');
@@ -407,9 +453,12 @@ async function refreshDetail(before = false) {
             timeline.merge(older, true);
             changed ||= older.reset || older.events.length > 0;
         }
-        if (tab === 'flow' && changed)
+        // gate.json 变化时重画标题区（轨道与门禁横幅）和正在看的门禁标签，保留滚动位置。
+        if (gateChanged)
+            header();
+        if (tab === 'flow' && (changed || gateChanged))
             renderFlow();
-        else if (tab !== 'flow' && (oldReport !== report || changed)) {
+        else if (tab !== 'flow' && (oldReport !== report || changed || gateChanged)) {
             const viewport = root.querySelector<HTMLElement>('.dbody > .scroll')!, top = viewport.scrollTop;
             renderTab();
             viewport.scrollTop = top;
@@ -485,6 +534,9 @@ root.addEventListener('click', async (e) => {
     }
     else if (d.tab) {
         tab = d.tab;
+        // 切标签时同步顶部门禁横幅：门禁标签里不显示，其它标签显示。
+        if (current())
+            banners(current()!);
         renderTab();
         root.querySelector<HTMLElement>('.dbody > .scroll')!.scrollTop = 0;
         void refreshDetail();
@@ -525,6 +577,14 @@ root.addEventListener('click', async (e) => {
     else if (b.hasAttribute('data-more')) {
         const t = current()!;
         menu(b, [{ label: c.openRepo, run: () => void action('repo') }, ...(t.spec ? [{ label: c.openSpec, run: () => void action('spec') }] : []), { label: t.hasReport ? c.openReport : c.reportPending, disabled: !t.hasReport, run: () => void action('report') }, { label: c.openProgress, run: () => void action('progress') }, { label: c.copyName, run: () => void action('copy') }, { label: c.hide, separator: true, disabled: t.status === 'run' || !processOk(), run: () => void action('hide') }]);
+    }
+    // 门禁标签里的验收命令：只切换展开状态，不重建 DOM，焦点和滚动都不动。
+    else if (d.gcmd !== undefined) {
+        const open = b.getAttribute('aria-expanded') !== 'true';
+        b.setAttribute('aria-expanded', String(open));
+        const out = root.querySelector<HTMLElement>(`[data-gout="${CSS.escape(d.gcmd)}"]`), note = root.querySelector<HTMLElement>(`[data-gnote="${CSS.escape(d.gcmd)}"]`);
+        if (out) out.hidden = !open;
+        if (note) note.hidden = !open;
     }
     else if (d.open)
         void action(d.open);

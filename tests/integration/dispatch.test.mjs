@@ -33,6 +33,9 @@ function setup(t) {
   fs.copyFileSync(fixture('fake-agent.txt'), fake);
   const env = { ...process.env };
   for (const k of Object.keys(env)) if (/^CODEX_|^CLAUDECODE$|^CLAUDE_CODE_SESSION_ID$|^FAKE_/.test(k)) delete env[k];
+  // 开发者的终端里可能设着派发用的新名；本用例只设旧名，必须删掉新名，否则新名优先（协议 1）。
+  // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
+  for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   Object.assign(env, { USERPROFILE: base, HOME: base, APPDATA: base, CLAUDE_CONFIG_DIR: path.join(base, 'claude'), CODEX_HOME: path.join(base, 'codex'), XDG_CONFIG_HOME: base, CODEX_DISPATCH_HOME: home, CODEX_NO_WATCH: '1', CODEX_DISPATCH_TEST_AGENT: fake,
     FAKE_ECHO: path.join(base, 'argv.json'), FAKE_FIXTURES: JSON.stringify(samples) });
   for (const key of ['USERPROFILE', 'HOME', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'XDG_CONFIG_HOME', 'CODEX_DISPATCH_HOME']) {

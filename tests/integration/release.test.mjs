@@ -42,6 +42,9 @@ test('技能 ZIP 解压后无需依赖即可 --yes 安装并 --status 确认 Cla
   assert.ok(names.every(name => /^(skills\/|core\/|installer\/|package.json$|LICENSE$|THIRD_PARTY_NOTICES.md$|README.md$)/.test(name)));
   const env = { ...process.env, CODEX_DISPATCH_HOME: path.join(s.base, 'dispatch'), USERPROFILE: path.join(s.base, 'user'), HOME: path.join(s.base, 'user'),
     APPDATA: path.join(s.base, 'appdata'), CLAUDE_CONFIG_DIR: path.join(s.base, 'claude'), CODEX_HOME: path.join(s.base, 'codex'), XDG_CONFIG_HOME: path.join(s.base, 'xdg') };
+  // 本用例只设旧名；终端里设着新名时新名优先（协议 1），会盖掉隔离目录。
+  // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
+  for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
   const run = args => { const r = spawnSync(process.execPath, ['installer/install.mjs', ...args], { cwd: unpacked, env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 20000 }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
   run(['--yes']); const status = run(['--status']);

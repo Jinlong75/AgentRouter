@@ -2,9 +2,9 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：开发中（v0.3.0）。本仓库仅包含运行、构建与测试所需的文件。
+> 状态：开发中（v0.4.0 候选）。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: in development (v0.3.0). This repository contains only the files needed to run, build and test the project.
+> Status: in development (v0.4.0 candidate). This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 
@@ -25,7 +25,8 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 | 技能安装器：安装、更新、备份、回退（Claude Code） | ✅ |
 | 执行者：DeepSeek、Xiaomi MiMo（经 Claude Code 外壳）、Codex；密钥只记变量名 | ✅ |
 | 调度中心：任务页、Agent 页（导入向导、测试连接）、项目页（添加、初始化、提交）、新建任务页、再派一次、批量删除 | ✅ |
-| 任务说明规范与机器门禁、自动重试、worktree 并行与验收合并、交叉审查、路由 | 🚧 计划中 |
+| 任务说明规范与机器门禁：执行者结束后，核心自己检查提交、改动范围并逐条运行验收命令；软件显示流水线轨道与门禁结果 | ✅ |
+| 自动重试、worktree 并行与验收合并、交叉审查、路由 | 🚧 计划中 |
 
 ### 技术栈
 
@@ -78,6 +79,34 @@ node <技能目录>\core\ar.mjs agents add --preset deepseek
 node <技能目录>\core\ar.mjs dispatch "在 README.md 末尾加一行并提交"
 ```
 
+### 任务说明与门禁
+
+任务说明是项目里的 `docs/specs/NNN-简述.md`（软件"新建任务 → 新建任务说明"会帮你写）。开头的 frontmatter 告诉 AgentRouter 这次允许改哪些文件、怎样算做完：
+
+```markdown
+---
+id: 012
+title: 给登录页加"记住我"
+type: code
+allowed_paths:
+  - src/auth/**
+  - tests/auth/**
+verify:
+  - npm test -- tests/auth
+---
+
+## 目标
+## 不做什么
+## 验收标准
+```
+
+- `allowed_paths`、`verify` 不写时用项目配置 `.agent-router/project.json` 的 `allowedPaths`、`verify`。字段写错时派发会直接报错并给出行号。
+- **门禁**：执行者以 0 结束后，由核心自己检查结果，不依赖执行者的自我汇报——①没有留下未提交的文件；②要求提交的类型（code / test / fix / refactor）确实提交了；③改动的文件都在 `allowed_paths` 里；④逐条运行 `verify` 命令（一条失败不中断，一次看到全部问题）。结果写进任务目录的 `gate.json`，软件任务详情的"门禁"标签逐项显示。全部通过才算完成；没通过时任务为失败，`ar dispatch` / `ar wait` 退出码为 `3`，并打印一句原因。
+- 退出码 `3` 表示门禁未通过；执行者自己也可能以 `3` 退出，判断是否门禁未通过以 `--json` 结果里的 `gate` 字段为准。
+- 只有用任务说明派发、并且有验收命令或限定了允许路径（或类型要求提交）的任务才跑门禁；直接写任务文字派发的任务与以前完全一样。
+- 跑门禁的任务派发前要求：任务说明已提交、工作区干净（`.agent-runs/` 除外）。软件新建任务页会自动先提交任务说明。
+- Windows 上验收命令不经 shell：`npm`、`npx` 用 Node 直接运行；其他 `.cmd` / `.bat` 的参数里有 `&`、`|`、`%` 等特殊字符时拒绝运行。验收命令拿不到执行者的密钥变量，也拿不到 AgentRouter 自己的环境变量。
+
 ### 开发与测试
 
 ```powershell
@@ -112,7 +141,8 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 | Skill installer: install, update, back up, roll back (Claude Code) | ✅ |
 | Workers: DeepSeek, Xiaomi MiMo (through Claude Code), Codex; only key variable names are stored | ✅ |
 | Dispatch console: Tasks, Agents (import wizard, connection test), Projects (add, initialise, commit), New Task, re-dispatch, batch delete | ✅ |
-| Task spec format and machine gates, automatic retry, worktree parallelism and accept/merge, cross review, routing | 🚧 Planned |
+| Task specs and machine gates: after the worker exits, the core itself checks commits and changed files and runs each verify command; the app shows a pipeline track and the gate result | ✅ |
+| Automatic retry, worktree parallelism and accept/merge, cross review, routing | 🚧 Planned |
 
 ### Tech stack
 
@@ -164,6 +194,34 @@ node <skill folder>\core\ar.mjs init
 node <skill folder>\core\ar.mjs agents add --preset deepseek
 node <skill folder>\core\ar.mjs dispatch "append a line to README.md and commit"
 ```
+
+### Task specs and gates
+
+A task spec is `docs/specs/NNN-name.md` in your project (the app's New Task → New spec writes one for you). Its frontmatter tells AgentRouter which files may change and what "done" means:
+
+```markdown
+---
+id: 012
+title: Add "remember me" to the login page
+type: code
+allowed_paths:
+  - src/auth/**
+  - tests/auth/**
+verify:
+  - npm test -- tests/auth
+---
+
+## Goal
+## Out of scope
+## Acceptance criteria
+```
+
+- Without `allowed_paths` / `verify`, the project's `.agent-router/project.json` (`allowedPaths`, `verify`) applies. A malformed field stops the dispatch with the line number.
+- **Gate**: after the worker exits with 0, the core checks the result itself rather than relying on the worker's own report — ① no uncommitted files are left; ② types that must commit (code / test / fix / refactor) did commit; ③ every changed file matches `allowed_paths`; ④ each `verify` command is run (a failure does not stop the rest, so you see every problem at once). The result goes to `gate.json` in the task folder and the task's Gate tab in the app shows each item. Only a full pass counts as done; otherwise the task fails, `ar dispatch` / `ar wait` exit with `3` and print a one-line reason.
+- Exit code `3` means the gate failed; a worker may also exit with `3` on its own, so use the `gate` field in the `--json` result to tell whether the gate failed.
+- Only tasks dispatched from a spec that has verify commands or restricted paths (or a type that must commit) run the gate; tasks dispatched as plain text behave exactly as before.
+- Gated tasks require a committed spec and a clean working tree (except `.agent-runs/`) at dispatch time. The app's New Task page commits the spec for you.
+- On Windows verify commands never go through a shell: `npm` and `npx` run their JS entry with Node; other `.cmd` / `.bat` files are refused if an argument contains `&`, `|`, `%` or other special characters. Verify commands get neither the worker's secret variables nor AgentRouter's own environment variables.
 
 ### Development & testing
 

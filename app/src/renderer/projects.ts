@@ -285,7 +285,10 @@ export class ProjectsView {
             this.rows = Array.isArray(list.projects) ? list.projects : [];
             // 先按原样匹配，再不区分大小写匹配（Windows 路径）；都没有才退回第一个项目。
             if (!this.rows.some(p => p.path === this.selected)) this.selected = this.rows.find(p => this.selected && p.path.toLowerCase() === this.selected.toLowerCase())?.path ?? this.rows[0]?.path ?? '';
-            this.show = null;
+            // 刷新时如果选中的仍是同一个项目，保留上一份详情，等新的 projects:show 返回再替换：
+            // 这段时间里"编辑配置"、更多菜单、初始化、提交等依赖详情的入口照常用上一份数据执行，不会被静默丢掉。
+            // 只有选中的项目变了（或它已不在列表里）才清空。
+            if (!this.show || !this.selected || !samePath(this.show.path, this.selected)) this.show = null;
             if (this.selected) {
                 const r = await window.dock.console('projects:show', { path: this.selected });
                 if (seq !== this.seq) return;
@@ -489,6 +492,8 @@ export class ProjectsView {
         sheet.busy(true);
         try {
             await window.dock.console('projects:config', { path, set });
+            // 刷新返回之前，把刚保存的键合进本地详情：这段时间"编辑配置"用上一份数据打开时看到的就是刚保存的值。
+            if (this.show && samePath(this.show.path, path)) this.show = { ...this.show, config: { ...(this.show.config ?? {}), ...set } };
             sheet.close();
             await this.refresh();
         }

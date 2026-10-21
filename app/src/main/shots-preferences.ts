@@ -164,11 +164,25 @@ export async function capturePreferences(h: Harness) {
     const codexEdit = async () => { await agentsPage(); await press('[data-more-agent=codex]'); await press('.ctx button:nth-child(1)'); await wait('!!document.querySelector(".sheet [data-setting=model]")'); };
     const closeSheet = async () => { await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")'); };
     nativeTheme.themeSource = 'dark';
+    // 037 第 4 项（来源核实见任务汇报）：claude-code 行的版本在验收里走 AR_TEST_AGENT 的假脚本（那份脚本是为 codex 写的），
+    // 会串成 codex-cli；真实安装没有这个问题（detect 跑的是真 claude --version）。这里把向导创建的 deepseek 指向假 Claude Code
+    //（profile.path 优先于 AR_TEST_AGENT），行内版本与随后重测的连接结果就都是 Claude Code 风格。
+    if ((await readConfig()).profiles?.deepseek?.adapter === 'claude-code') {
+        const cfg = await readConfig();
+        cfg.profiles.deepseek.path = path.join(home, 'fake-claude.cjs');
+        await writeFile(config, JSON.stringify(cfg));
+    }
 
     // UI06 技能：检测、更新、版本提示、较新版本保护、自改版本替换与回退。
     await press('[data-page=connect]'); await wait('!!document.querySelector("[data-host-card]") && !document.querySelector("[data-pref=detect]").disabled && !!document.querySelector("[data-agent=codex]")');
     await save('connect-normal-dark'); nativeTheme.themeSource = 'light'; await save('connect-normal-light'); nativeTheme.themeSource = 'dark';
     await check('UI06 Agent 页执行者区的 Codex 行通过假 Codex 检测版本和登录状态', 'document.querySelector("[data-agent=codex]").textContent.includes("codex-cli 0.156.1") && document.querySelector("[data-agent=codex]").textContent.includes("已登录")');
+    // 037 第 4 项：claude-code 执行者（deepseek）行的版本不能是 codex-cli，必须是 Claude Code 风格；codex 行仍含 codex-cli。
+    // 行内版本来自刚切换页面时的检测；再真实测一次连接，让行下的测试结果行也换成 Claude Code 版本（旧结果是向导时期记的 codex-cli）。
+    await press('[data-test=deepseek]');
+    await wait('!!document.querySelector("[data-agent=deepseek] .xresult") && !document.querySelector("[data-test=deepseek]").disabled', '重新测试 deepseek 连接', 60000);
+    await check('UI06 Agent 页 claude-code 执行者（deepseek）行的版本是 Claude Code 风格、不含 codex-cli', 'document.querySelector("[data-agent=deepseek]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=deepseek]").textContent.includes("codex-cli")');
+    await check('UI06 Agent 页 Codex 行的版本含 codex-cli（claude-code 行串版本不波及它）', 'document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
     await writeFile(marker, JSON.stringify({ ...JSON.parse(originalMarker), version: '0.0.0' }));
     await writeFile(agent, JSON.stringify({ version: 'codex-cli 0.157.0', loggedIn: true }));
     await refresh(); await wait('!!document.querySelector("[data-agent=codex] [data-agent-ack]")'); await save('connect-update-dark');
@@ -282,7 +296,7 @@ export async function capturePreferences(h: Harness) {
     await check('UI07 设置页不再有 Codex 一节（参数在 Agent 页"编辑执行者"里）', '![...document.querySelectorAll(".sect h2")].some(h=>h.textContent.startsWith("Codex")) && !document.querySelector("[data-setting=model]")');
     const configured = await readFile(config, 'utf8');
     const withoutCodex = JSON.parse(configured);
-    delete withoutCodex.profiles.codex; withoutCodex.profiles.example = { adapter: 'claude-code', label: '示例执行者', enabled: true }; withoutCodex.defaultProfile = 'example';
+    delete withoutCodex.profiles.codex; withoutCodex.profiles.example = { adapter: 'claude-code', label: '示例执行者', enabled: true, path: path.join(home, 'fake-claude.cjs') }; withoutCodex.defaultProfile = 'example';
     await writeFile(config, JSON.stringify(withoutCodex));
     await agentsPage('example');
     await check('UI07 没有 codex 执行者时执行者区没有 Codex 行', '!document.querySelector("[data-agent=codex]") && !!document.querySelector("[data-agent=example]")');
@@ -356,7 +370,8 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
     const readConfig = async () => JSON.parse(await readFile(config, 'utf8'));
     await writeFile(config, JSON.stringify({ v: 2, defaultProfile: 'ok', managed: false, watchWindow: 'never', profiles: {
         codex: { adapter: 'codex', label: 'Codex', enabled: true, model: null, effort: null, tier: null, sandbox: 'workspace-write' },
-        example: { adapter: 'claude-code', label: 'Example Agent', enabled: true, env: { ANTHROPIC_BASE_URL: 'https://example.invalid/api', ANTHROPIC_MODEL: 'example-model' }, auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'EXAMPLE_TEST_KEY' }, maxTurns: null },
+        // 037 第 4 项：claude-code 执行者指向假 Claude Code（path 优先于 AR_TEST_AGENT），版本不串成 codex-cli。
+        example: { adapter: 'claude-code', label: 'Example Agent', enabled: true, path: path.join(home, 'fake-claude.cjs'), env: { ANTHROPIC_BASE_URL: 'https://example.invalid/api', ANTHROPIC_MODEL: 'example-model' }, auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'EXAMPLE_TEST_KEY' }, maxTurns: null },
         ok: { adapter: 'fake', label: 'Fake Ok', enabled: true, events: [{ kind: 'say', text: 'OK' }], report: 'OK\n' },
         bad: { adapter: 'fake', label: 'Fake Bad', enabled: true, events: [{ kind: 'error', text: '接口返回 401' }], report: '没有完成\n', exit: 3 },
         slow: { adapter: 'fake', label: 'Fake Slow', enabled: true, events: [{ kind: 'say', text: '慢' }, { kind: 'say', text: '还在' }], report: 'OK\n', delayMs: 60000 },
@@ -365,6 +380,8 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
     try {
         await press('[data-page=tasks]'); await press('[data-page=connect]'); await wait('!!document.querySelector("[data-agent=bad]")');
         await check('UI06 执行者区每行：标签、默认、认证状态（隔离密钥文件）', 'document.querySelector("[data-agent=ok] .x1").textContent.includes("默认") && document.querySelector("[data-agent=example] .xtag").textContent==="EX" && document.querySelector("[data-agent=example] .x2").textContent.includes("已设置") && document.querySelector("[data-agent=codex] .x1").textContent.includes("只在指定时使用")');
+        // 037 第 4 项：claude-code 执行者（example）行版本是 Claude Code 风格、不含 codex-cli；codex 行含 codex-cli。
+        await check('UI06 claude-code 执行者（example）行的版本不含 codex-cli，codex 行含', 'document.querySelector("[data-agent=example]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=example]").textContent.includes("codex-cli") && document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
         await save('connect-executors-dark'); nativeTheme.themeSource = 'light'; await save('connect-executors-light'); nativeTheme.themeSource = 'dark';
         await press('[data-test=ok]');
         await check('UI06 测试连接中按钮忙碌并禁用', 'document.querySelector("[data-test=ok]").disabled');

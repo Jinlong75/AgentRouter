@@ -30,6 +30,7 @@ export const ALLOW_DOC_FILES = [
   'core/templates/roles/lead.md',
   'core/templates/roles/reviewer.md',
   'core/templates/roles/worker.md',
+  'core/templates/spec.md',
   'skills/agent-router/SKILL.md',
   'skills/lead-workflow/SKILL.md',
   'tests/fixtures/README.md',

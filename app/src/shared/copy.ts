@@ -161,7 +161,7 @@ export const pj = {
     removeTitle: (name: string) => `移除项目「${name}」？`, removeBody: '只从 AgentRouter 的列表里移除，不删除任何文件；以后可以再添加。', removeConfirm: '移除',
     config: '项目配置', configFile: '.agent-router/project.json', edit: '编辑配置', unset: '未设置', recent: '最近任务',
     fields: { baseBranch: '主分支', setup: '准备命令', verify: '验收命令', allowedPaths: '允许改动的路径', specsDir: '任务说明目录' } as Record<string, string>,
-    fieldHelp: { baseBranch: '执行者从这里开始，验收后合并回这里', setup: '每行一条；建工作区后先运行', verify: '每行一条；Stage04 起作为门禁', allowedPaths: '每行一个通配符', specsDir: '' } as Record<string, string>,
+    fieldHelp: { baseBranch: '执行者从这里开始，验收后合并回这里', setup: '每行一条；建工作区后先运行', verify: '每行一条；任务说明没写验收命令时，门禁用这里的', allowedPaths: '每行一个通配符；任务说明没写时，门禁用这里的', specsDir: '' } as Record<string, string>,
     editTitle: '编辑项目配置', editNote: '写入 .agent-router/project.json（核心校验后原子写入）', save: '保存',
     // 非 git 文件夹
     gitTitle: '这个文件夹不是 git 仓库', gitHelp: '任务要靠 git 记录改动、方便撤销。"初始化为 git 仓库"会运行 git init -b main，不改动已有文件。', gitInit: '初始化为 git 仓库',
@@ -190,16 +190,51 @@ export const nt = {
     dispatched: (n: number) => n ? `已派发 ${n} 次` : '未派发',
     text: '任务文字', textHelp: '直接交给执行者，不生成任务说明文件；适合一次性的小事',
     titleField: '标题', titleHelp: '会成为文件名：NNN-标题.md', goal: '目标', goalHelp: '做完后是什么样子', type: '类型', types: ['code', 'test', 'fix', 'research', 'docs'],
-    allowed: '允许改动的文件', allowedHelp: '每行一个通配符；默认取项目配置，Stage04 起由门禁检查', verify: '验收命令', verifyHelp: '每行一条；默认取项目配置',
+    allowed: '允许改动的文件', allowedHelp: '每行一个通配符；先填入项目配置。门禁检查改动是否都在这里', verify: '验收命令', verifyHelp: '每行一条；先填入项目配置。执行者结束后由门禁逐条运行',
     nonGoals: '不做什么', refs: '参照', refsHelp: '相关文件、已有实现、界面稿', refsPlaceholder: '例如：docs/architecture.md', questions: '汇报要回答的问题', questionsPlaceholder: '例如：哪些步骤你没法实际验证？',
     required: (name: string) => `请填写${name}`,
     worker: '执行者', auto: (label: string) => `自动（默认：${label}）`, noWorker: '还没有可用的执行者，先到 Agent 页导入',
     commitSpec: '先提交任务说明', commitSpecHelp: '推荐：执行者从干净的基线开始，改动和说明分得清',
+    // 启用门禁时（有验收命令、限定了允许路径，或类型要求提交）：门禁要从干净的基线比较改动，说明文件必须先提交。
+    // 051：锁定时写出为什么会跑门禁（原因按 类型 → 验收命令 → 允许路径 的顺序用"、"连接）。
+    // 表单里填了就说"有"，表单空着、用的是 .agent-router/project.json 的值就说"项目配置"。
+    commitSpecForcedWhy: (reasons: string[]) => `这个任务会跑门禁（${reasons.join('、')}）：门禁从干净的基线比较改动，任务说明必须先提交`,
+    gateWhyType: (type: string) => `${type} 类型要求提交`,
+    gateWhyVerify: (n: number) => `有 ${n} 条验收命令`,
+    gateWhyVerifyProject: (n: number) => `项目配置有 ${n} 条验收命令`,
+    gateWhyPaths: '限定了允许改动的文件',
+    gateWhyPathsProject: '项目配置限定了允许改动的文件',
+    // 底栏后果说明的门禁后缀（接在 conseqNew / conseqExisting 后面）：没有验收命令时门禁只检查提交与改动范围
+    conseqGate: (commands: number) => commands ? `；结束后跑门禁（${commands} 条验收命令）` : '；结束后跑门禁（检查提交与改动范围）',
     preview: '预览', previewTitle: '预览任务说明', previewViews: { rendered: '排版', source: '源码' } as Record<string, string>, close: '关闭', dispatch: '派发', dispatching: '正在派发…', dispatchingNote: '正在写任务说明并派发……',
     conseqText: (label: string) => `直接把这段文字派给 ${label}`, conseqExisting: (spec: string, label: string) => `派发 ${spec} 给 ${label}`,
     conseqNew: (spec: string, label: string, commit: boolean) => `写入 ${spec}${commit ? '，提交后' : '，'}派给 ${label}`,
     failed: '派发没有完成',
     identityWarn: '这个项目还没有设置 git 提交身份："先提交任务说明"和执行者提交改动都会失败。',
+};
+
+// Stage04 门禁（协议第 12 节）：流水线轨道、门禁标签、列表徽标、横幅。summary 由核心生成，原样显示。
+export const gt = {
+    tab: '门禁',
+    // 流水线轨道前三段（派发 · 执行 · 门禁）；节点下的小字
+    track: { dispatch: '派发', run: '执行', gate: '门禁' } as Record<string, string>,
+    trackAt: (time: string) => time, trackRun: '运行中', trackExit: (exit: number | null) => exit === 0 ? '完成' : `exit ${exit}`, trackStopped: '已中断',
+    trackGateOk: (passed: number, total: number) => `${passed}/${total}`, trackGateFail: '未通过', trackGating: '检查中', trackGateOff: '未启用', trackGateWait: '等待',
+    // 节点按钮的 aria-label：说清状态并提示可点
+    nodeLabel: (step: string, state: string) => `${step}：${state}，查看详情`,
+    // 列表行第二行的门禁徽标
+    badge: { ok: '门禁通过', fail: '门禁未通过', running: '门禁中' } as Record<string, string>,
+    // 详情顶部横幅
+    okTitle: (checks: number, commands: number, seconds: string) => `门禁通过（${checks} 项检查，${commands} 条命令，${seconds} 秒）`,
+    failTitle: '门禁未通过', failHelp: '执行者已经正常结束，但核心自己检查后没有通过。看"门禁"标签了解每一项。',
+    runningTitle: '门禁进行中', runningHelp: (commands: number) => `正在检查提交与改动范围${commands ? `，并逐条运行 ${commands} 条验收命令` : ''}。`,
+    viewGate: '查看门禁',
+    // 门禁标签里的区块
+    commitSec: '提交检查', commitRequired: '要求执行者提交', commitNotRequired: '不要求提交', commitOk: (base: string, head: string) => `已提交：${base} → ${head}`, commitNone: '没有提交任何改动',
+    uncommittedSec: '未提交的文件', uncommittedNone: '没有', uncommittedHelp: '执行者结束时工作区里还有这些改动没提交（不含 .agent-runs/）',
+    scopeSec: '改动范围', scopeAllowed: '允许', scopeAll: '全部文件', scopeNone: '没有改动文件', scopeOutside: '超出范围', scopeCount: (changed: number, outside: number) => outside ? `${changed} 个文件，${outside} 个超出范围` : `${changed} 个文件，都在范围内`,
+    commandsSec: '验收命令', commandsNone: '没有验收命令', timedOut: '超时', truncated: '只保留了最后 200 行', ms: (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} 秒`,
+    pending: '门禁结束后显示结果', missing: '没有找到门禁结果文件（gate.json）',
 };
 
 // Stage03 主进程调用核心（console 通道）的错误文案；核心自己的错误已经是中文，原样显示。

@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { API, Snapshot } from '../shared/types';
-const api: API = { preferences: async (action, payload) => {
+// 验收 / 演示模式的固定"现在"（AR_DEMO_NOW，毫秒）：主进程只在验收模式经 additionalArguments 传 --ar-demo-now，
+// 正常启动没有这个参数，window.dock.demoNow 为 undefined，渲染层按当前时间（037 第 2 项）。
+const demoNowArg = process.argv.find(arg => arg.startsWith('--ar-demo-now='));
+const demoNowValue = demoNowArg ? Number(demoNowArg.slice('--ar-demo-now='.length)) : NaN;
+const demoNow = Number.isFinite(demoNowValue) && demoNowValue > 0 ? demoNowValue : undefined;
+const api: API = { demoNow, preferences: async (action, payload) => {
     const result = await ipcRenderer.invoke('preferences', action, payload);
     if (!result.ok) throw Error(result.error);
     return result.value;

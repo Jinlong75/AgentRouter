@@ -416,6 +416,9 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .choice .ct { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .choice .ct span { color: var(--text-3); font-size: var(--fs-small); line-height: var(--lh-small); }
 .choice.off { opacity: .6; }
+/* 050 勾选且不可取消（启用门禁时的"先提交任务说明"）：整行变灰、说明前有锁形图标，鼠标不是手形 */
+.choice.off { cursor: default; }
+.choice.off .ct span i { margin-right: 4px; font-size: 12px; vertical-align: -1px; }
 
 /* ---------- 012：关闭询问、设置页数据一节 ---------- */
 .close-sheet { width: 480px; }
@@ -446,6 +449,46 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .banner.ok { background: var(--ok-soft); }
 .banner.info { background: var(--run-bg); }
 .banner.brand { background: var(--brand-soft); }
+
+/* ---------- Stage04：流水线轨道（前三段）、门禁徽标、门禁标签 ---------- */
+/* 轨道放在详情标题行下面、标签栏上面；节点是真正的按钮（点击切到对应标签）。 */
+.track-holder { padding: 2px var(--sp-6) 0; flex: 0 0 auto; }
+.track-holder:empty { display: none; }
+.track { display: flex; align-items: flex-start; gap: 0; padding: 4px 0 2px; }
+.track .node { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 64px; padding: 2px 4px; border: 0; border-radius: var(--r-ctl); background: transparent; color: var(--text-2); font-size: var(--fs-small); line-height: var(--lh-small); cursor: default; }
+.track .node:hover { background: var(--surface-2); }
+.track .node .dot { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; border: 1.5px solid var(--todo); background: transparent; color: var(--todo); font-size: 12px; box-sizing: border-box; }
+.track .node .sub { font-family: var(--font-mono); font-size: 11px; color: var(--text-3); }
+.track .link { flex: 0 1 72px; min-width: 24px; height: 1.5px; margin-top: 12px; background: var(--track); }
+.track .link.done { background: var(--ok); }
+.track .node.done .dot { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+.track .node.running .dot { border: 1.5px dashed var(--run); animation: spin 2.4s linear infinite; }
+.track .node.running { color: var(--run); }
+.track .node.failed .dot { border-color: var(--fail); color: var(--fail); }
+.track .node.failed { color: var(--fail); }
+.track .node.failed .sub { color: var(--fail); }
+.track .node.stopped .dot { border-color: var(--stale); color: var(--stale); }
+.track .node.skip .dot { border-style: dashed; }
+.track .node.skip, .track .node.todo { color: var(--text-3); }
+@media (prefers-reduced-motion: reduce) { .track .node.running .dot { animation: none; } }
+
+/* 列表行第二行的门禁徽标：图标 + 文字，颜色跟状态 */
+.gbadge { display: inline-flex; align-items: center; gap: 2px; margin-right: 6px; font-size: 11px; vertical-align: 0; }
+.gbadge i { font-size: 12px; }
+.gbadge.ok { color: var(--ok); } .gbadge.fail { color: var(--fail); } .gbadge.running { color: var(--run); }
+.trow .tm span .gbadge.ok { color: var(--ok); } .trow .tm span .gbadge.fail { color: var(--fail); } .trow .tm span .gbadge.running { color: var(--run); }
+
+/* 门禁标签：区块标题 + 细线分隔的行；超出范围的文件、失败的命令标红 */
+.grow { display: grid; grid-template-columns: var(--mark) minmax(0, 1fr) auto; align-items: start; column-gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--divider); }
+.grow > .mk { margin-top: 2px; }
+.grow .v { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.grow .v.mono { font-family: var(--font-mono); font-size: 12px; line-height: 20px; color: var(--text-2); }
+.grow .meta { color: var(--text-3); font-size: 11px; line-height: 20px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.grow.bad .v, .grow.bad .v.mono, .grow.bad .cmd code { color: var(--fail); }
+.grow .cmd { max-width: 100%; }
+.grow .note { display: block; color: var(--text-3); font-size: var(--fs-small); line-height: var(--lh-small); margin-top: 2px; }
+.gallow { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 0 0 8px; color: var(--text-3); font-size: var(--fs-small); }
+.gallow .mono { color: var(--text-2); }
 
 /* 表单行：左 152px 标签与说明，右边控件伸展 */
 .form { display: flex; flex-direction: column; }

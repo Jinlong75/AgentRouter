@@ -18,6 +18,9 @@ function setup(t) {
   const base = fs.mkdtempSync(join(tmpdir(), '安装 测试 '));
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (/^CODEX_|^CLAUDE|^FAKE_/.test(key)) delete env[key];
+  // 本用例只设旧名；终端里设着新名时新名优先（协议 1），会盖掉隔离目录。
+  // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
+  for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   Object.assign(env, { USERPROFILE: join(base, '用户'), HOME: join(base, '用户'), APPDATA: join(base, '应用 数据'),
     CLAUDE_CONFIG_DIR: join(base, 'Claude 配置'), CODEX_HOME: join(base, 'Codex 配置'), CODEX_DISPATCH_HOME: join(base, '派发 配置'), XDG_CONFIG_HOME: join(base, 'XDG 配置') });
   for (const key of ['USERPROFILE', 'HOME', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEX_DISPATCH_HOME', 'XDG_CONFIG_HOME']) {

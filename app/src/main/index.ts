@@ -12,7 +12,7 @@ import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { Registry, reportText } from './registry';
 import { windowsPlatform } from './platform';
 import { readEvents, validCursor } from './events';
-import type { Task, Snapshot } from '../shared/types';
+import type { Task, Snapshot, GateResult } from '../shared/types';
 import { c, cx, p } from '../shared/copy';
 import { coreRun } from './core';
 import { createConsole } from './console.mjs';
@@ -159,6 +159,32 @@ async function cachedReport(file: string) {
     return text;
 }
 const platform = windowsPlatform(file => effects.open(file));
+// 门禁结果（gate.json）：与汇报一样按文件时间戳缓存；不存在为 null，解析失败给出 { error }（界面显示空状态）。
+const gateCache = new Map<string, { stamp: string; value: GateResult }>();
+async function cachedGate(dir: string): Promise<GateResult> {
+    const file = path.join(dir, 'gate.json');
+    const info = await stat(file).catch((e: NodeJS.ErrnoException) => { if (e.code !== 'ENOENT')
+        throw e; return null; });
+    if (!info) {
+        gateCache.delete(file);
+        return null;
+    }
+    const stamp = `${info.ino}:${info.mtimeMs}:${info.size}`, cached = gateCache.get(file);
+    if (cached?.stamp === stamp)
+        return cached.value;
+    let value: GateResult;
+    try {
+        const parsed = JSON.parse(await readFile(file, 'utf8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+            throw Error('内容不是对象');
+        value = parsed as GateResult;
+    }
+    catch (e) {
+        value = { error: e instanceof Error ? e.message : String(e) };
+    }
+    gateCache.set(file, { stamp, value });
+    return value;
+}
 const snapshot = (select?: string): Snapshot => ({ tasks: registry?.tasks ?? [], processCheck: registry?.processCheck, theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light', version: app.getVersion(), select });
 const publish = (select?: string) => { updateTray(); if (win && !win.isDestroyed())
     win.webContents.send('snapshot', snapshot(select)); };
@@ -287,7 +313,11 @@ app.whenReady().then(async () => {
     catch { }
     const shotMode=!!(process.env.AR_SHOTS&&isolated);
     effects.stub = shotMode;
-    win = new BrowserWindow({ ...bounds, minWidth: 960, minHeight: 600, show: false, icon: iconPath, title: c.app, autoHideMenuBar: true, titleBarStyle: 'hidden', titleBarOverlay: { color: token('bg'), symbolColor: token('text-2'), height: 44 }, backgroundColor: token('bg'), webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, backgroundThrottling:!shotMode } });
+    // 验收模式且外部指定了 AR_DEMO_NOW（毫秒）时把它经 additionalArguments 交给 preload（只读，见 037 第 2 项），
+    // 让"今天 / 昨天"分组与演示数据用同一个"现在"（跨午夜截图不失败）；正常启动不带这个参数，行为不变。
+    const demoNowValue = shotMode ? Number(process.env.AR_DEMO_NOW) : NaN;
+    const demoNow = Number.isFinite(demoNowValue) && demoNowValue > 0 ? Math.floor(demoNowValue) : null;
+    win = new BrowserWindow({ ...bounds, minWidth: 960, minHeight: 600, show: false, icon: iconPath, title: c.app, autoHideMenuBar: true, titleBarStyle: 'hidden', titleBarOverlay: { color: token('bg'), symbolColor: token('text-2'), height: 44 }, backgroundColor: token('bg'), webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true, nodeIntegration: false, backgroundThrottling:!shotMode, ...(demoNow ? { additionalArguments: [`--ar-demo-now=${demoNow}`] } : {}) } });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     win.webContents.on('will-navigate', e => e.preventDefault());
     updateTray();
@@ -376,7 +406,9 @@ app.whenReady().then(async () => {
     handle('close-choice', (action, remember) => answerClose(action, remember));
     // 关闭询问已显示：取消兜底计时（之前询问显示后 5 秒内没回答，软件会自己退出）。
     handle('close-shown', () => { if (closeDialog && closeTimer) { clearTimeout(closeTimer); closeTimer = null; } });
-    handle('detail', async (id) => ({ report: await cachedReport(task(id).report) }));
+    // 记录目录从已读取的 progress 路径导出（v2 记录是 <仓库>/.agent-runs/<记录名>/progress.log）；
+    // gate.json 与事件、汇报都在同一个目录里。
+    handle('detail', async (id) => { const t = task(id); return { report: await cachedReport(t.report), gate: await cachedGate(path.dirname(t.progress)) }; });
     const allowedFiles = new Map<string, Set<string>>();
     handle('events', async (id, cursor, before) => { if (!validCursor(cursor) || before !== undefined && typeof before !== 'boolean')
         throw Error('Invalid cursor'); const t = task(id), page = await readEvents(t, cursor, before); const files = allowedFiles.get(id) ?? new Set<string>(); for (const e of page.events)

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { createConsole, claudeLaunch } from '../../app/src/main/console.mjs';
+import { dayGroup } from '../../app/src/shared/types.ts';
 
 // 与 app/src/shared/copy.ts 的 cx 同形的假文案（.mjs 不能直接导入 TS）。
 const messages = {
@@ -188,6 +189,25 @@ test('specs:new 表单经 input 传入，--dry-run / --commit 按需', async () 
   assert.equal(calls[1].input, JSON.stringify(form));
 });
 
+test('specs:commit 先核对已登记项目，再调 spec commit <项目> <相对路径>；参数不合法不调用核心', async () => {
+  const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, commit: 'abc1234' }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('specs:commit', { project: proj, rel: 'docs/specs/001-demo.md' }), { ok: true, commit: 'abc1234' });
+  assert.deepEqual(calls[0].args, ['projects', 'list', '--registry-only']);
+  assert.deepEqual(calls[1].args, ['spec', 'commit', proj, 'docs/specs/001-demo.md']);
+  assert.equal(calls[1].timeoutMs, 60000);
+
+  const bad = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [
+    { project: 'relative/path', rel: 'docs/specs/001-demo.md' },
+    { project: proj, rel: 'not-md.txt' },
+    { project: proj, rel: '/abs.md' },
+    { project: proj, rel: 'C:\\x.md' },
+    { project: proj, rel: 'a\nb.md' },
+    { project: proj },
+  ]) await assert.rejects(bad.call('specs:commit', payload), /参数无效/);
+});
+
 test('tasks:dispatch spec / text 两种来源，cwd 为项目路径，带 --host agentrouter 与 --detach', async () => {
   const { calls, coreRun } = fakeCore([...registered({ resolve: { code: 0, json: { ok: true, id: '1' }, stderr: '' } }), ...registered({ resolve: { code: 0, json: { ok: true, id: '2' }, stderr: '' } })]);
   const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
@@ -300,4 +320,35 @@ test('shell:open-folder / shell:open-claude：只接受已登记项目，交给�
   const s2 = createConsole({ coreRun: unregistered.coreRun, chooseFolder: async () => null, messages, launch: async () => assert.fail('不应启动') });
   await assert.rejects(s2.call('shell:open-claude', { path: other }), /这个项目没有登记/);
   await assert.rejects(s2.call('shell:open-claude', { path: 'relative' }), /参数无效/);
+});
+
+// 037 第 2 项：任务列表 / 新建任务页"今天 / 昨天"分组的纯函数（输入：任务开始时刻、"现在"）。
+// 四种情形：跨午夜前后、同一天、昨天、更早；"现在"可以被 AR_DEMO_NOW 固定（验收跨午夜不串组）。
+test('dayGroup：以"现在"所在那一天的本地零点为界分今天 / 昨天 / 更早', () => {
+  // 用本地时间构造（分组按本地日历日），固定为 2026-10-21 15:30。
+  const now = new Date(2026, 9, 21, 15, 30).getTime();
+  const todayStart = new Date(2026, 9, 21, 0, 0).getTime();
+  const yesterdayStart = new Date(2026, 9, 20, 0, 0).getTime();
+  // 同一天。
+  assert.equal(dayGroup(now, now), 'today');
+  assert.equal(dayGroup(todayStart + 3600 * 1000, now), 'today');
+  // 跨午夜前后：今天零点整算今天，前 1 毫秒算昨天。
+  assert.equal(dayGroup(todayStart, now), 'today');
+  assert.equal(dayGroup(todayStart - 1, now), 'yesterday');
+  // 昨天。
+  assert.equal(dayGroup(yesterdayStart + 30 * 1000, now), 'yesterday');
+  // 更早。
+  assert.equal(dayGroup(yesterdayStart - 1, now), 'earlier');
+  assert.equal(dayGroup(0, now), 'earlier');
+});
+
+test('dayGroup："现在"固定在午夜刚过（AR_DEMO_NOW）时与演示数据同一口径', () => {
+  // 验收跨午夜的场景：AR_DEMO_NOW 固定为某天 00:00:30，演示数据里"今天 23:59:30"的任务仍算今天。
+  const justAfterMidnight = new Date(2026, 9, 22, 0, 0, 30).getTime();
+  assert.equal(dayGroup(new Date(2026, 9, 22, 0, 0, 0).getTime(), justAfterMidnight), 'today');
+  assert.equal(dayGroup(new Date(2026, 9, 21, 23, 59, 30).getTime(), justAfterMidnight), 'yesterday');
+  // 同一时刻若"现在"固定在前一天 23:59:30，该任务算今天（负向验证用的就是这个口径）。
+  const beforeMidnight = new Date(2026, 9, 21, 23, 59, 30).getTime();
+  assert.equal(dayGroup(beforeMidnight, beforeMidnight), 'today');
+  assert.equal(dayGroup(new Date(2026, 9, 20, 23, 59, 30).getTime(), beforeMidnight), 'yesterday');
 });

@@ -210,6 +210,13 @@ export async function captureProjects(h: Harness) {
         assert.deepEqual(c.allowedPaths, ['**']);
         assert.equal(c.specsDir, 'docs/specs');
     });
+    // 041：保存后刷新还在进行时立即点"编辑配置"，点击不能被静默丢掉：对话框要打开，字段是刚保存的新值。
+    // 配合 AR_SHOTS_EXPERIMENT=projects-show-delay 可以确定性地让这次点击落在刷新窗口里（见汇报）。
+    await press('[data-pj=edit]');
+    await wait('!!document.querySelector(".sheet [data-pj-f=verify]")', '保存后立即点"编辑配置"能打开');
+    await check('UI15 保存后刷新期间点"编辑配置"能打开，字段是刚保存的新值', `document.querySelector('[data-pj-f=verify]').value === 'npm run test:shots'`);
+    await key('Escape');
+    await wait('!document.querySelector(".sheet")', '关闭刚打开的编辑配置');
     const beforeInvalid = await readFile(path.join(dir.initialized, '.agent-router', 'project.json'), 'utf8');
     await press('[data-pj=edit]');
     await wait('!!document.querySelector(".sheet [data-pj-f=specsDir]")');

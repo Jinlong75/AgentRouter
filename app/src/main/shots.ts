@@ -1,5 +1,6 @@
 import { captureWizard, capturePreferences } from './shots-preferences';
 import { captureProjects } from './shots-projects';
+import { captureGate } from './shots-gate';
 import { captureNewtask, waitNewtaskReady } from './shots-newtask';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
 import type { BrowserWindow } from 'electron';
@@ -426,8 +427,14 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // UI05 更多菜单：进行中不能隐藏；键盘可操作；各项真实触发。
     await press('[data-more]');
     await check('UI05 菜单打开后焦点在菜单里', '!!document.activeElement.closest(".ctx")');
-    await key('ArrowDown');
-    await check('UI05 方向键在菜单项之间移动', '!!document.activeElement.closest(".ctx")');
+    // 037 第 1 项：sendInputEvent 的有效键名是 Down / Up（ArrowDown 无效），并断言焦点真的在菜单项之间移动——
+    // 记下按键前焦点是第几项，Down 后必须到"下一个可用项"（跳过禁用，口径同菜单实现 ui.ts），Up 后回到原来那一项。
+    const menuFocus = await evaluate(`(() => { const items = [...document.querySelectorAll('.ctx button')]; const i = items.indexOf(document.activeElement); let next = -1; for (let k = 1; k <= items.length; k++) { const j = (i + k) % items.length; if (!items[j].disabled) { next = j; break; } } return { i, next }; })()`);
+    assert.ok(menuFocus.i >= 0 && menuFocus.next >= 0 && menuFocus.next !== menuFocus.i, `UI05 方向键检查：菜单打开后焦点应在菜单项上且后面还有可用项（当前第 ${menuFocus.i} 项，下一个可用第 ${menuFocus.next} 项）`);
+    await key('Down');
+    await check('UI05 方向键 Down 把焦点移到下一个可用菜单项（跳过禁用）', `[...document.querySelectorAll('.ctx button')].indexOf(document.activeElement) === ${menuFocus.next}`);
+    await key('Up');
+    await check('UI05 方向键 Up 把焦点移回原来那一项', `[...document.querySelectorAll('.ctx button')].indexOf(document.activeElement) === ${menuFocus.i}`);
     await key('Escape');
     await check('UI05 Esc 关闭菜单', '!document.querySelector(".ctx")');
     // 进行中的任务还没有汇报文件：菜单项禁用并写明"汇报尚未生成"，点击不会触发打开。
@@ -458,8 +465,32 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await check('UI02 列表行显示执行者标签：DeepSeek 任务为 DS、Codex 任务为 CO，等宽 10px，悬停显示全名', '(()=>{const ds=document.querySelector("[data-task=t8] .xtag"),co=document.querySelector("[data-task=t3] .xtag");return ds?.textContent==="DS" && co?.textContent==="CO" && getComputedStyle(ds).fontSize==="10px" && ds.title==="DeepSeek V4 Pro" && document.querySelectorAll("[data-task] .xtag").length===document.querySelectorAll("[data-task]").length;})()');
     await press('[data-project]');
     await check('UI02 自制项目下拉', '!!document.querySelector("[role=listbox]") && !document.querySelector("select")');
-    await press('.ctx button:nth-child(2)');
-    await check('UI02 选择项目后列表只显示该项目', 'document.querySelectorAll("[data-task]").length === 5');
+    // 诊断（用户 2026-10-21 批准，断言不变）：f73349b 最终回归在这里失败一次，没有留下实际显示了什么。
+    // 点击前记下菜单各项（菜单按任务顺序列项目，第 2 项是哪个项目取决于当时的任务顺序），检查不成立时打印
+    // 实际行数、每行任务名与所属项目、当前选中项目、列表是否在刷新、时间戳，并截一张图。通过时只多一次点击前的读取。
+    const ui02Menu = String(await evaluate('JSON.stringify([...document.querySelectorAll(".ctx button")].map(b => (b.textContent || "").trim()))'));
+    // 每次都打印（通过时也打）：菜单顺序与两个进行中演示任务的开始时刻，用来统计"第 2 项是哪个项目"与时刻先后的关系。
+    console.log(`UI02 点击前菜单 ${ui02Menu}；进行中任务开始时刻：${registry.tasks.filter(t => t.status === 'run').map(t => `${t.id}（${path.basename(t.repo)}）=${t.started}`).join('，')}`);
+    // 按名字点 pixel-garden（用户 2026-10-21 批准）：原来点"第 2 项"，菜单按任务列表顺序（started 倒序）列项目，
+    // 本地时间晚于演示任务 t3 的 14:02 时第 2 项变成 notes-web，检查就失败（诊断 3 次中 3 次复现；筛选结果本身正确）。
+    await press(await menuItem('pixel-garden'));
+    const ui02PressedAt = Date.now();
+    await check('UI02 选择项目后列表只显示该项目', 'document.querySelectorAll("[data-task]").length === 5', async () => {
+        const at = Date.now();
+        const ui = JSON.parse(await evaluate(`JSON.stringify({ rows: [...document.querySelectorAll('[data-task]')].map(r => r.dataset.task), project: document.querySelector('[data-project]')?.textContent.trim() ?? null, menuOpen: !!document.querySelector('.ctx'), groups: [...document.querySelectorAll('.tgroup')].map(g => g.textContent.trim()), trace: (window.__arTrace ?? []).slice(-15).map(e => e.event + ' @' + e.at), now: Date.now() })`)) as { rows: string[]; project: string | null; menuOpen: boolean; groups: string[]; trace: string[]; now: number };
+        const byId = new Map(registry.tasks.map(t => [t.id, t]));
+        const rows = ui.rows.map(id => { const t = byId.get(id); return `${id}「${t?.name ?? '?'}」项目=${t ? path.basename(t.repo) : '?'}`; });
+        const perProject = new Map<string, number>();
+        for (const t of registry.tasks) perProject.set(path.basename(t.repo), (perProject.get(path.basename(t.repo)) ?? 0) + 1);
+        const refreshing = (registry as unknown as { work?: unknown }).work !== undefined;
+        const shot = await saveNow('ui02-filter-fail').then(() => '截图 ui02-filter-fail.png', error => `截图失败：${(error as Error).message}`);
+        return `UI02 诊断（${shot}）：检查不成立后 ${at - ui02PressedAt} ms 采集（点击返回于 ${new Date(ui02PressedAt).toISOString()}，渲染层时刻 ${new Date(ui.now).toISOString()}）；`
+            + `实际 ${ui.rows.length} 行；当前选中项目「${ui.project}」；点击前菜单 ${ui02Menu}；菜单仍展开=${ui.menuOpen}；主进程 Registry 正在刷新=${refreshing}；`
+            + `分组 ${JSON.stringify(ui.groups)}；各行：${rows.join('；') || '（无）'}；主进程各项目任务数（含隐藏）：${[...perProject].map(([k, v]) => `${k}=${v}`).join('，')}；`
+            + `渲染层最近事件：${ui.trace.join('，') || '（无）'}`;
+    });
+    const pixelGarden = registry.tasks.filter(t => path.basename(t.repo) === 'pixel-garden').map(t => t.id);
+    await check('UI02 选择 pixel-garden 后每一行都属于 pixel-garden', `(() => { const ids = ${JSON.stringify(pixelGarden)}; const rows = [...document.querySelectorAll('[data-task]')].map(r => r.dataset.task); return rows.length > 0 && rows.every(id => ids.includes(id)); })()`);
     await press('[data-project]');
     await press('.ctx button');
     // 015：演示数据加了软件派发的任务 t13，全量任务从 12 条变 13 条（原检查 12，见汇报"改写的检查"）。
@@ -576,6 +607,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     });
     await check('UI04 停止后列表与详情显示中断', 'document.querySelector("[data-task=t2] .mk").classList.contains("stale") && !document.querySelector("[data-stop]") && document.querySelector(".banner .rt b").textContent==="你停止了这个任务"');
 
+    // UI22（Stage04 门禁界面）：演示任务 t20～t22 默认隐藏，检查时临时显示、检查完恢复。
+    await captureGate(h, registry, out, save);
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
     await captureProcessUnknown(h, registry, save, menuItem, runs);
     const fontLoaded = await capturePreferences(h);
@@ -659,7 +692,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     const ui = [...new Set(checks.map(c => c.match(/^UI\d\d/)?.[0]).filter(Boolean))].sort();
     // UI19 = 关闭询问与托盘（012 A），UI20 = 设置页"数据"一节与清除缓存 / 重置确认框（012 B）。
     // 原 UI10 / UI11 已分别是"主题"与"最小窗口"，所以新增要求改用 UI19、UI20（见汇报）。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21'], '界面功能基线 UI01～UI21 都要有检查');
+    // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
+    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22'], '界面功能基线 UI01～UI22 都要有检查');
     console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。
@@ -1180,7 +1214,16 @@ async function captureDataAndReset(h: Harness, win: BrowserWindow, save: (name: 
         assert.ok(existsSync(keep), '无关文件应该保留');
     });
     await check('UI20 清除结果与大小显示在"清除缓存"这一行', 'document.querySelector("[data-cache-result]").textContent.startsWith("已清除 ")');
+    // 037 第 3 项：这张截图原来停在设置页顶部，看不到"已清除 …"结果行；截图前用页面现有滚动把它滚进视口（不改样式），
+    // 并断言截图时这一行完全在视口内。深浅两张都截（浅色按本页其他设置截图的命名惯例补拍，未改任何既有截图名）。
+    await evaluate('document.querySelector("[data-cache-result]").scrollIntoView({block:"center"})');
+    await check('UI20 截图时"已清除"结果行在视口内', '(()=>{const r=document.querySelector("[data-cache-result]").getBoundingClientRect();return r.height>0&&r.top>=0&&r.bottom<=innerHeight;})()');
     await save('settings-data-cleared-dark');
+    nativeTheme.themeSource = 'light';
+    await evaluate('document.querySelector("[data-cache-result]").scrollIntoView({block:"center"})');
+    await check('UI20 浅色下截图时"已清除"结果行在视口内', '(()=>{const r=document.querySelector("[data-cache-result]").getBoundingClientRect();return r.height>0&&r.top>=0&&r.bottom<=innerHeight;})()');
+    await save('settings-data-cleared-light');
+    nativeTheme.themeSource = 'dark';
 
     // 重置确认框：用一份临时配置验证"密钥来源变量名"出现在选项说明里，检查完恢复原配置。
     const configFile = path.join(home, 'config.json');

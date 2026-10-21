@@ -5,12 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { fork, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { tasks, plan1, ev1, ev5, ev6, files3 } from './data.mjs';
+import { tasks, gates, plan1, ev1, ev5, ev6, files3 } from './data.mjs';
 import { legacyRunsDir } from '../../core/lib/compat.mjs';
 export async function demo(){
   const home=await mkdtemp(path.join(os.tmpdir(),'agentrouter-demo-'));const children=[];
   for(let i=0;i<2;i++){const child=fork(fileURLToPath(new URL('./ar.mjs',import.meta.url)),[],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});await new Promise((resolve,reject)=>{child.once('message',resolve);child.once('error',reject);});children.push(child);}
-  const rows=[],now=Date.now();let active=0;
+  // AR_DEMO_NOW（毫秒，界面验收时由 tools/shots.mjs 设）：演示数据的"今天 / 昨天"时间戳按它算，
+  // 与软件渲染时用的"现在"一致（037 第 2 项，跨午夜不串组）；没有就用真实当前时间。
+  const demoNow=Number(process.env.AR_DEMO_NOW)||Date.now();
+  const rows=[],now=demoNow;let active=0;
   for(const t of tasks){
     // 演示：除 t4 外都是协议 v2 记录（.agent-runs/<名>/）；t4 保留 v1 旧布局，界面显示"旧任务"标签。
     const repo=path.join(home,'projects',t.project),name=t.record??t.name,legacy=t.id==='t4';
@@ -18,10 +21,19 @@ export async function demo(){
     const x={profile:'codex',adapter:'codex',label:'Codex',model:null,agentVersion:'codex-cli 0.156.1',...t.executor};
     const dir=legacy?legacyRunsDir(repo):path.join(repo,'.agent-runs',name);await mkdir(dir,{recursive:true});
     const file=legacy?{progress:name+'.progress.log',report:name+'.md',events:name+'.events.jsonl',raw:name+'.log'}:{progress:'progress.log',report:'report.md',events:'events.jsonl',raw:'raw.log'};
-    // 演示进程创建时间必须与 started 接近，不能伪造身份时间。
-    const started=t.state==='run'?now:new Date(new Date().setHours(...t.start.split(':').map(Number),0,0)).getTime()-(t.day==='yesterday'?86400000:0);
-    const entry={v:legacy?1:2,event:'start',id:t.id,repo,name,...(legacy?{}:{dir,project:t.project,profile:x.profile,adapter:x.adapter,label:x.label}),title:t.name,spec:t.record?null:`docs/specs/${t.name}.md`,role:t.role,pid:t.state==='run'?children[active++].pid:0,started,progress:path.join(dir,file.progress),report:path.join(dir,file.report),events:path.join(dir,file.events),raw:path.join(dir,file.raw),model:x.model,effort:null,tier:null,sandbox:t.sandbox,managed:t.id==='t1',agent:x.adapter,agentVersion:x.agentVersion,dispatcher:{host:t.dispatcher??'claude-code',session:null}};
-    rows.push(entry);if(t.state==='done'||t.state==='fail')rows.push({v:1,event:'end',id:t.id,exit:t.exit??0,at:started+60000*parseFloat(t.dur),minutes:parseFloat(t.dur)});if(t.state==='stop')rows.push({v:1,event:'interrupted',id:t.id,at:started+192000,signal:t.signal??'session-closed'});
+    // 演示进程创建时间必须与 started 接近，不能伪造身份时间；同时进程创建时间必须 ≤ started（registry 的 dispatchMatches）。
+    // AR_DEMO_NOW 在派发演示子进程之前取得，可能比子进程创建时间早几毫秒，进行中的任务取两者的较大者。
+    const started=t.state==='run'?Math.max(now,Date.now()):new Date(new Date(demoNow).setHours(...t.start.split(':').map(Number),0,0)).getTime()-(t.day==='yesterday'?86400000:0);
+    const entry={v:legacy?1:2,event:'start',id:t.id,repo,name,...(legacy?{}:{dir,project:t.project,profile:x.profile,adapter:x.adapter,label:x.label}),title:t.name,spec:t.record?null:`docs/specs/${t.name}.md`,role:t.role,pid:t.state==='run'?children[active++].pid:0,started,progress:path.join(dir,file.progress),report:path.join(dir,file.report),events:path.join(dir,file.events),raw:path.join(dir,file.raw),model:x.model,effort:null,tier:null,sandbox:t.sandbox,managed:t.id==='t1',agent:x.adapter,agentVersion:x.agentVersion,dispatcher:{host:t.dispatcher??'claude-code',session:null},...(t.gate!==undefined?{gate:t.gate,base:t.base??'main'}:{})};
+    rows.push(entry);
+    // 门禁事件按核心的顺序：gating → gate → end（协议第 2 节、12.1）。只有真跑过门禁的 end 带 agentExit。
+    if(t.state==='done'||t.state==='fail'){
+      const endedAt=started+60000*parseFloat(t.dur),g=gates[t.id];
+      if(g)rows.push({v:1,event:'gating',id:t.id,at:endedAt});
+      if(g)rows.push({v:1,event:'gate',id:t.id,ok:g.ok,attempt:g.attempt,at:endedAt+g.ms,summary:g.summary});
+      rows.push({v:1,event:'end',id:t.id,exit:t.exit??0,at:endedAt,minutes:parseFloat(t.dur),...(g?{agentExit:t.agentExit??0}:{})});
+    }
+    if(t.state==='stop')rows.push({v:1,event:'interrupted',id:t.id,at:started+192000,signal:t.signal??'session-closed'});
     const events=[];let seq=0;const add=e=>events.push({v:1,seq:++seq,at:started+seq*1000,...e});
     if(t.id==='t1')add({kind:'plan',items:plan1.map(([text,status])=>({text,done:status==='done'}))});
     if(t.id==='t2')add({kind:'plan',items:[{text:'读任务说明',done:true},{text:'分页组件',done:false},{text:'接口参数',done:false},{text:'验证、提交、汇报',done:false}]});
@@ -32,13 +44,16 @@ export async function demo(){
     await writeFile(entry.progress,`=== Codex 开始：${t.name}  ${new Date(started).toLocaleString('zh-CN',{hour12:false})} ===\n[15:39:00] ${t.last??'说：已完成，见汇报。'}\n`);
     if(entry.spec){await mkdir(path.join(repo,'docs/specs'),{recursive:true});await writeFile(path.join(repo,entry.spec??'docs/specs/demo.md'),`# ${t.name}\n`);}
     for(const e of events)for(const f of e.files??[]){const file=path.join(repo,f.path);await mkdir(path.dirname(file),{recursive:true});await writeFile(file,'// 演示文件\n');}
+    // 门禁结果文件（协议 12.3）：只给真跑过门禁的任务写；结果原样供软件只读展示。
+    if(gates[t.id])await writeFile(path.join(dir,'gate.json'),JSON.stringify({...gates[t.id],at:started+60000*parseFloat(t.dur)},null,2)+'\n');
     if(t.state==='done')await writeFile(entry.report,t.id==='t3'?['# 完成了什么','存档加了版本号，读取时按 v1 → v2 → v3 逐级迁移；旧存档读取后自动写回新格式，并保留一份 `.bak`。','提交：`4f2a9c1`','## 验证','- `npm test` 46/46 通过，新增迁移测试 9 条。','- 用 3 份旧存档样例实际读取，背包、地图、设置都对得上。','## TODO(lead) 2 条','1. 迁移失败时给玩家看的提示文案，现在是占位“【文案待定：存档无法升级】”。','2. 是否在读取旧存档时提示“已升级”。','## 推断清单 3 条','1. 备份文件名用 `<存档名>.bak`，只保留最近一份。','2. 未知字段原样保留，不删除。','3. 版本号写在存档顶层 `v` 字段。','## 已知问题','无。'].join('\n'):t.id==='t4'?'# 完成了什么\n排查结果：白屏是因为首次启动时读取空的设置文件抛错。只读任务，没有改动文件。':`# 完成了什么\n已完成。\n提交：\`${t.commit}\`\n`);
   }
   await writeFile(path.join(home,'runs.jsonl'),rows.map(r=>JSON.stringify(r)).join('\n')+'\n');
-  // 项目页演示数据：两个演示仓库登记进隔离的 projects.json；pixel-garden 预置项目配置，notes-web 保持未初始化。
+  // 项目页演示数据：演示仓库登记进隔离的 projects.json；pixel-garden 预置项目配置，notes-web 保持未初始化。
+  // reader-app 是 Stage04 门禁演示项目（没有验收命令、允许全部文件），原来的 13 个任务与计数不变。
   // 这里只 git init，不提交，项目页会显示"未提交的改动"，正好演示状态行。
   const projectRows=[];
-  for(const name of ['pixel-garden','notes-web']){
+  for(const name of ['pixel-garden','notes-web','reader-app']){
     const repo=path.join(home,'projects',name);
     spawnSync('git',['init','-b','main'],{cwd:repo,stdio:'ignore',shell:false,windowsHide:true});
     projectRows.push({path:repo,name,addedAt:now,lastUsed:now});
@@ -47,6 +62,18 @@ export async function demo(){
   const pixelGarden=path.join(home,'projects','pixel-garden');
   await mkdir(path.join(pixelGarden,'.agent-router'),{recursive:true});
   await writeFile(path.join(pixelGarden,'.agent-router','project.json'),JSON.stringify({v:1,name:'pixel-garden',baseBranch:'main',specsDir:'docs/specs',setup:['npm ci'],verify:['npm test','npm run lint'],allowedPaths:['**'],routing:{rules:[]},worktree:true},null,2)+'\n');
+  // 门禁演示项目：没有验收命令、允许全部文件。新建任务页用它演示"类型要求提交时才跑门禁"与可以取消勾选。
+  const readerApp=path.join(home,'projects','reader-app');
+  await mkdir(path.join(readerApp,'.agent-router'),{recursive:true});
+  await writeFile(path.join(readerApp,'.agent-router','project.json'),JSON.stringify({v:1,name:'reader-app',baseBranch:'main',specsDir:'docs/specs',setup:[],verify:[],allowedPaths:['**'],routing:{rules:[]},worktree:true},null,2)+'\n');
+  // 验收 / 演示默认把门禁演示任务隐藏（AR_DEMO_HIDDEN_IDS），原有任务数量与列表断言的计数不变；
+  // UI22 检查时再由验收代码临时显示它们，结束后恢复。
+  const hiddenIds=String(process.env.AR_DEMO_HIDDEN_IDS??'').split(',').map(id=>id.trim()).filter(Boolean);
+  if(hiddenIds.length){
+    const keys=rows.filter(r=>r.event==='start'&&hiddenIds.includes(r.id)).map(r=>`${r.id}:${r.started}`);
+    await mkdir(path.join(home,'monitor'),{recursive:true});
+    await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[],hidden:keys})+'\n');
+  }
   // 调用方必须先等 Electron 退出再 close：先结束演示进程（我们自己的假派发进程，5 秒不退再结束），再删除临时目录。
   // 删除失败只警告并给出残留，不覆盖调用方真正的结果。
   return {home,children,async close({limitMs=15000}={}){
