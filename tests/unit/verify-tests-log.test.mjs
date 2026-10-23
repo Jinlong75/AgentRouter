@@ -8,7 +8,11 @@ import { KEEP_LOGS, logFileName, pruneVerifyLogs, saveVerifyLog, verifyLogDir } 
 // 065：verify 全量日志落盘的目录注入、文件生成与只保留最近 20 份。
 // 全部写在测试自己的临时目录里，不往真实 %TEMP%\agent-router-verify 写测试数据。
 
-test('verify 日志目录：AR_VERIFY_LOG_DIR 注入优先，缺省是系统临时目录下的 agent-router-verify', () => {
+test('verify 日志目录：AR_VERIFY_LOG_DIR 注入优先，缺省是系统临时目录下的 agent-router-verify', t => {
+  // 不读外部环境：记下并删掉真实的 AR_VERIFY_LOG_DIR，结束时原样恢复。
+  const saved = process.env.AR_VERIFY_LOG_DIR;
+  delete process.env.AR_VERIFY_LOG_DIR;
+  t.after(() => { if (saved === undefined) delete process.env.AR_VERIFY_LOG_DIR; else process.env.AR_VERIFY_LOG_DIR = saved; });
   assert.equal(verifyLogDir({ AR_VERIFY_LOG_DIR: join(tmpdir(), '注入的目录') }), join(tmpdir(), '注入的目录'));
   assert.equal(verifyLogDir({}), join(tmpdir(), 'agent-router-verify'));
   assert.equal(verifyLogDir(), join(tmpdir(), 'agent-router-verify'));

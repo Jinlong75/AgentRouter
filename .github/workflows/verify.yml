@@ -37,6 +37,11 @@ on:
         description: '单独连续重复跑一条 node:test 用例（诊断用，目前可填 agents-test-timeout；留空不跑）'
         required: false
         default: ''
+      # 只在 Linux 上跑 lint:tree 与 verify（诊断用，复现只在 Linux 上失败的测试；只手动触发，不计作正式回归）。
+      linux:
+        description: '1 = 只在 ubuntu-latest 上跑 lint:tree 与 verify（诊断用，不计作正式回归）；留空不跑'
+        required: false
+        default: ''
 jobs:
   windows:
     if: github.event_name != 'workflow_dispatch'
@@ -53,6 +58,34 @@ jobs:
       - run: npm ci
       - run: npm run lint:tree
       - run: npm run verify
+  # Linux 复现（诊断用）：只手动触发（workflow_dispatch 且 linux 非空），不挂 push / pull_request。
+  # lint:tree 失败时 verify 仍然运行，一次看到全部问题；verify 的完整日志与 TAP 作为产物上传，不计作正式回归。
+  linux:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.linux != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # verify 不启动 Electron，省下载时间
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint:tree
+      - if: always()
+        run: npm run verify
+      # 日志目录以 os.tmpdir() 为准（verify 写在其下的 agent-router-verify/），不写死路径。
+      - id: logdir
+        if: always()
+        run: echo "dir=$(node -p "require('os').tmpdir()")/agent-router-verify" >> "$GITHUB_OUTPUT"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-verify-logs
+          path: ${{ steps.logdir.outputs.dir }}
+          retention-days: 7
   # 单项连续重复运行（诊断用）：只手动触发（workflow_dispatch 且 nodetest 非空），不挂 push / pull_request。
   # 只重复跑一个 node:test 用例，次数沿用 repeat 输入（默认 30）；输入经 env 传入，不直接拼进脚本。
   # 诊断用，不替代三连续完整回归。
@@ -89,7 +122,8 @@ jobs:
   # 界面验收（真实输入、每页通用检查、UI 基线）。验收窗口不显示，不需要桌面会话。
   gui:
     # 手动触发且开了单项重复运行（nodetest 非空）时只跑 nodetest，不跑界面验收。
-    if: github.event_name != 'workflow_dispatch' || (github.event.inputs.h1 != 'quiet' && github.event.inputs.nodetest == '')
+    # 手动触发且开了 Linux 复现（linux 非空）时只跑 linux 作业，也不跑界面验收。
+    if: github.event_name != 'workflow_dispatch' || (github.event.inputs.h1 != 'quiet' && github.event.inputs.nodetest == '' && github.event.inputs.linux == '')
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

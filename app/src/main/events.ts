@@ -42,6 +42,8 @@ export function parseEvent(line: string, offset: number, legacy = false): Event 
             out.phase = e.phase;
         if (e.exit === null || Number.isInteger(e.exit))
             out.exit = e.exit;
+        if (Number.isSafeInteger(e.attempt) && e.attempt >= 1)
+            out.attempt = e.attempt;
         out.truncated = e.truncated === true;
         if (Array.isArray(e.files))
             out.files = e.files.filter((f: any) => f && ['add', 'update', 'delete'].includes(f.kind) && typeof f.path === 'string').map((f: any) => ({ kind: f.kind, path: f.path }));

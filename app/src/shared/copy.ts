@@ -269,6 +269,14 @@ export const rt = {
     notePh: '例如：函数名改为 add；不要修改测试文件',
     start: (n: number) => `开始第 ${n} 次尝试`, starting: '正在开始…', consequence: (gate: boolean) => `在同一工作区继续${gate ? '，结束后跑门禁' : ''}；不占自动重试的次数`,
     failed: '没有开始重试',
+    // Stage06：执行者需要越界（协议 14.5）——任务详情横幅，路径逐行列在说明下面
+    needsScopeTitle: '执行者认为需要改允许范围以外的文件',
+    needsScopeHelp: (count: number) => `列出了 ${count} 个路径，没有再自动重试。要继续，先在任务说明里扩大允许改动的文件并提交，再点"重试"；也可以改写任务说明后重新派发。`,
+    // Stage06：工作区外写入（协议 12.4）——任务详情横幅、门禁标签里的一项
+    outsideTitle: '工作区外出现了新文件',
+    outsideHelp: '执行者只应在工作区里写文件。下面这些是任务进行中新出现的，可能是这个执行者写的，也可能是同时进行的其他任务或其他程序。已停止自动重试，请核对；AgentRouter 不会删除或移动它们。',
+    outsideGate: '工作区外的新文件', outsideRoot: { user: '用户目录', home: '公共目录' } as Record<string, string>,
+    outsideUnchecked: (error: string) => `没能核对工作区外写入：${error}`,
 };
 
 // Stage03 主进程调用核心（console 通道）的错误文案；核心自己的错误已经是中文，原样显示。

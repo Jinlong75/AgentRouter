@@ -135,8 +135,8 @@ export interface Event {
         input: number | null;
         output: number | null;
     };
-    // 事件所属的尝试（协议 14.2 第 4 条）；主进程的事件解析目前不保留这个字段，
-    // 界面没有它时按事件时刻与各次尝试的开始时刻归属。TODO(lead): events.ts 的 parseEvent 补 attempt 后界面自动优先用它。
+    // 事件所属的尝试（协议 14.2 第 4 条）；主进程解析时保留，界面优先用它；
+    // 没有时按事件时刻与各次尝试的开始时刻归属。
     attempt?: number;
     offset: number;
     time?: string;

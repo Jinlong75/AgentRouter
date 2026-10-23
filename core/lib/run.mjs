@@ -18,6 +18,17 @@ import { readJson } from './json.mjs';
 import { redactPaths } from './process.mjs';
 import { tracing } from './trace.mjs';
 
+// 托管执行者进程脱离启动、标准错误没人看：认领请求文件失败时留一行痕迹（只记文件名）。写日志失败一律吞掉。
+function claimFailure(env, reason, requestFile) {
+  try {
+    const dir = join(homeDirectory(env), 'managed');
+    mkdirSync(dir, { recursive: true });
+    const d = new Date(), p = (n, w = 2) => String(n).padStart(w, '0');
+    const time = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    appendFileSync(join(dir, 'claim-failures.log'), `${time}\t${reason}\t${basename(String(requestFile))}\n`);
+  } catch { /* 留痕失败不影响返回值 */ }
+}
+
 export async function run({ adapter: adapterOverride, scriptPath, args = process.argv.slice(2), env = process.env, root = process.cwd(), onDetach, onGate, onRetry, retry = null } = {}) {
   // 公共目录保护（协议第 1 节）：必须在改名请求文件、读写公共目录、启动进程之前检查。
   // 只检查显式设置的新名 / 旧名环境变量；--run-request 执行者进程也走这里。
@@ -28,9 +39,9 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   // 只负责派发与托管执行者入口；wait / stop / config 等子命令在 cli.mjs。
   let requestFile = args[0] === '--run-request' ? args[1] : null;
   if (requestFile) {
-    if (!requestFile.endsWith('.claimed.json')) return 0;
+    if (!requestFile.endsWith('.claimed.json')) { claimFailure(env, '不是 .claimed.json', requestFile); return 0; }
     const running = requestFile.replace(/\.claimed\.json$/, '.running.json');
-    try { renameSync(requestFile, running); } catch { return 0; }
+    try { renameSync(requestFile, running); } catch (error) { claimFailure(env, `改名失败：${error?.code ?? 'UNKNOWN'}`, requestFile); return 0; }
     requestFile = running;
   }
   const request = requestFile ? readJson(requestFile) : null;
@@ -247,7 +258,7 @@ function requireGateBase(root, specPath) {
   let base;
   try { base = headSha(root); }
   catch (error) { throw new Error(`启用门禁的任务需要 git 仓库：${error.message}`); }
-  // TODO(lead): 协议 11.4 第 1 条没给固定文案，暂时用这句话。
+  //（协议 11.4 第 1 条）
   if (!base) throw new Error('启用门禁的任务需要项目至少有一个提交：先提交一次再派发。');
   // 2. 任务说明已提交（不是未跟踪、也没有未提交的修改）。
   const rel = relative(root, resolvePath(root, specPath)).replaceAll('\\', '/');

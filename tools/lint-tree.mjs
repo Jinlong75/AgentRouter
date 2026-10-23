@@ -3,6 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { scanWorkspace } from './public-scan.mjs';
 
 const root = process.cwd();
 const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
@@ -103,6 +104,13 @@ for (const f of texts.filter(f => /^app\/src\/renderer\/.*\.css$/.test(f))) {
   const lines = corpus.get(f).split('\n'), at = lines.findIndex(l => hexColor.test(l.replace(/\/\*.*?\*\//g, '')));
   if (at >= 0) report('R7 令牌外颜色', f, `第 ${at + 1} 行：${lines[at].match(hexColor)[0]}`);
 }
+
+// R8 公开内容：会导出到公开仓库的已跟踪文本文件，做与 public:snapshot 相同的四类内容扫描（读工作区内容）。
+// 没有私有词表（公开仓库里就没有）时只做不依赖词表的扫描，不算问题；词表文件损坏算问题。命中里的词表词已遮成 ***。
+const scan = scanWorkspace(root, tracked);
+if (scan.error) report('R8 公开内容', '.agent-router/public-scan.json', scan.error);
+else if (scan.wordlist === 'none') console.log('R8：没有私有词表，个人词与本机路径词表的扫描跳过');
+for (const h of scan.hits) report('R8 公开内容', h.file, `第 ${h.line} 行：${h.category} ${h.masked}`);
 
 if (problems.length === 0) { console.log(`目录检查通过：${tracked.length} 个已跟踪文件`); process.exit(0); }
 for (const p of problems) console.log(`${p.rule}  ${p.file}${p.detail ? '  ' + p.detail : ''}`);
