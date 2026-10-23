@@ -1,8 +1,98 @@
-import type { BrowserWindow } from 'electron';
-import { nativeTheme } from 'electron';
+import { BrowserWindow, nativeTheme } from 'electron';
 import assert from 'node:assert/strict';
 import { effects } from './effects';
 import { performance } from 'node:perf_hooks';
+import { mkdir, readdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import * as processLib from '../../../core/lib/process.mjs';
+
+// ---- 066：保存失败现场用到的纯函数（文件名安全化、截断、脱敏、现场 JSON 的字段）。不碰 Electron，单元测试经 esbuild 打包后直接引用（tests/unit/shots-scene.test.mjs）。----
+// 最近输入保留的条数；现场里焦点元素 outerHTML 的截取长度。
+export const INPUT_LOG_SIZE = 20;
+export const OUTER_HTML_LIMIT = 300;
+
+// 检查标签 → 安全的文件名片段：去掉 Windows 文件名不允许的字符与控制字符，空白合并成一个下划线，截断；全部去掉后用 check。
+export function safeFileName(label: unknown, max = 60): string {
+    const cleaned = String(label ?? '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ').replace(/\s+/g, '_').replace(/^[_.]+|[_.]+$/g, '');
+    return Array.from(cleaned).slice(0, max).join('').replace(/[_.]+$/g, '') || 'check';
+}
+
+// 按字符数截断（不拆代码点）；超出时不加省略号，由调用方决定怎么标。
+export function truncate(text: unknown, limit: number): string {
+    const chars = Array.from(String(text ?? ''));
+    return chars.length > limit ? chars.slice(0, limit).join('') : chars.join('');
+}
+
+// 脱敏：额外给出的根目录（如隔离公共目录）写成 <临时目录>，其余临时目录 / 用户目录由 core 的 redactPaths 处理（process.d.mts 没有声明它，这里按签名取用）。
+const corePaths = (processLib as unknown as { redactPaths(text: string): string }).redactPaths;
+export function redactScene(text: unknown, roots: string[] = []): string {
+    let out = String(text ?? '');
+    for (const root of roots) {
+        if (!root) continue;
+        for (const variant of new Set([root, root.replace(/\\/g, '/'), root.replace(/\//g, '\\')])) out = out.split(variant).join('<临时目录>');
+    }
+    return corePaths(out);
+}
+
+// 嵌套对象 / 数组里的字符串逐个脱敏（专项现场 extra 用）。
+export function deepRedact<T>(value: T, roots: string[] = []): T {
+    if (typeof value === 'string') return redactScene(value, roots) as unknown as T;
+    if (Array.isArray(value)) return value.map(item => deepRedact(item, roots)) as unknown as T;
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, deepRedact(item, roots)])) as T;
+    return value;
+}
+
+// 失败现场文件的基名：序号两位 + 安全化的检查标签。
+export function sceneBaseName(index: number, label: unknown): string {
+    return `${String(index).padStart(2, '0')}-${safeFileName(label)}`;
+}
+
+export interface InputEntry { type: string; at: string; key?: string; selector?: string; text?: string }
+// 输入记录环：只留最近 INPUT_LOG_SIZE 条，每条 { type, key | selector | text, at }。
+export function pushInput<T extends InputEntry>(log: T[], entry: T, size = INPUT_LOG_SIZE): T[] {
+    log.push(entry);
+    if (log.length > size) log.splice(0, log.length - size);
+    return log;
+}
+
+export interface ScenePage { outerHTML?: string | null; outlineStyle?: string; outlineWidth?: string; outlineColor?: string; boxShadow?: string; focusVisible?: boolean | null; focus?: boolean | null; hasFocus?: boolean; visibilityState?: string }
+export interface SceneWindow { isFocused?: boolean; webContentsIsFocused?: boolean; isVisible?: boolean; isMinimized?: boolean; focusedWindowIsThis?: boolean }
+export interface SceneInput { message: string; label: string; now?: number; page?: ScenePage | null; win?: SceneWindow | null; inputs?: InputEntry[]; screenshot?: string | null; captureError?: string | null; readError?: string | null; extra?: unknown; roots?: string[] }
+
+// 现场 JSON：字段固定，路径一律脱敏；page / win 读不到时对应字段为 null（captureError / readError 写原因）。
+export function sceneRecord(input: SceneInput): Record<string, any> {
+    const roots = input.roots ?? [];
+    const red = (value: unknown) => value === null || value === undefined ? null : redactScene(value, roots);
+    const page = input.page ?? null, win = input.win ?? null;
+    const record: Record<string, any> = {
+        message: red(input.message),
+        label: red(input.label),
+        at: new Date(input.now ?? Date.now()).toISOString(),
+        screenshot: input.screenshot ?? null,
+        captureError: red(input.captureError),
+        readError: red(input.readError),
+        activeElement: page ? {
+            outerHTML: page.outerHTML === null || page.outerHTML === undefined ? null : truncate(red(page.outerHTML), OUTER_HTML_LIMIT),
+            outlineStyle: page.outlineStyle ?? null,
+            outlineWidth: page.outlineWidth ?? null,
+            outlineColor: page.outlineColor ?? null,
+            boxShadow: page.boxShadow ?? null,
+            matchesFocusVisible: page.focusVisible ?? null,
+            matchesFocus: page.focus ?? null,
+        } : null,
+        document: page ? { hasFocus: page.hasFocus ?? null, visibilityState: page.visibilityState ?? null } : null,
+        window: win ? {
+            isFocused: win.isFocused ?? null,
+            webContentsIsFocused: win.webContentsIsFocused ?? null,
+            isVisible: win.isVisible ?? null,
+            isMinimized: win.isMinimized ?? null,
+            focusedWindowIsThis: win.focusedWindowIsThis ?? null,
+        } : null,
+        recentInputs: (input.inputs ?? []).slice(-INPUT_LOG_SIZE).map(e => Object.fromEntries(Object.entries(e).map(([name, value]) => [name, typeof value === 'string' ? red(value) : value]))),
+    };
+    if (input.extra !== undefined) record.extra = deepRedact(input.extra, roots);
+    return record;
+}
 
 // 等待一律按单调时钟的真实截止时刻判断（PR #5：原来按轮询次数计时，每次检查本身的耗时会把实际等待拉长，曾出现实际 11.7 秒仍通过 10 秒的等待）。
 // 条件必须在截止前被观察到成立：某次检查本身很慢、返回"成立"时已过截止，也算超时。上限数值与原来相同。
@@ -25,6 +115,17 @@ export function ipcReport(afterSeq: number, now = Date.now(), withStart = false)
     return rows.map(e => `#${e.seq} ${e.channel}:${e.name}${withStart ? ` @-${now - e.start}ms` : ''} ${e.end === undefined ? `未返回（已等 ${now - e.start} ms）` : `${e.end - e.start} ms ${e.ok ? '成功' : '失败：' + e.error}`}`).join('；');
 }
 export const ipcSeq = () => effects.ipcLog.length;
+// 等某个 IPC 调用（channel:name）在序号 afterSeq 之后开始并返回（成败都算返回），上限 limitMs；
+// 返回这次调用在主进程里的用时。超时抛错，信息里列出这段时间的 IPC 调用与用时。
+export async function waitIpcReturn(label: string, channel: string, name: string, afterSeq: number, limitMs: number) {
+    const started = clock();
+    while (true) {
+        const entry = effects.ipcLog.find(e => e.seq > afterSeq && e.channel === channel && e.name === name && e.end !== undefined);
+        if (entry) return entry.end! - entry.start;
+        if (clock() - started >= limitMs) throw Error(`${label}：${limitMs} ms 内 ${channel}:${name} 没有返回\n这段时间的 IPC 调用：${ipcReport(afterSeq)}`);
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+}
 // 瞬时 CPU：隔约 1 秒对每个进程各读两次累计 CPU 时间，每次读数各自计时；差值 ÷ 该进程自己的时间窗 ÷ 核数 = 这段时间里它占全部 CPU 的百分比。
 // （早先用两次枚举之间的总间隔做分母，枚举本身慢时会把占用放大，合计超过 100%；已改。）各进程合计不应超过 100%，读不到的受保护进程计入 unreadable。
 // 前几名里：svchost 列出它承载的系统服务名；electron 从命令行分出软件主进程（没有 --type）、渲染 / GPU / 工具进程、核心进程（ar.mjs）。
@@ -96,6 +197,50 @@ export function coreReport(afterSeq: number, now = Date.now()) {
         : `#${e.seq} ar ${e.args}：${(e.exited ?? now) - e.requested} ms code=${e.code}`).join('；');
 }
 
+// 066：任何检查失败（断言抛出）时，在退出前保存现场到 <out>/failures/：截图 .png 与同名 .json（失败信息原文、检查标签、焦点元素与计算样式、
+// 窗口与页面的焦点状态、最近 20 次真实输入）。路径一律脱敏；每一步读取都有时限，读不到的写进 captureError / readError，
+// 绝不抛出，也不改变原来的失败信息与退出码。返回现场目录（没能创建时为 null）。
+const bounded = <T>(work: Promise<T>, ms: number, what: string): Promise<T> => {
+    let timer: NodeJS.Timeout;
+    return Promise.race([work, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(Error(`${what}超时（${ms} ms）`)), ms); })]).finally(() => clearTimeout(timer));
+};
+const SCENE_PAGE = `(() => { const el = document.activeElement, s = el ? getComputedStyle(el) : null;
+    return { outerHTML: el ? el.outerHTML.slice(0, 600) : null, outlineStyle: s?.outlineStyle, outlineWidth: s?.outlineWidth, outlineColor: s?.outlineColor, boxShadow: s?.boxShadow,
+        focusVisible: el ? el.matches(':focus-visible') : null, focus: el ? el.matches(':focus') : null, hasFocus: document.hasFocus(), visibilityState: document.visibilityState }; })()`;
+export async function windowFocusState(win: BrowserWindow) {
+    return {
+        isFocused: win.isFocused(), webContentsIsFocused: win.webContents.isFocused(), isVisible: win.isVisible(), isMinimized: win.isMinimized(),
+        focusedWindowIsThis: BrowserWindow.getFocusedWindow()?.id === win.id,
+    };
+}
+export async function saveFailureScene(win: BrowserWindow, error: unknown, out: string, roots: string[]): Promise<string | null> {
+    const dir = path.join(out, 'failures');
+    try {
+        await mkdir(dir, { recursive: true });
+        const index = (await readdir(dir).catch(() => [] as string[])).filter(name => name.endsWith('.json')).length + 1;
+        const base = sceneBaseName(index, progress.current);
+        const input: SceneInput = { message: error instanceof Error ? error.message : String(error), label: progress.current, inputs: progress.inputs, roots, extra: progress.sceneExtra, screenshot: null };
+        // 先读焦点状态（截图前不动页面），再截图。
+        try { input.page = await bounded(win.webContents.executeJavaScript(SCENE_PAGE), 5000, '读取焦点元素'); }
+        catch (e) { input.readError = `页面：${e instanceof Error ? e.message : String(e)}`; }
+        try { input.win = await windowFocusState(win); }
+        catch (e) { input.readError = `${input.readError ? input.readError + '；' : ''}窗口：${e instanceof Error ? e.message : String(e)}`; }
+        try {
+            // 与正常截图一致：截图里不显示隔离目录的本机绝对路径（进程马上退出，不需要还原）。
+            for (const root of roots) await bounded(win.webContents.executeJavaScript(`(() => { const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); while (w.nextNode()) { const n = w.currentNode; if (n.textContent.includes(${JSON.stringify(root)})) n.textContent = n.textContent.replaceAll(${JSON.stringify(root)}, '<临时目录>'); } })()`), 5000, '截图前替换路径');
+            const png = (await bounded(win.webContents.capturePage(), 10000, '截图')).toPNG();
+            await writeFile(path.join(dir, base + '.png'), png);
+            input.screenshot = base + '.png';
+        } catch (e) { input.captureError = e instanceof Error ? e.message : String(e); }
+        await writeFile(path.join(dir, base + '.json'), JSON.stringify(sceneRecord(input), null, 2) + '\n');
+        console.log(`失败现场已保存：${redactScene(path.relative(process.cwd(), dir) || dir, roots)}（${base}）`);
+        return dir;
+    } catch (e) {
+        console.log(`失败现场没能保存：${e instanceof Error ? e.message : String(e)}`);
+        return null;
+    }
+}
+
 // 界面验收的真实输入助手：先做命中测试，再用 webContents.sendInputEvent 发系统级鼠标/键盘事件，
 // 与人手操作走同一条路。被遮挡、不可见、已禁用、键盘到不了的控件都会让检查失败。
 export interface Harness {
@@ -120,7 +265,10 @@ export interface Harness {
 }
 
 // 当前这次验收已经通过的检查（失败时由 capture 打印完成范围，PR #5 CI 环境实验要比较各组实际跑到哪里）。
-export const progress = { checks: [] as string[] };
+// 066：current 是最近开始的检查标签（失败现场里的"检查标签"）；inputs 是最近 20 次真实输入；focusRestored 是检查前恢复过输入焦点的记录（写进 checks.json）。
+// sceneExtra：个别检查失败前登记的专项现场（例如截图隐私检查的含路径元素），原样写进现场 JSON 的 extra。
+export const progress = { checks: [] as string[], current: '', inputs: [] as InputEntry[], focusRestored: [] as { label: string; at: string; restored: boolean }[], sceneExtra: undefined as unknown };
+const recordInput = (entry: Omit<InputEntry, 'at'>) => { pushInput(progress.inputs, { ...entry, at: new Date().toISOString() }); };
 export function createHarness(win: BrowserWindow, save: (name: string) => Promise<void>): Harness {
     const checks: string[] = [], consoleErrors: string[] = [];
     progress.checks = checks;
@@ -134,6 +282,7 @@ export function createHarness(win: BrowserWindow, save: (name: string) => Promis
     };
     // 默认最多等约 10 秒；个别跨进程操作（如停止要先用 PowerShell 核对进程）可以单独给更长的上限。
     const wait = async (expression: string, label = expression, timeoutMs = 10000) => {
+        progress.current = label;
         if ((await pollUntil(() => evaluate(expression), timeoutMs)).ok) return;
         // busy 只是禁用按钮的个数，不能说明是哪个操作卡住：同时列出每个禁用按钮的 data 属性与文字。
         // busy 只是禁用按钮的个数，不能说明是哪个操作卡住：列出每个禁用按钮的 data 属性与文字；另看失败横幅在不在、看不看得见，以及渲染层追踪的最后 30 条事件。
@@ -156,6 +305,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // diagnose（可选）：不成立时立刻采集的专项现场，在采 CPU（约 1.5 秒）之前调用，尽量贴近检查那一刻；
     // 通过时不调用，不改判断、不重试、不等待。
     const check = async (label: string, expression: string, diagnose?: () => Promise<string>) => {
+        progress.current = label;
         const value = await evaluate(expression);
         if (value !== true) {
             const extra = diagnose ? await diagnose().catch(error => `专项诊断失败：${(error as Error).message}`) : '';
@@ -167,6 +317,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // within：设计上是异步的结果（跨进程回应、关闭后放回焦点等），必须在明确的时间标准内成立。
     // 从调用时起每 50 ms 查一次；每次都打印实际用时，超时时打印当前焦点与界面，便于区分"慢"和"错"。
     const within = async (label: string, expression: string, limitMs: number) => {
+        progress.current = label;
         const started = lastInput;
         while (true) {
             // 成立且仍在标准内才算通过；成立时已超过标准，按超时处理。
@@ -186,6 +337,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // happened：主进程一侧的副作用（桩记录"打开文件"、"复制"等）要经 IPC 异步发生，必须在时间标准内出现；
     // 只负责等到它发生并打印用时，发生了几次、内容对不对由调用方紧接着精确断言。
     const happened = async (label: string, fn: () => boolean, limitMs: number) => {
+        progress.current = label;
         const started = lastInput;
         while (!(fn() && clock() - started <= limitMs)) {
             if (clock() - started >= limitMs) throw Error(`${label}：${limitMs} ms 内没有发生`);
@@ -196,6 +348,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         return elapsed;
     };
     const verify = async (label: string, fn: () => Promise<void> | void) => {
+        progress.current = label;
         try { await fn(); }
         catch (error) { throw Error(`${label}：${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
         checks.push(label);
@@ -215,6 +368,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         return { x: Math.round(x), y: Math.round(y) };
     })()`);
     const press = async (selector: string) => {
+        recordInput({ type: 'press', selector });
         const box = await hits(selector);
         // 有的检查本就预期点不了（已禁用等），这里只记一行，不做 CPU 采样。
         if ('error' in box) console.log(`点击前命中测试失败：${selector}：${box.error}`);
@@ -226,7 +380,20 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         lastInput = clock();
         await pause();
     };
+    // 066：键盘输入（key / tabTo）之前确认页面有输入焦点（document.hasFocus()）。页面没有焦点时 Tab 仍会移动焦点，但 :focus / :focus-visible 都不成立，
+    // 焦点环样式不生效（对照实验见 shots.ts captureFocusRing）。没有焦点就先恢复、等到页面取得焦点（上限 1 秒），
+    // 打印一行并记进 progress.focusRestored（写入 checks.json），不悄悄恢复；恢复不了也只记录，不在这里判失败。
+    const ensureInputFocus = async () => {
+        if (await evaluate('document.hasFocus()') === true) return;
+        const label = progress.current, at = new Date().toISOString();
+        win.webContents.focus();
+        const back = (await pollUntil(() => evaluate('document.hasFocus()'), 1000, 20)).ok;
+        progress.focusRestored.push({ label, at, restored: back });
+        console.log(back ? `检查前窗口没有输入焦点，已恢复（${label}）` : `检查前窗口没有输入焦点，恢复后 1 秒内页面仍未取得焦点（${label}）`);
+    };
     const key = async (keyCode: string, modifiers: Electron.InputEvent['modifiers'] = []) => {
+        recordInput({ type: 'key', key: [...(modifiers ?? []), keyCode].join('+') });
+        await ensureInputFocus();
         // 验收窗口不显示，键盘事件前确保 webContents 有输入焦点，否则按键不按键盘导航处理（:focus-visible 不生效）。
         if (!win.webContents.isFocused()) win.webContents.focus();
         win.webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
@@ -238,6 +405,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         await pause(80);
     };
     const type = async (selector: string, text: string) => {
+        recordInput({ type: 'type', selector, text: text.slice(0, 40) });
         await press(selector);
         const focusedNow = await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(selector)})`);
         if (focusedNow !== true) console.log(`点击后没有获得焦点：${selector}；此刻焦点 ${await evaluate('document.activeElement?.outerHTML.slice(0, 120) ?? null')}；窗口有输入焦点 ${win.webContents.isFocused()}\n${await scene()}`);
@@ -246,6 +414,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         await pause(80);
     };
     const tabTo = async (selector: string, max = 60) => {
+        recordInput({ type: 'tabTo', selector });
         for (let i = 0; i < max; i++) {
             if (await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(selector)})`)) return;
             await key('Tab');
@@ -253,6 +422,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         assert.fail(`${selector}：按 ${max} 次 Tab 仍无法到达`);
     };
     const focusRing = async (label: string) => {
+        progress.current = label;
         const ring = await evaluate(`(() => { const el = document.activeElement, s = getComputedStyle(el); const ok = (s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) > 0) || (s.boxShadow && s.boxShadow !== 'none'); return ok ? true : el.outerHTML.slice(0, 120) + ' outline=' + s.outlineStyle + ' ' + s.outlineWidth + ' focusVisible=' + el.matches(':focus-visible'); })()`);
         assert.equal(ring, true, `${label}：焦点环不可见（${ring}）`);
     };
@@ -271,6 +441,25 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
 
     // 每页通用检查：深浅两种主题 × 1160×720 与 960×600。
     // ① 所有可操作元素都能用 Tab 到达且焦点环可见 ② 没有横向溢出 ③ 显示出来的图标按钮都有 aria-label ④ 没有控制台错误 ⑤ 减少动态效果时没有动画
+    // 053：真实 Tab / Shift+Tab 后，焦点控件不能停在吸顶页头下面。
+    // 只看"含吸顶页头（:scope > .page-h.sticky）的滚动容器"里的焦点；焦点在页头里面时不算。
+    // 焦点元素上边不高于页头下边（允许 0.5px 误差）才算通过。
+    const FOCUS_COVERED = `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body || el === document.documentElement) return { covered: false };
+        for (let sc = el.parentElement; sc; sc = sc.parentElement) {
+            const head = sc.querySelector(':scope > .page-h.sticky');
+            if (!head) continue;
+            const flow = getComputedStyle(sc).overflowY;
+            if (flow !== 'auto' && flow !== 'scroll') continue;
+            if (head.contains(el)) return { covered: false };
+            const r = el.getBoundingClientRect(), h = head.getBoundingClientRect();
+            if (r.top >= h.bottom - 0.5) return { covered: false };
+            const rect = x => [x.left, x.top, x.right, x.bottom].map(v => Math.round(v * 10) / 10);
+            return { covered: true, focus: el.outerHTML.slice(0, 120), focusRect: rect(r), headRect: rect(h), scrollTop: sc.scrollTop, scroll: sc.className };
+        }
+        return { covered: false };
+    })()`;
     const audit = async (page: string, prepare: () => Promise<void>) => {
         for (const [width, height] of [[1160, 720], [960, 600]]) for (const theme of ['dark', 'light'] as const) {
             win.setContentSize(width, height); nativeTheme.themeSource = theme;
@@ -285,12 +474,25 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
                 document.activeElement?.blur();
                 return usable.length;
             })()`);
+            // 053：每一步真实 Tab / Shift+Tab 之后当场判断（不重试、不等待）；失败时打印页面、主题、尺寸、方向、焦点元素与矩形、scrollTop。
+            const covered = async (direction: 'Tab' | 'Shift+Tab') => {
+                const state = await evaluate(FOCUS_COVERED);
+                if (state.covered === true) console.log(`检查不成立：${where} 按 ${direction} 后焦点控件被吸顶页头遮挡\n${JSON.stringify(state)}`);
+                assert.equal(state.covered, false, `${where} 按 ${direction} 后焦点控件被吸顶页头遮挡：${JSON.stringify(state)}`);
+            };
+            const sticky = await evaluate('!!document.querySelector(".page-h.sticky")');
+            progress.current = `${where} 键盘遍历`;
+            const tabSteps = count * 2 + 6;
             const seen = new Set<string>();
-            for (let i = 0; i < count * 2 + 6 && seen.size < count; i++) {
+            for (let i = 0; i < tabSteps && seen.size < count; i++) {
                 await key('Tab');
+                await covered('Tab');
                 const id = await evaluate('document.activeElement?.getAttribute("data-audit")');
                 if (id !== null && id !== undefined) { seen.add(id); await focusRing(`${where} 第 ${id} 个可操作元素`); }
             }
+            // 有吸顶页头的页面：从当前焦点再 Shift+Tab 倒退走一遍，次数与上面的 Tab 循环相同。
+            if (sticky) for (let i = 0; i < tabSteps; i++) { await key('Tab', ['shift']); await covered('Shift+Tab'); }
+            checks.push(`${prefix}${where}：真实 Tab${sticky ? ' / Shift+Tab' : ''} 后焦点控件不被吸顶页头遮挡`);
             const missing = await evaluate(`[...document.querySelectorAll('[data-audit]')].filter(el => !${JSON.stringify([...seen])}.includes(el.getAttribute('data-audit'))).map(el => el.outerHTML.slice(0, 80))`);
             assert.deepEqual(missing, [], `${where}：Tab 到不了的元素`);
             checks.push(`${prefix}${where}：${count} 个可操作元素都能用 Tab 到达，焦点环可见`);

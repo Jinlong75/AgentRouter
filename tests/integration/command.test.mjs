@@ -4,17 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planCommand, runCommand } from '../../core/lib/command.mjs';
+import { assertIdentitiesGone, captureIdentities } from '../fixtures/identity.mjs';
 
 const windowsOnly = process.platform === 'win32' ? false : '需要 Windows 的 cmd.exe / .cmd 或 npm.cmd 包装';
 const fixture = (t, prefix = 'ar-command-') => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   return dir;
-};
-// 按 pid 核对进程是否还在；EPERM 说明进程还在，只是不能发信号。
-const alive = pid => {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return error.code === 'EPERM'; }
 };
 
 test('真跑 npm --version：计划不经 cmd.exe，退出 0 且输出版本号', { skip: windowsOnly, timeout: 120000 }, async t => {
@@ -58,23 +54,52 @@ test('含空格与中文目录里的普通 .cmd：按路径调用成功；参数
 test('超时：结束整棵进程树，15 秒内结算，子进程与孙进程都已不存在', { timeout: 60000 }, async t => {
   const dir = fixture(t);
   // 命令自己再派生一个孙进程，验证结束的是整棵树。
-  // 启动慢的机器上 1.5 秒内可能还没写出 pid 文件，所以按 result.pid 判断子进程，孙进程只在写出 pid 文件时核对。
+  // 子进程先写 child.pid 再派生孙进程；孙进程只在写出 pid 文件时核对。
+  // 070：Windows 复用 PID 很快，只看 PID 会误判，所以按身份（PID + 创建时间）判断；
+  // 身份要在进程还活着时取，因此在 runCommand 运行期间并行轮询两个 pid 文件。
   const script = "const { spawn } = require('child_process'); const fs = require('fs');"
+    + " fs.writeFileSync('child.pid', String(process.pid));"
     + " const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });"
     + " fs.writeFileSync('grandchild.pid', String(grandchild.pid));"
     + " setInterval(() => {}, 1000)";
+  const started = Date.now();
+  let finished = false;
+  const captured = {}; // 名字 -> { pid, created, at }
+  const capture = async name => {
+    if (captured[name]) return;
+    let pid;
+    try { pid = Number(fs.readFileSync(path.join(dir, `${name}.pid`), 'utf8')); } catch { return; }
+    if (!Number.isSafeInteger(pid) || pid <= 0) return; // 文件可能还没写完
+    try {
+      const [identity] = await captureIdentities([pid], `${name} 运行期间`);
+      captured[name] = { ...identity, at: Date.now() - started };
+    } catch { /* 已不在快照里或快照失败：继续轮询，结束后统一判断 */ }
+  };
+  const poller = (async () => {
+    while (!finished) {
+      await Promise.all([capture('child'), capture('grandchild')]);
+      if (captured.child && captured.grandchild) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  })();
   const result = await runCommand(`node -e "${script}"`, { cwd: dir, env: process.env, timeoutMs: 1500 });
+  finished = true;
+  await poller;
   assert.equal(result.timedOut, true);
   assert.equal(result.exit, null);
   assert.match(result.error, /超过 1\.5 秒没有结束，已结束进程树/);
   assert.ok(result.ms < 15000, `结算用时 ${result.ms} ms`);
   assert.ok(Number.isSafeInteger(result.pid) && result.pid > 0, `result.pid：${result.pid}`);
-  assert.equal(alive(result.pid), false, `子进程 ${result.pid} 仍在运行`);
-  const pidFile = path.join(dir, 'grandchild.pid');
-  if (fs.existsSync(pidFile)) {
-    const grandchild = Number(fs.readFileSync(pidFile, 'utf8'));
+  // 子进程的断言无条件：运行期间没取到身份就失败，不能悄悄跳过。
+  assert.ok(captured.child, `运行期间没取到子进程 ${result.pid} 的身份（child.pid 未读到或不在进程快照里），无法判断它是否已退出`);
+  assert.equal(captured.child.pid, result.pid, `child.pid ${captured.child.pid} 与 result.pid ${result.pid} 不一致`);
+  await assertIdentitiesGone([captured.child], '子进程');
+  if (fs.existsSync(path.join(dir, 'grandchild.pid'))) {
+    const grandchild = Number(fs.readFileSync(path.join(dir, 'grandchild.pid'), 'utf8'));
     assert.ok(Number.isSafeInteger(grandchild) && grandchild > 0, `孙进程 pid：${grandchild}`);
-    assert.equal(alive(grandchild), false, `孙进程 ${grandchild} 仍在运行`);
+    assert.ok(captured.grandchild, `孙进程 ${grandchild} 已写出 pid 文件，但运行期间没取到它的身份`);
+    assert.equal(captured.grandchild.pid, grandchild, `孙进程身份 pid ${captured.grandchild.pid} 与 pid 文件 ${grandchild} 不一致`);
+    await assertIdentitiesGone([captured.grandchild], '孙进程');
   }
 });
 

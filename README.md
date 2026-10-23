@@ -20,13 +20,14 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 |---|---|
 | 派发任务（任务说明文件或任务文字），后台运行；进度、统一事件、汇报 | ✅ |
 | `ar wait` 等待、`ar stop` 停止整棵进程树；托管（关掉 Claude Code 会话也不中断） | ✅ |
-| 统一入口 `ar`：`dispatch · wait · stop · config · init · projects · agents · secrets · spec · version`，`--json` 供软件调用 | ✅ |
+| 统一入口 `ar`：`dispatch · wait · stop · config · init · projects · agents · secrets · spec · retry · version`，`--json` 供软件调用 | ✅ |
 | `ar init`：在任意 git 仓库生成项目配置与约定文件（幂等、不覆盖） | ✅ |
 | 技能安装器：安装、更新、备份、回退（Claude Code） | ✅ |
 | 执行者：DeepSeek、Xiaomi MiMo（经 Claude Code 外壳）、Codex；密钥只记变量名 | ✅ |
 | 调度中心：任务页、Agent 页（导入向导、测试连接）、项目页（添加、初始化、提交）、新建任务页、再派一次、批量删除 | ✅ |
 | 任务说明规范与机器门禁：执行者结束后，核心自己检查提交、改动范围并逐条运行验收命令；软件显示流水线轨道与门禁结果 | ✅ |
-| 自动重试、worktree 并行与验收合并、交叉审查、路由 | 🚧 计划中 |
+| 自动重试与升级：失败原因交回执行者、同一工作区再试，每次尝试留档；`ar retry` 与软件"重试"、尝试切换与重试历史 | ✅ |
+| worktree 并行与验收合并、交叉审查、路由 | 🚧 计划中 |
 
 ### 技术栈
 
@@ -107,6 +108,16 @@ verify:
 - 跑门禁的任务派发前要求：任务说明已提交、工作区干净（`.agent-runs/` 除外）。软件新建任务页会自动先提交任务说明。
 - Windows 上验收命令不经 shell：`npm`、`npx` 用 Node 直接运行；其他 `.cmd` / `.bat` 的参数里有 `&`、`|`、`%` 等特殊字符时拒绝运行。验收命令拿不到执行者的密钥变量，也拿不到 AgentRouter 自己的环境变量。
 
+### 失败后会发生什么
+
+用任务说明派发的任务，没通过时不会马上算失败，AgentRouter 会在**同一个工作区**再试：
+
+1. **自动重试**：门禁没通过，或执行者异常退出时，核心把失败原因原样交给执行者，包括哪条验收命令失败及其输出末尾、哪些文件越界、哪些没提交，然后让它接着改。默认最多再试 2 次（共 3 次）；任务说明写 `max_retries: N`，或项目配置写 `maxRetries`，可以改，`0` 表示不重试。执行者根本没能启动（缺密钥、找不到程序）或任务被停止时不重试。
+2. **换更强的执行者**：执行者配置写 `escalate: "<另一个执行者>"` 时，最后一次自动重试改用它。目标没有启用就不换，进度里会说明。
+3. **每次尝试都留档**：`.agent-runs/<名>/attempts/<n>/` 里有这次实际发出的指令 `prompt.md`、原始输出、汇报和门禁结果；任务目录顶层的 `report.md`、`gate.json` 是最近一次的。软件里，列表行显示"尝试 n/N"；任务详情有尝试切换条，可以按次看进展、汇报和门禁；"重试历史"每次一行。
+4. **手动重试**：自动重试用完仍失败，或者结果不满意，可以在软件里点"重试"（可以换执行者、写补充说明），或运行 `ar retry <记录名> --note "补充说明"`。已完成的任务重试时必须写补充说明。任务还在进行时不能重试，先停止。
+5. **重试不会绕过门禁**：每次都完整跑门禁。`.agent-router/` 与任务说明目录受保护，执行者改它们算越界，除非 `allowed_paths` 明确写了这个目录。删除的文件会单独列出来，方便你检查有没有删测试。
+
 ### 开发与测试
 
 ```powershell
@@ -136,13 +147,14 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 |---|---|
 | Dispatch work (spec file or task text) in the background; progress, unified events and reports | ✅ |
 | `ar wait`, `ar stop` for the whole process tree; managed mode (tasks survive closed Claude Code sessions) | ✅ |
-| Single entry `ar`: `dispatch · wait · stop · config · init · projects · agents · secrets · spec · version`, `--json` for the app | ✅ |
+| Single entry `ar`: `dispatch · wait · stop · config · init · projects · agents · secrets · spec · retry · version`, `--json` for the app | ✅ |
 | `ar init`: project config and conventions for any git repository (idempotent, never overwrites) | ✅ |
 | Skill installer: install, update, back up, roll back (Claude Code) | ✅ |
 | Workers: DeepSeek, Xiaomi MiMo (through Claude Code), Codex; only key variable names are stored | ✅ |
 | Dispatch console: Tasks, Agents (import wizard, connection test), Projects (add, initialise, commit), New Task, re-dispatch, batch delete | ✅ |
 | Task specs and machine gates: after the worker exits, the core itself checks commits and changed files and runs each verify command; the app shows a pipeline track and the gate result | ✅ |
-| Automatic retry, worktree parallelism and accept/merge, cross review, routing | 🚧 Planned |
+| Automatic retry and escalation: failures handed back to the worker, retried in the same tree, every attempt kept; `ar retry` and Retry in the app, attempt switcher and retry history | ✅ |
+| Worktree parallelism and accept/merge, cross review, routing | 🚧 Planned |
 
 ### Tech stack
 
@@ -222,6 +234,16 @@ verify:
 - Only tasks dispatched from a spec that has verify commands or restricted paths (or a type that must commit) run the gate; tasks dispatched as plain text behave exactly as before.
 - Gated tasks require a committed spec and a clean working tree (except `.agent-runs/`) at dispatch time. The app's New Task page commits the spec for you.
 - On Windows verify commands never go through a shell: `npm` and `npx` run their JS entry with Node; other `.cmd` / `.bat` files are refused if an argument contains `&`, `|`, `%` or other special characters. Verify commands get neither the worker's secret variables nor AgentRouter's own environment variables.
+
+### What happens when a task fails
+
+A task dispatched from a spec does not fail on its first miss. AgentRouter tries again **in the same working tree**:
+
+1. **Automatic retry**: when the gate fails or the worker exits abnormally, the core hands the failure back to the worker as is: which verify command failed and the tail of its output, which files are out of scope, and which are uncommitted. The worker then carries on. By default it retries up to 2 more times (3 in all). Set `max_retries: N` in the spec, or `maxRetries` in the project config, to change this; `0` means no retry. A worker that never started (missing key, program not found) and a stopped task are not retried.
+2. **Escalation**: if a worker profile has `escalate: "<another profile>"`, the last automatic retry uses that profile. If the target is not enabled, the worker stays the same and the progress log says so.
+3. **Every attempt is kept**: `.agent-runs/<name>/attempts/<n>/` holds the exact prompt sent (`prompt.md`), the raw output, the report and the gate result. The top-level `report.md` and `gate.json` are the latest. In the app, the list row shows "attempt n/N"; the task details have an attempt switcher for progress, report and gate; and Retry history shows one row per attempt.
+4. **Manual retry**: when the automatic retries are used up, or you are not happy with the result, click Retry in the app (you can pick another worker and add a note) or run `ar retry <name> --note "…"`. Retrying a finished task requires a note. A task that is still running cannot be retried; stop it first.
+5. **Retries never skip the gate**: the full gate runs every time. `.agent-router/` and the specs folder are protected. A worker that changes them is out of scope unless `allowed_paths` names that folder explicitly. Deleted files are listed separately, so you can check that no tests were removed.
 
 ### Development & testing
 

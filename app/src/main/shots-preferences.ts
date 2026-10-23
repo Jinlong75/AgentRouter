@@ -1,6 +1,6 @@
 import { readFile, writeFile, rename, rm, stat, readdir, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
-import { pollUntil } from './shots-input';
+import { pollUntil, ipcSeq, waitIpcReturn } from './shots-input';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -304,7 +304,11 @@ export async function capturePreferences(h: Harness) {
     await writeFile(config, configured);
     // 打开控件之后文件被外部破坏：写入必须失败并恢复界面原值（编辑执行者里）。
     await codexEdit();
+    // 074：先等这次输入触发的 preferences:save 返回（上限 5000 ms），再断言界面已恢复；原来不等，写入偶尔还没返回时检查就先跑了（072）。
+    const saveFrom = ipcSeq();
     await writeFile(config, 'invalid'); await press('[data-setting=tier]'); await press('.ctx button:nth-child(3)');
+    const saveMs = await waitIpcReturn('UI07 写入失败这次 preferences:save', 'preferences', 'save', saveFrom, 5000);
+    console.log(`用时 UI07 写入失败这次 preferences:save：${saveMs} ms（上限 5000 ms）`);
     await check('UI07 写入失败恢复原值并显示原因（编辑执行者）', 'document.querySelector(".sheet [data-setting=tier]").textContent.trim()==="default" && !!document.querySelector(".sheet .banner.fail")');
     await verify('UI07 写入失败不篡改文件', async () => { assert.equal(await readFile(config, 'utf8'), 'invalid'); });
     await closeSheet();
@@ -497,6 +501,22 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
         await check('UI13 选 MiMo（Token Plan）进入第 2 步：密钥变量名为 MIMO_API_KEY，隔离密钥文件里未设置', 'document.querySelector("[data-w=secretVar]").value==="MIMO_API_KEY" && document.querySelector("[data-w-status]").textContent==="未设置"');
         await save('connect-import-2-mimo-dark');
         await key('Escape'); await wait('!document.querySelector(".sheet")');
+        // 063：config.json 无效时 Agent 页显示核心的原因（不再回退到内置默认），也不显示"还没有导入执行者"的空状态；
+        // 对照：真的没有执行者（可读的空配置）时照旧显示空状态。
+        await writeFile(config, JSON.stringify({ v: 2, defaultProfile: null, managed: false, watchWindow: 'never', profiles: {} }));
+        await press('[data-page=tasks]'); await press('[data-page=connect]');
+        await wait('!!document.querySelector("[data-agents] .empty.short")', '对照：没有执行者时的空状态');
+        await check('UI06 对照：真的没有执行者时显示"还没有导入执行者"空状态', '!!document.querySelector("[data-agents] .empty.short") && document.querySelector("[data-agents] .empty.short").textContent.includes("还没有导入执行者") && !document.querySelector("[data-agents] .banner.fail")');
+        await writeFile(config, 'invalid');
+        await press('[data-page=tasks]'); await press('[data-page=connect]');
+        await wait('!!document.querySelector("[data-agents] .banner.fail")', 'Agent 页显示配置无效的原因');
+        await check('UI06 配置无效时 Agent 页显示核心的原因，不显示"还没有导入执行者"空状态', `(() => {
+            const banner = document.querySelector('[data-agents] .banner.fail');
+            return !!banner && banner.textContent.includes('config.json 无法读取') && banner.textContent.includes('不是有效的 JSON')
+                && banner.textContent.includes('请修好这个文件') && !document.querySelector('[data-agents] .empty.short')
+                && !document.body.textContent.includes('还没有导入执行者');
+        })()`);
+        await verify('UI06 配置无效时软件不改写坏文件', async () => { assert.equal(await readFile(config, 'utf8'), 'invalid'); });
         void evaluate;
     } finally {
         await rm(config, { force: true });

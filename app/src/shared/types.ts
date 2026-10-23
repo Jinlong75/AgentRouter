@@ -8,6 +8,9 @@ export interface Task {
     role: string | null;
     pid: number;
     started: number;
+    // 当前派发进程的核对时刻（065）：start 时等于 started（不写出这个字段，读取时按 pidSince ?? started），
+    // resume 时等于 resume.at；停止与存活核对用它，开始时间 / 按天分组 / 时长仍用 started。
+    pidSince?: number;
     progress: string;
     report: string;
     raw?: string;
@@ -50,7 +53,26 @@ export interface Task {
     gateSummary?: string;
     // 执行者进程自己的退出码（end.agentExit）：门禁只在它为 0 时运行。
     agentExit?: number;
+    // 尝试列表（Stage05，协议 14.2 / 14.3）：attempt / attempt-end 事件累积；
+    // 旧记录（Stage04 及更早）没有这些事件，也就没有这两个字段。
+    attempts?: TaskAttempt[];
+    // 当前尝试 = 最后一个 attempt（界面显示"尝试 n/N"、重试历史用）。
+    attempt?: TaskAttempt;
     last: string;
+}
+// 一次尝试：attempt 行先记开始信息（n、total、profile、reason、at），
+// attempt-end 补上结果（ok、exit、gate、usage、ms）；手动重试 total 为 null（协议 14.3）。
+export interface TaskAttempt {
+    n: number;
+    total: number | null;
+    profile: string | null;
+    reason: string;
+    at: number;
+    ok?: boolean;
+    exit?: number | null;
+    gate?: boolean | null;
+    usage?: { input: number | null; output: number | null };
+    ms?: number;
 }
 // 任务记录目录里的 gate.json（文件协议 12.3）；软件只读展示，不写入。
 export interface GateCommand {
@@ -73,12 +95,20 @@ export interface GateFile {
     head?: string | null;
     commit?: { required: boolean; ok: boolean };
     uncommitted?: string[];
-    scope?: { allowed?: string[]; changed?: string[]; outside?: string[] };
+    // protected / deleted 是 Stage05 加的（协议 12.3）：Stage04 写的 gate.json 没有这两个字段，按可选读取。
+    scope?: { allowed?: string[]; changed?: string[]; outside?: string[]; protected?: string[]; deleted?: string[] };
     commands?: GateCommand[];
     summary?: string;
 }
 // detail 通道里的门禁结果：文件不存在为 null，解析失败为 { error }。
 export type GateResult = GateFile | { error: string } | null;
+// console 通道 tasks:attempt-files 的返回：某一次尝试的汇报与门禁（attempts/<n>/report.md、gate.json）。
+// exists 为 false 表示这个任务没有 attempts/<n>/ 目录（旧任务），界面改读顶层文件。
+export interface AttemptFiles {
+    exists: boolean;
+    report: string;
+    gate: GateResult;
+}
 export interface Event {
     v: 1;
     seq: number;
@@ -105,6 +135,9 @@ export interface Event {
         input: number | null;
         output: number | null;
     };
+    // 事件所属的尝试（协议 14.2 第 4 条）；主进程的事件解析目前不保留这个字段，
+    // 界面没有它时按事件时刻与各次尝试的开始时刻归属。TODO(lead): events.ts 的 parseEvent 补 attempt 后界面自动优先用它。
+    attempt?: number;
     offset: number;
     time?: string;
 }

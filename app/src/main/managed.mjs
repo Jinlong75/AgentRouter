@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { watch, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, statSync } from 'node:fs';
+import { watch, existsSync, mkdirSync, readdirSync, writeFileSync, renameSync, unlinkSync, statSync } from 'node:fs';
 import { join, basename, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -10,9 +10,9 @@ const embedded = node => !['node', 'node.exe'].includes(basename(node).toLowerCa
 // onWarn：已经自动恢复、不影响使用的情况，只打一行说明（不带堆栈），避免看起来像崩溃。
 export async function createManaged(root, env = process.env, onError = console.error, onWarn = message => console.warn(message)) {
   const load = file => import(pathToFileURL(join(root, file)).href);
-  const [install, config, common, options] = await Promise.all([
+  const [install, config, common, options, json] = await Promise.all([
     load('installer/lib/install.mjs'), load('core/lib/config.mjs'), load('core/lib/managed.mjs'),
-    load('core/lib/options.mjs')]);
+    load('core/lib/options.mjs'), load('core/lib/json.mjs')]);
   const home = config.homeDirectory(env), dir = join(home, 'managed');
   const terminal = new Map();
   let watcher, timer, closed = false;
@@ -21,7 +21,7 @@ export async function createManaged(root, env = process.env, onError = console.e
     const target = file.replace(/\.(request|claimed)\.json$/, '.rejected.json');
     try {
       renameSync(file, target);
-      let value; try { value = JSON.parse(readFileSync(target, 'utf8')); } catch { value = {}; }
+      let value; try { value = json.readJson(target); } catch { value = {}; }
       writeFileSync(target + '.tmp', JSON.stringify({ ...value, reason }), { mode: 0o600 });
       renameSync(target + '.tmp', target);
     } catch (e) { if (e.code !== 'ENOENT') onError(e); }
@@ -37,7 +37,7 @@ export async function createManaged(root, env = process.env, onError = console.e
     try {
       // 技能布局：<技能目录>/core/ar.mjs，安装记录在 <技能目录>/.agent-router.json。
       const skillDir = dirname(dirname(r.script));
-      const marker = JSON.parse(readFileSync(join(skillDir, '.agent-router.json'), 'utf8'));
+      const marker = json.readJson(join(skillDir, '.agent-router.json'));
       owned = basename(r.script) === 'ar.mjs' && basename(dirname(r.script)) === 'core' && install.hosts.includes(marker.host)
         && install.installationStatus(skillDir, marker.host, 'agent-router').state === 'owned';
     } catch { /* 没有有效安装记录就不能执行。 */ }
@@ -68,7 +68,7 @@ export async function createManaged(root, env = process.env, onError = console.e
     for (const name of readdirSync(dir)) {
       const file = join(dir, name);
       if (name.endsWith('.request.json')) {
-        let r; try { r = JSON.parse(readFileSync(file, 'utf8')); } catch { reject(file, '请求文件无效'); continue; }
+        let r; try { r = json.readJson(file); } catch { reject(file, '请求文件无效'); continue; }
         const reason = verify(r, file); if (reason) { reject(file, reason); continue; }
         const claimed = file.replace(/\.request\.json$/, '.claimed.json');
         try { renameSync(file, claimed); } catch (e) { if (e.code !== 'ENOENT') onError(e); continue; }
@@ -76,7 +76,17 @@ export async function createManaged(root, env = process.env, onError = console.e
       }
       if (/\.(claimed|running|rejected|withdrawn)\.json$/.test(name)) {
         const id = name.replace(/\.(claimed|running|rejected|withdrawn)\.json$/, '');
-        const read = terminal.get(id) ?? common.terminalReader(home, id); terminal.set(id, read);
+        let read = terminal.get(id);
+        if (!read) {
+          // 带 retry 的请求（协议 14.3 / 14.4）：只认本次尝试（同编号 resume 之后）的终结事件。
+          // 读不出 JSON 按没有 retry 处理（与改动前一致）；文件刚好被改名读不到就留到下一轮。
+          let n = null;
+          try {
+            const retry = json.readJson(file)?.retry;
+            if (Number.isSafeInteger(retry?.n) && retry.n > 0) n = retry.n;
+          } catch (e) { if (e.code === 'ENOENT') continue; }
+          read = common.terminalReader(home, id, undefined, n); terminal.set(id, read);
+        }
         if (read()) { remove(file); terminal.delete(id); }
       }
     }

@@ -28,12 +28,12 @@ export function hostActions(skills, backup) {
 export const defaultChecked = state => state === 'missing' || state === 'update';
 export async function createPreferences(root, data, env = process.env) {
   const module = file => import(pathToFileURL(join(root, file)).href);
-  const [install, config, adapter, codexConfig] = await Promise.all([
+  const [install, config, adapter, codexConfig, json] = await Promise.all([
     module('installer/lib/install.mjs'), module('core/lib/config.mjs'),
-    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs')]);
+    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs'), module('core/lib/json.mjs')]);
   const home = config.homeDirectory(env), ownFile = join(data, 'preferences.json');
   let own = { notifications: true, theme: 'system', wizardDone: false, closeAction: 'ask', trayHintShown: false };
-  try { own = { ...own, ...JSON.parse(readFileSync(ownFile, 'utf8')) }; } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  try { own = { ...own, ...json.parseJson(readFileSync(ownFile, 'utf8')) }; } catch (e) { if (e.code !== 'ENOENT') throw e; }
   const saveOwn = patch => {
     const next = { ...own, ...patch }; mkdirSync(data, { recursive: true });
     writeFileSync(ownFile + '.tmp', JSON.stringify(next)); renameSync(ownFile + '.tmp', ownFile); own = next;
@@ -51,14 +51,16 @@ export async function createPreferences(root, data, env = process.env) {
   const leftoverFile = join(tmpdir(), 'agent-router-reset-leftover.json');
   const leftover = () => {
     try {
-      const value = JSON.parse(readFileSync(leftoverFile, 'utf8'));
+      const value = json.parseJson(readFileSync(leftoverFile, 'utf8'));
       return value && typeof value.home === 'string' ? value : null;
     } catch { return null; }
   };
   function settings() {
     let state;
     try { state = config.loadConfig(home, {}, {}); }
-    catch (e) { state = { ...config.readConfig(home), reason: e.message, settings: config.defaults }; }
+    // reason 给 copy.ts 的 configError 拼句：用读取层的短原因（"不是有效的 JSON"等），
+    // 错误对象里完整的协议行不重复拼进去（063：loadConfig 对无效配置直接拒绝）。
+    catch (e) { const disk = config.readConfig(home); state = { ...disk, reason: disk.reason ?? e.message, settings: config.defaults }; }
     // 设置页这一节是 Codex 执行者的设置：取 codex profile 的值（与 writeConfig 写入的位置一致），不取默认执行者的。
     if (!state.reason && state.config?.v === 2) try { state.settings = config.resolveSettings(state.config, {}, {}, 'codex').settings; } catch { /* 保留上面的值。 */ }
     const current = codexConfig.readCodexConfig(env)?.values || {};
@@ -78,7 +80,7 @@ export async function createPreferences(root, data, env = process.env) {
       const skills = h.skills.map(s => ({ skill: s.skill, version: s.version, state: skillState(s, install.version), checked: defaultChecked(skillState(s, install.version)) }));
       let installedAt = 0;
       for (const s of h.skills.filter(s => s.state === 'owned')) {
-        try { const record = JSON.parse(readFileSync(join(s.target,'.agent-router.json'),'utf8')); if(Number.isFinite(record.installedAt)) installedAt=Math.max(installedAt,record.installedAt); }
+        try { const record = json.parseJson(readFileSync(join(s.target,'.agent-router.json'),'utf8')); if(Number.isFinite(record.installedAt)) installedAt=Math.max(installedAt,record.installedAt); }
         catch { /* 检测期间记录消失时不显示时间。 */ }
       }
       let backup = false;

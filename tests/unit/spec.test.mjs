@@ -243,7 +243,7 @@ test('verify 的列表项不能为空', () => {
 
 test('mergeSpec：没有任务说明时取项目配置与默认值', () => {
   assert.deepEqual(mergeSpec({}, {}), {
-    allowed_paths: ['**'], verify: [], expect_commit: false, timeout_min: 60, verify_timeout_min: 10, gate: false,
+    allowed_paths: ['**'], verify: [], expect_commit: false, timeout_min: 60, verify_timeout_min: 10, max_retries: 2, gate: false,
   });
 });
 
@@ -283,6 +283,24 @@ test('mergeSpec：超时默认 60 / 10，写了就用', () => {
   const merged = mergeSpec({ timeout_min: 5, verify_timeout_min: 2 });
   assert.equal(merged.timeout_min, 5);
   assert.equal(merged.verify_timeout_min, 2);
+});
+
+test('mergeSpec：verify_timeout_min 任务说明优先，压过项目配置 verifyTimeoutMin', () => {
+  assert.equal(mergeSpec({ verify_timeout_min: 5 }, { verifyTimeoutMin: 20 }).verify_timeout_min, 5);
+});
+
+test('mergeSpec：任务说明没写时项目配置 verifyTimeoutMin 兜底', () => {
+  assert.equal(mergeSpec({}, { verifyTimeoutMin: 20 }).verify_timeout_min, 20);
+});
+
+test('mergeSpec：项目配置 verifyTimeoutMin 不是正整数时当没写，取默认 10', () => {
+  for (const value of [0, -1, 1.5, '20', null]) {
+    assert.equal(mergeSpec({}, { verifyTimeoutMin: value }).verify_timeout_min, 10, `verifyTimeoutMin: ${JSON.stringify(value)}`);
+  }
+});
+
+test('mergeSpec：任务说明与项目配置都没写 verify_timeout_min → 10', () => {
+  assert.equal(mergeSpec({}, {}).verify_timeout_min, 10);
 });
 
 test('mergeSpec：gate 的三个条件分别为真', () => {

@@ -6,6 +6,7 @@ import { existsSync, readdirSync, statSync, rmSync, chmodSync, readFileSync, wri
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
+import { parseJson } from '../../../core/lib/json.mjs';
 
 // monitor/ 下由 Chromium 自己写的缓存目录；preferences.json / window.json / tasks.json 等不在此列。
 export const cacheDirectoryNames = [
@@ -250,7 +251,7 @@ export function writeResetMarker(home) {
 }
 export function readResetMarker(home) {
   try {
-    const value = JSON.parse(readFileSync(resetMarkerPath(home), 'utf8'));
+    const value = parseJson(readFileSync(resetMarkerPath(home), 'utf8'));
     return value && typeof value.home === 'string' ? value : null;
   } catch { return null; }
 }
@@ -265,7 +266,7 @@ export function assertResetMarker(home, options = {}) {
 export function leftoverPath(tmp = os.tmpdir()) { return path.join(tmp, 'agent-router-reset-leftover.json'); }
 export function readLeftover(tmp = os.tmpdir()) {
   try {
-    const value = JSON.parse(readFileSync(leftoverPath(tmp), 'utf8'));
+    const value = parseJson(readFileSync(leftoverPath(tmp), 'utf8'));
     return value && typeof value.home === 'string' ? value : null;
   } catch { return null; }
 }
@@ -296,7 +297,11 @@ export async function cleanupHome(options = {}) {
   if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) throw Error('拒绝删除：不能删除包含用户主目录的路径');
   const markerFile = path.join(target, '.agent-router-reset.json');
   let marker;
-  try { marker = JSON.parse(fs.readFileSync(markerFile, 'utf8')); }
+  // 自包含：这段函数会被 toString() 后独立执行，BOM 去除就地写（U+FEFF），不引用模块里的工具。
+  try {
+    const text = fs.readFileSync(markerFile, 'utf8');
+    marker = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+  }
   catch { throw Error('拒绝删除：找不到重置标记'); }
   if (!marker || typeof marker.home !== 'string' || path.resolve(marker.home) !== target) throw Error('拒绝删除：路径不是软件当前使用的公共目录');
 

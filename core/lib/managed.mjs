@@ -1,14 +1,15 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, readSync, closeSync, statSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, renameSync, openSync, readSync, closeSync, statSync } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { waitInterval } from './wait.mjs';
 import { taskPaths } from './records.mjs';
+import { readJson } from './json.mjs';
 
 function appName(value) {
   return typeof value === 'string' && value.trim() ? Array.from(value.trim()).slice(0, 40).join('') : 'AgentRouter';
 }
 export function viewerApp(home) {
-  try { return appName(JSON.parse(readFileSync(join(home, 'viewer.json'), 'utf8'))?.app); }
+  try { return appName(readJson(join(home, 'viewer.json'))?.app); }
   catch { return 'AgentRouter'; }
 }
 export const managedMessage = app => `托管：任务已交给 ${appName(app)}，关掉当前会话也不会中断。`;
@@ -23,7 +24,7 @@ export function managedEnvironment(env) {
 export function acceptsManaged(home, enabled) {
   if (!enabled) return false;
   try {
-    const viewer = JSON.parse(readFileSync(join(home, 'viewer.json'), 'utf8'));
+    const viewer = readJson(join(home, 'viewer.json'));
     if (viewer.acceptsManaged !== true || !Number.isSafeInteger(viewer.pid) || viewer.pid <= 0) return false;
     process.kill(viewer.pid, 0); return true;
   } catch { return false; }
@@ -71,15 +72,18 @@ function validProfileConfig(p) {
 }
 export const existingPaths = taskPaths;
 // 只处理完整行，保留尾部半行；轮询时不重复读取整个清单。
-export function terminalReader(home, id, onStart = () => {}) {
+// afterResume（可选，协议 14.4）：给了正整数 n 时，只认清单里 n 相同的 resume 之后的 end / interrupted；
+// 之前（上一次尝试）的终结事件忽略。不传时行为不变。
+export function terminalReader(home, id, onStart = () => {}, afterResume = null) {
   let offset = 0, pending = Buffer.alloc(0);
+  let armed = afterResume === null;
   // 同一任务的 gate 事件总在 end 之前；读到 end 时把它一并交给等待方（协议 13）。
   let gate = null;
   return () => {
     let fd;
     try {
       const file = join(home, 'runs.jsonl'), size = statSync(file).size;
-      if (size < offset) { offset = 0; pending = Buffer.alloc(0); gate = null; }
+      if (size < offset) { offset = 0; pending = Buffer.alloc(0); gate = null; armed = afterResume === null; }
       fd = openSync(file, 'r');
       while (offset < size) {
         const chunk = Buffer.alloc(Math.min(65536, size - offset));
@@ -93,7 +97,8 @@ export function terminalReader(home, id, onStart = () => {}) {
             if ((e.v === 1 || e.v === 2) && e.id === id) {
               if (e.event === 'start') onStart(e);
               if (e.event === 'gate') gate = { ok: e.ok === true, summary: e.summary };
-              if (['end','interrupted'].includes(e.event)) return gate ? { ...e, gate } : e;
+              if (e.event === 'resume' && e.n === afterResume) { armed = true; gate = null; }
+              if (armed && ['end','interrupted'].includes(e.event)) return gate ? { ...e, gate } : e;
             }
           } catch { /* 忽略损坏行。 */ }
         }
@@ -113,7 +118,7 @@ export async function handoff(home, request, announce, { timeout = 5000, startTi
   while (true) {
     // 拒绝先于认领判断；认领者完成 reason 原子写入后才回退。
     if (existsSync(base + '.rejected.json')) {
-      const rejected = JSON.parse(readFileSync(base + '.rejected.json', 'utf8'));
+      const rejected = readJson(base + '.rejected.json');
       if (typeof rejected.reason === 'string') return { reason: rejected.reason };
     }
     const ended = terminal();

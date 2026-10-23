@@ -2,6 +2,7 @@ import { readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node
 import { join, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homeDirectory, legacyHomeFor, userDirectory, noWatchEnv, pickName } from './compat.mjs';
+import { parseJson } from './json.mjs';
 
 export { homeDirectory, userDirectory };
 // codex 执行者的派发设置与窗口策略的内置默认值。
@@ -33,7 +34,8 @@ export function migrateV1(v1 = {}) {
     ...(Object.keys(otherAgents).length ? { agents: otherAgents } : {}),
   };
 }
-// 没有配置或配置无法读取时的内置默认：等同于迁移一份空的 v1 配置（Codex 可用，与 DispatchDock 行为一致）。
+// 没有配置时的内置默认：等同于迁移一份空的 v1 配置（Codex 可用，与 DispatchDock 行为一致）。
+// 配置存在却读不了时不走这里（协议第 4 节：拒绝，不回退到内置默认的真实 Codex）。
 export const builtinConfig = () => migrateV1({});
 // 首次写入（config init、首次引导）时把默认值显式写进文件，之后来源显示 config.json（继承 v1 的写法）。
 const initialConfig = () => migrateV1({ agents: { codex: { model: null, effort: null, tier: null, sandbox: 'workspace-write' } }, watchWindow: 'auto', managed: false });
@@ -43,7 +45,7 @@ function readJson(file) {
   try { text = readFileSync(file, 'utf8'); }
   catch (error) { return { exists: error.code !== 'ENOENT', reason: error.code === 'ENOENT' ? null : `读取失败：${error.code}` }; }
   let value;
-  try { value = JSON.parse(text); }
+  try { value = parseJson(text); }
   catch { return { exists: true, reason: '不是有效的 JSON' }; }
   if (!object(value) || ![1, 2].includes(value.v)) return { exists: true, reason: 'v 不是 1 或 2' };
   return { exists: true, reason: null, value };
@@ -63,6 +65,13 @@ export function readConfig(home) {
     if (legacy.value?.v === 1) return { file, exists: false, reason: null, config: {}, legacy: { file: legacyFile, config: migrateV1(legacy.value) } };
   }
   return { file, exists: false, reason: null, config: {} };
+}
+
+// 配置文件存在却读不了（不是 JSON、v 不是 1 或 2、读取出错）：一律拒绝（协议第 4 节，Stage05 058 事故——
+// 回退到内置默认等于悄悄改用真实 Codex）。action：派发族与只读命令是"这次没有派发"（协议原文），
+// 写入类命令换成"这次没有改动配置"，其余文字与路径不变。
+export function configInvalid(state, action = '这次没有派发') {
+  return Object.assign(new Error(`配置：config.json 无法读取（${state.reason}）。为免改用你没有选的执行者，${action}。请修好这个文件，或者删掉它（删掉后按内置默认）：${state.file}`), { arCode: 'CONFIG_INVALID' });
 }
 
 function writeAtomic(home, file, config) {
@@ -133,6 +142,8 @@ export function resolveSettings(config, opts = {}, env = {}, profileName) {
 
 export function loadConfig(home, opts = {}, env = process.env) {
   const state = readConfig(home);
+  // 配置无效：在读取任何回退之前就拒绝，不派发、不写入（063）。
+  if (state.reason) throw configInvalid(state);
   let config = state.config, warning = null;
   if (state.legacy) {
     // 旧目录的 v1 配置迁移到新目录；旧文件不动。
@@ -140,8 +151,6 @@ export function loadConfig(home, opts = {}, env = process.env) {
     writeAtomic(home, state.file, config);
     warning = `配置：已把旧版 config.json 迁移到 AgentRouter（原文件保留在 ${state.legacy.file}）`;
     Object.assign(state, { exists: true, config });
-  } else if (state.reason) {
-    config = builtinConfig(); warning = `配置：config.json 无法读取（${state.reason}），本次按内置默认运行`;
   } else if (!state.exists) {
     config = builtinConfig(); warning = '配置：未找到 config.json，模型、强度、档位跟随 Codex 自己的配置';
   } else if (state.upgraded) warning = '配置：config.json 是旧版本，已按 v2 解读';
@@ -152,8 +161,9 @@ export function loadConfig(home, opts = {}, env = process.env) {
 
 export function writeConfig(home, changes = {}, { init = false } = {}) {
   const state = readConfig(home);
+  // 写入类命令在配置无效时拒绝（063）：坏文件一个字节都不动；config init 也不再拿"文件存在"搪塞。
+  if (state.reason) throw configInvalid(state, '这次没有改动配置');
   if (init && state.exists) return { ...state, unchanged: true };
-  if (state.reason) throw new Error(`无法读取（${state.reason}），请先修好或删掉 config.json`);
   for (const [key, value] of Object.entries(changes)) {
     if (key !== 'managed' && !Object.hasOwn(defaults, key)) throw new Error(`未知配置键：${key}`);
     validate(key, value, '命令行');
@@ -179,7 +189,8 @@ export function writeConfig(home, changes = {}, { init = false } = {}) {
 // 修改整份配置（执行者增删、启停）：在当前配置（没有时用首次写入的默认、或旧目录迁移来的）上修改，校验后原子写入。
 export function updateConfig(home, mutate) {
   const state = readConfig(home);
-  if (state.reason) throw new Error(`无法读取（${state.reason}），请先修好或删掉 config.json`);
+  // 执行者增删改走这里：配置无效时拒绝（063），不写入任何文件。
+  if (state.reason) throw configInvalid(state, '这次没有改动配置');
   const config = structuredClone(state.exists ? state.config : state.legacy?.config ?? initialConfig());
   mutate(config);
   config.v = 2;
@@ -190,6 +201,8 @@ export function updateConfig(home, mutate) {
 
 export function formatConfig(home, env = process.env) {
   const state = readConfig(home);
+  // 只读显示也拒绝（063）：不列出内置默认的执行者。
+  if (state.reason) throw configInvalid(state);
   let profileLine = '', settings, sources, codexNote = null;
   try {
     const loaded = loadConfig(home, {}, env);
@@ -202,7 +215,6 @@ export function formatConfig(home, env = process.env) {
     profileLine = `  执行者：无（${error.message}）`;
   }
   const lines = [`配置文件：${state.file}（${state.exists || state.legacy ? '已存在' : '不存在'}）${profileLine}`];
-  if (state.reason) lines.push(`无法读取（${state.reason}）`);
   if (codexNote) lines.push(codexNote);
   // 中文字符占两列；保留原有列宽，不引入终端格式化依赖。
   const padColumn = (text, width) => {

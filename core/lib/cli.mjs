@@ -1,7 +1,6 @@
-// ar 子命令：dispatch · wait · stop · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs）。
+// ar 子命令：dispatch · redispatch · retry · wait · stop · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs）。
 // 所有面向软件的命令支持 --json：标准输出只有一个 JSON 对象；出错时 { ok:false, error } 且退出码非 0。
 import { trace, tracing } from './trace.mjs';
-import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { run } from './run.mjs';
 import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from './compat.mjs';
@@ -12,15 +11,17 @@ import { agentsCommand, secretsCommand, listAgents } from './agents.mjs';
 import { unsetUserSecret } from './secrets.mjs';
 import { initCommand, projectsCommand } from './project.mjs';
 import { specCommand, readSpecForm } from './spec-new.mjs';
-import { readDispatch } from './records.mjs';
+import { readDispatch, optionArgs } from './records.mjs';
+import { readJson } from './json.mjs';
 
-export const commands = ['dispatch', 'redispatch', 'wait', 'stop', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'version', '--run-request'];
+export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'version', '--run-request'];
 export { listAgents };
 const legacy = { '--wait': 'wait', '--stop': 'stop', '--config': 'config' };
 export const usage = [
   '用法：',
   '  ar dispatch <任务说明 | "任务文字"> [补充说明] [--profile <名>] [--role <角色>] [--name <记录名>] [--host claude-code|agentrouter] [--sandbox …] [--watch-window …] [--detach]',
   '  ar redispatch <记录名> [--detach] [--host claude-code|agentrouter]（按记录里保存的参数再派发一次，记录名自动去重）',
+  '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--detach] [--host claude-code|agentrouter]（同一工作区手动重试下一次尝试，协议 14.3）',
   '  ar wait [记录名]　　ar stop <记录名>　　ar config [键=值 … | init]',
   '  ar init [项目路径] [--dry-run]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径>|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
   '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--base-url …] [--secret-var …] [--auth login|token]|update <名> […|--max-turns <正整数>|-]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
@@ -42,7 +43,7 @@ export function coreVersion(scriptPath) {
   // 开发：core/../package.json；软件：resources/app/package.json；技能：技能目录/package.json。
   // 安装后的技能没有 package.json，版本在技能目录的安装记录 .agent-router.json 里。
   for (const file of [join(dirname(scriptPath), '..', 'package.json'), join(dirname(scriptPath), '..', '.agent-router.json'), join(dirname(scriptPath), 'package.json')]) {
-    try { const version = JSON.parse(readFileSync(file, 'utf8')).version; if (typeof version === 'string') return version; } catch { /* 换下一个位置。 */ }
+    try { const version = readJson(file).version; if (typeof version === 'string') return version; } catch { /* 换下一个位置。 */ }
   }
   return 'unknown';
 }
@@ -101,11 +102,40 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           const saved = readDispatch(cwd, names[0]);
           if (!saved) throw new Error('这个任务是旧版本派发的，没有保存派发参数，不能再派一次');
           runArgs = [saved.task, ...(saved.extra ? [saved.extra] : []), '--name', saved.name, '--profile', saved.profile,
-            ...(saved.role ? ['--role', saved.role] : []), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
+            ...(saved.role ? ['--role', saved.role] : []), ...optionArgs(saved.options), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
         } else runArgs = command === 'dispatch' ? rest : ['--run-request', ...rest];
         const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, onDetach: id => { detach = id; }, onGate: value => { gate = value; } }));
         const name = lines.find(l => l.startsWith('记录名：'))?.slice(4), progress = lines.find(l => l.startsWith('进度：'))?.slice(3);
         emit({ ok: code === 0, exit: code, name: name ?? null, progress: progress ?? null, ...(detach ? { id: detach, detached: true } : {}), ...(gate ? { gate } : {}), lines, ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '派发失败' }) });
+        return code;
+      }
+      case 'retry': {
+        // 手动重试（协议 14.3，任务 059）：记录名允许中文、空格等（同 redispatch），只校验个数与开关取值。
+        const usageText = '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--detach] [--host claude-code|agentrouter]';
+        let profile = null, note = null, host = null;
+        const names = [];
+        for (let i = 0; i < rest.length; i++) {
+          const a = rest[i];
+          if (a === '--detach') continue;
+          if (a === '--profile' || a === '--note' || a === '--host') {
+            const value = rest[++i];
+            if (value === undefined || value.startsWith('--')) throw new Error(usageText);
+            if (a === '--profile') profile = value; else if (a === '--note') note = value; else host = value;
+            continue;
+          }
+          names.push(a);
+        }
+        if (names.length !== 1 || !names[0] || names[0].startsWith('--')) throw new Error(usageText);
+        // 派活方取值同 dispatch：claude-code（技能 / 会话）、agentrouter（监控软件），其他值报错。
+        if (host && !['claude-code', 'agentrouter'].includes(host)) throw new Error(`无效的派活方：${host}`);
+        let retried = null, detached = null, gate = null;
+        const code = await capture(() => run({ scriptPath, env, root: cwd, retry: { name: names[0], profile, note, detach: rest.includes('--detach'), host },
+          onRetry: value => { retried = value; }, onDetach: id => { detached = id; }, onGate: value => { gate = value; } }));
+        const recordName = lines.find(l => l.startsWith('记录名：'))?.slice(4) ?? null;
+        const progress = lines.find(l => l.startsWith('进度：'))?.slice(3) ?? null;
+        emit({ ok: code === 0, exit: code, id: retried?.id ?? detached ?? null, name: recordName, n: retried?.n ?? null, progress,
+          ...(detached ? { detached: true } : {}), ...(gate ? { gate } : {}), lines,
+          ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '重试失败' }) });
         return code;
       }
       case 'wait': {

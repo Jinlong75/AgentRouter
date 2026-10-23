@@ -51,8 +51,8 @@ function setup(t, { profile = loadPreset('deepseek').profile } = {}) {
 test('claude-code 端到端（回放真实样例）：进度、统一事件、汇报 = result 文本、清单带 profile 与 adapter', { skip: process.platform !== 'win32' }, t => {
   const s = setup(t), result = s.invoke();
   assert.equal(result.status, 0, result.stderr);
-  const [start, spawned, end] = jsonl(path.join(s.home, 'runs.jsonl'));
-  assert.deepEqual([start.event, spawned.event, end.event], ['start', 'spawned', 'end']);
+  const [start, attempt, spawned, attemptEnd, end] = jsonl(path.join(s.home, 'runs.jsonl'));
+  assert.deepEqual([start.event, attempt.event, spawned.event, attemptEnd.event, end.event], ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   assert.equal(start.profile, 'deepseek'); assert.equal(start.adapter, 'claude-code'); assert.equal(start.agent, 'claude-code');
   assert.equal(start.model, 'deepseek-v4-pro', '模型名取自执行者配置');
   assert.equal(start.agentVersion, '2.1.302 (Claude Code)');
@@ -98,6 +98,6 @@ test('claude-code 缺少密钥：不启动执行者，记录启动失败，提�
   assert.ok(!fs.existsSync(path.join(s.base, 'env.json')), '执行者没有启动');
   const progress = fs.readFileSync(path.join(s.dir, 'progress.log'), 'utf8');
   assert.match(progress, /出错：启动 DeepSeek V4 Pro 失败：未设置密钥 AR_TEST_SURELY_MISSING_KEY_7Q/);
-  assert.deepEqual(jsonl(path.join(s.home, 'runs.jsonl')).map(r => r.event), ['start', 'end']);
+  assert.deepEqual(jsonl(path.join(s.home, 'runs.jsonl')).map(r => r.event), ['start', 'attempt', 'attempt-end', 'end']);
   s.assertNoSecret(result);
 });

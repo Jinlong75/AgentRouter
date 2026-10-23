@@ -23,7 +23,9 @@ function dispatch(t, profileName) {
   const profiles = { codex: { adapter: 'codex' }, deepseek: loadPreset('deepseek').profile };
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: profileName, profiles, managed: false }));
   const env = {};
-  for (const [k, v] of Object.entries(process.env)) if (!/^(CODEX_|ANTHROPIC_|CLAUDE|AR_|FAKE_|AGENT_ROUTER_)/i.test(k)) env[k] = v;
+  // GIT_CONFIG_GLOBAL 也不带进来：064 起核心会把调用方的这个变量交给执行者（沙箱里 git 仍用真实全局配置），
+  // 在执行者会话里跑测试时外层环境就带着它（Stage05 058 第 4 次派发），这里要的是与外层无关的固定输入。
+  for (const [k, v] of Object.entries(process.env)) if (!/^(CODEX_|ANTHROPIC_|CLAUDE|AR_|FAKE_|AGENT_ROUTER_|GIT_CONFIG_GLOBAL$)/i.test(k)) env[k] = v;
   Object.assign(env, UNRELATED, PROXY, { DEEPSEEK_API_KEY: SOURCE, CLAUDECODE: '1', CLAUDE_CODE_MESSAGING_TOKEN: 'lead-messaging-token',
     AGENT_ROUTER_HOME: home, AR_NO_WATCH: '1', AR_TEST_AGENT: fake, AR_TEST_ENV_NAMES: path.join(base, 'names.json'),
     USERPROFILE: base, HOME: base, APPDATA: base, CODEX_HOME: path.join(base, 'codex') });

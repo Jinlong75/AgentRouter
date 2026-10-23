@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { createConsole, claudeLaunch } from '../../app/src/main/console.mjs';
 import { dayGroup } from '../../app/src/shared/types.ts';
 
@@ -320,6 +322,53 @@ test('shell:open-folder / shell:open-claude：只接受已登记项目，交给�
   const s2 = createConsole({ coreRun: unregistered.coreRun, chooseFolder: async () => null, messages, launch: async () => assert.fail('不应启动') });
   await assert.rejects(s2.call('shell:open-claude', { path: other }), /这个项目没有登记/);
   await assert.rejects(s2.call('shell:open-claude', { path: 'relative' }), /参数无效/);
+});
+
+// 074：tasks:attempt-files 只读"任务清单里的记录目录"。用系统临时目录里的真实文件；注入的 knownRunDir 代表主进程已读到的任务。
+test('tasks:attempt-files：清单里的目录照常返回；形状合法但不在清单里的目录拒绝，也不读文件', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ar-attempt-files-'));
+  try {
+    const known = path.join(root, 'repo-a', '.agent-runs', '012-示例');
+    const stranger = path.join(root, 'repo-b', '.agent-runs', '013-别处');
+    for (const dir of [known, stranger]) {
+      await mkdir(path.join(dir, 'attempts', '1'), { recursive: true });
+      await writeFile(path.join(dir, 'attempts', '1', 'report.md'), `汇报：${path.basename(dir)}`);
+      await writeFile(path.join(dir, 'attempts', '1', 'gate.json'), JSON.stringify({ passed: true }));
+    }
+    const asked = [];
+    const service = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages, knownRunDir: dir => { asked.push(dir); return path.resolve(dir).toLowerCase() === path.resolve(known).toLowerCase(); } });
+    // ① 清单里的目录：照常返回汇报与门禁。
+    assert.deepEqual(await service.call('tasks:attempt-files', { dir: known, n: 1 }), { exists: true, report: '汇报：012-示例', gate: { passed: true } });
+    // ② 路径形状合法（…/.agent-runs/<名>）、文件也真实存在，但不在清单里：参数无效，不是返回内容。
+    await assert.rejects(service.call('tasks:attempt-files', { dir: stranger, n: 1 }), /参数无效/);
+    // ② 目录根本不存在：同样是参数无效，而不是 exists:false。
+    await assert.rejects(service.call('tasks:attempt-files', { dir: path.join(root, 'repo-c', '.agent-runs', '014-不存在'), n: 1 }), /参数无效/);
+    // 形状不对的参数在询问清单之前就被挡掉。
+    asked.length = 0;
+    await assert.rejects(service.call('tasks:attempt-files', { dir: path.join(root, 'repo-a'), n: 1 }), /参数无效/);
+    await assert.rejects(service.call('tasks:attempt-files', { dir: known, n: 0 }), /参数无效/);
+    assert.deepEqual(asked, []);
+    // 没有注入判断函数时一律拒绝（默认不放行）。
+    const bare = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages });
+    await assert.rejects(bare.call('tasks:attempt-files', { dir: known, n: 1 }), /参数无效/);
+    // 判断函数可以是异步的。
+    const slow = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages, knownRunDir: async dir => dir === known });
+    assert.equal((await slow.call('tasks:attempt-files', { dir: known, n: 1 })).exists, true);
+    await assert.rejects(slow.call('tasks:attempt-files', { dir: stranger, n: 1 }), /参数无效/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('tasks:attempt-files：同一目录只是大小写不同（Windows）也接受，没有 attempts/ 的旧任务 exists 为 false', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ar-attempt-files-'));
+  try {
+    const known = path.join(root, 'repo-a', '.agent-runs', 'Old-Task');
+    await mkdir(known, { recursive: true });
+    const ci = process.platform === 'win32';
+    const service = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages, knownRunDir: dir => (ci ? path.resolve(dir).toLowerCase() === path.resolve(known).toLowerCase() : dir === known) });
+    const differentCase = path.join(root, 'REPO-A', '.agent-runs', 'old-task');
+    if (ci) assert.deepEqual(await service.call('tasks:attempt-files', { dir: differentCase, n: 1 }), { exists: false, report: '', gate: null });
+    assert.deepEqual(await service.call('tasks:attempt-files', { dir: known, n: 1 }), { exists: false, report: '', gate: null });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 // 037 第 2 项：任务列表 / 新建任务页"今天 / 昨天"分组的纯函数（输入：任务开始时刻、"现在"）。

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { buildEnv, authOf, allowedEnv, secretSources } from '../../core/lib/env.mjs';
+import { buildEnv, authOf, allowedEnv, secretSources, sandboxHome, ensureSandboxHome } from '../../core/lib/env.mjs';
 import { codex } from '../../core/adapters/codex.mjs';
 import { loadPreset, listPresets } from '../../core/lib/agents.mjs';
 import { claudeCode } from '../../core/adapters/claude-code.mjs';
@@ -32,7 +32,10 @@ test('白名单 + 清除项（名字或模式、不区分大小写）；覆盖�
   const snapshot = { ...base };
   const adapter = { isolate: () => ({ clear: ['TEMP'], set: { FOO: 'iso' } }) };
   const env = buildEnv({ base, adapter, home, profileName: 'p', profile: { env: { FOO: 'profile', foo2: 'v' }, secrets: { BAR: 'KEY_SRC' } }, resolve: n => `resolved:${n}` });
-  assert.deepEqual(env, { Path: 'p', FOO: 'iso', foo2: 'v', BAR: 'resolved:KEY_SRC' });
+  // 064：执行者的用户目录指向沙箱（协议第 7 节），USERPROFILE / HOME（Windows 另有 HOMEDRIVE / HOMEPATH）是沙箱路径。
+  const sandbox = sandboxHome(home, 'p');
+  assert.deepEqual(env, { Path: 'p', FOO: 'iso', foo2: 'v', BAR: 'resolved:KEY_SRC', USERPROFILE: sandbox, HOME: sandbox,
+    ...(process.platform === 'win32' ? { HOMEDRIVE: 'D:', HOMEPATH: sandbox.slice(2) } : {}) });
   assert.deepEqual(base, snapshot);
 });
 
@@ -153,7 +156,9 @@ test('白名单：codex 与 claude-code 执行者环境里都没有密钥来源�
       assert.ok(!Object.keys(env).some(k => k.toLowerCase() === key.toLowerCase()), `${name} 环境里出现了 ${key}`);
     for (const value of [...Object.values(UNRELATED), KEYS.ANTHROPIC_API_KEY, KEYS.CLAUDE_CODE_OAUTH_TOKEN, 'lead-token', 'msg-token', 'https://lead.example', 'lead-model'])
       assert.ok(!values(env).includes(value), `${name} 环境里出现了无关的值`);
-    for (const [k, v] of Object.entries({ ...SYSTEM_BASE, ...PROXY })) assert.equal(env[k], v, `${name} 缺少 ${k}`);
+    // 064：USERPROFILE 换成沙箱（单独断言），其余系统变量与代理照原样保留。
+    for (const [k, v] of Object.entries({ ...SYSTEM_BASE, ...PROXY })) if (k !== 'USERPROFILE') assert.equal(env[k], v, `${name} 缺少 ${k}`);
+    assert.equal(env.USERPROFILE, sandboxHome(home, name), `${name} 的 USERPROFILE 应是沙箱`);
   }
   assert.equal(deepseekEnv.ANTHROPIC_AUTH_TOKEN, KEYS.DEEPSEEK_API_KEY, '自己的 secrets 照常注入（改名为目标变量）');
   assert.ok(!values(codexEnv).includes(KEYS.DEEPSEEK_API_KEY), 'codex 读不到 deepseek 的密钥');

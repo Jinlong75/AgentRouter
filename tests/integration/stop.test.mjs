@@ -57,6 +57,41 @@ test('新入口 ar.mjs 派发的任务同样能停止，其他脚本不行', asy
     assert.equal(code,expected); assert.equal(killed,expected===0);
   }
 });
+
+// 060 跨尝试读取（协议 14.4）：resume 之后按 resume.pid 与 resume.at 核对与结束。
+test('resume 之后用 resume.pid 核对与结束，写 interrupted；resume 之前的 end 不算数', async t => {
+  const f = fixture(t);
+  f.record(f.start);
+  f.record({ event: 'end', id: 'sample', exit: 1 });
+  f.record({ event: 'resume', id: 'sample', pid: 424242, n: 2, at: Date.now() });
+  const queried = [];
+  let killed = null;
+  const code = await stopTask(f.home, f.home, '中文 空格', {
+    info: async pid => { queried.push(pid); return { created: 0, command: 'node "C:\\示例\\core\\ar.mjs" dispatch 任务' }; },
+    alive: async () => true,
+    killTree: async pid => { killed = pid; },
+    log: () => {},
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(queried, [424242], '进程身份核对用 resume.pid，不是最初的 start.pid');
+  assert.equal(killed, 424242, '结束的是 resume 的进程');
+  const last = JSON.parse(readFileSync(f.file, 'utf8').trim().split('\n').at(-1));
+  assert.equal(last.event, 'interrupted');
+  assert.equal(last.id, 'sample');
+  assert.equal(last.signal, 'stopped-by-command');
+});
+
+test('resume 之后已经有新的 end：按"已经结束"处理，不结束进程', async t => {
+  const f = fixture(t);
+  const output = [];
+  const options = { log: s => output.push(s), killTree: () => assert.fail('不应结束进程') };
+  f.record(f.start);
+  f.record({ event: 'end', id: 'sample', exit: 1 });
+  f.record({ event: 'resume', id: 'sample', pid: 424242, n: 2, at: Date.now() });
+  f.record({ event: 'end', id: 'sample', exit: 0, at: Date.now() });
+  assert.equal(await stopTask(f.home, f.home, '中文 空格', options), 0);
+  assert.equal(output.pop(), '停止：中文 空格（已经结束）');
+});
 test('平台树结束必须等待子孙退出，超时失败', async () => {
   const calls=[];
   await assert.rejects(killProcessTree(123456,{platform:'win32',timeout:30,list:async()=>[{pid:123456,parent:0,created:1},{pid:123457,parent:123456,created:2}],executeFile:async(...args)=>calls.push(args),alive:pid=>pid===123457}),/超时/);

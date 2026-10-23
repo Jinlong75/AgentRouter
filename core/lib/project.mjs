@@ -7,6 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { parseJson, readJson } from './json.mjs';
 
 export const BEGIN = '<!-- agent-router:begin -->', END = '<!-- agent-router:end -->';
 const templateDir = fileURLToPath(new URL('../templates/', import.meta.url));
@@ -88,9 +89,23 @@ export function requireGitIdentity(root) {
 const read = (root, rel) => { try { return readFileSync(join(root, rel), 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
 const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-export function planInit(root, templates = loadTemplates()) {
+// 仓库的主分支（协议第 6 节 baseBranch，067）：依次取 ① origin/HEAD 指向的分支；② 本地 main；③ 本地 master；
+// ④ 当前分支（还没有分支名时 main）。返回 { name, step, source }，step 是取自第几步，source 是给人看的来源说明。
+export function detectBaseBranch(root, current = gitBranch(root)) {
+  const origin = git(root, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  const remote = origin.status === 0 ? origin.stdout.trim().replace(/^origin\//, '') : '';
+  if (remote) return { name: remote, step: 1, source: '取自 origin/HEAD（第 1 步）' };
+  for (const [step, name] of [[2, 'main'], [3, 'master']]) {
+    if (git(root, ['show-ref', '--verify', '--quiet', `refs/heads/${name}`]).status === 0) return { name, step, source: `本地有 ${name} 分支（第 ${step} 步）` };
+  }
+  const named = git(root, ['symbolic-ref', '--short', 'HEAD']).status === 0;
+  return { name: current, step: 4, source: named ? '取当前分支（第 4 步）' : '还没有分支名，用 main（第 4 步）' };
+}
+
+export function planInit(root, templates = loadTemplates(), base = null) {
   root = resolve(root);
-  const { branch } = gitRoot(root);
+  gitRoot(root);
+  const { name: branch } = base ?? detectBaseBranch(root);
   const plan = [];
   const create = (rel, content) => { if (read(root, rel) === null) plan.push({ path: rel, action: 'create', content }); };
   create('.agent-router/project.json', templates.project(basename(root), branch));
@@ -128,7 +143,7 @@ export function applyInit(root, plan, home) {
 const projectsFile = home => join(home, 'projects.json');
 export function readProjects(home) {
   try {
-    const value = JSON.parse(readFileSync(projectsFile(home), 'utf8'));
+    const value = readJson(projectsFile(home));
     if (value?.v === 1 && Array.isArray(value.projects)) return value.projects.filter(p => typeof p?.path === 'string');
     throw new Error('projects.json 格式无效');
   } catch (error) { if (error.code === 'ENOENT') return []; throw new Error(`projects.json 无法读取（${error.message}）`); }
@@ -173,7 +188,7 @@ async function projectStatus(p) {
 function readProjectConfig(root) {
   const raw = read(root, '.agent-router/project.json');
   if (raw === null) return { config: null, configError: null };
-  try { return { config: JSON.parse(raw), configError: null }; }
+  try { return { config: parseJson(raw), configError: null }; }
   catch (error) { return { config: null, configError: `project.json 无法解析：${error.message}` }; }
 }
 // 公共目录 runs.jsonl 里这个仓库最近一条 start 的 { name, started }。
@@ -238,7 +253,7 @@ function projectConfig(root, assignments) {
   const raw = read(root, '.agent-router/project.json');
   if (raw === null) throw new Error('项目还没有初始化：先运行 ar init');
   let config;
-  try { config = JSON.parse(raw); } catch (error) { throw new Error(`project.json 无法解析：${error.message}`); }
+  try { config = parseJson(raw); } catch (error) { throw new Error(`project.json 无法解析：${error.message}`); }
   if (!assignments.length) return { config };
   const next = structuredClone(config);
   for (const a of assignments) {
@@ -281,12 +296,16 @@ export function initCommand(rest, { home, cwd, json }) {
   const dryRun = rest.includes('--dry-run'), positional = rest.filter(a => a !== '--dry-run');
   if (positional.length > 1 || positional.some(a => a.startsWith('--'))) throw new Error('用法：ar init [项目路径] [--dry-run]');
   const root = resolve(cwd, positional[0] ?? '.');
-  const plan = planInit(root);
+  gitRoot(root);
+  const base = detectBaseBranch(root);
+  const plan = planInit(root, undefined, base);
   const changes = dryRun ? plan.map(({ path, action }) => ({ path, action })) : applyInit(root, plan, home);
+  // 主分支只有这次要新建 project.json 时才有意义（已有的不改）；--dry-run 的计划里写出取到的值和来源。
+  const baseInfo = dryRun && plan.some(p => p.path === '.agent-router/project.json') ? { name: base.name, step: base.step, source: base.source } : null;
   if (json) {
-    // 只有 --dry-run 才带 content / preview；不加 --dry-run 的输出不变。
+    // 只有 --dry-run 才带 content / preview 与 baseBranch；不加 --dry-run 的输出不变。
     const jsonChanges = dryRun ? plan.map(({ path, action, content }) => ({ path, action, content, preview: previewOf(root, { path, action, content }) })) : changes;
-    return { ok: true, root, dryRun, changes: jsonChanges, registered: !dryRun };
+    return { ok: true, root, dryRun, changes: jsonChanges, registered: !dryRun, ...(baseInfo ? { baseBranch: baseInfo } : {}) };
   }
   const lines = [];
   if (!changes.length) lines.push(`没有需要改动的文件：${root}`);
@@ -294,6 +313,7 @@ export function initCommand(rest, { home, cwd, json }) {
     lines.push(`${dryRun ? '将要改动' : '已改动'}（${root}）：`);
     for (const c of changes) lines.push(`  ${actionText[c.action]}  ${c.path}`);
   }
+  if (baseInfo) lines.push(`主分支（baseBranch）：${baseInfo.name}（${baseInfo.source}）`);
   if (!dryRun) {
     lines.push(`已登记项目：${root}`);
     if (changes.length) {

@@ -8,7 +8,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { build } from 'esbuild';
-import { pidAlive, processList, redactPaths } from '../../core/lib/process.mjs';
+import { identityAlive, pidAlive, processList, redactPaths } from '../../core/lib/process.mjs';
+import { cleanupProcesses } from '../fixtures/identity.mjs';
 
 // 049：停止任务时的结束顺序。全部在系统临时目录、隔离的 AGENT_ROUTER_HOME 与 fake 执行者里做，
 // 不碰真实安装、配置与进程。
@@ -94,10 +95,12 @@ function fixture(t, profile = {}, spec = null) {
     child.on('error', error => { clearTimeout(timer); reject(error); });
     child.on('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
-  // 命令行里带着这个临时仓库或隔离公共目录的进程，加上指定的 pid。
-  f.related = async pids => {
-    const list = await processList(), set = new Set(pids);
-    return list.filter(p => set.has(p.pid) || String(p.command).includes(repo) || String(p.command).includes(home));
+  // 命令行里带着这个临时仓库或隔离公共目录的进程，加上指定的进程。
+  // 069：targets 里的元素是 { pid, created } 身份时按身份（PID + 创建时间）匹配——PID 被别的进程复用不算；是纯 PID 数字时仍按 PID 匹配（停止前取快照用）。
+  f.related = async targets => {
+    const list = await processList();
+    const matches = p => targets.some(target => typeof target === 'number' ? target === p.pid : identityAlive([p], target));
+    return list.filter(p => matches(p) || String(p.command).includes(repo) || String(p.command).includes(home));
   };
   f.waitGone = async (pids, label, timeout = 5000) => {
     let left = [];
@@ -109,13 +112,8 @@ function fixture(t, profile = {}, spec = null) {
     throw Error(`${label}：仍有进程存活：${left.map(p => `pid=${p.pid} ${redactPaths(p.command)}`).join('；')}`);
   };
   t.after(async () => {
-    // 只结束命令行里带着这个临时仓库 / 隔离公共目录的进程：只按记录里的 PID 结束，
-    // 万一 PID 已经被别的进程复用，会杀掉无关的真实进程。
-    for (const p of await f.related([])) {
-      if (!pidAlive(p.pid)) continue;
-      if (process.platform === 'win32') execFileSync('taskkill.exe', ['/PID', String(p.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      else process.kill(p.pid);
-    }
+    // 只结束命令行里带着这个临时目录的进程，按身份（PID + 创建时间）逐个结束，不带 /T，不按 PID。
+    await cleanupProcesses(base, { diagnostic: message => t.diagnostic(message) });
     assert.ok(path.relative(tempRoot, base).startsWith('ar-stop-order-'));
     rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -156,13 +154,14 @@ test('--detach 任务被 ar stop 停止：清单只有 start / spawned / interru
       t.diagnostic(`第 1 次 ar stop 的进程树追踪：\n${traceSample}`);
     }
 
-    // 清单事件只有 start、spawned、interrupted：没有 end。
+    // 清单事件只有 start、attempt、spawned、interrupted：没有 end。
     assert.deepEqual(rows(f.home).filter(row => row.id === start.id).map(row => row.event),
-      ['start', 'spawned', 'interrupted'], `第 ${i} 次清单事件`);
+      ['start', 'attempt', 'spawned', 'interrupted'], `第 ${i} 次清单事件`);
     // 停止后的完整进程快照：命令行里带着这个临时仓库 / 隔离公共目录的进程为 0，两个 pid 也不在。
-    await f.waitGone([start.pid, spawned.agentPid], `第 ${i} 次停止后仍有进程`);
     const identities = [before.find(p => p.pid === start.pid), before.find(p => p.pid === spawned.agentPid)];
     assert.ok(identities.every(p => p && Number.isFinite(p.created)), `第 ${i} 次停止前快照里有派发进程与执行者的创建时间`);
+    // 069：按停止前的身份（PID + 创建时间）等它们退出，PID 被复用不再算"仍有进程存活"。
+    await f.waitGone(identities, `第 ${i} 次停止后仍有进程`);
     assert.deepEqual(await sameProcessesAlive(identities), [], `第 ${i} 次派发进程与执行者（同一 PID、同一创建时间）都已退出`);
   }
 
@@ -211,7 +210,7 @@ test('门禁中停止：清单没有 end、有 interrupted，验收命令的整�
   assert.equal(events.at(-1), 'interrupted');
   assert.ok(events.includes('gating'));
   assert.deepEqual(await sameProcessesAlive([rootBefore]), [], '派发进程（同一 PID、同一创建时间）已退出');
-  await f.waitGone([start.pid], '停止后仍有进程');
+  await f.waitGone([rootBefore], '停止后仍有进程'); // 069：按停止前的身份（PID + 创建时间）
   const left = (await processList()).filter(p => String(p.command).includes(marker));
   assert.deepEqual(left, [], '验收命令及其整棵进程树都已退出');
 

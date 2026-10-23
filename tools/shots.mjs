@@ -3,25 +3,87 @@ import electron from 'electron';
 import { preferenceFixture } from './demo/preferences.mjs';
 import path from 'node:path';
 import { demo } from './demo/index.mjs';
-import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 import { isolatedEnvKey, isolationOverrides } from '../app/src/main/app-env.mjs';
+import { unsafeHomeReason } from '../core/lib/compat.mjs';
 // 界面验收可能跨午夜（037 第 2 项）：演示数据生成与软件里的"今天 / 昨天"分组用同一个"现在"——
 // AR_DEMO_NOW（毫秒时间戳）。这里在生成演示数据之前设好；外部已设时沿用不覆盖（负向验证要指定时刻）。
 process.env.AR_DEMO_NOW ||= String(Date.now());
 // Stage04 门禁演示任务（reader-app 的 t20～t22）默认隐藏：原有列表计数与检查不变，
 // UI22 在验收里临时显示它们，检查完再恢复 hidden。
 process.env.AR_DEMO_HIDDEN_IDS ||= 't20,t21,t22';
+
+// 启动前检查（052）：假用户目录的整棵目录快照（相对路径 → 目录 / 文件的大小与修改时间），
+// 用来断言主进程拒绝时不在这棵目录里写任何东西。
+async function snapshotTree(root) {
+  const entries=new Map();
+  const walk=async dir=>{
+    for(const item of await readdir(dir,{withFileTypes:true})) {
+      const full=path.join(dir,item.name),rel=path.relative(root,full);
+      if(item.isDirectory()) { entries.set(rel,'dir'); await walk(full); }
+      else { const info=await stat(full); entries.set(rel,`${info.size}:${info.mtimeMs}`); }
+    }
+  };
+  await walk(root);
+  return entries;
+}
+// 超时后结束整棵进程树（Electron 会带出子进程）；已经退出时忽略。
+function killTree(pid) {
+  try {
+    if(process.platform==='win32') execFileSync('taskkill',['/PID',String(pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});
+    else process.kill(pid,'SIGKILL');
+  } catch { /* 已经退出 */ }
+}
+// 启动前检查（052）：公共目录指向假用户目录时，主进程必须在设置数据目录、取锁、迁移之前拒绝并以退出码 2 退出；
+// 假用户目录整棵前后完全相同。盘符根不做实测（防护失效会写进真实的盘符根），由 047 的单元测试覆盖。
+async function unsafeHomeStartupCheck(out,real,isolated) {
+  const fakeUser=await mkdtemp(path.join(tmpdir(),'agent-router-shots-user-'));
+  await writeFile(path.join(fakeUser,'known-file.txt'),'已知文件：用来核对整棵目录前后是否相同\n');
+  const before=await snapshotTree(fakeUser);
+  // 隔离覆盖与正式验收同一个机制：公共目录、用户目录都指向假用户目录；AR_SHOTS 直接设在 Electron 进程环境里（不弹框）。
+  const guardIsolated={...isolated,AGENT_ROUTER_HOME:fakeUser,USERPROFILE:fakeUser,HOME:fakeUser};
+  const guardEnv={...real,AR_SHOTS:out,[isolatedEnvKey]:JSON.stringify(isolationOverrides(real,guardIsolated))};
+  const started=Date.now();
+  const child=spawn(electron,['.'],{env:guardEnv,stdio:['ignore','pipe','pipe'],windowsHide:true,shell:false});
+  let stderr='',timedOut=false;
+  child.stdout.resume();
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data',chunk=>{stderr+=chunk;});
+  const timer=setTimeout(()=>{timedOut=true;killTree(child.pid);},20000);
+  const code=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve);});
+  clearTimeout(timer);
+  const elapsed=Date.now()-started,after=await snapshotTree(fakeUser);
+  assert.equal(timedOut,false,'主进程应在 20 秒内拒绝不安全的公共目录并退出');
+  assert.equal(code,2,`主进程应以退出码 2 拒绝不安全的公共目录（实际 ${code}）`);
+  const reason=unsafeHomeReason(path.resolve(fakeUser));
+  assert.ok(stderr.includes(reason),`标准错误应包含原因原文（实际：${stderr.trim()||'（空）'}）`);
+  assert.equal(after.size,before.size,'假用户目录的文件数量不应变化');
+  for(const [rel,stamp] of before) assert.equal(after.get(rel),stamp,`假用户目录中的 ${rel} 不应被修改`);
+  console.log(`启动前检查：主进程拒绝把公共目录设为用户目录（退出码 2，用时 ${elapsed} ms，假用户目录没有任何改动）`);
+}
+
+// 066：失败现场目录（任何检查失败时由软件写入截图与焦点 JSON）。每次验收开始时清空，只清这一个目录。
+const failuresDir=path.resolve('app/dist/shots','failures');
+async function announceFailures() {
+  const files=await readdir(failuresDir).catch(()=>[]);
+  if(files.length) console.log('失败现场目录：'+path.relative(process.cwd(),failuresDir)+'（'+files.join('、')+'）');
+}
+
 const fixture=await demo();
 try {
   const out=path.resolve('app/dist/shots');
+  await rm(failuresDir,{recursive:true,force:true});
   // 与 npm run demo 相同：隔离环境只经 AR_ISOLATED_ENV 交给软件内部，Electron 进程本身拿用户真实环境（见 app/src/main/app-env.mjs）。
   const real={...process.env};delete real.ELECTRON_RUN_AS_NODE;
   const isolated={...await preferenceFixture(fixture.home,{install:['agent-router']}),AGENT_ROUTER_HOME:fixture.home};delete isolated.ELECTRON_RUN_AS_NODE;
   // AR_QUIT_TRACE=1：软件退出的各阶段（窗口关闭、before-quit、各清理步骤）带时刻打到标准错误，退出后实测失败时用来对时间线。
   const env={...real,AR_SHOTS:out,AR_TEST_NODE:process.execPath,AR_SHOTS_AGENT_TIMEOUT:"8",AR_QUIT_TRACE:"1",[isolatedEnvKey]:JSON.stringify(isolationOverrides(real,isolated))};
+  // 052：正式验收启动之前先做一次启动前检查（公共目录保护），失败时整个验收以非 0 退出。
+  await unsafeHomeStartupCheck(out,real,isolated);
   await unlink(path.join(out,'exit-pending.json')).catch(e=>{if(e.code!=='ENOENT')throw e;});
   const child=spawn(electron,['.'],{env,stdio:'inherit',windowsHide:true,shell:false});
   const code=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',resolve);});
@@ -153,4 +215,4 @@ try {
     },null,2));
     console.log('Windows 实测：软件退出后在隔离公共目录上完成真实重置——公共目录删除、勾选的密钥与技能删除、未勾选的不动。');
   }
-} finally {await fixture.close();}
+} finally {await fixture.close();await announceFailures();}

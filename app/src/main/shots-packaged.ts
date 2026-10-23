@@ -32,7 +32,7 @@ export async function capturePackaged(win: BrowserWindow, out: string) {
     await wait('!!document.querySelector(".presets .preset.on")');
     await click('[data-pref=skip]');
     await wait('!!document.querySelector("[data-task=t1]")');
-    assert.equal(await evaluate('document.querySelectorAll("[data-task]").length'), 16);
+    assert.equal(await evaluate('document.querySelectorAll("[data-task]").length'), 17);
     await click('[data-page=connect]');
     await wait('!!document.querySelector("[data-operation=reinstall][data-host=claude-code]")');
     await click('[data-operation=reinstall][data-host=claude-code]');
@@ -68,7 +68,7 @@ export async function capturePackaged(win: BrowserWindow, out: string) {
     const core = await coreRun(['version']);
     assert.equal(core.code, 0, core.stderr); assert.equal(core.json.ok, true);
     assert.equal(core.json.node, process.versions.node); assert.equal(core.json.electron, process.versions.electron); assert.equal(core.json.version, app.getVersion());
-    const evidence = { packaged: app.isPackaged, version: app.getVersion(), tasks: 16, wizardInstall: true, connectionReinstall: true, installed, fonts, fontHash, coreNode: core.json.node, coreElectron: core.json.electron };
+    const evidence = { packaged: app.isPackaged, version: app.getVersion(), tasks: 17, wizardInstall: true, connectionReinstall: true, installed, fonts, fontHash, coreNode: core.json.node, coreElectron: core.json.electron };
     await writeFile(path.join(out, 'packaged.json'), JSON.stringify(evidence, null, 2));
     console.log(JSON.stringify(evidence, null, 2));
 }

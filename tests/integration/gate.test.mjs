@@ -54,7 +54,8 @@ test('全部通过：改动在范围内并已提交，验收命令退出 0', asy
   assert.equal(gate.summary, '门禁通过');
   assert.deepEqual(gate.commit, { required: true, ok: true });
   assert.deepEqual(gate.uncommitted, []);
-  assert.deepEqual(gate.scope, { allowed: ['src/**'], changed: ['src/a.js'], outside: [] });
+  // 056：scope 多了 protected / deleted 两个数组（协议 12.3），其余字段与原断言一致。
+  assert.deepEqual(gate.scope, { allowed: ['src/**'], changed: ['src/a.js'], outside: [], protected: [], deleted: [] });
   assert.equal(gate.commands.length, 1);
   assert.equal(gate.commands[0].exit, 0);
   assert.equal(gate.commands[0].error, null);
@@ -255,4 +256,133 @@ test('去掉 AgentRouter 自己的变量：验收命令只看到普通变量', a
     'AGENT_ROUTER_HOME=absent', 'CODEX_DISPATCH_HOME=absent', 'AR_CORE_TRACE=absent', mixed, 'GATE_TEST_KEEP=present',
   ].join(','));
   assert.equal(gate.ok, true);
+});
+
+// ---- 056：受保护的路径与删除的文件（协议 12.1 第 4 步） ----
+
+// 基线：先提交 .agent-router/project.json 与任务说明目录，再取 base。
+const protectedFixture = (t, specsDir = 'docs/specs') => {
+  const { root, dir } = fixture(t);
+  write(path.join(root, '.agent-router/project.json'), `${JSON.stringify({ v: 1, name: '演示', baseBranch: 'main', specsDir }, null, 2)}\n`);
+  write(path.join(root, specsDir, '012-示例.md'), '# 示例\n');
+  commitAll(root, '加项目配置与任务说明');
+  return { root, dir, base: headSha(root) };
+};
+
+test('受保护的路径：allowed_paths 为 ** 时改任务说明目录照样越界，记入 outside 与 protected', async t => {
+  const { root, dir, base } = protectedFixture(t);
+  write(path.join(root, 'docs/specs/012-示例.md'), '# 示例改过\n');
+  commitAll(root, '改任务说明');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, false);
+  assert.deepEqual(gate.scope.outside, ['docs/specs/012-示例.md']);
+  assert.deepEqual(gate.scope.protected, ['docs/specs/012-示例.md']);
+  // 受保护的文件照常出现在 summary 的"改动超出范围"里（协议 12.3）。
+  assert.equal(gate.summary, '改动超出范围：docs/specs/012-示例.md');
+});
+
+test('受保护的路径：allowed_paths 明确写了 docs/specs/** 时放行', async t => {
+  const { root, dir, base } = protectedFixture(t);
+  write(path.join(root, 'docs/specs/012-示例.md'), '# 示例改过\n');
+  commitAll(root, '改任务说明');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['src/**', 'docs/specs/**'], expect_commit: true }) });
+  assert.equal(gate.ok, true);
+  assert.deepEqual(gate.scope.outside, []);
+  assert.deepEqual(gate.scope.protected, []);
+  assert.equal(gate.summary, '门禁通过');
+});
+
+test('受保护的路径：基线 specsDir 为 specs 时保护的是 specs/', async t => {
+  const { root, dir, base } = protectedFixture(t, 'specs');
+  write(path.join(root, 'specs/012-示例.md'), '# 示例改过\n');
+  write(path.join(root, 'docs/specs/另一个.md'), '# 不在保护范围\n');
+  commitAll(root, '改任务说明');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, false);
+  assert.deepEqual(gate.scope.protected, ['specs/012-示例.md']);
+  // docs/specs/ 不在基线的保护范围里（回退到默认 docs/specs 没有发生）：allowed_paths ** 放行。
+  assert.ok(!gate.scope.protected.includes('docs/specs/另一个.md'));
+  assert.ok(!gate.scope.outside.includes('docs/specs/另一个.md'));
+});
+
+test('受保护的路径：执行者在这次改动里改 project.json 的 specsDir 不影响判断（读的是基线）', async t => {
+  const { root, dir, base } = protectedFixture(t, 'docs/specs');
+  // 基线 specsDir 是 docs/specs；这次改动把配置改成 specs，并新增 specs/ 下的文件、改 docs/specs/ 下的文件。
+  write(path.join(root, '.agent-router/project.json'), `${JSON.stringify({ v: 1, name: '演示', baseBranch: 'main', specsDir: 'specs' }, null, 2)}\n`);
+  write(path.join(root, 'specs/新说明.md'), '# 新目录\n');
+  write(path.join(root, 'docs/specs/012-示例.md'), '# 示例改过\n');
+  commitAll(root, '改配置与说明');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, false);
+  // 仍按基线 docs/specs 保护；这次改动里的 project.json 也在 .agent-router/ 下，同样是越界。
+  assert.deepEqual([...gate.scope.protected].sort(), ['.agent-router/project.json', 'docs/specs/012-示例.md'].sort());
+  assert.deepEqual([...gate.scope.outside].sort(), ['.agent-router/project.json', 'docs/specs/012-示例.md'].sort());
+  // specs/ 下的文件不在基线保护范围里，allowed_paths ** 放行。
+  assert.ok(!gate.scope.protected.includes('specs/新说明.md'));
+  assert.ok(!gate.scope.outside.includes('specs/新说明.md'));
+});
+
+// ---- 065：specsDir 为项目根本身（协议 12.1 第 4 步）----
+
+test('受保护的路径：specsDir 为 . 时 ** 下根目录的 NNN-*.md 越界并记入 protected，普通文件不受影响', async t => {
+  const { root, dir, base } = protectedFixture(t, '.');
+  write(path.join(root, '065-修复.md'), '# 改过\n');
+  write(path.join(root, 'README.md'), '# 普通文件改过\n');
+  write(path.join(root, 'src/a.js'), '普通源文件改过\n');
+  commitAll(root, '改根目录文件');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, false);
+  assert.deepEqual(gate.scope.outside, ['065-修复.md'], '只有根目录的任务说明命名文件算越界');
+  assert.deepEqual(gate.scope.protected, ['065-修复.md']);
+  assert.equal(gate.summary, '改动超出范围：065-修复.md');
+});
+
+test('受保护的路径：specsDir 为 . 时 allowed_paths 明确写 065-*.md 放行', async t => {
+  const { root, dir, base } = protectedFixture(t, '.');
+  write(path.join(root, '065-修复.md'), '# 改过\n');
+  commitAll(root, '改任务说明');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['065-*.md'], expect_commit: true }) });
+  assert.equal(gate.ok, true);
+  assert.deepEqual(gate.scope.outside, []);
+  assert.deepEqual(gate.scope.protected, []);
+  assert.equal(gate.summary, '门禁通过');
+});
+
+test('受保护的路径：specsDir 为 . 时只有根目录的 NNN-*.md 受保护：子目录的编号文件与根目录普通文件不受影响', async t => {
+  const { root, dir, base } = protectedFixture(t, '.');
+  write(path.join(root, 'docs/066-说明.md'), '子目录里的编号文件\n');
+  write(path.join(root, 'NOTES.md'), '根目录普通 markdown\n');
+  commitAll(root, '加子目录编号文件与根目录普通文件');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, true, '子目录里的编号文件与根目录非编号文件都不在保护范围，** 放行');
+  assert.deepEqual(gate.scope.protected, []);
+  assert.deepEqual(gate.scope.outside, []);
+});
+
+test('删除的文件：记入 deleted，不单独让门禁失败', async t => {
+  const { root, dir } = fixture(t);
+  write(path.join(root, 'tests/old.test.js'), '旧测试\n');
+  commitAll(root, '加一个测试文件');
+  const base = headSha(root);
+  git(root, ['rm', '-q', 'tests/old.test.js']);
+  commitAll(root, '删掉旧测试');
+
+  const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
+  assert.equal(gate.ok, true);
+  assert.deepEqual(gate.scope.deleted, ['tests/old.test.js']);
+  // 删除的文件也是改动（出现在 changed 里），在范围内就不进 outside。
+  assert.ok(gate.scope.changed.includes('tests/old.test.js'));
+  assert.deepEqual(gate.scope.outside, []);
+  assert.equal(gate.summary, '门禁通过');
+  // gate.json 里两个新字段照协议写出（协议 12.3）。
+  const saved = JSON.parse(readFileSync(path.join(dir, 'gate.json'), 'utf8'));
+  assert.deepEqual(saved.scope.protected, []);
+  assert.deepEqual(saved.scope.deleted, ['tests/old.test.js']);
 });

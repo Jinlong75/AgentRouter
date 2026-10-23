@@ -17,11 +17,26 @@ import { c, cx, p } from '../shared/copy';
 import { coreRun } from './core';
 import { createConsole } from './console.mjs';
 import { runClearCache, secretNames, writeResetMarker, cleanupScript } from './reset.mjs';
-import { homeDirectory, legacyHomeDirectory, homeEnv } from '../../../core/lib/compat.mjs';
+import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from '../../../core/lib/compat.mjs';
+import { parseJson } from '../../../core/lib/json.mjs';
+import { mkdtempSync } from 'node:fs';
 // 软件内部用的环境（演示的隔离覆盖只合并在这里，process.env 保持用户原样，见 app-env.mjs）。
 const env = appEnvironment(process.env);
 // 公共目录与核心一致：%APPDATA%\agent-router（AGENT_ROUTER_HOME 覆盖）；旧任务另从 codex-dispatch 目录读取。
 const home = homeDirectory(env), legacyHome = legacyHomeDirectory(env);
+// 公共目录保护（052 / 协议第 1 节"软件主进程同样保护"）：与核心同一个 unsafeHome，用合并后的内部环境判断。
+// 必须在任何写操作之前判断（userData、单实例锁、迁移、窗口、托盘、Worker 都在下面）。
+const unsafeReason = unsafeHome(home, { env });
+if (unsafeReason) {
+    // Electron 默认数据目录是 %APPDATA%\agent-router（用户真实的公共目录），先指到临时目录下的一次性目录。
+    app.setPath('userData', mkdtempSync(path.join(os.tmpdir(), 'agent-router-unsafe-home-')));
+    console.error(unsafeReason);
+    // 界面验收模式只打印，不弹框（弹框会挡住自动检查）。
+    if (!process.env.AR_SHOTS) dialog.showErrorBox(p.homeUnsafeTitle, unsafeReason);
+    app.exit(2);
+    // 兜底：确保 app.exit 之后不再执行下面的取锁、迁移与创建窗口，退出码保持 2。
+    process.exit(2);
+}
 const isolated = homeEnv.some(key => env[key]);
 // 软件自己的数据一律放在公共目录下的 monitor\（隔离时在临时 home 里），见 app-data.ts。
 app.setPath('userData', appDataDir(home));
@@ -174,7 +189,7 @@ async function cachedGate(dir: string): Promise<GateResult> {
         return cached.value;
     let value: GateResult;
     try {
-        const parsed = JSON.parse(await readFile(file, 'utf8'));
+        const parsed = parseJson(await readFile(file, 'utf8'));
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
             throw Error('内容不是对象');
         value = parsed as GateResult;
@@ -246,7 +261,7 @@ async function resetNow(payload: unknown) {
         // 隔离验收用：记录密钥文件里还剩哪些名字（值从不读取、不落盘）。
         let remainingSecrets: string[] | null = null;
         if (env.AR_TEST_SECRETS_FILE) {
-            try { remainingSecrets = Object.keys(JSON.parse(await readFile(env.AR_TEST_SECRETS_FILE, 'utf8'))); }
+            try { remainingSecrets = Object.keys(parseJson(await readFile(env.AR_TEST_SECRETS_FILE, 'utf8'))); }
             catch { remainingSecrets = []; }
         }
         // 托管线程先正常退出，再让清理进程等本进程结束后删目录。
@@ -301,7 +316,7 @@ app.whenReady().then(async () => {
         y?: number;
     } = { width: 1160, height: 720 };
     try {
-        const saved = JSON.parse(await readFile(path.join(data, 'window.json'), 'utf8'));
+        const saved = parseJson(await readFile(path.join(data, 'window.json'), 'utf8'));
         if (Number.isFinite(saved.width) && Number.isFinite(saved.height)) {
             bounds = { width: Math.max(960, saved.width), height: Math.max(600, saved.height) };
             if (Number.isFinite(saved.x) && Number.isFinite(saved.y) && screen.getAllDisplays().some(d => saved.x < d.workArea.x + d.workArea.width && saved.x + saved.width > d.workArea.x && saved.y < d.workArea.y + d.workArea.height && saved.y + 44 > d.workArea.y)) {
@@ -379,6 +394,7 @@ app.whenReady().then(async () => {
     // testTimeout 平时是 180 秒；只有验收模式（AR_SHOTS 且隔离环境）下 AR_SHOTS_AGENT_TIMEOUT 为正整数时用其值，方便测"超时"不必等 3 分钟。
     const consoleService = createConsole({
       coreRun, messages: cx,
+      knownRunDir: dir => registry.knownRunDir(dir),
       openFolder: async dir => { const error = await effects.open(dir); if (error) throw Error(error); },
       launch: (executable, args, { cwd }) => effects.launch(executable, args, cwd),
       // Windows Terminal：用户目录下的应用执行别名（不存在时退回 cmd.exe）。

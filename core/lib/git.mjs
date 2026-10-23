@@ -1,7 +1,8 @@
 // 门禁需要的几个 git 调用（文件协议 12.1）。零依赖。
 // 约定：参数数组、shell: false、windowsHide: true；输出按 UTF-8 解码，-z 下路径原样（不转义）。
-// 只导出 git、headSha、uncommittedFiles、changedFiles 与两个 -z 解析函数（解析函数供单元测试）。
+// 只导出 git、headSha、uncommittedFiles、changedFiles、deletedFiles、baseProjectConfig 与 -z 解析函数（解析函数供单元测试）。
 import { spawnSync } from 'node:child_process';
+import { parseJson } from './json.mjs';
 
 // 一次 diff / status 的输出可能很大（未跟踪文件多、重命名多），留足余量。
 const MAX_BUFFER = 64 * 1024 * 1024;
@@ -63,22 +64,35 @@ export function uncommittedFiles(root) {
   return parseStatusPorcelainZ(result.stdout);
 }
 
-// 解析 `git diff --name-status -z -M`（协议 12.1 第 4 步）。
+// 解析 `git diff --name-status -z -M`（协议 12.1 第 4 步），返回带状态的条目：{ status, paths }。
 // 每条记录先是一个状态（A/M/D/R100/C075…），换行写成 NUL；重命名 / 复制项在 -z 下按旧路径、新路径的顺序给出两条。
-// 去重并保持出现顺序。
-export function parseNameStatusZ(text) {
+export function parseNameStatusEntriesZ(text) {
   const fields = String(text ?? '').split('\0');
-  const files = [];
-  const add = file => { if (file && !files.includes(file)) files.push(file); };
+  const entries = [];
   for (let i = 0; i < fields.length; i++) {
     const status = fields[i];
     if (!status) continue;
     if (/^[RC]/.test(status)) {
-      add(fields[++i]);
-      add(fields[++i]);
+      const paths = [fields[++i], fields[++i]].filter(Boolean);
+      if (paths.length) entries.push({ status, paths });
     } else {
-      add(fields[++i]);
+      const file = fields[++i];
+      if (file) entries.push({ status, paths: [file] });
     }
+  }
+  return entries;
+}
+
+// 条目里状态为 D 的路径（协议 12.1：重命名不算删除，它的新旧路径已在改动列表里）。
+export function deletedFromEntries(entries) {
+  return entries.filter(entry => entry.status === 'D').flatMap(entry => entry.paths);
+}
+
+// 解析 `git diff --name-status -z -M`：改动的路径，去重并保持出现顺序。
+export function parseNameStatusZ(text) {
+  const files = [];
+  for (const { paths } of parseNameStatusEntriesZ(text)) {
+    for (const file of paths) if (!files.includes(file)) files.push(file);
   }
   return files;
 }
@@ -89,4 +103,27 @@ export function changedFiles(root, base, head) {
   const result = git(root, ['diff', '--name-status', '-z', '-M', `${base}..${head}`]);
   if (result.status !== 0) throw new Error(FAILURE_REASON(result, 'git diff '));
   return parseNameStatusZ(result.stdout);
+}
+
+// base..head 里删除的文件（状态 D；重命名不算删除，协议 12.1 第 4 步）。base === head 时不调用 git。
+export function deletedFiles(root, base, head) {
+  if (base === head) return [];
+  const result = git(root, ['diff', '--name-status', '-z', '-M', `${base}..${head}`]);
+  if (result.status !== 0) throw new Error(FAILURE_REASON(result, 'git diff '));
+  return deletedFromEntries(parseNameStatusEntriesZ(result.stdout));
+}
+
+// 基线提交里的 .agent-router/project.json（门禁受保护路径读它，协议 12.1 第 4 步）。
+// 文件不存在、git 出错、不是合法 JSON 或不是对象时都返回 null（当作没有），不抛错。
+export function baseProjectConfig(root, base) {
+  if (!base) return null;
+  const result = git(root, ['show', `${base}:.agent-router/project.json`]);
+  if (result.status !== 0) return null;
+  try {
+    // 基线里的 project.json 也可能带 BOM（056 起与工作区里的读法一致）。
+    const parsed = parseJson(result.stdout);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }

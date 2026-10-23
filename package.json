@@ -1,14 +1,14 @@
 {
   "name": "agent-router",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "MIT",
   "description": "A strong lead agent routes clearly specified work to cheaper worker agents, with a Windows dispatch console. Based on DispatchDock.",
   "repository": "https://github.com/Jinlong75/AgentRouter",
   "type": "module",
   "scripts": {
     "lint:tree": "node tools/lint-tree.mjs",
-    "verify": "tsc --noEmit && node tools/verify-monitor.mjs && node --test",
+    "verify": "tsc --noEmit && node tools/verify-monitor.mjs && node tools/verify-tests.mjs",
     "public:snapshot": "node tools/public-snapshot.mjs",
     "build": "node tools/build.mjs",
     "start": "npm run build && electron .",

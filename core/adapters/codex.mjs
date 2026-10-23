@@ -71,7 +71,8 @@ export const codex = {
   label: 'Codex',
   writesReport: true,
   // 执行者环境是白名单（../lib/env.mjs）；Codex 还要读自己的配置目录与自定义接口地址（都不是密钥）。
-  isolate: () => ({ keep: ['CODEX_HOME', 'OPENAI_BASE_URL'] }),
+  // 064：执行者的用户目录是沙箱，Codex 的登录在用户真实的 ~/.codex：没设 CODEX_HOME 时指向它（与以前行为一致）。
+  isolate: () => ({ keep: ['CODEX_HOME', 'OPENAI_BASE_URL'], realHomeDefaults: { CODEX_HOME: '.codex' } }),
   detect({ env = process.env, settings = {}, tracePrefix } = {}) {
     try {
       const run = () => {

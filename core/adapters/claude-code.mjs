@@ -125,6 +125,8 @@ export const claudeCode = {
   id: 'claude-code',
   label: 'Claude Code',
   writesReport: false,
+  // 这些设置项适配器不支持：派发时进度里提示一次后忽略。
+  unsupportedSettings: ['tier'],
   capabilities: { readOnly: true, usage: true, cost: false, reportFile: false },
   detect({ env = process.env, settings = {}, tracePrefix } = {}) {
     try {
@@ -150,6 +152,9 @@ export const claudeCode = {
     else args.push('--permission-mode', 'bypassPermissions');
     const turns = settings.maxTurns ?? profile.maxTurns;
     if (Number.isInteger(turns) && turns > 0) args.push('--max-turns', String(turns));
+    // 值原样传入，不在核心里校验（取值不对时 Claude Code 自己报错）；tier 没有对应参数，由派发层提示后忽略。
+    if (settings.model != null) args.push('--model', String(settings.model));
+    if (settings.effort != null) args.push('--effort', String(settings.effort));
     // 隔离的配置目录事先建好（首次使用时 Claude Code 在空目录里自行初始化，见【核实】）。
     if (env.CLAUDE_CONFIG_DIR) mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
     return { executable, args, stdin: prompt };

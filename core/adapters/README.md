@@ -31,8 +31,9 @@ Stage07 加 `generic`。启动器解析（npm `.cmd` 包装 → Node 入口、PA
 | `releaseTimeoutMs` | 等 `releaseFile` 的上限（毫秒，正整数，默认 120000）；超时往 stderr 写一行说明、以非 0 退出且不写汇报，不会无限挂着 |
 | `writes` | 只用于测试与演示：`[{ path, content }]`，在放行之后、写汇报之前按顺序写入；路径相对项目根、用 `/` 分隔，不接受绝对路径与 `..`，目录不存在时自动创建；默认 `[]` |
 | `commit` | 只用于测试与演示：写完文件后的提交信息（非空字符串），只 `git add` / `git commit` `writes` 里的路径（参数数组、不经 shell）；`null`（默认）表示不提交。提交失败时往 stderr 写一行说明、以 1 退出且不写汇报 |
+| `attempts` | 只用于测试与演示（Stage05）：按第几次尝试改写回放字段，例如 `{ "1": { "exit": 1 }, "2": { "exit": 0, "report": "第二次\n" } }`；键是 1 起的尝试次数，值只能改上面的回放字段（`events` / `report` / `exit` / `delayMs` / `releaseFile` / `releaseTimeoutMs` / `writes` / `commit`），与基础字段合并后按同一套规则校验；默认 `{}`。用来写"第 1 次门禁失败、第 2 次通过"这类多次尝试的测试。`attempts` 本身不进子进程的回放说明 |
 
-`releaseFile` / `releaseTimeoutMs` / `writes` / `commit` 随执行者快照带给托管与脱离派发的执行者进程（见 `snapshotKeys`）；没有设置时回放说明与之前逐字节一致。
+`releaseFile` / `releaseTimeoutMs` / `writes` / `commit` / `attempts` 随执行者快照带给托管与脱离派发的执行者进程（见 `snapshotKeys`）；没有设置时回放说明与之前逐字节一致。
 
 ## 接口
 
@@ -42,7 +43,7 @@ Stage07 加 `generic`。启动器解析（npm `.cmd` 包装 → Node 入口、PA
 | `label` | 显示名：进度首末行（`=== <显示名> 开始/结束 …`）、只读窗口标题、启动失败文案。profile 的 `label` 优先 |
 | `writesReport` | 是否由执行者写 `report`。为 `false` 时公共层把最后一条 `say.text` 原样写入；没有 `say` 时不虚构汇报 |
 | `detect({env, settings, profile})` | 返回（或异步返回）`{installed, version}`；取不到版本写 `null`，可携带适配器私有的 `launcher` / `error`。检测只运行版本命令，不发任务 |
-| `command({root, report, prompt, settings, detection, env, profile})` | 返回 `{executable, args, stdin}`，分别为可执行文件、字符串数组、输入文本。公共层固定 `shell:false`；检测结果原样传回此处 |
+| `command({root, report, prompt, settings, detection, env, profile, attempt})` | 返回 `{executable, args, stdin}`，分别为可执行文件、字符串数组、输入文本。公共层固定 `shell:false`；检测结果原样传回此处。`report` 指这次尝试的 `<任务目录>/attempts/<n>/report.md`（顶层 `report.md` 是最新一次的副本）；`attempt` 是这次的尝试次数（1 起），执行者想按次表现不同时用它（见 fake 的 `attempts`） |
 | `mapLine(line, {root})` | 一行 stdout 转成零到多个事件数组。事件只含协议规定的 `kind` 及附加字段，`v/seq/at` 由公共层追加。未知 JSON 事件丢弃，非空非 JSON 行转 `text` |
 | `createMapper()`（可选） | 返回有状态的 `mapLine`（同一任务内记住命令 id 等）；有它时公共层每个任务新建一个，否则用 `mapLine`。映射函数可带 `lastResult`，交给 `finish` |
 | `isolate({home, profileName})`（可选） | 返回 `{clear, set, keep}`：`keep` 是白名单之外该执行者还要从基础环境保留的变量名（如 codex 的 `CODEX_HOME`，不得是密钥）；`clear` 是要去掉的变量名或正则；`set` 是追加的变量（如执行者自己的配置目录）。公共层按"原环境取密钥 → 白名单（系统、代理、keep；所有 profile 的密钥来源变量除外）→ 清除 → profile.env → 密钥 → set"的顺序合成环境（`../lib/env.mjs`）。白名单之外的变量一律不传给执行者，需要时写进 profile 的 `env` |
@@ -101,7 +102,7 @@ export function makeAdapter(executable) {
 ## claude-code
 
 - 启动：`profiles.<名>.path` 有值时直接用，否则在 PATH 中找 `claude.exe` 或 npm `claude.cmd`；npm 包装指向原生 `claude.exe` 时直接启动该 exe（【核实】Claude Code 2.1.302 的 npm 包是原生程序）。
-- 写入模式：`-p --output-format stream-json --verbose --permission-mode bypassPermissions`，任务指令从标准输入传入。只读模式：`--permission-mode dontAsk --tools Read,Grep,Glob,WebSearch,WebFetch --allowedTools` 同一白名单。profile 的 `maxTurns` 拼成 `--max-turns`。
+- 写入模式：`-p --output-format stream-json --verbose --permission-mode bypassPermissions`，任务指令从标准输入传入。只读模式：`--permission-mode dontAsk --tools Read,Grep,Glob,WebSearch,WebFetch --allowedTools` 同一白名单。profile 的 `maxTurns` 拼成 `--max-turns`。`model` / `effort`（命令行 > profile，见协议第 4 节）不为 `null` 时两种模式都依次追加 `--model <值>`、`--effort <值>`，值原样传入、不校验；为 `null` 时不拼。`tier` 不传入任何参数，派发时进度里写一行"配置：claude-code 执行者不支持 tier，已忽略"。
 - 隔离：`CLAUDE_CONFIG_DIR` 指向 `<公共目录>/workers/<profile>/claude`，读不到用户本人的登录、设置与个人技能；设 `DISABLE_AUTOUPDATER=1`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`。子进程环境是白名单（见接口表 `isolate`），另按前缀清掉 `ANTHROPIC_*`、`CLAUDE_*`、`CLAUDECODE`（主导会话会传下自己的会话变量），再放入 profile 的 `env` 与密钥。
 - 认证：profile 的 `auth` 为 `token` 时，`secrets` 里的变量（如 `ANTHROPIC_AUTH_TOKEN`）从用户环境变量读出值后放入子进程环境，值不进命令行、日志或文件；为 `login` 时用执行者配置目录里的订阅登录。
 - 映射：`system/init` → 模型；`assistant` 的文字 / 思考 / 工具调用与 `user` 的工具结果 → `say` / `think` / `cmd` / `file` / `plan` / `tool`；`result` → `turn` 用量与最终汇报（`finish` 优先用它）。其余 `system` 事件丢弃。

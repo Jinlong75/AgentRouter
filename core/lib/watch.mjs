@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { legacyRunsName } from './compat.mjs';
+import { readJson } from './json.mjs';
 
 export function viewerTakesOver(home, alive = pid => process.kill(pid, 0)) {
   try {
-    const viewer = JSON.parse(readFileSync(join(home, 'viewer.json'), 'utf8'));
+    const viewer = readJson(join(home, 'viewer.json'));
     if (!viewer.suppressWatchWindow || !Number.isSafeInteger(viewer.pid) || viewer.pid <= 0) return false;
     alive(viewer.pid);
     return true;

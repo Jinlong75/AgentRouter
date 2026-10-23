@@ -1,6 +1,6 @@
-import { c, cx, gt, p } from '../shared/copy';
+import { c, cx, gt, p, rt } from '../shared/copy';
 import { dayGroup } from '../shared/types';
-import type { Task, Snapshot, Event as TaskEvent, GateResult } from '../shared/types';
+import type { Task, Snapshot, Event as TaskEvent, GateResult, AttemptFiles, AgentRow } from '../shared/types';
 import { esc, markdown } from '../shared/markdown';
 import { icon, menu, confirmStop, tooltips, notice, openSheet, toast, trace } from './ui';
 import { executorAdapter, executorLabel, executorTag, isCodexTask } from '../shared/executor';
@@ -10,6 +10,7 @@ import { PreferencesView } from './preferences';
 import { ProjectsView } from './projects';
 import { NewTaskView } from './newtask';
 import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack } from './gate';
+import { attemptBadge, attemptBar, attemptList, attemptPick, attemptPickItems, historyTab, lastFailure, multiAttempts, openRetrySheet, separators, attemptLabel, type Labels } from './attempts';
 import brandSVG from '../../design/icons/mark.svg';
 const root = document.querySelector<HTMLElement>('#app')!;
 const brand = brandSVG.replace('<svg ', '<svg aria-hidden="true" ');
@@ -32,6 +33,13 @@ const taskTitle = (t: Task) => `<span class="ttl">${esc(t.title)}</span>${attemp
 let state: Snapshot = { tasks: [], theme: 'dark', version: '0.1.0' }, page = 'tasks', filter = 'all', repo = '', selected = '', tab = 'flow', think = false, timeline: Timeline | undefined, report = '', generation = 0, loading = false, queued = false, detailSignature = '';
 // 当前任务的门禁结果（detail 通道读 gate.json）：null 是文件不存在，{ error } 是读不出来，原样展示。
 let gateResult: GateResult = null;
+// 多次尝试（Stage05）：进展标签的尝试切换（'all' 或第几次）、汇报 / 门禁标签的尝试下拉（null = 最新）、
+// 当前任务各次尝试用到的执行者显示名（配置名 → 显示名）、下拉选中那一次的汇报与门禁、重试历史用的各次门禁。
+let flowAtt: 'all' | number = 'all', pickAtt: number | null = null, attTask = '', attLabels: Labels = new Map(), attLabelsLoaded = false;
+let attFiles: (AttemptFiles & { key: string }) | null = null;
+let histGates = new Map<number, GateResult>();
+// 已结束的尝试汇报与门禁不会再变，读一次就记住（按 任务 id + 序号）。
+const attCache = new Map<string, AttemptFiles>();
 // 再派一次：正在派发的任务、失败原因（只显示在触发它的那个任务详情上）。
 let redispatchFor = '', redispatchBusy = false, redispatchError = '', redispatchErrorFor = '';
 // 017：批量选择与删除。checked 只存 id；筛选后不可见的勾选保留，计数照实。
@@ -64,7 +72,16 @@ const projectsHost = { tasks: () => state.tasks, openTask: showTask };
 let projectsView = new ProjectsView(projectsHost);
 const newTaskView = new NewTaskView({ tasks: () => state.tasks, openTask: showTask });
 const current = () => state.tasks.find(t => t.id === selected);
-const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit]);
+// 多次尝试：汇报、门禁标签当前看的是哪一次（下拉没选过就是最新一次）；它的汇报与门禁来自 attempts/<n>/，
+// 还没读到（key 对不上）返回 null；任务没有 attempts/ 目录（旧任务）时照旧读顶层文件。
+const attKey = (t: Task, n: number) => `${t.id}#${n}`;
+function pickedAttempt(t: Task) { const list = attemptList(t); return list.length < 2 ? null : list.find(a => a.n === pickAtt) ?? list.at(-1)!; }
+function attView(t: Task, att: { n: number }): { report: string; gate: GateResult } | null {
+    if (!attFiles || attFiles.key !== attKey(t, att.n))
+        return null;
+    return attFiles.exists ? { report: attFiles.report, gate: attFiles.gate } : { report, gate: gateResult };
+}
+const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit, t.attempts]);
 const action = (name: string, value?: string) => { trace('action-send', { task: selected, name }); return window.dock.action(selected, name, value).then(() => trace('action-done', { name }), error => { trace('action-error', { name, error: String((error as Error)?.message ?? error) }); notice(error); }); };
 function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="wordmark">${c.app}</span></div><div class="tb-r"></div><nav class="nav"></nav><section class="content"></section>`; nav(); pageView(); }
 // 侧栏只在内容变化时重建：异步刷新晚到时不替换按钮，避免吞掉正在进行的点击；重建后焦点放回同一个导航按钮。
@@ -212,7 +229,7 @@ function list() {
         groups.set(day, [...(groups.get(day) ?? []), t]);
     }
     const box = root.querySelector<HTMLElement>('.tlist')!, scroll = box.scrollTop;
-    box.innerHTML = tasks.length ? [...groups].map(([day, rows]) => `<div class="tgroup">${day}<span class="mono">${day === c.status.run ? rows.length : new Date(rows[0].started).toLocaleDateString('en-CA', { month: '2-digit', day: '2-digit' })}</span></div>${rows.map(t => { const gateFail = t.status === 'fail' && gateState(t) === 'fail'; const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : gateFail ? '' : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : mark(t.status); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t)}</b><span class="${t.status === 'run' ? 'live' : ''}"><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${gateBadge(t)}${esc(project(t))}${tail ? ' · ' + esc(tail) : ''}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`;
+    box.innerHTML = tasks.length ? [...groups].map(([day, rows]) => `<div class="tgroup">${day}<span class="mono">${day === c.status.run ? rows.length : new Date(rows[0].started).toLocaleDateString('en-CA', { month: '2-digit', day: '2-digit' })}</span></div>${rows.map(t => { const gateFail = t.status === 'fail' && gateState(t) === 'fail'; const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : gateFail ? '' : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : mark(t.status); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t)}</b><span class="${t.status === 'run' ? 'live' : ''}"><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${attemptBadge(t)}${gateBadge(t)}${esc(project(t))}${tail ? ' · ' + esc(tail) : ''}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`;
     box.scrollTop = scroll;
     restoreFocus(focus);
 }
@@ -230,9 +247,21 @@ function detail() {
         box.innerHTML = `<div class="empty">${icon('file-list-3-line')}<b>${state.tasks.length ? c.select : c.emptyDetail}</b><p>${c.detailHelp}</p></div>`;
         return;
     }
-    // 切到没有门禁的任务时，"门禁"标签不存在，回到进展。
+    // 切到没有门禁的任务时，"门禁"标签不存在，回到进展；"重试"标签只在有 2 次及以上尝试时存在。
     if (tab === 'gate' && !gateEnabled(t))
         tab = 'flow';
+    if (tab === 'retry' && !multiAttempts(t))
+        tab = 'flow';
+    // 换了任务：尝试切换、下拉和执行者显示名都重新开始（同一任务反复重建详情时保留）。
+    if (attTask !== selected) {
+        attTask = selected;
+        flowAtt = 'all';
+        pickAtt = null;
+        attFiles = null;
+        histGates = new Map();
+        attLabels = new Map();
+        attLabelsLoaded = false;
+    }
     box.innerHTML = '<div class="dh"></div><div class="track-holder"></div><div class="dtabs"></div><div class="banner-holder"></div><div class="dbody edge"><div class="scroll" tabindex="0"><div class="tab-body"></div></div><button class="plan-compact plan-h" data-plan-top hidden></button><button class="btn sm follow" data-latest hidden></button></div>';
     header();
     const viewport = box.querySelector<HTMLElement>('.dbody > .scroll')!;
@@ -302,9 +331,11 @@ function header() {
     const finished = ['done', 'fail', 'stop'].includes(t.status);
     const gate = gateState(t), gateFail = t.status === 'fail' && gate === 'fail';
     const redispatch = finished ? `<button class="btn sm" data-redispatch data-tip="${esc(c.redispatchHelp)}" aria-label="${esc(c.redispatch)}" ${busy ? 'disabled' : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.redispatching)}` : `${icon('refresh-line')}${esc(c.redispatch)}`}</button>` : '';
+    // 重试（Stage05）：结束的任务（完成、失败、中断）在"再派一次"前多一个次按钮，在同一工作区新开一次尝试。
+    const retry = finished ? `<button class="btn sm" data-retry title="${esc(rt.buttonTip)}" aria-label="${esc(rt.button)}">${icon('arrow-go-forward-line')}${esc(rt.button)}</button>` : '';
     // 失败且门禁没过时，状态行第二段说明是门禁没过（不再是笼统的 exit=3）。
     const stateTail = t.status === 'run' ? ` · <span data-elapsed="${esc(t.id)}">${elapsed(t)}</span>` : t.status === 'done' ? ` · ${c.elapsed} ${t.minutes ?? '—'} ${c.minutes}` : t.status === 'fail' ? gateFail ? ` · ${esc(gt.badge.fail)}` : ` · exit=${t.exit}` : '';
-    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2"><span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span><span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
+    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${retry}${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2"><span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span><span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
     // 流水线轨道（B3）：只给带 gate 字段的任务画；放在标题区下面、标签栏上面。
     const track = root.querySelector<HTMLElement>('.track-holder');
     if (track) track.innerHTML = gateTrack(t, gateFile(gateResult));
@@ -335,10 +366,16 @@ function banners(t: Task) {
 }
 function tabs() {
     const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!, t = current();
-    if (!bar.children.length) {
-        // "门禁"插在"汇报"后面；其它标签顺序与选中逻辑不变，只有启用了门禁的任务才有。
-        const items: [string, string][] = [['flow', c.flow], ['report', c.report], ...(t && gateEnabled(t) ? [['gate', gt.tab] as [string, string]] : []), ['files', c.files], ['params', c.params]];
+    // "门禁"插在"汇报"后面、"重试"在"改动"后面；其它标签顺序与选中逻辑不变。
+    // 门禁只有启用了门禁的任务才有，"重试"只在有 2 次及以上尝试时出现；标签集合变了才重建（尝试增加时出现"重试"）。
+    const items: [string, string][] = [['flow', c.flow], ['report', c.report], ...(t && gateEnabled(t) ? [['gate', gt.tab] as [string, string]] : []), ['files', c.files], ...(t && multiAttempts(t) ? [['retry', rt.tab] as [string, string]] : []), ['params', c.params]];
+    const signature = items.map(([key]) => key).join();
+    if (!bar.children.length || bar.dataset.tabs !== signature) {
+        const focused = document.activeElement instanceof HTMLElement && bar.contains(document.activeElement) ? document.activeElement.dataset.tab : undefined;
+        bar.dataset.tabs = signature;
         bar.innerHTML = `<div class="segm sm">${items.map(([key, label]) => `<button data-tab="${key}">${label}</button>`).join('')}</div><span class="sp"></span><span class="hint">${c.think}<button class="toggle" data-think role="switch" aria-label="${c.think}"></button></span>`;
+        if (focused)
+            bar.querySelector<HTMLElement>(`[data-tab="${focused}"]`)?.focus({ preventScroll: true });
     }
     for (const button of bar.querySelectorAll<HTMLButtonElement>('[data-tab]')) {
         button.classList.toggle('on', button.dataset.tab === tab);
@@ -347,10 +384,26 @@ function tabs() {
     const fileButton = bar.querySelector<HTMLElement>('[data-tab=files]')!, label = c.files + (files ? ` <span class="n">${files}</span>` : '');
     if (fileButton.innerHTML !== label)
         fileButton.innerHTML = label;
+    // "重试"标签右边的数字是尝试次数。
+    const retryButton = bar.querySelector<HTMLElement>('[data-tab=retry]');
+    if (retryButton && t) {
+        const retryLabel = `${rt.tab} <span class="n">${attemptList(t).length}</span>`;
+        if (retryButton.innerHTML !== retryLabel)
+            retryButton.innerHTML = retryLabel;
+    }
     bar.querySelector<HTMLElement>('.hint')!.hidden = tab !== 'flow';
     const toggle = bar.querySelector<HTMLElement>('[data-think]')!;
     toggle.classList.toggle('on', think);
     toggle.setAttribute('aria-checked', String(think));
+}
+// 切标签：同步顶部门禁横幅（门禁标签里不显示，其它标签显示），重画标签内容并回到顶部。
+function switchTab(name: string) {
+    tab = name;
+    if (current())
+        banners(current()!);
+    renderTab();
+    root.querySelector<HTMLElement>('.dbody > .scroll')!.scrollTop = 0;
+    void refreshDetail();
 }
 function changedFiles() { const files = new Map<string, NonNullable<TaskEvent['files']>[number]>(); for (const e of timeline?.events ?? [])
     for (const f of e.files ?? [])
@@ -362,7 +415,7 @@ function renderTab() {
     const viewport = body.parentElement!;
     if (tab === 'flow') {
         const events = timeline?.events ?? [], cursor = timeline?.cursor, follow = timeline?.follow ?? t.status === 'run';
-        body.innerHTML = '<div class="plan-slot"></div><button class="btn sm quiet" data-earlier hidden></button><div class="events-host"></div><div class="live-foot"></div>';
+        body.innerHTML = '<div class="att-slot"></div><div class="plan-slot"></div><button class="btn sm quiet" data-earlier hidden></button><div class="events-host"></div><div class="live-foot"></div>';
         timeline = new Timeline(body.querySelector('.events-host')!, viewport);
         timeline.events = events;
         timeline.cursor = cursor;
@@ -370,10 +423,28 @@ function renderTab() {
         timeline.think = think;
         renderFlow();
     }
-    else if (tab === 'report')
-        body.innerHTML = report ? `<div class="sum">${t.commit ? `<span>${icon('git-commit-line')}<em>${c.commit}</em><span class="mono">${t.commit}</span></span>` : ''}<span>${icon('time-line')}<em>${c.elapsed}</em>${t.minutes ?? '—'} ${c.minutes}</span><span class="sp"></span><button class="btn icon quiet" data-open="report" data-tip="${c.openReport}" aria-label="${c.openReport}">${icon('external-link-line')}</button></div><div class="md selectable">${markdown(report)}</div>` : `<div class="empty">${icon('file-text-line')}<b>${t.status === 'run' ? c.reportLater : c.noReport}</b>${t.status === 'run' ? '' : `<p>${t.status === 'done' ? c.noReportDone(executorLabel(t)) : c.noReportHelp(executorLabel(t))}</p>`}</div>`;
-    else if (tab === 'gate')
-        body.innerHTML = gateTab(t, gateFile(gateResult), gateResult);
+    else if (tab === 'report') {
+        // 有多次尝试时顶部是尝试下拉，汇报读选中那一次的 attempts/<n>/report.md（还没读到时只显示下拉）。
+        const att = pickedAttempt(t), pick = att ? attemptPick(t, att.n, attLabels) : '';
+        const view = att ? attView(t, att) : { report, gate: gateResult };
+        const text = view ? view.report : null;
+        const latest = !att || att === attemptList(t).at(-1);
+        const commit = att ? (latest ? t.commit : gateFile(view?.gate ?? null)?.head?.slice(0, 7)) : t.commit;
+        const minutes = att ? (att.ms !== undefined ? (att.ms / 60000).toFixed(1) : '—') : t.minutes ?? '—';
+        const who = att ? `<span>${icon('robot-2-line')}<em>${c.executor}</em>${esc(attemptLabel(t, att, attLabels))}</span>` : '';
+        body.innerHTML = pick + (text === null ? '' : text ? `<div class="sum">${commit ? `<span>${icon('git-commit-line')}<em>${c.commit}</em><span class="mono">${esc(commit)}</span></span>` : ''}<span>${icon('time-line')}<em>${c.elapsed}</em>${minutes} ${c.minutes}</span>${who}<span class="sp"></span><button class="btn icon quiet" data-open="report" data-tip="${c.openReport}" aria-label="${c.openReport}">${icon('external-link-line')}</button></div><div class="md selectable">${markdown(text)}</div>` : `<div class="empty">${icon('file-text-line')}<b>${t.status === 'run' && latest ? c.reportLater : c.noReport}</b>${t.status === 'run' && latest ? '' : `<p>${t.status === 'done' ? c.noReportDone(executorLabel(t)) : c.noReportHelp(executorLabel(t))}</p>`}</div>`);
+    }
+    else if (tab === 'gate') {
+        const att = pickedAttempt(t);
+        if (att) {
+            const view = attView(t, att);
+            body.innerHTML = attemptPick(t, att.n, attLabels) + (view ? gateTab(t, gateFile(view.gate), view.gate, { latest: att === attemptList(t).at(-1), exit: att.exit }) : '');
+        }
+        else
+            body.innerHTML = gateTab(t, gateFile(gateResult), gateResult);
+    }
+    else if (tab === 'retry')
+        body.innerHTML = historyTab(t, attLabels, histGates);
     else if (tab === 'files') {
         const files = [...changedFiles().values()];
         body.innerHTML = files.length ? `<div class="sec-t">${c.filesHelp}${t.status === 'run' ? c.filesLive : ''}</div><div class="rows">${files.map(f => `<div class="r ${f.kind}">${icon(f.kind === 'add' ? 'add-line' : f.kind === 'delete' ? 'delete-bin-line' : 'edit-line')}<span class="muted">${c.kinds[f.kind]}</span><span class="v mono">${esc(f.path)}</span><button class="btn sm quiet" data-file="${esc(f.path)}">${c.open}</button></div>`).join('')}</div>` : `<div class="empty">${icon('file-copy-line')}<b>${c.noFiles}</b></div>`;
@@ -406,9 +477,30 @@ function renderFlow() {
     if (!items.length)
         compact.hidden = true;
     timeline.think = think;
-    // 门禁开始时在进展末尾插一行分隔（B6）：时刻取 gating 事件，执行者这时已经以 0 退出。
+    // 多次尝试：顶部切换条 + 按尝试分组的分隔行；选了不存在的那一次（尝试列表变了）回到"全部"。
     const t = current();
-    timeline.footer = t?.gatingAt ? `<div class="tl k-turn gate-sep"><span class="t mono">${clock(t.gatingAt)}</span><div class="c">执行者结束（exit=${t.agentExit ?? 0}）· 门禁开始</div></div>` : '';
+    const attempts = t ? attemptList(t) : [];
+    if (typeof flowAtt === 'number' && !attempts.some(a => a.n === flowAtt))
+        flowAtt = 'all';
+    timeline.attempts = t && attempts.length >= 2 ? separators(t, attLabels) : [];
+    timeline.attemptFilter = flowAtt;
+    const attSlot = root.querySelector<HTMLElement>('.att-slot');
+    if (attSlot) {
+        const bar = t && attempts.length >= 2 ? attemptBar(t) : '';
+        // 选中态是代码套上去的，所以按生成的 markup 比较（存在 dataset 里），没变就不重建，焦点不丢。
+        if (attSlot.dataset.markup !== bar) {
+            attSlot.dataset.markup = bar;
+            attSlot.innerHTML = bar;
+        }
+        for (const button of attSlot.querySelectorAll<HTMLButtonElement>('[data-att]')) {
+            const on = button.dataset.att === String(flowAtt);
+            button.classList.toggle('on', on);
+            button.setAttribute('aria-pressed', String(on));
+        }
+    }
+    // 门禁开始时在进展末尾插一行分隔（B6）：时刻取 gating 事件，执行者这时已经以 0 退出。只在看"全部"或最新一次时显示（门禁属于最新一次尝试）。
+    const showFooter = flowAtt === 'all' || flowAtt === attempts.at(-1)?.n || attempts.length < 2;
+    timeline.footer = showFooter && t?.gatingAt ?`<div class="tl k-turn gate-sep"><span class="t mono">${clock(t.gatingAt)}</span><div class="c">执行者结束（exit=${t.agentExit ?? 0}）· 门禁开始</div></div>` : '';
     timeline.render();
     const earlier = root.querySelector<HTMLButtonElement>('[data-earlier]')!;
     earlier.hidden = !timeline.cursor?.start;
@@ -420,6 +512,58 @@ function followButton() { const b = root.querySelector<HTMLButtonElement>('[data
     b.hidden = tab !== 'flow' || !timeline || timeline.follow || current()?.status !== 'run';
     b.textContent = c.latest;
 } }
+// 多次尝试（Stage05）：任务有 2 次及以上尝试时，读各次尝试用到的执行者显示名（一次），
+// 以及汇报 / 门禁标签选中那一次的 attempts/<n>/ 文件（或重试标签要的各次门禁）。已结束的尝试读一次就缓存。返回界面要不要重画。
+async function refreshAttempts(t: Task | undefined, gen: number, id: string): Promise<boolean> {
+    if (!t || attemptList(t).length < 2)
+        return false;
+    const list = attemptList(t), dir = t.progress.replace(/[\\/][^\\/]*$/, '');
+    const stale = () => gen !== generation || id !== selected;
+    let changed = false;
+    const read = async (n: number) => {
+        const key = attKey(t, n), cached = attCache.get(key);
+        if (cached)
+            return cached;
+        // 读不出来（目录不是 .agent-runs 下的记录目录等）按没有 attempts/ 处理，界面改读顶层文件，不反复弹错误。
+        const files = await (window.dock.console('tasks:attempt-files', { dir, n }) as Promise<AttemptFiles>).catch((): AttemptFiles => ({ exists: false, report: '', gate: null }));
+        if (list.find(a => a.n === n)?.ok !== undefined)
+            attCache.set(key, files);
+        return files;
+    };
+    if (!attLabelsLoaded) {
+        attLabelsLoaded = true;
+        try {
+            const result = await window.dock.console('agents:list');
+            if (stale())
+                return false;
+            attLabels = new Map(((result?.agents ?? []) as AgentRow[]).map(a => [a.name, a.label]));
+            changed = true;
+        }
+        catch { /* 读不到执行者列表就显示配置名 */ }
+    }
+    if (tab === 'report' || tab === 'gate') {
+        const att = pickedAttempt(t)!, files = await read(att.n);
+        if (stale() || pickedAttempt(t)?.n !== att.n)
+            return changed;
+        const next = { ...files, key: attKey(t, att.n) };
+        if (JSON.stringify(next) !== JSON.stringify(attFiles)) {
+            attFiles = next;
+            changed = true;
+        }
+    }
+    else if (tab === 'retry') {
+        const next = new Map<number, GateResult>();
+        for (const a of list)
+            next.set(a.n, (await read(a.n)).gate);
+        if (stale())
+            return changed;
+        if (JSON.stringify([...next]) !== JSON.stringify([...histGates])) {
+            histGates = next;
+            changed = true;
+        }
+    }
+    return changed;
+}
 async function refreshDetail(before = false) {
     if (preferences.wizard || page !== 'tasks' || !current())
         return;
@@ -453,12 +597,16 @@ async function refreshDetail(before = false) {
             timeline.merge(older, true);
             changed ||= older.reset || older.events.length > 0;
         }
+        // 多次尝试：读各次尝试的执行者显示名、选中那一次的汇报与门禁（或重试历史要的各次门禁）。
+        const attChanged = await refreshAttempts(current(), gen, id);
+        if (gen !== generation || id !== selected)
+            return;
         // gate.json 变化时重画标题区（轨道与门禁横幅）和正在看的门禁标签，保留滚动位置。
         if (gateChanged)
             header();
-        if (tab === 'flow' && (changed || gateChanged))
+        if (tab === 'flow' && (changed || gateChanged || attChanged))
             renderFlow();
-        else if (tab !== 'flow' && (oldReport !== report || changed || gateChanged)) {
+        else if (tab !== 'flow' && (oldReport !== report || changed || gateChanged || attChanged)) {
             const viewport = root.querySelector<HTMLElement>('.dbody > .scroll')!, top = viewport.scrollTop;
             renderTab();
             viewport.scrollTop = top;
@@ -532,14 +680,36 @@ root.addEventListener('click', async (e) => {
         list();
         detail();
     }
-    else if (d.tab) {
-        tab = d.tab;
-        // 切标签时同步顶部门禁横幅：门禁标签里不显示，其它标签显示。
-        if (current())
-            banners(current()!);
-        renderTab();
+    else if (d.tab)
+        switchTab(d.tab);
+    // 多次尝试：重试历史的一行 → 切到进展并选中那一次；进展顶部的切换条；汇报、门禁顶部的下拉；标题行的"重试"。
+    else if (d.attRow) {
+        flowAtt = Number(d.attRow);
+        switchTab('flow');
+    }
+    else if (d.attPick !== undefined) {
+        const t = current();
+        if (t)
+            menu(b, attemptPickItems(t, attLabels, n => {
+                pickAtt = n;
+                const hit = attCache.get(attKey(t, n));
+                attFiles = hit ? { ...hit, key: attKey(t, n) } : null;
+                renderTab();
+                root.querySelector<HTMLElement>('[data-att-pick]')?.focus({ preventScroll: true });
+                void refreshDetail();
+            }), true);
+    }
+    else if (d.att !== undefined) {
+        flowAtt = d.att === 'all' ? 'all' : Number(d.att);
+        if (timeline)
+            timeline.follow = false;
+        renderFlow();
         root.querySelector<HTMLElement>('.dbody > .scroll')!.scrollTop = 0;
-        void refreshDetail();
+    }
+    else if (b.hasAttribute('data-retry')) {
+        const t = current();
+        if (t)
+            openRetrySheet({ t, trigger: b, failure: lastFailure(t, t.gateSummary ?? gateFile(gateResult)?.summary ?? ''), gate: gateEnabled(t) });
     }
     else if (b.hasAttribute('data-think')) {
         think = !think;

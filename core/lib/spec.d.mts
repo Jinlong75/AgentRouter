@@ -6,11 +6,14 @@ export interface SpecInput {
     expect_commit?: boolean;
     timeout_min?: number;
     verify_timeout_min?: number;
+    max_retries?: number;
     [key: string]: unknown;
 }
 export interface ProjectGateConfig {
     allowedPaths?: string[];
     verify?: string[];
+    verifyTimeoutMin?: number;
+    maxRetries?: number;
     [key: string]: unknown;
 }
 export interface MergedSpec {
@@ -19,6 +22,7 @@ export interface MergedSpec {
     expect_commit: boolean;
     timeout_min: number;
     verify_timeout_min: number;
+    max_retries: number;
     gate: boolean;
 }
 export declare function mergeSpec(spec?: SpecInput, project?: ProjectGateConfig): MergedSpec;

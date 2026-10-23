@@ -2,8 +2,17 @@
 // 再写入 profile.env、解析后的 secrets、隔离项（隔离项最后写，profile 不能改掉它）。
 // 其他变量（别的密钥、令牌、个人配置）一律不传；任何 profile 的密钥来源变量都不原样传下去。
 // 返回的对象只交给 spawn，调用方绝不打印或写盘。
+import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, parse } from 'node:path';
 import { resolveSecret } from './secrets.mjs';
 import { testAgent, testAgentEnv } from './compat.mjs';
+
+// 064：执行者进程的用户目录指向沙箱 <公共目录>/workers/<profile>/home（协议第 7 节"执行者的用户目录"）。
+// 原因：执行者在 PowerShell 里给只读的 $home 赋值失败后，$home 仍是真实用户目录根，脚本随后把文件直接写进去
+//（Stage04 041、Stage05 058、063）；文字规则拦不住。PowerShell 的 $HOME 与 Node 的 os.homedir() 都跟随 USERPROFILE / HOME，
+// 指向沙箱后，这类误写只会落进沙箱。核心自己的进程不受影响。
+export const sandboxHome = (home, profileName) => join(home, 'workers', profileName, 'home');
 
 // 认证方式（D18）：login 沿用 CLI 自己的登录，不注入任何凭据；token 从 secrets 指向的环境变量注入。
 // 没写 auth 时：有 secrets 就是 token，否则 login（旧配置里的 codex 就是 login）。
@@ -50,7 +59,57 @@ export function buildEnv({ base = process.env, profile = {}, adapter, home, prof
   for (const [k, v] of Object.entries(profile.env ?? {})) { del(k); env[k] = String(v); }
   for (const [k, v] of secrets) { del(k); env[k] = v; }
   for (const [k, v] of Object.entries(iso.set ?? {})) { del(k); env[k] = String(v); }
+  if (home && profileName) applySandboxHome(env, { base, home, profileName, realHomeDefaults: iso.realHomeDefaults, del });
   return env;
+}
+
+// 用户目录换成沙箱（最后做，profile.env 与适配器都改不掉它）：
+// - USERPROFILE、HOME 指向沙箱；Windows 上 HOMEDRIVE / HOMEPATH 按沙箱路径拆开。
+// - git 仍用用户真实的全局配置（提交身份）：GIT_CONFIG_GLOBAL 指向真实的 ~/.gitconfig（或 ~/.config/git/config），
+//   调用方环境已经设了 GIT_CONFIG_GLOBAL 时沿用；都没有就不设。
+// - 适配器可以用 realHomeDefaults 声明"没设时指向真实用户目录下某处"的变量（codex 的 CODEX_HOME：Codex 执行者要用用户自己的登录）。
+function applySandboxHome(env, { base, home, profileName, realHomeDefaults = {}, del }) {
+  const sandbox = sandboxHome(home, profileName);
+  const pick = name => Object.entries(base).find(([k, v]) => matches(name, k) && typeof v === 'string' && v)?.[1];
+  const real = pick('USERPROFILE') ?? pick('HOME') ?? null;
+  for (const [key, relative] of Object.entries(realHomeDefaults)) {
+    if (real && !Object.keys(env).some(k => matches(key, k))) env[key] = join(real, relative);
+  }
+  const gitGlobal = pick('GIT_CONFIG_GLOBAL') ?? (real ? [join(real, '.gitconfig'), join(real, '.config', 'git', 'config')].find(file => existsSync(file)) : undefined);
+  for (const key of ['USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'GIT_CONFIG_GLOBAL']) del(key);
+  pointHome(env, sandbox);
+  if (gitGlobal) env.GIT_CONFIG_GLOBAL = gitGlobal;
+}
+
+function pointHome(env, dir) {
+  env.USERPROFILE = dir;
+  env.HOME = dir;
+  if (process.platform === 'win32') {
+    env.HOMEDRIVE = parse(dir).root.replace(/[\\/]+$/, '');
+    env.HOMEPATH = dir.slice(env.HOMEDRIVE.length) || '\\';
+  }
+}
+
+// 启动执行者之前建好沙箱目录（buildEnv 本身只算环境、不碰文件系统）。公共目录下建不了（例如公共目录不可写）时，
+// 改用系统临时目录里新建的一次性目录——**绝不回落到真实用户目录**。返回实际使用的目录。
+export function ensureSandboxHome(env, { home, profileName } = {}) {
+  if (!home || !profileName || env.USERPROFILE !== sandboxHome(home, profileName)) return env.USERPROFILE ?? null;
+  try { makeSandbox(env.USERPROFILE); return env.USERPROFILE; }
+  catch {
+    const dir = mkdtempSync(join(tmpdir(), `ar-sandbox-${String(profileName).replace(/[^\w.-]/g, '_')}-`));
+    pointHome(env, dir);
+    makeSandbox(dir);
+    return dir;
+  }
+}
+
+// Windows 上查"本机应用数据 / 漫游应用数据"这类已知文件夹时，按注册表里的 %USERPROFILE%\AppData\… 展开；
+// 沙箱里没有这两个目录时 .NET 的 GetFolderPath 返回空串，PowerShell 随后把模块分析缓存写成相对路径，
+// 落进执行者的工作目录（Stage05 058 第 4 次派发：仓库根多出 Microsoft/Windows/PowerShell/ModuleAnalysisCache）。
+// 所以建沙箱时一并建好这两个目录，这类缓存留在沙箱里。
+function makeSandbox(dir) {
+  mkdirSync(dir, { recursive: true });
+  if (process.platform === 'win32') for (const sub of ['Local', 'Roaming']) mkdirSync(join(dir, 'AppData', sub), { recursive: true });
 }
 
 // 配置里所有 profile 的密钥来源变量名。

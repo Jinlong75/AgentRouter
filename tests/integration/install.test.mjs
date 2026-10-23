@@ -542,10 +542,16 @@ test('配置命令：查看、来源、修改、清空、init、未知键、拒�
     else assert.equal(invoke([arg]).status, 0);
     assert.deepEqual(fs.readFileSync(join(s.home, 'config.json')), before);
   }
+  // 063：配置无效时查看与写入都拒绝（协议第 4 节），不再"无法读取但继续显示 / 回退内置默认"。
   for (const [bad, reason] of [['{', '不是有效的 JSON'], ['{"v":3}', 'v 不是 1 或 2']]) {
-    write(join(s.home, 'config.json'), bad);
-    assert.match(invoke([]).stdout, new RegExp(`无法读取（${reason}）`));
-    assert.notEqual(invoke(['model=new']).status, 0); assert.equal(fs.readFileSync(join(s.home, 'config.json'), 'utf8'), bad);
+    const file = join(s.home, 'config.json');
+    write(file, bad);
+    const shown = invoke([]); assert.equal(shown.status, 2, shown.stderr);
+    assert.ok(shown.stderr.includes(`配置：config.json 无法读取（${reason}）。为免改用你没有选的执行者，这次没有派发。请修好这个文件，或者删掉它（删掉后按内置默认）：${file}`), shown.stderr);
+    assert.doesNotMatch(shown.stdout + shown.stderr, /执行者：/);
+    const writing = invoke(['model=new']); assert.equal(writing.status, 2, writing.stderr);
+    assert.ok(writing.stderr.includes(`为免改用你没有选的执行者，这次没有改动配置。请修好这个文件，或者删掉它（删掉后按内置默认）：${file}`), writing.stderr);
+    assert.equal(fs.readFileSync(file, 'utf8'), bad);
   }
 });
 
@@ -605,13 +611,15 @@ test('清单 spec 和进度文件路径统一为 /，无效配置提示文案及
   assert.equal(row.spec, 'docs/任务.md');
   assert.match(fs.readFileSync(row.progress, 'utf8'), /新增文件：src\/new.ts/);
   assert.match(fs.readFileSync(row.progress, 'utf8'), /出错：示例条目错误/);
+  // 063：配置无效时不再"按内置默认运行"（内置默认是真实 Codex），拒绝派发、不写清单、不动坏文件。
   for (const [invalid, reason] of [['{', '不是有效的 JSON'], ['{"v":3}', 'v 不是 1 或 2']]) {
-    write(join(s.home, 'config.json'), invalid); s.env.CODEX_DISPATCH_TEST_AGENT = fake;
-    result = s.cli(['任务'], entry); assert.equal(result.status, 0, result.stderr);
-    const warning = `配置：config.json 无法读取（${reason}），本次按内置默认运行`;
-    assert.ok(result.stdout.includes(warning));
-    row = fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse).filter(r => r.event === 'start').at(-1);
-    assert.ok(fs.readFileSync(row.progress, 'utf8').split('\n')[1].endsWith(warning));
+    const file = join(s.home, 'config.json');
+    write(file, invalid);
+    const rows = fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').length;
+    result = s.cli(['任务'], entry); assert.equal(result.status, 2, result.stderr);
+    assert.ok(result.stderr.includes(`配置：config.json 无法读取（${reason}）。为免改用你没有选的执行者，这次没有派发。请修好这个文件，或者删掉它（删掉后按内置默认）：${file}`), result.stderr);
+    assert.equal(fs.readFileSync(join(s.home, 'runs.jsonl'), 'utf8').trim().split('\n').length, rows, '没有新的清单行');
+    assert.equal(fs.readFileSync(file, 'utf8'), invalid);
   }
 });
 

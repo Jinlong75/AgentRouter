@@ -7,13 +7,15 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { main } from '../../core/lib/cli.mjs';
 import { loadPreset } from '../../core/lib/agents.mjs';
+import { withFakeCodex } from '../fixtures/fake-codex-path.mjs';
 
 // 隔离公共目录；假密钥只放在传入的环境里。任何输出都不能出现它的值。
 const SECRET = 'sk-test-agents-cli-5c1e';
 function setup(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ar agents 测试 '));
   t.after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
-  const env = { AGENT_ROUTER_HOME: home, DEEPSEEK_API_KEY: SECRET, MIMO_API_KEY: SECRET, PATH: process.env.PATH, SystemRoot: process.env.SystemRoot };
+  // PATH 最前面是测试自己的假 codex：内置默认与预设里有 codex 执行者，不能在真实 ~/.codex 里运行真实 codex（Stage05 哨兵查出）。
+  const env = withFakeCodex({ AGENT_ROUTER_HOME: home, DEEPSEEK_API_KEY: SECRET, MIMO_API_KEY: SECRET, PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }, home);
   const outputs = [];
   const call = async (argv, extra = {}) => {
     const out = [];

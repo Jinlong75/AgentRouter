@@ -1,5 +1,5 @@
 import type { GateFile, GateResult, Task } from '../shared/types';
-import { gt } from '../shared/copy';
+import { gt, rt } from '../shared/copy';
 import { esc } from '../shared/markdown';
 import { icon } from './ui';
 
@@ -14,6 +14,10 @@ export function gateState(t: Task): GateState | null {
         return null;
     if (t.gate === false)
         return 'off';
+    // Stage05：自动重试时第 2 次起的尝试进行中，快照里的 gateOk / gatingAt 还是上一次尝试的（清单解析不在尝试开始时清掉）：
+    // 这一次的门禁还没开始就是"等待"，gating 事件晚于这次尝试开始才是"检查中"。
+    if (t.status === 'run' && t.attempt && t.attempt.n > 1 && t.attempt.ok === undefined)
+        return t.gatingAt !== undefined && t.gatingAt >= t.attempt.at ? 'running' : 'pending';
     if (t.gateOk !== undefined)
         return t.gateOk ? 'ok' : 'fail';
     if (t.gatingAt !== undefined)
@@ -51,11 +55,14 @@ export function gateTrack(t: Task, file: GateFile | null) {
     if (state === null)
         return '';
     const exit = t.agentExit ?? t.exit ?? null;
+    // Stage05：有多次尝试（当前尝试 total > 1）时，运行中写"第 n/N 次"，完成且不是第 1 次写"第 n 次完成"。
+    const attempt = t.attempt, many = attempt && attempt.total && attempt.total > 1 ? attempt : null;
     const exec = t.status === 'stop' ? ['stopped', icon('stop-fill'), gt.trackStopped, '已中断']
-        : t.status === 'run' ? ['running', '', gt.trackRun, `运行中，已运行 ${elapsed(t)}`]
+        : t.status === 'run' ? ['running', '', many ? rt.trackRun(many.n, many.total!) : gt.trackRun, many ? rt.nodeRun(many.n, many.total!) : `运行中，已运行 ${elapsed(t)}`]
             : (state === 'notrun' || (t.agentExit !== undefined && t.agentExit !== 0) || (t.agentExit === undefined && t.exit !== 0))
                 ? ['failed', icon('close-line'), gt.trackExit(exit), `异常退出（exit=${exit ?? '—'}）`]
-                : ['done', icon('check-line'), '完成', '执行者正常结束'];
+                : attempt && attempt.n > 1 ? ['done', icon('check-line'), rt.trackDone(attempt.n), rt.nodeDone(attempt.n)]
+                    : ['done', icon('check-line'), '完成', '执行者正常结束'];
     const commands = file?.commands ?? [], passed = commands.filter(command => command.exit === 0 && !command.timedOut && command.error == null).length;
     const summary = t.gateSummary ?? file?.summary ?? '';
     const gate = state === 'pending' ? ['todo', '', gt.trackGateWait, '执行者结束后运行', '等待']
@@ -72,10 +79,16 @@ const gms = (ms: number) => gt.ms(ms);
 const commandOk = (command: { exit: number | null; timedOut?: boolean; error?: string | null }) => command.exit === 0 && !command.timedOut && command.error == null;
 const seconds = (ms: number | undefined) => Number.isFinite(ms) ? ((ms as number) / 1000).toFixed(1) : '—';
 
-// "门禁"标签：横幅 → 提交检查 → 未提交的文件 → 改动范围 → 验收命令。
+// "门禁"标签：横幅 → 提交检查 → 未提交的文件 → 改动范围 → 删除的文件（旧记录没有时整块不显示）→ 验收命令。
 // 命令行沿用时间线的 .cmd / .out 组件；这里用 data-gcmd / data-gout，不与时间线的 data-cmd 混用。
-export function gateTab(t: Task, file: GateFile | null, result: GateResult): string {
-    const state = gateState(t);
+// Stage05：attempt 是下拉选中的某一次尝试。读到了那一次的 gate.json 就直接显示它（不看任务当前的门禁状态）；
+// 没读到时，最新一次仍按任务状态显示（进行中、等待…），更早的一次说明门禁没有结果。
+export function gateTab(t: Task, file: GateFile | null, result: GateResult, attempt?: { latest: boolean; exit?: number | null }): string {
+    const state = attempt && result ? null : gateState(t);
+    if (attempt && !result && !attempt.latest)
+        return attempt.exit
+            ? `<div class="empty">${icon('shield-check-line')}<b>门禁没有运行</b><p>执行者没有正常结束（exit=${esc(attempt.exit)}），门禁只在执行者以 0 退出后运行。</p></div>`
+            : `<div class="empty">${icon('shield-check-line')}<b>${esc(gt.missing)}</b></div>`;
     if (state === 'running')
         return `<div class="banner info" role="status">${runm}<div class="rt"><b>${esc(gt.runningTitle)}</b><span>${esc(gt.runningHelp(0))}</span></div></div><div class="empty">${runm}<b>${esc(gt.pending)}</b></div>`;
     if (state === 'pending')
@@ -87,6 +100,9 @@ export function gateTab(t: Task, file: GateFile | null, result: GateResult): str
     if (!file)
         return `<div class="empty">${icon('shield-check-line')}<b>${esc(gt.missing)}</b></div>`;
     const commands = file.commands ?? [], outside = file.scope?.outside ?? [], changed = file.scope?.changed ?? [], uncommitted = file.uncommitted ?? [];
+    const protectedPaths = file.scope?.protected ?? [];
+    const deletedRaw = file.scope?.deleted;
+    const deleted = Array.isArray(deletedRaw) ? deletedRaw : null;
     const head = file.ok
         ? `<div class="banner ok" role="status">${okm}<div class="rt"><b>${esc(gt.okTitle(3, commands.length, seconds(file.ms)))}</b><span>执行者结束后，核心自己检查了提交、未提交的文件与改动范围，并运行了验收命令。</span></div></div>`
         : `<div class="banner fail" role="alert">${failm}<div class="rt"><b>${esc(gt.failTitle)}</b><span>${esc(file.summary ?? '')}</span></div></div>`;
@@ -97,11 +113,16 @@ export function gateTab(t: Task, file: GateFile | null, result: GateResult): str
         : row(true, esc(gt.commitNotRequired));
     const unc = uncommitted.length ? uncommitted.map(path => row(false, esc(path), '', true)).join('') : row(true, esc(gt.uncommittedNone), '', false, esc(gt.uncommittedHelp));
     const allowed = file.scope?.allowed ?? [];
-    const scope = `<div class="gallow"><span>${esc(gt.scopeAllowed)}</span>${allowed.length ? allowed.map(allowedPath => `<span class="mono">${esc(allowedPath)}</span>`).join('<span>·</span>') : `<span>${esc(gt.scopeAll)}</span>`}</div>` + (changed.length ? changed.map(path => row(!outside.includes(path), esc(path), outside.includes(path) ? gt.scopeOutside : '', true)).join('') : row(true, esc(gt.scopeNone)));
+    const scope = `<div class="gallow"><span>${esc(gt.scopeAllowed)}</span>${allowed.length ? allowed.map(allowedPath => `<span class="mono">${esc(allowedPath)}</span>`).join('<span>·</span>') : `<span>${esc(gt.scopeAll)}</span>`}</div>` + (changed.length ? changed.map(path => row(!outside.includes(path), esc(path), protectedPaths.includes(path) ? gt.scopeProtected : outside.includes(path) ? gt.scopeOutside : '', true)).join('') : row(true, esc(gt.scopeNone)));
+    // 删除的文件（界面稿 gateTab）：只是提示，图标与文字用次级色；旧记录没有 deleted 字段时整块不显示。
+    const del = deleted === null ? '' : `<div class="sec-t">${esc(gt.deletedSec)}<span class="sp"></span><span>${deleted.length ? esc(gt.deletedCount(deleted.length)) : ''}</span></div>`
+        + (deleted.length
+            ? deleted.map(path => `<div class="grow info">${icon('delete-bin-line')}<span class="v mono">${esc(path)}</span><span class="meta">${outside.includes(path) ? esc(gt.scopeOutside) : ''}</span></div>`).join('')
+            : `<div class="grow info">${icon('delete-bin-line')}<span class="v">${esc(gt.deletedNone)}<span class="note">${esc(gt.deletedNoneHelp)}</span></span><span class="meta"></span></div>`);
     const cmds = commands.length ? commands.map((command, index) => {
         const meta = [command.timedOut ? gt.timedOut : command.exit ? `exit=${command.exit}` : '', gms(command.ms ?? 0)].filter(Boolean).join(' · ');
         const errorNote = command.error ? `<span class="note">${esc(command.error)}</span>` : '';
         return `<div class="grow ${commandOk(command) ? '' : 'bad'}">${commandOk(command) ? okm : failm}<span class="v"><button class="cmd" data-gcmd="${index}" aria-expanded="false">${command.output ? icon('arrow-right-s-line') : ''}<code>${esc(command.line)}</code></button>${command.output ? `<pre class="out selectable" data-gout="${index}" hidden>${esc(command.output)}</pre>${command.truncated ? `<span class="note" data-gnote="${index}" hidden>${esc(gt.truncated)}</span>` : ''}` : errorNote}</span><span class="meta">${esc(meta)}</span></div>`;
     }).join('') : row(true, esc(gt.commandsNone));
-    return `${head}<div class="sec-t">${esc(gt.commitSec)}</div>${commit}<div class="sec-t">${esc(gt.uncommittedSec)}</div>${unc}<div class="sec-t">${esc(gt.scopeSec)}<span class="sp"></span><span>${esc(gt.scopeCount(changed.length, outside.length))}</span></div>${scope}<div class="sec-t">${esc(gt.commandsSec)}</div>${cmds}`;
+    return `${head}<div class="sec-t">${esc(gt.commitSec)}</div>${commit}<div class="sec-t">${esc(gt.uncommittedSec)}</div>${unc}<div class="sec-t">${esc(gt.scopeSec)}<span class="sp"></span><span>${esc(gt.scopeCount(changed.length, outside.length))}</span></div>${scope}${del}<div class="sec-t">${esc(gt.commandsSec)}</div>${cmds}`;
 }

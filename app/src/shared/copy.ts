@@ -97,6 +97,8 @@ export const p = {
     window: '窗口', closeAction: '点关闭按钮时', closeActionHelp: '托盘图标在任务栏右下角；右键托盘图标可以退出', closeOptions: { ask: '每次询问', tray: '最小化到托盘', quit: '退出' } as Record<string, string>,
     trayTip: (running: number) => running ? `AgentRouter · ${running} 个任务进行中` : 'AgentRouter', trayOpen: '打开 AgentRouter', trayQuit: '退出 AgentRouter',
     trayFirst: 'AgentRouter 仍在后台运行：点托盘图标打开，右键可以退出。',
+    // Stage05 开工前第 1 条：主进程公共目录保护。弹窗标题；正文用核心的 unsafeHomeReason（与命令行同一句话）。
+    homeUnsafeTitle: 'AgentRouter 无法启动',
     // 数据（012）：清除缓存、重置
     data: '数据', dataHelp: '排查问题或卸载前清理用。项目文件夹里的代码、任务说明和任务记录（.agent-runs）不受影响。',
     clearCache: '清除缓存', clearCacheHelp: '界面缓存、执行者的会话记录和测试连接留下的临时文件。配置、Agent、项目和任务列表都保留。',
@@ -233,8 +235,40 @@ export const gt = {
     commitSec: '提交检查', commitRequired: '要求执行者提交', commitNotRequired: '不要求提交', commitOk: (base: string, head: string) => `已提交：${base} → ${head}`, commitNone: '没有提交任何改动',
     uncommittedSec: '未提交的文件', uncommittedNone: '没有', uncommittedHelp: '执行者结束时工作区里还有这些改动没提交（不含 .agent-runs/）',
     scopeSec: '改动范围', scopeAllowed: '允许', scopeAll: '全部文件', scopeNone: '没有改动文件', scopeOutside: '超出范围', scopeCount: (changed: number, outside: number) => outside ? `${changed} 个文件，${outside} 个超出范围` : `${changed} 个文件，都在范围内`,
+    // Stage05 开工前第 5 条：受保护的路径（.agent-router/ 与任务说明目录）超出范围时的行尾标注；删除的文件单独一块（只是提示）
+    scopeProtected: '受保护的路径', deletedSec: '删除的文件', deletedNone: '没有', deletedNoneHelp: '这次没有删除任何文件', deletedCount: (n: number) => `${n} 个`,
     commandsSec: '验收命令', commandsNone: '没有验收命令', timedOut: '超时', truncated: '只保留了最后 200 行', ms: (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} 秒`,
     pending: '门禁结束后显示结果', missing: '没有找到门禁结果文件（gate.json）',
+};
+
+// Stage05 多次尝试与重试（界面稿 app/design/preview.js 的"自动重试中 / 重试历史 / 按尝试看汇报 / 重试弹窗 / 完成后再改"）
+export const rt = {
+    // 列表第二行：尝试 n/N（与"再派一次"的「第 N 次」标签区分）
+    tag: (n: number, total: number) => `尝试 ${n}/${total}`, tagTip: (n: number, total: number) => `第 ${n} 次尝试，共允许 ${total} 次`,
+    // 流水线轨道执行节点下的小字与 aria-label 里的状态
+    trackRun: (n: number, total: number) => `第 ${n}/${total} 次`, trackDone: (n: number) => `第 ${n} 次完成`,
+    nodeRun: (n: number, total: number) => `运行中，第 ${n} 次尝试（共允许 ${total} 次）`,
+    nodeDone: (n: number) => `第 ${n} 次尝试完成，前 ${n - 1} 次没有通过，查看重试历史`,
+    // 进展顶部的尝试切换条；汇报、门禁顶部的尝试下拉
+    barLabel: '按尝试查看', all: '全部', nth: (n: number) => `第 ${n} 次`,
+    pick: '尝试', pickOption: (n: number, latest: boolean, label: string) => `第 ${n} 次${latest ? '（最新）' : ''} · ${label}`,
+    // 进展里每次尝试开头的分隔行
+    sep: (n: number) => `第 ${n} 次尝试`, sepMeta: (label: string, reason: string) => `${label} · 原因：${reason}`,
+    reason: { first: '首次', gate: '门禁未通过', agent: '执行者异常退出', manual: '手动重试' } as Record<string, string>,
+    escalated: ' · 升级执行者',
+    // "重试"标签（重试历史）
+    tab: '重试', histHead: (count: number, total: number | null) => `共 ${count} 次尝试${total ? `，自动最多 ${total} 次` : ''}`, histHint: '点一行查看那一次的进展',
+    rowLabel: (n: number, result: string) => `第 ${n} 次尝试：${result}，查看进展`,
+    resultRunning: '进行中', resultDone: '完成', resultGateOk: '门禁通过', resultGateFail: (summary: string) => `门禁未通过：${summary}`,
+    resultAgent: (exit: number | null) => `执行者异常退出（exit ${exit ?? '?'}）`, resultStopped: '已中断', tokens: (input: string, output: string) => `token ${input} / ${output}`,
+    // 标题行按钮与重试弹窗（调用 ar retry --detach --json）
+    button: '重试', buttonTip: '在同一工作区继续：新开一次尝试，可以补充说明或换执行者',
+    title: (name: string) => `重试 · ${name}`, lastFail: '会附上上一次的失败原因',
+    worker: '执行者', workerHelp: '默认沿用这个任务的执行者；可以换成更强的执行者', workerOrig: (label: string) => `${label}（原执行者）`,
+    note: '补充说明', noteHelp: '可选：告诉执行者这一次要注意什么', noteHelpRequired: '已完成的任务重试时必须写：说明这一轮要改什么',
+    notePh: '例如：函数名改为 add；不要修改测试文件',
+    start: (n: number) => `开始第 ${n} 次尝试`, starting: '正在开始…', consequence: (gate: boolean) => `在同一工作区继续${gate ? '，结束后跑门禁' : ''}；不占自动重试的次数`,
+    failed: '没有开始重试',
 };
 
 // Stage03 主进程调用核心（console 通道）的错误文案；核心自己的错误已经是中文，原样显示。

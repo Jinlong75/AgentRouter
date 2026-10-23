@@ -2,12 +2,13 @@ import { watch, type FSWatcher } from 'node:fs';
 import { open, readFile, writeFile, appendFile, mkdir, rename, unlink, readdir, stat, lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { DeleteResult, Task } from '../shared/types';
+import type { DeleteResult, Task, TaskAttempt } from '../shared/types';
 import { commitFrom } from '../shared/markdown';
 import { c } from '../shared/copy';
 import { dispatchMatches, type Platform, type ProcessInfo } from './platform';
 import type { ProcessCheck } from '../shared/types';
 import { legacyRunsName } from '../../../core/lib/compat.mjs';
+import { parseJson } from '../../../core/lib/json.mjs';
 export function mergeLine(tasks: Map<string, Task>, line: string) {
     try {
         const e = JSON.parse(line);
@@ -40,6 +41,46 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 return;
             if (e.event === 'spawned')
                 t.agentPid = e.agentPid ?? e.codexPid;
+            // 手动重试（协议 14.3 / 14.4）：resume 之后任务回到"进行中"——上一次的 exit / 中断标记 /
+            // 门禁结果不再算最终；停止按钮与进程身份核对改用这次 resume 的 pid 与核对时刻（pidSince = resume.at，
+            // started 保持最初的派发时刻）。之后写的新 end / interrupted 照常生效。字段不合法时整条忽略（同未知事件）。
+            if (e.event === 'resume') {
+                if (!Number.isSafeInteger(e.pid) || e.pid <= 0 || !Number.isFinite(e.at))
+                    return;
+                t.status = 'run';
+                t.pid = e.pid;
+                // 065：开始时间保持最初的派发时刻（started），核对时刻换成这次进程的 resume.at（pidSince）。
+                t.pidSince = e.at;
+                t.exit = undefined;
+                t.ended = undefined;
+                t.minutes = undefined;
+                t.signal = undefined;
+                t.agentExit = undefined;
+                t.gateOk = undefined;
+                t.gateSummary = undefined;
+                t.gatingAt = undefined;
+            }
+            // 尝试记录（协议 14.2 / 14.3）：attempt 记开始信息，attempt-end 补上结果字段；
+            // 当前尝试 = 最后一个 attempt。旧记录没有这些事件，任务对象与以前一致。
+            if (e.event === 'attempt' && Number.isSafeInteger(e.n) && e.n > 0) {
+                const item: TaskAttempt = { n: e.n, total: Number.isSafeInteger(e.total) ? e.total : null, profile: typeof e.profile === 'string' ? e.profile : null, reason: typeof e.reason === 'string' ? e.reason : '', at: Number.isFinite(e.at) ? e.at : 0 };
+                t.attempts = [...(t.attempts ?? []), item];
+                t.attempt = item;
+            }
+            if (e.event === 'attempt-end' && Number.isSafeInteger(e.n)) {
+                const item = (t.attempts ?? []).find(a => a.n === e.n);
+                if (item) {
+                    item.ok = e.ok === true;
+                    if (Number.isInteger(e.exit) || e.exit === null)
+                        item.exit = e.exit;
+                    if (typeof e.gate === 'boolean' || e.gate === null)
+                        item.gate = e.gate;
+                    if (e.usage && typeof e.usage === 'object')
+                        item.usage = { input: Number.isFinite(e.usage.input) ? e.usage.input : null, output: Number.isFinite(e.usage.output) ? e.usage.output : null };
+                    if (Number.isFinite(e.ms))
+                        item.ms = e.ms;
+                }
+            }
             // 门禁开始：执行者结束后核心写 gating，随后写 gate 结果，最后才写 end。
             if (e.event === 'gating' && Number.isFinite(e.at))
                 t.gatingAt = e.at;
@@ -67,7 +108,9 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
 }
 export function parseRegistry(text: string) { const tasks = new Map<string, Task>(); for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n'))
     mergeLine(tasks, line); return [...tasks.values()]; }
-export function statusOf(t: Task, ps: ProcessInfo[]): Task['status'] { return t.exit !== undefined ? (t.exit === 0 ? 'done' : 'fail') : t.status === 'stop' ? 'stop' : dispatchMatches(ps.find(p => p.pid === t.pid), t.started) ? 'run' : 'stop'; }
+// 065：进程身份核对用的时刻——resume 之后是 pidSince（这次进程的时刻），否则是最初的 started。
+export function matchTime(t: Task) { return t.pidSince ?? t.started; }
+export function statusOf(t: Task, ps: ProcessInfo[]): Task['status'] { return t.exit !== undefined ? (t.exit === 0 ? 'done' : 'fail') : t.status === 'stop' ? 'stop' : dispatchMatches(ps.find(p => p.pid === t.pid), matchTime(t)) ? 'run' : 'stop'; }
 // 017：记录目录名只允许是 .agent-runs 下的一层名字——不能为空、不能是 . / ..、
 // 不能含路径分隔符或 `..`，也不能是盘符开头的绝对路径。
 export function validRecordName(name: unknown): name is string {
@@ -178,6 +221,13 @@ export class Registry {
     get file() { return path.join(this.home, 'runs.jsonl'); }
     // 新清单（AgentRouter）与旧清单（DispatchDock 的 codex-dispatch 公共目录）；测试隔离时两者相同。
     get files() { return [...new Set([this.file, path.join(this.legacyHome, 'runs.jsonl')])]; }
+    // dir 是否是看板上某个任务的记录目录（progress.log 所在目录，与 detail 通道的写法一致）；
+    // 比较按 Windows 不区分大小写。看板任务的仓库不一定登记过，所以不看项目登记表。
+    knownRunDir(dir: string): boolean {
+        const norm = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+        const wanted = norm(dir);
+        return this.tasks.some(t => norm(path.dirname(t.progress)) === wanted);
+    }
     private async readAll() {
         const rows: Task[] = [];
         for (const file of this.files) {
@@ -192,7 +242,7 @@ export class Registry {
         await mkdir(this.data, { recursive: true });
         const saved = await reportText(path.join(this.data, 'tasks.json'));
         if (saved) {
-            const v = JSON.parse(saved);
+            const v = parseJson(saved);
             this.imports = Array.isArray(v.imports) ? v.imports.flatMap((value:Task)=>{
                 if(!value?.imported||!['done','fail','stop'].includes(value.status))return [];
                 const task=parseRegistry(JSON.stringify({...value,v:1,event:'start',pid:0})+'\n')[0];
@@ -319,7 +369,7 @@ export class Registry {
         return Error(c.changed);
     }
     hide(id: string) { return this.serial(async () => { await this.refresh(); const t = this.tasks.find(t => t.id === id); if (!t || t.status === 'run')
-        throw this.stateChanged('隐藏', id, t, t ? '任务仍在进行' : '找不到任务'); const ps = t.pid ? await this.platform.processes([t.pid]) : []; if (dispatchMatches(ps[0], t.started))
+        throw this.stateChanged('隐藏', id, t, t ? '任务仍在进行' : '找不到任务'); const ps = t.pid ? await this.platform.processes([t.pid]) : []; if (dispatchMatches(ps[0], matchTime(t)))
         throw this.stateChanged('隐藏', id, t, '派发进程仍然存活'); this.hidden.add(this.key(t)); await this.save(); await this.refresh(); }); }
     // 017：批量从列表删除（可选同时删除项目里的任务记录目录）。渲染层只传 id，
     // 路径一律从这里已读取的任务导出；runs.jsonl 不改，删除沿用 hidden。
@@ -337,7 +387,7 @@ export class Registry {
             const pids = targets.filter(t => t.pid).map(t => t.pid);
             const ps = pids.length ? await this.platform.processes(pids) : [];
             const removable = targets.filter(t => {
-                if (t.pid && dispatchMatches(ps.find(p => p.pid === t.pid), t.started)) { result.failed++; return false; }
+                if (t.pid && dispatchMatches(ps.find(p => p.pid === t.pid), matchTime(t))) { result.failed++; return false; }
                 return true;
             });
             // 一次写入 hidden，不逐条保存。
@@ -385,7 +435,7 @@ export class Registry {
     // 清空任务列表（018）：一次把所有已结束任务（含旧版本导入的任务）的键加入 hidden 并只保存一次；
     // 进行中的任务与派发进程仍存活的不动。不改 runs.jsonl，不删任何文件。
     hideFinished() { return this.serial(async () => { await this.refresh(); const candidates = this.tasks.filter(t => t.status !== 'run'); const ps = await this.platform.processes(candidates.filter(t => t.pid).map(t => t.pid)); let removed = 0; for (const t of candidates) {
-        if (t.pid && dispatchMatches(ps.find(p => p.pid === t.pid), t.started))
+        if (t.pid && dispatchMatches(ps.find(p => p.pid === t.pid), matchTime(t)))
             continue;
         this.hidden.add(this.key(t));
         removed++;
@@ -397,7 +447,7 @@ export class Registry {
     async reloadHidden() {
         await this.serial(async () => {
             const saved = await reportText(path.join(this.data, 'tasks.json'));
-            const v = saved ? JSON.parse(saved) : {};
+            const v = saved ? parseJson(saved) : {};
             this.hidden = new Set(Array.isArray(v.hidden) ? v.hidden.filter((key: unknown) => typeof key === 'string') : []);
             await this.refresh();
         });
@@ -408,19 +458,52 @@ export class Registry {
             const t = this.tasks.find(t => t.id === id);
             if (!t || t.imported || t.status !== 'run' || !t.pid)
                 throw this.stateChanged('停止', id, t, !t ? '找不到任务' : t.imported ? '导入的旧任务' : t.status !== 'run' ? '任务已不在进行中' : '没有 pid');
-            const ps = await this.platform.processes([t.pid]);
-            if (!dispatchMatches(ps.find(p => p.pid === t.pid), t.started))
-                throw this.stateChanged('停止', id, t, ps.length ? '进程身份与派发时不一致（可能 PID 被复用）' : '派发进程已经不在了');
+            // 065（协议第 9 节）：软件的停止与 ar stop 同规则——进程查询失败（抛错，或没有结果但 PID 仍存活）
+            // 间隔约 1 秒重试，最多共查 3 次；仍失败就报"无法核对进程"，不结束任何进程、不写 interrupted。
+            let ps: ProcessInfo[] | null = null, lastQueryError = '';
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                if (attempt > 1) await new Promise(resolve => setTimeout(resolve, 1000));
+                try {
+                    const rows = await this.platform.processes([t.pid]);
+                    const found = rows.find(p => p.pid === t.pid);
+                    if (found || !this.platform.alive || !this.platform.alive(t.pid)) { ps = rows; break; }
+                    lastQueryError = '查询没有结果但 PID 仍然存活';
+                } catch (error) { lastQueryError = error instanceof Error ? error.message : String(error); }
+            }
+            if (ps === null) {
+                const message = `停止：${t.name} 无法核对进程（进程查询失败：${lastQueryError}），没有结束任何进程`;
+                console.warn(`任务状态已经变了：停止 ${id}（当时状态 ${t.status}，pid=${t.pid}）：${message}`);
+                throw new Error(message);
+            }
+            const pre = ps;
+            if (!dispatchMatches(pre.find(p => p.pid === t.pid), matchTime(t)))
+                throw this.stateChanged('停止', id, t, pre.length ? '进程身份与派发时不一致（可能 PID 被复用）' : '派发进程已经不在了');
             await this.platform.killTree(t.pid);
-            const after = await this.platform.processes([t.pid]);
-            if (after.some(p => ps.some(old => old.pid === p.pid && old.created === p.created)))
-                throw this.stateChanged('停止', id, t, '结束进程树后派发进程仍然存活');
+            // 065 B：结束进程树返回后再确认派发进程真正退出（最多等 10 秒）才写 interrupted；
+            // 查询失败、或没有结果但 PID 仍存活时按"还没确认"继续等，到时限仍未确认就拒绝。
+            const deadline = Date.now() + 10000;
+            let lastReason = '结束进程树后派发进程仍然存活';
+            for (;;) {
+                let gone = false;
+                try {
+                    const after = await this.platform.processes([t.pid]);
+                    const stillThere = after.some(p => pre.some(old => old.pid === p.pid && old.created === p.created));
+                    if (stillThere) lastReason = '结束进程树后派发进程仍然存活';
+                    // 同 PID 但创建时间变了（PID 被复用）按已经退出；没有结果时要本地存活也为假才算确认。
+                    else if (after.some(p => p.pid === t.pid)) gone = true;
+                    else if (!this.platform.alive || !this.platform.alive(t.pid)) gone = true;
+                    else lastReason = '查询没有结果但 PID 仍然存活（派发进程还没退出）';
+                } catch (error) { lastReason = `无法核对进程（进程查询失败：${error instanceof Error ? error.message : String(error)}）`; }
+                if (gone) break;
+                if (Date.now() >= deadline) throw this.stateChanged('停止', id, t, lastReason);
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
             await appendFile(this.sources.get(id) ?? this.file, '\n' + JSON.stringify({ v: 1, event: 'interrupted', id, signal: 'stopped-by-app', at: Date.now() }) + '\n');
             await this.refresh();
         });
     }
     async close() { this.closed = true; clearTimeout(this.timer); clearInterval(this.fallback); this.watchers.forEach(w => w.close()); await this.work?.catch(() => { }); await this.mutations; const file = path.join(this.home, 'viewer.json'); try {
-        if (JSON.parse(await readFile(file, 'utf8')).pid === process.pid)
+        if (parseJson(await readFile(file, 'utf8')).pid === process.pid)
             await unlink(file);
     }
     catch (e) {

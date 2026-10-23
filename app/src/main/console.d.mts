@@ -19,6 +19,8 @@ export interface ConsoleOptions {
   openFolder?: (dir: string) => Promise<void>;
   launch?: (executable: string, args: string[], options: { cwd: string }) => Promise<void>;
   findWt?: () => Promise<string | null>;
+  // tasks:attempt-files 只读看板任务的记录目录：dir 是否是某个已读到的任务的记录目录（Registry.knownRunDir）。
+  knownRunDir?: (dir: string) => boolean | Promise<boolean>;
 }
 export function claudeLaunch(options: { dir: string; name?: string; wt?: string | null }): { executable: string; args: string[] };
 export function createConsole(options: ConsoleOptions): { call(action: string, payload?: Record<string, unknown>): Promise<any> };

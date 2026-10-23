@@ -239,6 +239,7 @@ function checkAllowedPath(item, index, fail) {
 }
 
 // 按协议第 11.3 节合并：任务说明 > 项目配置 > 内置默认；allowed_paths 不与项目配置合并。
+// max_retries 的合并见 14.1（只对用任务说明派发的任务有意义）。
 // gate 为真表示派发后要跑门禁（协议第 11.4 节的三个条件任一条成立）。
 export function mergeSpec(spec = {}, project = {}) {
   const source = spec ?? {};
@@ -255,10 +256,19 @@ export function mergeSpec(spec = {}, project = {}) {
     ? source.expect_commit
     : COMMIT_TYPES.has(source.type);
   const timeout_min = source.timeout_min ?? 60;
-  const verify_timeout_min = source.verify_timeout_min ?? 10;
+  // verify_timeout_min：任务说明写了就用；否则取项目配置 verifyTimeoutMin（必须是正整数，
+  // 不是——0、负数、小数、字符串、null——就当作没写），再落到内置默认 10（协议 11.3）。
+  const projectVerifyTimeout = Number.isSafeInteger(config.verifyTimeoutMin) && config.verifyTimeoutMin > 0
+    ? config.verifyTimeoutMin : undefined;
+  const verify_timeout_min = source.verify_timeout_min ?? projectVerifyTimeout ?? 10;
+  // max_retries：任务说明写了就用；否则取项目配置 maxRetries（必须是非负整数，
+  // 不是——负数、小数、字符串、null——就当作没写），再落到内置默认 2（协议 14.1）。
+  const projectMaxRetries = Number.isSafeInteger(config.maxRetries) && config.maxRetries >= 0
+    ? config.maxRetries : undefined;
+  const max_retries = source.max_retries ?? projectMaxRetries ?? 2;
   const gate = verify.length > 0
     || !(allowed_paths.length === 1 && allowed_paths[0] === '**')
     || expect_commit === true;
 
-  return { allowed_paths, verify, expect_commit, timeout_min, verify_timeout_min, gate };
+  return { allowed_paths, verify, expect_commit, timeout_min, verify_timeout_min, max_retries, gate };
 }

@@ -273,6 +273,8 @@ body.dragging, body.dragging * { user-select: none !important; }
 .doc { --col: 880px; }
 .doc-in { max-width: calc(var(--col) + 64px); margin: 0 auto; padding: 4px var(--sp-8) 40px; }
 .doc .page-h.sticky { position: sticky; top: 0; z-index: 2; background: var(--material); backdrop-filter: var(--material-blur); padding: 0 calc(var(--sp-8) + max(0px, (100% - var(--col) - 64px) / 2)); }
+/* 053：含吸顶页头的滚动容器按页头高度留出空间，真实 Tab / Shift+Tab 把上方控件滚进视口时不会被页头挡住。 */
+.doc.scroll, .scroll.doc-scroll { scroll-padding-top: var(--page-h); }
 @media (prefers-reduced-transparency: reduce) { .doc .page-h.sticky { background: var(--bg); backdrop-filter: none; } }
 .doc .page-h .lead { color: var(--text-3); font-size: var(--fs-small); }
 .sect { margin-top: 24px; }
@@ -487,6 +489,8 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .grow.bad .v, .grow.bad .v.mono, .grow.bad .cmd code { color: var(--fail); }
 .grow .cmd { max-width: 100%; }
 .grow .note { display: block; color: var(--text-3); font-size: var(--fs-small); line-height: var(--lh-small); margin-top: 2px; }
+/* Stage05：删除的文件——只是提示，不是通过 / 失败：图标与文字用次级色，图标占标记列（与 .mk 同宽对齐） */
+.grow.info > i { color: var(--text-3); font-size: 14px; line-height: 20px; justify-self: center; }
 .gallow { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 0 0 8px; color: var(--text-3); font-size: var(--fs-small); }
 .gallow .mono { color: var(--text-2); }
 
@@ -599,3 +603,32 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 /* T10 审美微调：执行者区是占位容器里的第一节，仍按普通小节的间距；表单里的复选卡片与输入框同宽。 */
 [data-agents] > .sect:first-child { margin-top: 24px; }
 .fc > .choice { width: 100%; max-width: 520px; }
+
+/* ---------- Stage05 多次尝试（UI23；与界面稿 preview.css 同一段） ---------- */
+/* 列表第二行"尝试 n/N"：与 xtag 同一族的小号描边标记，品牌色字，区别于"再派一次"的「第 N 次」标签 */
+.trow .tm span.att, .att { display: inline-block; margin-right: 6px; padding: 0 4px; border: 1px solid var(--brand-soft); border-radius: 4px; font: 10px/14px var(--font-mono); letter-spacing: .02em; color: var(--brand); vertical-align: 1px; }
+/* 进展顶部的尝试切换条；汇报、门禁顶部的尝试下拉 */
+.att-bar { margin: 0 0 12px; }
+.att-pick { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: var(--fs-small); }
+.att-pick .sel { max-width: 320px; }
+/* 每次尝试开头的分隔行：标题 + 执行者与原因，两侧细线（与 k-turn 同一做法） */
+.tl.k-att { grid-template-columns: 48px minmax(0, 1fr); margin-top: 6px; }
+.tl.k-att .c { display: flex; align-items: center; gap: 10px; font-size: var(--fs-small); color: var(--text-3); }
+.tl.k-att .c b { color: var(--text); font-weight: 500; }
+.tl.k-att .c::after { content: ""; height: 1px; flex: 1 1 auto; background: var(--divider); }
+/* 重试历史：每次一行、两层——第 1 层次数 · 执行者 · 原因，第 2 层结果（失败为 --fail）；右侧用时与 token。整行可点（跳到那一次的进展） */
+.ahist { display: grid; }
+.ahist-r { display: grid; grid-template-columns: var(--mark) minmax(0, 1fr) auto; column-gap: 10px; align-items: start; padding: 10px 8px; border: 0; border-bottom: 1px solid var(--divider); background: transparent; color: var(--text); font: inherit; text-align: left; border-radius: var(--r-ctl); }
+.ahist-r:hover { background: var(--surface-2); }
+.ahist-r .m { display: grid; gap: 2px; min-width: 0; }
+.ahist-r .l1 { display: flex; align-items: center; gap: 8px; min-width: 0; line-height: 20px; white-space: nowrap; }
+.ahist-r .l1 b { font-weight: 500; }
+.ahist-r .l1 .xtag { margin-right: -4px; }
+.ahist-r .ex { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; }
+.ahist-r .why { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; }
+.ahist-r .res { color: var(--text-2); font-size: var(--fs-small); line-height: var(--lh-small); overflow-wrap: anywhere; }
+.ahist-r.bad .res { color: var(--fail); }
+.ahist-r .meta { display: grid; justify-items: end; gap: 2px; font-family: var(--font-mono); font-size: 11px; line-height: 20px; color: var(--text-3); white-space: nowrap; }
+/* 重试弹窗里"会附上上一次的失败原因" */
+.retry-last { display: grid; grid-template-columns: var(--mark) minmax(0, 1fr); column-gap: 10px; padding: 10px 12px; border-radius: var(--r-ctl); background: var(--fail-bg); color: var(--text-2); font-size: var(--fs-small); }
+.retry-last b { display: block; color: var(--text); font-weight: 500; }

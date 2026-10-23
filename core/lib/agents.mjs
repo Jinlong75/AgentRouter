@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { readConfig, builtinConfig, loadConfig, updateConfig } from './config.mjs';
+import { readConfig, builtinConfig, loadConfig, updateConfig, configInvalid } from './config.mjs';
 import { secretStatus, setUserSecret } from './secrets.mjs';
 import { authOf } from './env.mjs';
 import { adapters } from '../adapters/index.mjs';
 import { killProcessTree, pidAlive, redactPaths } from './process.mjs';
 import { trace, traced, tracing } from './trace.mjs';
+import { parseJson, readJson } from './json.mjs';
 
 const presetDir = fileURLToPath(new URL('../templates/agents/', import.meta.url));
 const validProfileName = name => typeof name === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(name);
@@ -36,12 +37,12 @@ export function loadPreset(name) {
   try { text = readFileSync(path.join(presetDir, `${name}.json`), 'utf8'); }
   catch {
     const match = readdirSync(presetDir).filter(f => f.endsWith('.json')).find(f => {
-      try { return JSON.parse(readFileSync(path.join(presetDir, f), 'utf8')).name === name; } catch { return false; }
+      try { return readJson(path.join(presetDir, f)).name === name; } catch { return false; }
     });
     if (!match) throw new Error(`没有预设 ${name}（可用：${listPresets().join('、')}）`);
     text = readFileSync(path.join(presetDir, match), 'utf8');
   }
-  const { name: presetName, ...profile } = JSON.parse(text);
+  const { name: presetName, ...profile } = parseJson(text);
   return { name: presetName ?? name, profile };
 }
 
@@ -58,12 +59,14 @@ function modelOf(adapter, profile) {
   return null;
 }
 
-// 只读：不触发迁移写入；没有配置或配置损坏时显示内置默认。--detect 时才给每项补 installed / version。
+// 只读：不触发迁移写入；没有配置时显示内置默认。配置存在却读不了时拒绝（协议第 4 节，063），
+// 不列出内置默认的执行者。--detect 时才给每项补 installed / version。
 // traceSteps：只有 ar agents list 打开阶段追踪（AR_CORE_TRACE=1 时才有输出）；其他调用者保持原样。
 export function listAgents(home, { env = process.env, query, detect = false, traceSteps = false } = {}) {
   const step = (label, run) => traceSteps ? traced(label, run) : run();
   const state = step('agents list 读配置', () => readConfig(home));
-  const config = state.exists && !state.reason ? state.config : state.legacy?.config ?? builtinConfig();
+  if (state.reason) throw configInvalid(state);
+  const config = state.exists ? state.config : state.legacy?.config ?? builtinConfig();
   let selected = null;
   try { selected = step('agents list 确定默认执行者', () => loadConfig(home, {}, {}).profileName); } catch { /* 没有可用执行者时不标默认。 */ }
   const lastTests = step('agents list 读测试结果', () => readTestResults(home));
@@ -196,7 +199,7 @@ function readStartLine(home) {
 
 function readTestResults(home) {
   try {
-    const value = JSON.parse(readFileSync(path.join(home, 'agent-tests.json'), 'utf8'));
+    const value = readJson(path.join(home, 'agent-tests.json'));
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   } catch { return {}; }
 }
@@ -299,7 +302,9 @@ function runOnce({ scriptPath, repo, testHome, env, timeoutMs }) {
 // 超时后用 killProcessTree 结束整棵进程树；结果写进 <home>/agent-tests.json 供 list 读取。
 export async function testAgent(home, name, { env = process.env, scriptPath, timeoutSeconds = 180 } = {}) {
   const state = readConfig(home);
-  const config = state.exists && !state.reason ? state.config : builtinConfig();
+  // 测试连接会真实派发一次：配置无效时拒绝（063），不写测试结果、不启动任何进程。
+  if (state.reason) throw configInvalid(state);
+  const config = state.exists ? state.config : builtinConfig();
   const profile = config.profiles?.[name];
   if (!profile) throw new Error(`找不到执行者：${name}`);
   trace(`agents test ${name} 开始（超时 ${timeoutSeconds} 秒）`);

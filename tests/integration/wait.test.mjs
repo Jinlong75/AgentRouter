@@ -159,6 +159,48 @@ test('查询进程时写入结束记录，优先返回真实结果', async t => 
   assert.equal(code, 0); assert.equal(logs[0], '等待：中文任务（已结束）');
 });
 
+// 060 跨尝试读取（协议 14.4）：resume 之后旧 end 不算数，等新一次尝试的结果。
+test('resume 之前 end(exit 3) 不算数：resume 后继续等，按新 end(exit 0) 返回 0', async t => {
+  const f = fixture(t), fake = await f.fake();
+  f.append(f.start({ pid: fake.pid }));
+  f.append({ event: 'end', id: 'sample', exit: 3 });
+  f.append({ event: 'resume', id: 'sample', pid: fake.pid, n: 2, at: Date.now() });
+  f.append({ event: 'attempt', id: 'sample', n: 2, total: null, profile: 'fake', reason: 'manual', at: Date.now() });
+  const waiter = f.launch();
+  await until(() => waiter.output.includes('（进行中）'));
+  await delay(100); assert.equal(waiter.exitCode, null, 'resume 后没有新的结束记录时继续等');
+  fs.appendFileSync(f.file, '{"v":1,"event":"end","id":"sample","exit":0}\n');
+  const result = await waiter.done;
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /exit=0 report=/);
+  assert.ok(!result.stdout.includes('exit=3'), 'resume 之前的 end 不参与结果');
+});
+
+test('resume 之后进程不在且没有新的结束记录：按中断处理返回 1', async t => {
+  const f = fixture(t);
+  f.append(f.start());
+  f.append({ event: 'end', id: 'sample', exit: 3 });
+  f.append({ event: 'resume', id: 'sample', pid: 2147483646, n: 2, at: Date.now() });
+  const result = await f.launch().done;
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stdout, /任务进程已经不在了/);
+  assert.ok(!result.stdout.includes('exit=3'), '不按 resume 之前的 end 报结果');
+});
+
+test('resume 之后未结束继续等，随后 interrupted 才按中断返回 1', async t => {
+  const f = fixture(t), fake = await f.fake();
+  f.append(f.start({ pid: fake.pid }));
+  f.append({ event: 'end', id: 'sample', exit: 3 });
+  f.append({ event: 'resume', id: 'sample', pid: fake.pid, n: 2, at: Date.now() });
+  const waiter = f.launch();
+  await until(() => waiter.output.includes('（进行中）'));
+  await delay(100); assert.equal(waiter.exitCode, null, '进程存活且无新结束记录时一直等');
+  f.append({ event: 'interrupted', id: 'sample', signal: 'stopped-by-command', at: Date.now() });
+  const result = await waiter.done;
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stdout, /exit=1 report=/);
+});
+
 test('倒序读取跨块中文、坏行、未知版本和大清单；小堆内存仍能查到尾部任务', async t => {
   const f = fixture(t), row = { v: 1, ...f.start({ title: '中文'.repeat(40000) }) };
   fs.writeFileSync(f.file, JSON.stringify(row) + '\n坏行\n{"v":3,"event":"start"}\n半行');

@@ -2,10 +2,11 @@
 // 解析顺序：进程环境变量 → Windows 用户环境变量（注册表 HKCU\Environment，解决"刚设置、已打开的程序读不到"）→ 报错。
 // 任何返回值、错误信息、日志都只含变量名，不含值。
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { trace, traced } from './trace.mjs';
+import { readJson } from './json.mjs';
 
 // 追踪里子进程的结束状态：区分正常结束、被超时上限截断（ETIMEDOUT）与启动失败（只在 ar agents list 传入 tracePrefix 时使用）。
 const subprocessOutcome = r => !r
@@ -19,7 +20,7 @@ const checkName = name => { if (!validName(name)) throw Error(`变量名无效�
 // 隔离的密钥文件（仅测试 / 界面验收）：AR_TEST_SECRETS_FILE 指向 JSON 时，读写在它上面进行，完全跳过注册表。
 function readTestSecrets(file) {
   try {
-    const value = JSON.parse(readFileSync(file, 'utf8'));
+    const value = readJson(file);
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   } catch { return {}; }
 }

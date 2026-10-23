@@ -1,10 +1,10 @@
 import { captureWizard, capturePreferences } from './shots-preferences';
 import { captureProjects } from './shots-projects';
 import { captureGate } from './shots-gate';
+import { captureRetry } from './shots-retry';
 import { captureNewtask, waitNewtaskReady } from './shots-newtask';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
-import type { BrowserWindow } from 'electron';
-import { app, nativeTheme } from 'electron';
+import { app, BrowserWindow, nativeTheme } from 'electron';
 import { mkdir, writeFile, readFile, appendFile, open, rename, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -16,7 +16,7 @@ import type { Registry } from './registry';
 import { dispatchMatches, windowsPlatform } from './platform';
 import { coreRun, coreScript } from './core';
 import { effects } from './effects';
-import { createHarness, progress, type Harness } from './shots-input';
+import { createHarness, progress, saveFailureScene, windowFocusState, type Harness } from './shots-input';
 import { internal, spawnPhases, startProbe, wall, type SpawnPhases } from './shots-probe';
 import { appEnvironment, isolatedEnvKey } from './app-env.mjs';
 // 演示汇报正文与 npm run demo 同源（tools/demo/data.mjs）；只在验收里写入，不改演示生成器。
@@ -48,6 +48,8 @@ const appEnv = appEnvironment(process.env);
  * UI19 关闭询问与托盘（012 A）：点 × 的三种行为、记住选择、"窗口"设置、托盘状态与提示 ——「UI19 …」（本文件）
  * UI20 设置页"数据"一节（012 B）：清除缓存、重置确认框；真正的重置在隔离目录的第二次启动里执行 ——「UI20 …」（本文件、tools/shots.mjs）
  * UI21 进程查询失败（W4）：注入失败后横幅、"状态未知"、停止 / 隐藏 / 批量删除禁用且主进程拒绝、不推断结束；恢复后横幅消失、操作恢复 ——「UI21 …」（本文件）
+ * UI22 门禁界面（Stage04）：轨道、门禁标签、列表徽标、新建任务页的门禁说明 ——「UI22 …」（shots-gate.ts）
+ * UI23 多次尝试界面（Stage05）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、真实重试 ——「UI23 …」（shots-retry.ts）
  * 「通用 …」是每页通用检查、真实输入自测与环境检查。
  * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
  */
@@ -55,7 +57,12 @@ const appEnv = appEnvironment(process.env);
 export async function capture(win: BrowserWindow, registry: Registry, out: string) {
     const stopProbe = startProbe();
     try { await captureAll(win, registry, out); }
-    catch (error) { console.log(`本次完成的检查：${progress.checks.length} 项；最后通过的一项：${progress.checks.at(-1) ?? "（无）"}`); throw error; }
+    catch (error) {
+        console.log(`本次完成的检查：${progress.checks.length} 项；最后通过的一项：${progress.checks.at(-1) ?? "（无）"}`);
+        // 066：任何检查失败都在退出前保存截图与焦点现场（失败信息与退出码不变）。
+        await saveFailureScene(win, error, out, [appEnv.AGENT_ROUTER_HOME ?? ''].filter(Boolean)).catch(() => null);
+        throw error;
+    }
     finally { await stopProbe(); }
 }
 async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
@@ -64,30 +71,87 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     win.webContents.setBackgroundThrottling(false);
     win.webContents.focus();
     await mkdir(out, { recursive: true });
-    let screenshots = 0;
-    // settle=true 时先等 300ms 让界面稳定（常规截图）；再派一次的忙碌态只有几百毫秒，用 settle=false 当场抓。
-    const shoot = async (name: string, settle: boolean) => {
-        if (settle)
-            await h.pause();
-        // 仅截图时替换隔离目录前缀，实际设置数据仍保留完整路径。
-        await h.evaluate(`(() => {
-            window.__shotPaths = [];
+    let screenshots = 0, raceArmed = false;
+    // 072：截图期间暂停主进程向这个窗口推送 snapshot（界面收到会整段重写列表，替换过的文字节点就换成了带路径的新节点）。
+    // 只拦 snapshot 频道，期间只保留最新一条，截图结束（finally）补发；其他频道照常发送。不改 index.ts 与渲染层。
+    const sendOriginal = win.webContents.send.bind(win.webContents);
+    let holdSnapshots = false, heldSnapshot: unknown[] | null = null;
+    win.webContents.send = ((channel: string, ...args: unknown[]) => {
+        if (holdSnapshots && channel === 'snapshot') { heldSnapshot = args; return; }
+        return sendOriginal(channel, ...args);
+    }) as typeof win.webContents.send;
+    // 072：AR_SHOTS_FAIL_PROBE=race 的确定性对照：在"检查通过之后、截图之前"让主进程推送一条标题带路径的 snapshot（走上面这层暂停，不设开关时没有任何影响）。
+    const probeSnapshot = (withPath: boolean) => ({ tasks: registry.tasks.map((t, i) => withPath && i === 0 ? { ...t, title: `${t.title} ${appEnv.AGENT_ROUTER_HOME}` } : t), processCheck: registry.processCheck, theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light', version: app.getVersion() });
+    const pathScript = {
+        // 路径替换：把正文里含隔离公共目录的文字节点换成 <临时目录>，原节点与原文记进 window.__shotPaths 供截图后还原。
+        replace: `window.__shotPaths = [];
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             while (walker.nextNode()) {
                 const node = walker.currentNode;
-                if (node.textContent.includes(${JSON.stringify(appEnv.AGENT_ROUTER_HOME)})) {
+                if (node.textContent.includes(home)) {
                     window.__shotPaths.push([node, node.textContent]);
-                    node.textContent = node.textContent.replaceAll(${JSON.stringify(appEnv.AGENT_ROUTER_HOME)}, '<临时目录>');
+                    node.textContent = node.textContent.replaceAll(home, '<临时目录>');
                 }
-            }
-        })()`);
-        // 隔离路径也可能包含本机用户名，截图前确认正文没有泄漏该前缀。
-        assert.equal(await h.evaluate(`document.body.innerText.includes(${JSON.stringify(appEnv.AGENT_ROUTER_HOME)})`), false, '截图不能显示临时目录的本机绝对路径');
-        await h.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
-        const png = (await win.webContents.capturePage()).toPNG();
-        assert.ok(png.length > 10000, `截图 ${name} 为空`);
-        await writeFile(path.join(out, name + '.png'), png); screenshots++;
-        await h.evaluate('window.__shotPaths.forEach(([node, text]) => node.textContent = text); delete window.__shotPaths;');
+            }`,
+        // 066：检查不成立时记下含路径的元素与文字（路径先换成 <临时目录>），写进失败现场 JSON 的 extra。判断本身（正文不含隔离公共目录）不变。
+        diagnose: `(() => {
+            const hide = text => String(text).split(home).join('<临时目录>');
+            const replaced = new Set((window.__shotPaths ?? []).map(([node]) => node));
+            const hit = [...document.body.querySelectorAll('*')].filter(el => el.innerText?.includes(home) && ![...el.children].some(c => c.innerText?.includes(home)));
+            const where = el => { const parts = []; for (let n = el, i = 0; n && n !== document.body && i < 6; n = n.parentElement, i++) parts.push(n.tagName.toLowerCase() + (n.className && typeof n.className === 'string' ? '.' + n.className.trim().split(/\\s+/).join('.') : '')); return parts.join(' < '); };
+            return { elements: hit.slice(0, 10).map(el => ({
+                tag: el.tagName.toLowerCase(), class: el.className, data: Object.fromEntries(Object.entries(el.dataset)),
+                region: where(el), text: hide(el.innerText).slice(0, 300),
+                textNodesFromEarlierReplace: [...el.childNodes].filter(n => n.nodeType === 3 && replaced.has(n)).length,
+                textNodesNotReplaced: [...el.childNodes].filter(n => n.nodeType === 3 && n.textContent.includes(home) && !replaced.has(n)).length,
+            })), count: hit.length, replacedNodes: replaced.size };
+        })()`,
+    };
+    // settle=true 时先等 300ms 让界面稳定（常规截图）；再派一次的忙碌态只有几百毫秒，用 settle=false 当场抓。
+    const shoot = async (name: string, settle: boolean) => {
+        progress.current = `截图 ${name}`;
+        if (settle)
+            await h.pause();
+        // 072：暂停 snapshot 推送 → 替换与检查同一次执行 → 两帧 → 截图 → 截图之后再核对 → 还原 → 补发 snapshot（finally）。
+        holdSnapshots = true;
+        let probeSent = false;
+        try {
+            // 仅截图时替换隔离目录前缀，实际设置数据仍保留完整路径。隔离路径也可能包含本机用户名，所以替换和"正文不含该前缀"的检查
+            // 在同一段同步代码里完成（中间不可能插进别的渲染）。replaceToCheckMs 是页面内从替换完成到检查完成的间隔（只含读取 innerText 的耗时）。
+            const first = await h.evaluate(`(() => {
+                const home = ${JSON.stringify(appEnv.AGENT_ROUTER_HOME)};
+                ${pathScript.replace}
+                const replacedAt = performance.now();
+                const leaked = document.body.innerText.includes(home);
+                const replaceToCheckMs = Math.round((performance.now() - replacedAt) * 10) / 10;
+                return { leaked, replaceToCheckMs, diagnosis: leaked ? (() => { try { return ${pathScript.diagnose}; } catch (error) { return { diagnoseError: String(error) }; } })() : null };
+            })()`);
+            // 066：这条检查不成立时，在断言之前把现场写进 extra。
+            if (first.leaked !== false)
+                progress.sceneExtra = { shot: name, phase: '截图前（替换与检查同一次执行）', replaceToCheckMs: first.replaceToCheckMs, ...first.diagnosis };
+            assert.equal(first.leaked, false, '截图不能显示临时目录的本机绝对路径');
+            if (raceArmed) { raceArmed = false; probeSent = true; win.webContents.send('snapshot', probeSnapshot(true)); await h.pause(400); }
+            await h.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+            const png = (await win.webContents.capturePage()).toPNG();
+            assert.ok(png.length > 10000, `截图 ${name} 为空`);
+            await writeFile(path.join(out, name + '.png'), png); screenshots++;
+            // 072：截图之后、还原之前再核对一次（补上"检查通过之后到截图之前"原来查不到的空档）；判断条件与上面完全相同。
+            const after = await h.evaluate(`(() => {
+                const home = ${JSON.stringify(appEnv.AGENT_ROUTER_HOME)};
+                const leaked = document.body.innerText.includes(home);
+                return { leaked, diagnosis: leaked ? (() => { try { return ${pathScript.diagnose}; } catch (error) { return { diagnoseError: String(error) }; } })() : null };
+            })()`);
+            if (after.leaked !== false)
+                progress.sceneExtra = { shot: name, phase: '截图之后', ...after.diagnosis };
+            assert.equal(after.leaked, false, '截图不能显示临时目录的本机绝对路径');
+            await h.evaluate('window.__shotPaths.forEach(([node, text]) => node.textContent = text); delete window.__shotPaths;');
+        }
+        finally {
+            holdSnapshots = false;
+            if (heldSnapshot) { const args = heldSnapshot; heldSnapshot = null; sendOriginal('snapshot', ...args); }
+            // 对照开关发的那条带路径的 snapshot 只为这一张截图，补发之后再用真实数据覆盖，免得影响后面的检查。
+            if (probeSent) sendOriginal('snapshot', probeSnapshot(false));
+        }
     };
     const save = (name: string) => shoot(name, true);
     const saveNow = (name: string) => shoot(name, false);
@@ -194,6 +258,11 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         console.log(`只跑新建任务页加载：${rounds} 轮全部在标准内完成。`);
         return;
     }
+    if (process.env.AR_SHOTS_FOCUS === 'focus-ring') {
+        await captureFocusRing(h, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'focus-ring', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     if (process.env.AR_SHOTS_FOCUS === 'core-spawn') {
         const rounds = Math.max(1, Math.min(100, Number(process.env.AR_SHOTS_REPEAT) || 20));
         await captureCoreSpawn(rounds);
@@ -233,6 +302,22 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     }
     await press('[data-page=tasks]');
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 066：失败现场自检开关（AR_SHOTS_FAIL_PROBE=1，只在测试或手动诊断时设置）：第一个页面之后让一条检查故意失败，验证 failures/ 里的截图与 JSON、非 0 退出码和原失败信息。
+    if (process.env.AR_SHOTS_FAIL_PROBE === '1') {
+        await tabTo('[data-page=settings]');
+        await check('通用 故意失败自检（AR_SHOTS_FAIL_PROBE=1）', 'false');
+    }
+    // AR_SHOTS_FAIL_PROBE=path：模拟"路径替换之后界面又渲染出带路径的新文字"，验证截图隐私检查失败时的专项现场（含路径的元素、文字、替换到检查的间隔）。
+    if (process.env.AR_SHOTS_FAIL_PROBE === 'path') {
+        await evaluate(`(() => {
+            const home = ${JSON.stringify(appEnv.AGENT_ROUTER_HOME)}, add = (cls, text) => { const d = document.createElement('div'); d.className = cls; d.dataset.probe = cls; d.textContent = text; document.body.append(d); };
+            add('probe-early', '先有的路径 ' + home + '\\a');
+            new MutationObserver(() => { if (!document.querySelector('.probe-late')) add('probe-late', '替换之后又渲染出的路径 ' + home + '\\b'); }).observe(document.body, { subtree: true, characterData: true });
+            return true;
+        })()`);
+        await save('fail-probe-path');
+    }
+    if (process.env.AR_SHOTS_FAIL_PROBE === 'race') { raceArmed = true; await save('fail-probe-race'); }
     await verify('通用 sendInputEvent 在不显示的验收窗口中生效：首次引导全程由真实点击与键盘完成', () => { assert.ok(checks.some(label => label.startsWith('UI09'))); });
     // 当前 Electron 提供此诊断入口但未导出类型，限定在验收工具中使用。
     const contents = win.webContents as typeof win.webContents & { getLastWebPreferences(): Electron.WebPreferences };
@@ -609,6 +694,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
 
     // UI22（Stage04 门禁界面）：演示任务 t20～t22 默认隐藏，检查时临时显示、检查完恢复。
     await captureGate(h, registry, out, save);
+    // UI23（Stage05 多次尝试界面）：演示任务 t25 / t26 默认隐藏，检查时临时显示、检查完恢复；另有一次真实重试。
+    await captureRetry(h, registry, out, save);
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
     await captureProcessUnknown(h, registry, save, menuItem, runs);
     const fontLoaded = await capturePreferences(h);
@@ -688,12 +775,13 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // 检查完把夹具恢复回去（见 captureLists 尾部），后面的退出检查继续用演示数据。
     await captureLists(h, registry, save);
     await verify('通用 全程渲染进程没有控制台错误', () => { assert.deepEqual(h.consoleErrors, []); });
-    await writeFile(path.join(out, 'checks.json'), JSON.stringify({ screenshots, fontLoaded, checks }, null, 2));
+    await writeFile(path.join(out, 'checks.json'), JSON.stringify({ screenshots, fontLoaded, checks, focusRestored: progress.focusRestored }, null, 2));
     const ui = [...new Set(checks.map(c => c.match(/^UI\d\d/)?.[0]).filter(Boolean))].sort();
     // UI19 = 关闭询问与托盘（012 A），UI20 = 设置页"数据"一节与清除缓存 / 重置确认框（012 B）。
     // 原 UI10 / UI11 已分别是"主题"与"最小窗口"，所以新增要求改用 UI19、UI20（见汇报）。
     // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22'], '界面功能基线 UI01～UI22 都要有检查');
+    // UI23 = Stage05 多次尝试界面（061）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、一次真实重试。
+    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23'], '界面功能基线 UI01～UI23 都要有检查');
     console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。
@@ -757,6 +845,61 @@ async function ui17Timeline(h: Harness, m: Ui17Mark, tag = '') {
     return `UI17 时间线${tag}：点击前选中 ${m.task}（项目 ${m.project}，执行者 ${m.executor}；演示任务没有 dispatch.json，预期核心返回"旧版本派发、不能再派一次"）；渲染层 ${renderer}；主进程 tasks:redispatch ${main}；核心进程 ${core}；此刻失败横幅 ${banner}；再派一次按钮 ${button}`;
 }
 
+// ---- 066 焦点环对照实验（诊断用，AR_SHOTS_FOCUS=focus-ring；不在正式检查里：要把验收窗口显示出来并抢走焦点，会在用户屏幕上闪窗口）----
+// 每步打印 [焦点实验]：焦点元素、:focus-visible / :focus、document.hasFocus()、窗口与 webContents 的焦点状态。
+async function captureFocusRing(h: Harness, win: BrowserWindow) {
+    const { evaluate, pause, press } = h;
+    const state = async (tag: string) => {
+        const page = await evaluate(`(() => { const el = document.activeElement, s = getComputedStyle(el); return { el: el.tagName.toLowerCase() + (el.dataset.pref ? '[' + el.dataset.pref + ']' : ''), outline: s.outlineStyle + ' ' + s.outlineWidth, fv: el.matches(':focus-visible'), f: el.matches(':focus'), docFocus: document.hasFocus() }; })()`);
+        console.log(`[焦点实验] ${tag}：${JSON.stringify(page)} win=${JSON.stringify(await windowFocusState(win))}`);
+        return page as { el: string; fv: boolean; f: boolean; docFocus: boolean };
+    };
+    // 不经过 key()：不恢复焦点，直接发 Tab，用来看"焦点丢了以后按 Tab"的原始后果。
+    const rawTab = async (selector: string) => {
+        for (let i = 0; i < 60; i++) {
+            if (await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(selector)})`)) return;
+            win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' }); win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' });
+            await pause(80);
+        }
+        throw Error('rawTab 到不了 ' + selector);
+    };
+    const wizard = '[data-pref=wizard]';
+    await press('[data-page=about]'); await h.wait('!!document.querySelector(".about")');
+    const reset = async () => { await evaluate('document.activeElement?.blur(); true'); await pause(100); };
+    // ① 正常：不显示的验收窗口，tabTo 到按钮，焦点环可见。
+    await reset(); await h.tabTo(wizard); const normal = await state('① 正常 tabTo');
+    assert.deepEqual([normal.fv, normal.f, normal.docFocus], [true, true, true]); await h.focusRing('焦点实验 ① 正常');
+    // ② 验收窗口本来就不显示：win.blur()、另开窗口并获得焦点，页面焦点都不会丢（对照：这两种做法在验收配置下复现不了症状）。
+    await reset(); win.blur(); await pause(300); await rawTab(wizard); const blurred = await state('② win.blur() 后 rawTab');
+    assert.equal(blurred.docFocus, true);
+    const other = new BrowserWindow({ width: 200, height: 150, show: true });
+    await other.loadURL('about:blank'); other.focus(); await pause(500);
+    await reset(); await rawTab(wizard); const stolen = await state('② 另开窗口并获得焦点后 rawTab');
+    assert.equal(stolen.docFocus, true);
+    other.close(); await pause(300);
+    // ③ 窗口显示并有焦点 → 另一个窗口抢走焦点：页面失去焦点，Tab 仍能移动焦点，但 :focus / :focus-visible 都不成立、焦点环样式不生效（失败那三次的症状）。
+    win.show(); win.focus(); await pause(500);
+    await reset(); await h.tabTo(wizard); const shown = await state('③ 显示且有焦点时 tabTo');
+    assert.deepEqual([shown.fv, shown.docFocus], [true, true]);
+    const thief = new BrowserWindow({ width: 200, height: 150, show: true });
+    await thief.loadURL('about:blank'); thief.focus(); await pause(600);
+    await reset(); await rawTab(wizard); const lost = await state('③ 窗口失焦后 rawTab（不恢复焦点）');
+    assert.deepEqual([lost.el, lost.fv, lost.f, lost.docFocus], ['button[wizard]', false, false, false]);
+    await assert.rejects(h.focusRing('焦点实验 ③ 失焦'), /焦点环不可见/);
+    // ④ 同样失焦，改走 tabTo（key() 先恢复焦点）：焦点环回来。
+    await reset(); await h.tabTo(wizard); const restored = await state('④ 窗口失焦后 tabTo');
+    assert.deepEqual([restored.fv, restored.f, restored.docFocus], [true, true, true]);
+    thief.close(); await pause(300);
+    // ⑤ 显示再隐藏验收窗口后页面同样失去焦点；键盘类输入前的检查（shots-input.ts ensureInputFocus）要恢复它并记进 focusRestored。
+    win.hide(); await pause(300); await reset();
+    const hiddenLost = await state('⑤ show()+hide() 之后');
+    const before = progress.focusRestored.length;
+    await h.tabTo(wizard); const guarded = await state('⑤ 之后 tabTo');
+    console.log(`[焦点实验] 页面是否失去过焦点：${!hiddenLost.docFocus}；focusRestored 新增 ${progress.focusRestored.length - before} 条`);
+    if (!hiddenLost.docFocus) assert.equal(progress.focusRestored.length - before, 1);
+    assert.deepEqual([guarded.fv, guarded.docFocus], [true, true]); await h.focusRing('焦点实验 ⑤ 恢复后');
+    console.log(`[焦点实验] focusRestored = ${JSON.stringify(progress.focusRestored)}`);
+}
 // ---- 诊断：Electron-as-Node 与 node.exe 对照（PR #5 CI，AR_SHOTS_FOCUS=core-spawn）----
 // 同一条核心命令交替用两种运行时启动，各自打开核心追踪；每次拆成三段：启动（请求 → 子进程内最早标记，墙上时钟对齐）、
 // 业务（最早标记 → 命令结束）、退出（写出标准输出 → exit 事件）。另记子进程自己计时的"启动到追踪模块加载"。

@@ -5,6 +5,7 @@ import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { withFakeCodex } from '../fixtures/fake-codex-path.mjs';
 
 // 047：公共目录保护。子进程跑真实入口，公共目录与"用户目录"都指向系统临时目录下新建的文件夹，
 // 不碰真实用户目录与真实磁盘根（见 docs/roles/worker.md 的隔离规则）。
@@ -24,6 +25,9 @@ function fixture(t) {
   }
   // USERPROFILE / HOME / os.homedir() 都指向这个假用户目录；AR_DRY_RUN 保证即使保护失效也不会真派发。
   Object.assign(env, { USERPROFILE: fakeUser, HOME: fakeUser, AR_DRY_RUN: '1' });
+  // 安全目录下的 agents list 会检测内置默认的 codex 执行者：PATH 最前面放测试自己的假 codex，
+  // 不在真实 ~/.codex 里运行真实 codex（Stage05 哨兵查出）。
+  Object.assign(env, withFakeCodex(env, base));
   t.after(() => {
     assert.equal(dirname(base), resolve(tmpdir()));
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

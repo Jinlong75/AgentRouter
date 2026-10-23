@@ -1,23 +1,24 @@
-import { spawn } from 'node:child_process';
-import { appendFileSync, writeFileSync, readFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, writeFileSync, readFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { basename, isAbsolute, relative, join, resolve as resolvePath } from 'node:path';
-import { createInterface } from 'node:readline';
 import { homeDirectory, loadConfig } from './config.mjs';
 import { dispatcher, parseArgs, taskDetails } from './options.mjs';
-import { recordPaths, registryWriter, writeDispatch } from './records.mjs';
-import { clip, formatProgress, progressFooter, progressHeader } from './progress.mjs';
-import { openWatch, shouldWatch, viewerTakesOver } from './watch.mjs';
+import { recordPaths, registryWriter, writeDispatch, readDispatch, taskPaths, attemptPaths, explicitOptions, retryOptions, SHARED_OPTIONS, DISPATCH_OPTIONS } from './records.mjs';
+import { progressHeader } from './progress.mjs';
 import { acceptsManaged, viewerApp, managedEnvironment, validRequest, existingPaths, handoff, fallbackMessage, managedMessage } from './managed.mjs';
 import { printCompletion } from './completion.mjs';
-import { killProcessTree } from './process.mjs';
-import { dryRun as dryRunEnv, testStartTimeout, homeEnv, unsafeHome } from './compat.mjs';
+import { dryRun as dryRunEnv, testStartTimeout, homeEnv, unsafeHome, legacyHomeDirectory } from './compat.mjs';
+import { locateStart, findTerminal, reverseRows } from './wait.mjs';
 import { adapterFor } from '../adapters/index.mjs';
-import { buildEnv, allowedEnv, secretSources } from './env.mjs';
+import { buildEnv, allowedEnv, secretSources, ensureSandboxHome } from './env.mjs';
 import { parseSpec, validateSpec, mergeSpec } from './spec.mjs';
-import { git, headSha, parseStatusPorcelainZ, uncommittedFiles } from './git.mjs';
-import { runGate } from './gate.mjs';
+import { headSha, parseStatusPorcelainZ, uncommittedFiles } from './git.mjs';
+import { pipeline } from './pipeline.mjs';
+import { readJson } from './json.mjs';
+import { redactPaths } from './process.mjs';
+import { tracing } from './trace.mjs';
 
-export async function run({ adapter: adapterOverride, scriptPath, args = process.argv.slice(2), env = process.env, root = process.cwd(), onDetach, onGate } = {}) {
+export async function run({ adapter: adapterOverride, scriptPath, args = process.argv.slice(2), env = process.env, root = process.cwd(), onDetach, onGate, onRetry, retry = null } = {}) {
   // 公共目录保护（协议第 1 节）：必须在改名请求文件、读写公共目录、启动进程之前检查。
   // 只检查显式设置的新名 / 旧名环境变量；--run-request 执行者进程也走这里。
   if (homeEnv.some(key => env[key])) {
@@ -32,9 +33,18 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     try { renameSync(requestFile, running); } catch { return 0; }
     requestFile = running;
   }
-  const request = requestFile ? JSON.parse(readFileSync(requestFile, 'utf8')) : null;
+  const request = requestFile ? readJson(requestFile) : null;
   if (request && !validRequest(request)) throw Error('请求文件无效');
   if (request) root = request.repo;
+  // 手动重试（协议 14.3，任务 059）：前台由 cli.mjs 传进 retry；--detach 的执行者进程
+  //（--run-request）从请求里的 retry 字段认出后继续。只有前台与脱离两种走法（不做托管交接），
+  // 提前分流，下面的派发流程不受影响。不通过时 prepareRetry 抛错，按派发错误退出码 2 处理。
+  const retryOpts = retry
+    ? { name: retry.name, profile: retry.profile ?? null, note: retry.note ?? null, detach: retry.detach === true, host: retry.host ?? null, n: Number.isSafeInteger(retry.n) ? retry.n : null }
+    : request?.retry
+      ? { name: request.name, profile: request.retry.profile ?? request.profile ?? null, note: request.retry.note ?? null, detach: false, host: null, n: Number.isSafeInteger(request.retry.n) ? request.retry.n : null }
+      : null;
+  if (retryOpts) return runRetry({ adapterOverride, scriptPath, env, root, request, opts: retryOpts, onDetach, onGate, onRetry });
   const parsed = request ? { task: request.args.task, extra: request.args.extra, opts: { name: request.name, ...(request.args.role ? { role: request.args.role } : {}) } } : parseArgs(args);
   const details = taskDetails(root, parsed);
   const dryRun = !request && dryRunEnv(env);
@@ -52,11 +62,32 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     : loadConfig(home, parsed.opts, env);
   const adapter = adapterOverride ?? adapterFor(profile);
   const label = profile.label ?? adapter.label ?? adapter.id;
+  // 升级目标（协议 14.1）：执行者配置的 escalate 指向另一个配置名，只在最后一次自动重试换用它。
+  // 前台派发从 config.profiles 找目标（缺失或未启用记 null，进度行由 pipeline 写）；
+  // 托管 / 脱离执行者进程用请求里的快照（非密钥部分，同 profileConfig；shape: { profile, config }）。
+  const escalateName = request
+    ? (request.escalate && typeof request.escalate === 'object' && typeof request.escalate.profile === 'string' && request.escalate.profile !== '' ? request.escalate.profile : null)
+    : (typeof profile.escalate === 'string' && profile.escalate !== '' ? profile.escalate : null);
+  const escalateTarget = request
+    ? (request.escalate?.config && typeof request.escalate.config === 'object'
+      ? { adapter: request.escalate.config.adapter ?? request.adapter ?? 'codex', ...request.escalate.config } : null)
+    : (config.profiles?.[escalateName] && config.profiles[escalateName].enabled !== false ? config.profiles[escalateName] : null);
+  const escalate = escalateName ? { name: escalateName, profile: escalateTarget } : null;
+  // 请求里的升级快照：形状同 profileConfig（非密钥部分）；目标缺失 / 未启用 / 取不出快照时 config 为 null，
+  // 执行者进程据此同样不升级。不含任何密钥值。
+  const escalateRequest = escalate
+    ? { profile: escalate.name, config: (() => { try { return escalate.profile ? profileConfig(escalate.profile, adapterFor(escalate.profile)) : null; } catch { return null; } })() }
+    : null;
   // 用任务说明派发：解析 frontmatter、合并项目配置；启用门禁时先做派发前检查（协议 11.1～11.4）。
   // 全部在占记录名之前完成，失败时不留下空记录；托管 / 脱离派发的执行者进程直接用请求里的快照。
   let gateInfo = null, specWarnings = [];
   if (request) gateInfo = request.args.gate ?? null;
   else if (details.spec) ({ gate: gateInfo, warnings: specWarnings } = prepareSpecGate(root, details.spec));
+  // 自动重试次数（协议 14.1）：只有用任务说明派发的任务（gateInfo 非空）重试，总次数 1 + max_retries；
+  // 直接写任务文字派发的任务 maxRetries 为 0（总次数 1）。任务说明与项目配置的合并已在 merged.max_retries 里。
+  const mergedRetries = Number.isSafeInteger(gateInfo?.merged?.max_retries) && gateInfo.merged.max_retries >= 0
+    ? gateInfo.merged.max_retries : undefined;
+  const maxRetries = gateInfo ? (mergedRetries ?? 2) : 0;
   const paths = request ? existingPaths(root, request.name) : recordPaths(root, details.name, progressHeader(details.title, details.role?.name, started, label));
   console.log(`记录名：${paths.name}\n进度：${paths.progress}`);
   writeFileSync(paths.raw, '');
@@ -71,6 +102,10 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
     profile: profileName,
     name: paths.name,
+    // 命令行明确给出的 model / effort / tier / sandbox / watchWindow（067），一个都没给就没有这个字段。
+    ...(explicitOptions(parsed.opts) ? { options: explicitOptions(parsed.opts) } : {}),
+    // 用任务说明派发的另记门禁设置与基线（协议第 3 节，Stage05），供 ar retry；直接任务文字派发没有这个字段。
+    ...(gateInfo ? { gate: gateInfo } : {}),
   });
   const interactive = !!process.stdout.isTTY;
   const progress = (text, at = Date.now()) => {
@@ -79,6 +114,12 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     if (interactive) console.log(line);
   };
   if (warning) { progress(warning); if (!interactive) console.log(warning); }
+  // 适配器不支持的设置（claude-code 的 tier）只在前台派发时提示一次；托管 / 脱离的执行者进程不重复，自动重试在 pipeline 里也不重复。
+  if (!request) for (const key of adapter.unsupportedSettings ?? []) if (settings[key] != null) {
+    const line = `配置：${adapter.id} 执行者不支持 ${key}，已忽略`;
+    progress(line);
+    if (!interactive) console.log(line);
+  }
   // 不认识的字段只警告、不报错（协议 11.2）；进度里记一行，标准输出照常打印（--json 时由调用方收集）。
   for (const text of specWarnings) {
     const line = `任务说明警告：${text}`;
@@ -94,7 +135,7 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     const detachRequest = { v: 1, id, app: 'AgentRouter', at: started, script: scriptPath, node: process.execPath, repo: root, name: paths.name, profile: profileName, adapter: adapter.id,
       args: { task: parsed.task, extra: parsed.extra, role: parsed.opts.role ?? null, spec: details.spec, ...(gateInfo ? { gate: gateInfo } : {}) },
       settings: Object.fromEntries(['model','effort','tier','sandbox','path'].map(key => [key, settings[key]])), dispatcher: source, env: managedEnvironment(env),
-      profileConfig: profileConfig(profile, adapter), detached: true };
+      profileConfig: profileConfig(profile, adapter), ...(escalateRequest ? { escalate: escalateRequest } : {}), detached: true };
     const claimed = join(home, 'managed', `${id}.claimed.json`);
     mkdirSync(join(home, 'managed'), { recursive: true });
     const temp = `${claimed}.tmp`;
@@ -115,7 +156,7 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
       args: { task: parsed.task, extra: parsed.extra, role: parsed.opts.role ?? null, spec: details.spec, ...(gateInfo ? { gate: gateInfo } : {}) },
       settings: Object.fromEntries(['model','effort','tier','sandbox','path'].map(key => [key, settings[key]])), dispatcher: source, env: managedEnvironment(env),
       // 执行者配置快照：只有非密钥部分（secrets 只是变量名），密钥由托管执行者启动时自己解析。
-      profileConfig: profileConfig(profile, adapter) }, announce,
+      profileConfig: profileConfig(profile, adapter), ...(escalateRequest ? { escalate: escalateRequest } : {}) }, announce,
       { startTimeout: testStartTimeout(env) ?? 15000 });
     if ('exit' in result) {
       // 托管执行者把门禁结果写在自己的清单里；等待方从 end 行之前的 gate 事件取（协议 13）。
@@ -127,7 +168,8 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   // 执行者环境：白名单、profile.env、密钥、隔离项（见 env.mjs）。缺密钥等问题在下面记为启动失败，检测版本也只用白名单环境。
   const sources = secretSources(config);
   let childEnv, envError = null;
-  try { childEnv = buildEnv({ base: env, profile, adapter, home, profileName, sources }); }
+  // 064：执行者的用户目录是沙箱（协议第 7 节）；启动前建好目录（建不了就用系统临时目录里的一次性目录）。
+  try { childEnv = buildEnv({ base: env, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
   catch (error) { envError = error; childEnv = allowedEnv({ base: env, adapter, home, profileName, sources }); }
   const detection = await adapter.detect({ env: childEnv, settings, profile });
   registry({ event: 'start', v: 2, id, repo: root, name: paths.name, dir: paths.dir, project: basename(root), profile: profileName, adapter: adapter.id, label, spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
@@ -138,145 +180,19 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     // 用任务说明派发的任务记是否启用门禁；启用时记派发时的 HEAD（协议第 2 节、11.4）。其他任务没有这两个字段。
     ...(gateInfo ? { gate: gateInfo.enabled, ...(gateInfo.enabled ? { base: gateInfo.base } : {}) } : {}),
   });
-  let seq = 0, lastSay = null;
-  // 有状态映射（如 Claude Code 要靠 id 配对命令开始与结果）用 createMapper，否则用无状态的 mapLine。
-  const mapLine = adapter.createMapper ? adapter.createMapper() : adapter.mapLine;
-  const errors = [];
-  const emit = (event, at = Date.now()) => {
-    const unified = { ...event, v: 1, seq: ++seq, at };
-    appendFileSync(paths.events, `${JSON.stringify(unified)}\n`);
-    if (event.kind === 'say') lastSay = event.text;
-    if (event.kind === 'error') errors.push(event.text);
-    for (const line of formatProgress(unified)) progress(line, at);
-  };
-  const finish = (code, { gate = null, agentExit } = {}) => {
-    // 不自己写汇报文件的执行者：由适配器决定汇报正文（如 Claude Code 的 result），默认最后一条说话；都没有就不写。
-    if (!adapter.writesReport) {
-      const text = adapter.finish ? adapter.finish({ lastSay, result: mapLine.lastResult ?? null }) : lastSay;
-      if (text != null) writeFileSync(paths.report, text);
-    }
-    const minutes = ((Date.now() - started) / 60000).toFixed(1);
-    appendFileSync(paths.progress, progressFooter(code, minutes, paths.report, label));
-    // 先写 gate 事件再写 end（协议第 2 节、12.1）；跑过门禁的 end 另有 agentExit。
-    if (gate) registry({ event: 'gate', id, ok: gate.ok, attempt: gate.attempt, at: gate.at, summary: gate.summary });
-    registry({ event: 'end', id, exit: code, at: Date.now(), minutes: Number(minutes), ...(gate ? { agentExit } : {}) });
-    // 后台派发时进度不打印到标准输出；失败原因放在退出码前面，派活方不用翻日志就能看到。
-    if (code !== 0 && !interactive) for (const text of errors) console.log(`出错：${clip(text)}`);
-    // 门禁结果放在结果行前面（协议 13）；--json 时由调用方收集进 JSON。
-    if (gate) {
-      onGate?.({ ok: gate.ok === true, summary: gate.summary });
-      console.log(gate.ok ? '门禁通过' : `门禁未通过：${gate.summary}`);
-    }
-    console.log(`exit=${code} report=${paths.report}`);
-    return code ?? 1;
-  };
-  let command;
-  try {
-    if (envError) throw envError;
-    command = adapter.command({ root, report: paths.report, prompt: details.prompt, settings, detection, env: childEnv, profile });
-  }
-  catch (error) { emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` }); return finish(1); }
-  if (shouldWatch({ platform: process.platform, interactive, policy: settings.watchWindow, takeover: viewerTakesOver(home) })) openWatch(paths.name, paths.progress, label);
-  return await new Promise(resolve => {
-    let child;
-    try {
-      child = spawn(command.executable, command.args, { cwd: root, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
-    } catch (error) { emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` }); resolve(finish(1)); return; }
-    registry({ event: 'spawned', id, codexPid: child.pid ?? null, agentPid: child.pid ?? null, at: Date.now() });
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    createInterface({ input: child.stdout }).on('line', line => {
-      const at = Date.now();
-      let event;
-      try { event = JSON.parse(line); } catch { /* 非 JSON 行仍保留原文。 */ }
-      appendFileSync(paths.raw, `${event && typeof event === 'object' && !Array.isArray(event) ? JSON.stringify({ ...event, _at: at }) : line}\n`);
-      for (const mapped of mapLine(line, { root })) emit(mapped, at);
-    });
-    // 保留旧行为：stderr 原样存入 raw，不当成 stdout 的事件流。
-    let stderr = '';
-    child.stderr.on('data', chunk => { appendFileSync(paths.raw, chunk); stderr = (stderr + chunk).slice(-4096); });
-    let failed = false;
-    child.on('error', error => { failed = true; emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` }); });
-    child.stdin.on('error', error => {
-      if (error.code !== 'EPIPE') emit({ kind: 'error', text: error.message });
-    });
-    let stopping = false;
-    // 门禁进行中当前验收命令的 pid；没有门禁命令在跑时是 null（回调见 runCommand / runGate 的 onSpawn）。
-    let gatePid = null;
-    const signals = ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'];
-    const handlers = signals.map(signal => {
-      const handler = async () => {
-        if (stopping) return;
-        stopping = true;
-        // 门禁进行中要结束的是当前验收命令的进程树，不是已经结束的执行者（协议 12.1 第 8 条约定）。
-        const target = gatePid ?? child.pid;
-        try { if (target) await killProcessTree(target); }
-        catch { /* 结束失败仍记录中断并退出，平台函数有总时限。 */ }
-        finally {
-          try { appendFileSync(paths.progress, `\n=== 派发脚本收到 ${signal}，被外部中断 ===\n`); } catch { /* 不阻塞退出。 */ }
-          registry({ event: 'interrupted', id, signal, at: Date.now() });
-          process.exit(1);
-        }
-      };
-      process.on(signal, handler);
-      return [signal, handler];
-    });
-    child.stdin.end(command.stdin, 'utf8');
-    // close 在 stdout/stderr 完全排空后触发，避免 exit 提前丢掉最后的汇报事件。
-    child.on('close', async code => {
-      if (stopping) return;
-      // 干活方启动即退出时，原因往往只在 stderr 里（例如 Codex 拒绝在非 git 目录运行），补成出错事件。
-      if (!failed && code !== 0) {
-        const tail = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-5).join('\n');
-        if (tail) emit({ kind: 'error', text: tail });
-        // 失败原因可能只在 stderr，也可能在执行者自己的出错事件里（如接口返回 401）：两处一起交给适配器判断。
-        const hint = adapter.failureHint?.([stderr, ...errors].join('\n'), { profile });
-        if (hint) emit({ kind: 'error', text: hint });
-      }
-      const agentCode = failed ? 1 : code;
-      let exitCode = agentCode, gate = null;
-      // 执行者以 0 结束且启用门禁：跑门禁，end.exit 由门禁结果决定（协议 12.1、13）。
-      if (!failed && agentCode === 0 && gateInfo?.enabled) {
-        registry({ event: 'gating', id, at: Date.now() });
-        progress(`门禁开始：检查提交与改动范围，运行 ${gateInfo.merged.verify.length} 条验收命令`);
-        try {
-          gate = await runGate({
-            root, base: gateInfo.base, spec: gateInfo.merged, env,
-            // 去掉当前执行者配置 secrets 里的键与来源变量名（协议 12.2）。
-            dropEnv: Object.entries(profile.secrets ?? {}).flatMap(([key, value]) => [key, value]),
-            dir: paths.dir, attempt: 1,
-            onSpawn: pid => {
-              gatePid = pid;
-              // 停止信号已经到达时，刚启动的命令立即结束（门禁循环随后由进程退出结束）。
-              if (stopping && pid) killProcessTree(pid).catch(() => {});
-            },
-          });
-        } catch (error) {
-          // 门禁自身出错（如 gate.json 写不进去）：按未通过处理，仍写 gate 事件与 end。
-          gate = { ok: false, attempt: 1, at: Date.now(), summary: `门禁运行失败：${error.message}` };
-          emit({ kind: 'error', text: gate.summary });
-        }
-        for (const item of gate.commands ?? []) {
-          const status = item.timedOut ? '超时'
-            : item.error != null ? item.error
-              : item.exit === 0 ? '通过' : `exit ${item.exit}`;
-          progress(`门禁命令：${item.line} → ${status}（${(item.ms / 1000).toFixed(1)} 秒）`);
-        }
-        progress(gate.summary);
-        exitCode = gate.ok ? 0 : 3;
-      }
-      // 门禁进行中收到停止信号：信号处理器会写 interrupted 并以 1 退出，这里不再写 end。
-      if (stopping) return;
-      for (const [signal, handler] of handlers) process.off(signal, handler);
-      resolve(finish(exitCode, { gate, agentExit: agentCode }));
-    });
+  // 一次运行的编排（多次尝试的循环 → 门禁 → 收尾）在 pipeline.mjs，单次执行在 runner.mjs。
+  return pipeline({
+    root, paths, id, registry, progress, started, interactive, home,
+    adapter, label, profile, settings, detection, childEnv, envError, env,
+    prompt: details.prompt, gateInfo, onGate,
+    profileName, maxRetries, escalate, sources,
   });
 }
 
 // 项目配置：<项目根>/.agent-router/project.json；不存在、读不了或不是对象都当 {}（协议 11.3）。
 function readProjectConfig(root) {
   try {
-    const value = JSON.parse(readFileSync(join(root, '.agent-router', 'project.json'), 'utf8'));
+    const value = readJson(join(root, '.agent-router', 'project.json'));
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   } catch { return {}; }
 }
@@ -284,21 +200,45 @@ function readProjectConfig(root) {
 // 用任务说明派发时的派发前准备（协议 11.1～11.4）：
 // 解析 frontmatter → 校验 → 与项目配置合并；启用门禁时再做检查并取 base。不通过时抛出，调用方按派发错误（退出码 2）处理。
 // 返回 { warnings, gate: { enabled, base, merged } }；merged 只含门禁用到的字段，随托管 / 脱离请求带给执行者进程。
+// 派发与手动重试的重新准备共用 readAndMergeSpec / gateFields（任务 059）。
 function prepareSpecGate(root, specPath) {
+  const { parsed, merged } = readAndMergeSpec(root, specPath);
+  const fields = gateFields(merged);
+  if (!merged.gate) return { warnings: parsed.warnings, gate: { enabled: false, base: null, merged: fields } };
+  return { warnings: parsed.warnings, gate: { enabled: true, base: requireGateBase(root, specPath), merged: fields } };
+}
+
+// 读取 → 解析 → 校验 → 与项目配置合并任务说明（协议 11.1～11.3；派发与手动重试共用）。
+function readAndMergeSpec(root, specPath) {
   let text;
   try { text = readFileSync(resolvePath(root, specPath), 'utf8'); }
   catch (error) { throw new Error(`读不到任务说明 ${specPath}：${error.message}`); }
   const parsed = parseSpec(text, specPath);
   const spec = validateSpec(parsed, specPath);
-  const merged = mergeSpec(spec, readProjectConfig(root));
-  const fields = {
+  return { parsed, spec, merged: mergeSpec(spec, readProjectConfig(root)) };
+}
+
+// 门禁交给执行流程 / 请求快照的字段（协议 11.3）。
+function gateFields(merged) {
+  return {
     allowed_paths: merged.allowed_paths,
     verify: merged.verify,
     expect_commit: merged.expect_commit,
     verify_timeout_min: merged.verify_timeout_min,
+    // max_retries：随 merged 一起交给执行流程与托管 / 脱离请求（协议 14.1）。
+    max_retries: merged.max_retries,
   };
-  if (!merged.gate) return { warnings: parsed.warnings, gate: { enabled: false, base: null, merged: fields } };
-  return { warnings: parsed.warnings, gate: { enabled: true, base: requireGateBase(root, specPath), merged: fields } };
+}
+
+// 与 git() 相同的调用，另外带回信号（git() 丢掉了它）；只给 requireGateBase 的失败明细用。
+function gitWithSignal(root, args) {
+  try {
+    const child = spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, shell: false, windowsHide: true });
+    if (child.error) return { status: null, signal: null, stdout: '', stderr: child.error.message };
+    return { status: child.status, signal: child.signal ?? null, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+  } catch (error) {
+    return { status: null, signal: null, stdout: '', stderr: error.message };
+  }
 }
 
 // 启用门禁时的派发前检查（协议 11.4），返回 base。检查顺序与协议一致；任何一项不通过都抛出中文原因。
@@ -314,12 +254,24 @@ function requireGateBase(root, specPath) {
   const inside = !!rel && !rel.startsWith('../') && !isAbsolute(rel);
   const shown = inside ? rel : specPath;
   const notCommitted = () => new Error(`任务说明还没有提交：${shown}。启用门禁的任务要先提交任务说明，再派发。`);
-  if (!inside) throw notCommitted();
-  const tracked = git(root, ['ls-files', '--error-unmatch', '--', rel]);
+  if (!inside) {
+    process.stderr.write(`[ar-gate 核对] 任务说明还没有提交：${redactPaths(shown)}；任务说明路径在仓库之外，没有运行 git 检查\n`);
+    throw notCommitted();
+  }
+  const tracked = gitWithSignal(root, ['ls-files', '--error-unmatch', '--', rel]);
   if (tracked.status === null) throw new Error(`无法检查任务说明是否已提交：${tracked.stderr.trim() || 'git 无法运行'}`);
-  const status = git(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--', rel]);
+  const status = gitWithSignal(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--', rel]);
   if (status.status !== 0) throw new Error(`无法检查任务说明是否已提交：${status.stderr.trim() || `git status 退出码 ${status.status}`}`);
-  if (tracked.status !== 0 || parseStatusPorcelainZ(status.stdout).length) throw notCommitted();
+  const dirty = tracked.status !== 0 || parseStatusPorcelainZ(status.stdout).length > 0;
+  // 069 诊断（偶发的"任务说明还没有提交"没有现场）：失败路径（以及 AR_CORE_TRACE=1）在标准错误另写一行核对明细，返回给调用方的错误文字不变。
+  if (dirty || tracing) {
+    const part = (label, r) => {
+      const clip = text => redactPaths(String(text ?? '').slice(0, 300)).replace(/\r?\n/g, '⏎').replace(/\0/g, '␀');
+      return `${label}：退出码=${r.status}${r.signal ? ` 信号=${r.signal}` : ''} 标准错误前 300 字符="${clip(r.stderr)}" 输出前 300 字符="${clip(r.stdout)}"`;
+    };
+    process.stderr.write(`[ar-gate 核对] 任务说明${dirty ? '还没有提交' : '已提交（AR_CORE_TRACE=1）'}：${redactPaths(shown)}；${part('git ls-files --error-unmatch', tracked)}；${part('git status --porcelain', status)}\n`);
+  }
+  if (dirty) throw notCommitted();
   // 3. 工作区干净（.agent-runs/ 除外），列出前 5 个文件。
   let uncommitted;
   try { uncommitted = uncommittedFiles(root); }
@@ -336,4 +288,222 @@ export function profileConfig(profile = {}, adapter = null) {
   const extra = Object.fromEntries((adapter?.snapshotKeys ?? []).filter(key => profile[key] !== undefined).map(key => [key, profile[key]]));
   return { env: profile.env ?? {}, secrets: profile.secrets ?? {}, auth: profile.auth ?? null, maxTurns: profile.maxTurns ?? null, label: profile.label ?? null,
     adapter: profile.adapter ?? adapter?.id ?? null, path: profile.path ?? null, ...extra };
+}
+
+// ===== 手动重试（协议 14.3，任务 059）=====
+// 前台：cli.mjs 解析 --profile / --note / --detach / --host 后传进 run({ retry })；
+// --detach：与 ar dispatch --detach 相同（协议第 7 节第 8 条），请求里多 retry: { n, note, profile }，
+// 执行者进程（--run-request）认出后自己写 resume（pid 是执行者进程）再继续。
+// 与派发的差别：不占新记录名、不截断 raw.log / events.jsonl、不写 dispatch.json、
+// 写 resume 而不是 start、不做托管交接——同一工作区、同一 id 接着跑第 n 次尝试，只跑这一次。
+async function runRetry({ adapterOverride, scriptPath, env, root, request, opts, onDetach, onGate, onRetry }) {
+  const home = homeDirectory(env);
+  const registry = registryWriter(home);
+  const started = Date.now();
+  // 定位任务、状态判断、选执行者、取原始指令与门禁、算新编号与上一次的失败（只读；
+  // 不通过时抛错，调用方按派发错误退出码 2 处理）。脱离派发的执行者进程不再读配置（按快照运行）。
+  const plan = prepareRetry({ root, env, name: opts.name, profileOpt: opts.profile, note: opts.note, nOverride: opts.n, skipProfile: !!request });
+  const { paths, id, n, saved, prompt, gateInfo, warnings, baseNote, optionsNote, failure } = plan;
+  // 执行者配置：执行者进程用请求里的快照（同派发），前台重新读配置（顺便校验 --profile 存在且启用）。
+  const { settings, warning, config, profile } = request
+    ? { settings: { ...request.settings, watchWindow: 'never' }, warning: null, config: {}, profile: { adapter: request.adapter ?? 'codex', ...(request.profileConfig ?? {}) } }
+    : plan.loaded;
+  const profileName = plan.profileName;
+  const adapter = adapterOverride ?? adapterFor(profile);
+  const label = profile.label ?? adapter.label ?? adapter.id;
+  mkdirSync(paths.dir, { recursive: true });
+  const interactive = !!process.stdout.isTTY;
+  const progress = (text, at = Date.now()) => {
+    const line = `[${new Date(at).toLocaleTimeString('zh-CN', { hour12: false })}] ${text}`;
+    appendFileSync(paths.progress, `${line}\n`);
+    if (interactive) console.log(line);
+  };
+  console.log(`记录名：${paths.name}\n进度：${paths.progress}`);
+  if (warning) { progress(warning); if (!interactive) console.log(warning); }
+  if (!request) for (const key of adapter.unsupportedSettings ?? []) if (settings[key] != null) {
+    const line = `配置：${adapter.id} 执行者不支持 ${key}，已忽略`;
+    progress(line);
+    if (!interactive) console.log(line);
+  }
+  // 不认识的字段只警告（同派发，协议 11.2）；重新准备门禁时才会拿到新警告。
+  for (const text of warnings) {
+    const line = `任务说明警告：${text}`;
+    progress(line);
+    if (!interactive) console.log(line);
+  }
+  // start 没记基线时按当前 HEAD 重新取，原因写进进度（协议 14.3 第 5 条）。
+  if (baseNote) progress(baseNote);
+  if (optionsNote && !request) { progress(optionsNote); if (!interactive) console.log(optionsNote); }
+  if (request) progress(managedMessage(request.app));
+  onRetry?.({ id, name: paths.name, n });
+  // ——脱离重试——只写"已认领"请求并交给独立进程，不握手、不等待、不弹进度窗口（同 dispatch --detach）。
+  if (opts.detach && !request) {
+    const detachRequest = { v: 1, id, app: 'AgentRouter', at: started, script: scriptPath, node: process.execPath, repo: root, name: paths.name,
+      profile: profileName, adapter: adapter.id,
+      args: { task: saved.task, extra: saved.extra, role: saved.role ?? null, spec: saved.spec ?? null, ...(gateInfo ? { gate: gateInfo } : {}) },
+      settings: Object.fromEntries(['model', 'effort', 'tier', 'sandbox', 'path'].map(key => [key, settings[key]])),
+      dispatcher: dispatcher(opts.host, env), env: managedEnvironment(env),
+      profileConfig: profileConfig(profile, adapter),
+      // 手动重试的三件信息（协议 14.3 第 8 条）：执行者进程写 resume 时用请求里的 n / profile。
+      retry: { n, note: opts.note, profile: profileName }, detached: true };
+    const claimed = join(home, 'managed', `${id}.claimed.json`);
+    mkdirSync(join(home, 'managed'), { recursive: true });
+    const temp = `${claimed}.tmp`;
+    try { writeFileSync(temp, JSON.stringify(detachRequest), { flag: 'wx', mode: 0o600 }); renameSync(temp, claimed); }
+    catch (error) { rmSync(temp, { force: true }); throw error; }
+    // 执行者进程用调用者的完整环境启动（密钥在它自己解析 profile 时由 buildEnv 注入），请求文件里不含任何密钥值。
+    const childEnv = process.versions.electron ? { ...env, ELECTRON_RUN_AS_NODE: '1' } : env;
+    const child = spawn(process.execPath, [scriptPath, '--run-request', claimed], { cwd: root, env: childEnv, detached: true, stdio: 'ignore', shell: false, windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+    onDetach?.(id);
+    return 0;
+  }
+  // 执行者环境：与派发相同的白名单、密钥、沙箱用户目录（env.mjs）。
+  const sources = secretSources(config);
+  let childEnv, envError = null;
+  try { childEnv = buildEnv({ base: env, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
+  catch (error) { envError = error; childEnv = allowedEnv({ base: env, adapter, home, profileName, sources }); }
+  const detection = await adapter.detect({ env: childEnv, settings, profile });
+  // 开始前追加 resume（协议 14.3 第 7 条）：pid 是这次运行重试的进程
+  //（脱离派发时是执行者进程自己，在上面的 --run-request 里走同一条分支）。
+  registry({ event: 'resume', id, pid: process.pid, n, at: Date.now() });
+  // 之后与协议 14.2 相同，只是只跑这一次（retry），收尾写 attempt-end 与 end（end.attempts === n）。
+  return pipeline({
+    root, paths, id, registry, progress, started, interactive, home,
+    adapter, label, profile, profileName, settings, detection, childEnv, env, envError,
+    prompt, gateInfo, onGate,
+    maxRetries: 0, escalate: null, sources,
+    retry: { n, note: opts.note, failure },
+  });
+}
+
+// 手动重试的准备（协议 14.3 第 1～6 条）：定位任务 → 状态判断 → 执行者 → 编号 n →
+// 原始指令 → 门禁与基线 → 上一次的失败。只读，不写清单、不启动进程；
+// 不通过时抛出中文原因，调用方按派发错误（退出码 2）处理。
+// skipProfile：脱离派发的执行者进程不读配置（协议：执行者按快照运行），执行者由请求里的快照给出。
+function prepareRetry({ root, env, name, profileOpt = null, note = null, nOverride = null, skipProfile = false }) {
+  const home = homeDirectory(env);
+  // 1. 找任务（协议 14.3 第 1 条，同 ar wait 的规则：新旧公共目录里最近开始的那条）。
+  const found = locateStart([home, legacyHomeDirectory(env)], root, name);
+  if (!found) throw new Error(`重试：在当前仓库找不到记录 ${name}`);
+  const { file, start } = found;
+  const paths = taskPaths(root, start.name);
+  // 2. 状态（协议 14.4：最近一条 start / resume 之后有没有 end / interrupted）。
+  const terminal = findTerminal(file, start.id);
+  if (!terminal) throw new Error('任务还在进行，先停止');
+  // 3. 执行者：--profile 指定的必须存在且启用（报错文案就是 profile 选择的现有文案，loadConfig 抛出）；
+  //    不给就用最后一次尝试的 attempt.profile，没有 attempt 事件的旧任务用 start.profile。
+  //    配置读不了（协议第 4 节 CONFIG_INVALID）也在这一步拒绝：retry 属于"需要选执行者"的命令，
+  //    先于 --note / 旧任务判断，任何不合法的 retry 都统一拒绝、不派发（已有测试 config-invalid 覆盖）。
+  const lastAttempt = latestRow(file, start.id, 'attempt');
+  const wanted = profileOpt ?? lastAttempt?.profile ?? start.profile ?? undefined;
+  //    派发时命令行给的选项（dispatch.json 的 options，067）照用；换了执行者配置只沿用 sandbox / watchWindow。
+  const saved = readDispatch(root, start.name);
+  const savedOptions = saved?.options ?? {};
+  const switched = !!saved && !!wanted && wanted !== saved.profile;
+  const kept = retryOptions(savedOptions, switched);
+  // 进度说明行只在确实丢掉了 model / effort / tier 时才写（协议 14.3）。
+  const optionsNote = switched && Object.keys(savedOptions).some(key => !SHARED_OPTIONS.includes(key))
+    ? `手动重试：换了执行者配置（${saved.profile} → ${wanted}），不沿用 model / effort / tier` : null;
+  const loaded = skipProfile ? null : loadConfig(home, { profile: wanted, ...Object.fromEntries(Object.entries(kept).map(([key, value]) => [DISPATCH_OPTIONS[key], value])) }, env);
+  // 4. 完成（exit 0）的任务必须写 --note；没有 dispatch.json 的旧任务与 ar redispatch 同一句话。
+  //    中断、失败、完成后再改一轮则继续（协议 14.3 的表）。
+  if (terminal.event === 'end' && (terminal.exit ?? 1) === 0 && note == null) throw new Error('已完成的任务重试时必须写补充说明（--note）');
+  if (!saved) throw new Error('这个任务是旧版本派发的，没有保存派发参数，不能再派一次');
+  // 5. 新尝试编号：最后一个 attempt.n + 1；Stage04 没有 attempt 事件按已有 1 次算（n = 2）。
+  //    脱离派发时前台算好放进请求，执行者进程沿用，不重算。
+  const n = Number.isSafeInteger(nOverride) && nOverride >= 2 ? nOverride
+    : (Number.isSafeInteger(lastAttempt?.n) ? lastAttempt.n : 1) + 1;
+  // 6. 原始指令与门禁（不检查工作区是否干净：同一工作区继续）。
+  const prompt = originalPrompt(root, paths, saved);
+  const gate = retryGate(root, saved, start);
+  // 7. 上一次的失败（中断、完成后再改一轮没有失败段落，只有补充说明）。
+  const failure = previousFailure(file, paths, start.id, n, terminal);
+  return { start, paths, id: start.id, n, saved, prompt, gateInfo: gate.gateInfo, warnings: gate.warnings,
+    baseNote: gate.baseNote, optionsNote, failure, loaded, profileName: loaded ? loaded.profileName : wanted };
+}
+
+// 同一任务最近一条指定事件（清单从尾部往前找，协议 14.4 的读取方向）。
+function latestRow(file, id, event) {
+  for (const row of reverseRows(file)) if (row.id === id && row.event === event) return row;
+  return null;
+}
+
+// 原始指令（协议 14.3 第 5 条）：attempts/1/prompt.md 是派发时发出去的原文；
+// 没有它（Stage04 旧任务没有 attempts/）就按 dispatch.json 重新生成（与 dispatch 同一个 taskDetails）。
+function originalPrompt(root, paths, saved) {
+  try { return readFileSync(attemptPaths(paths, 1).prompt, 'utf8'); }
+  catch { /* 旧任务：按派发参数重新生成。 */ }
+  return taskDetails(root, { opts: { ...(saved.role ? { role: saved.role } : {}), name: saved.name }, task: saved.task, extra: saved.extra }).prompt;
+}
+
+// 门禁与基线（协议 14.3 第 5 条）：dispatch.json 里的直接用；缺了按派发规则重新准备
+//（重新解析任务说明、重新取基线），但**不检查工作区是否干净**——手动重试在同一工作区继续。
+// start.base 也没记（当时门禁没启用、这次改启用了）时按当前 HEAD，并在进度里说明（协议 14.3）。
+function retryGate(root, saved, start) {
+  if (saved.gate && typeof saved.gate === 'object' && typeof saved.gate.enabled === 'boolean') {
+    return { gateInfo: saved.gate, warnings: [], baseNote: null };
+  }
+  // 没有门禁字段：旧任务或直接任务文字派发。有任务说明就重新准备；没有就没有门禁。
+  if (saved.spec) {
+    const { parsed, merged } = readAndMergeSpec(root, saved.spec);
+    const fields = gateFields(merged);
+    if (merged.gate) {
+      const hasBase = typeof start.base === 'string' && start.base;
+      const base = hasBase ? start.base : headSha(root);
+      const baseNote = hasBase ? null : `手动重试：任务开始时没有记录基线，按当前 HEAD ${String(base).slice(0, 7)} 作为门禁基线`;
+      return { gateInfo: { enabled: true, base, merged: fields }, warnings: parsed.warnings, baseNote };
+    }
+    return { gateInfo: { enabled: false, base: null, merged: fields }, warnings: parsed.warnings, baseNote: null };
+  }
+  return { gateInfo: null, warnings: [], baseNote: null };
+}
+
+// 上一次的失败（协议 14.3 第 6 条），供这次的 prompt 加失败段落：
+// - 门禁未通过（attempt-end.gate === false）→ { kind: 'gate', gate }：gate.json 取 attempts/<n-1>/，
+//   缺了退回顶层 gate.json；两处都没有就没有失败段落（只有补充说明）。
+// - 执行者异常退出 → { kind: 'agent', exit, errors, stderrTail }：errors 只收 events.jsonl 里
+//   attempt === n-1 的出错事件文字（Stage04 的事件没有 attempt 字段，收不到）；
+//   stderrTail 取 attempts/<n-1>/raw.log 末尾 4096 字符，缺 attempts/ 时用顶层 raw.log。
+// - 中断（interrupted）、完成后再改一轮（end.exit === 0）→ null：只有补充说明，没有失败段落。
+// 两处 gate.json 都缺时按"没有失败段落"处理（协议 14.3）。
+function previousFailure(file, paths, id, n, terminal) {
+  if (terminal.event !== 'end' || (terminal.exit ?? 1) === 0) return null;
+  const previous = attemptPaths(paths, n - 1);
+  const attemptEnd = latestRow(file, id, 'attempt-end');
+  const mine = attemptEnd?.n === n - 1;
+  if (mine && attemptEnd.gate === false) {
+    const gate = readGateJson(previous.gate) ?? readGateJson(join(paths.dir, 'gate.json'));
+    if (gate) return { kind: 'gate', gate };
+    return null;
+  }
+  const errors = [];
+  for (const row of reverseRows(paths.events)) {
+    if (row.kind === 'error' && row.attempt === n - 1 && typeof row.text === 'string') errors.push(row.text);
+  }
+  errors.reverse();
+  const exit = mine ? (attemptEnd.exit ?? 1) : (terminal.exit ?? terminal.agentExit ?? 1);
+  return { kind: 'agent', exit, errors, stderrTail: tailText(existsSync(previous.raw) ? previous.raw : paths.raw, 4096) };
+}
+
+// 读一次门禁结果文件；不存在或不是带 summary 的对象都当没有（由上一层回退）。
+function readGateJson(file) {
+  try { const value = readJson(file); return value && typeof value === 'object' && typeof value.summary === 'string' ? value : null; }
+  catch { return null; }
+}
+
+// 文件末尾 maxChars 个字符：先读末尾 4 倍字节（UTF-8 最长 4 字节/字符），去掉开头的半行再按字符截取。
+function tailText(file, maxChars) {
+  let fd;
+  try { fd = openSync(file, 'r'); }
+  catch { return ''; }
+  try {
+    const size = fstatSync(fd).size, from = Math.max(0, size - maxChars * 4);
+    const buffer = Buffer.alloc(size - from);
+    const read = readSync(fd, buffer, 0, buffer.length, from);
+    let text = buffer.subarray(0, read).toString('utf8');
+    if (from > 0) { const newline = text.indexOf('\n'); if (newline !== -1) text = text.slice(newline + 1); }
+    return text.slice(-maxChars);
+  } finally { closeSync(fd); }
 }

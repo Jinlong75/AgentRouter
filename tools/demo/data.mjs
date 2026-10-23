@@ -1,5 +1,7 @@
 import { summarizeGate } from '../../core/lib/gate.mjs';
 
+// 多次尝试演示任务的第一个执行者（DeepSeek）；第 3 次升级用的 claude-native 见 attemptSets。
+const DS = { profile: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', agentVersion: '2.1.302 (Claude Code)' };
 const tasks = [
   { id: 't1', day: 'run', name: '012-背包拖拽与堆叠', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'run', start: '15:21', dur: '18:42', last: '运行：npm test -- inventory', sandbox: 'workspace-write' },
   { id: 't2', day: 'run', name: '007-搜索结果分页', project: 'notes-web', host: 'Claude Code', role: '执行者', state: 'run', start: '15:36', dur: '4:05', last: '修改文件：src/search/Results.tsx', sandbox: 'workspace-write' },
@@ -21,9 +23,18 @@ const tasks = [
   // Stage04 门禁演示（单独的 reader-app 项目，不影响原有任务数量）：
   // t20 门禁通过；t21 门禁未通过（越界文件 + 失败的截断命令，任务 exit=3 而执行者 agentExit=0）；
   // t22 说明派发但没启用门禁（gate:false）。
+  // 056：t24 门禁未通过，演示受保护路径越界与删除的文件（gate.json 带 protected / deleted）；
+  // t21 保留旧式 gate.json（没有这两个字段），用来检查旧记录不显示"删除的文件"一块。
   { id: 't20', day: 'today', name: '020-导出书签', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'done', start: '09:20', dur: '7.4 分钟', commit: '7f0c9de', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
   { id: 't21', day: 'today', name: '021-导出筛选', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'fail', exit: 3, agentExit: 0, start: '09:05', dur: '6.1 分钟', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
   { id: 't22', day: 'today', name: '022-整理导出文档', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'done', start: '08:50', dur: '3.5 分钟', commit: '5b7e2c0', sandbox: 'workspace-write', gate: false, base: 'a1b2c3d' },
+  { id: 't24', day: 'today', name: '024-调整导出权限', project: 'reader-app', host: 'Claude Code', role: '执行者', state: 'fail', exit: 3, agentExit: 0, start: '08:35', dur: '5.2 分钟', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  // Stage05 多次尝试演示（061，UI23；默认隐藏，形状照界面稿的 ATTEMPTS，尝试明细在下面的 attemptSets）：
+  // t25 自动重试进行中（第 2/3 次，门禁等待）。运行中的任务不会被"隐藏"，所以演示里它没有存活的派发进程（状态是中断）；
+  // UI23 检查时临时拉起一个假派发进程并追加 resume，让它回到进行中，检查完恢复。
+  // t26 升级后第 3 次完成（第 3 次换用 claude-native）。
+  { id: 't25', day: 'today', name: '025-导出 JSON', project: 'reader-app', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: DS, state: 'retrying', start: '15:40', dur: '6:12', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't26', day: 'today', name: '026-快捷键设置', project: 'reader-app', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: DS, state: 'done', start: '12:20', dur: '32.4 分钟', commit: '7c1d2e9', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
 ];
 
 // 门禁结果（文件协议 12.3，写入任务记录目录的 gate.json）。at 由生成器按任务开始时间补。
@@ -46,9 +57,60 @@ const gates = {
       { line: 'node tools/check-scope.mjs', argv: ['node', 'tools/check-scope.mjs'], exit: 1, ms: 2400, output: '读取允许范围：src/export/**、tests/export-*\n检查改动文件……\n发现越界文件：src/legacy/report.ts\n……（更早的输出省略）', truncated: true, error: null },
     ],
   },
+  // 056：受保护路径（任务说明目录、项目配置）越界 + 删除的文件——两个新字段 protected / deleted 的演示；
+  // 删除的旧测试在允许范围内，只提示、不让门禁因此失败（失败来自两条越界）。
+  t24: {
+    v: 1, attempt: 1, ms: 5400, ok: false, base: 'a1b2c3d', head: '3c4d5e6',
+    commit: { required: true, ok: true }, uncommitted: [],
+    scope: {
+      allowed: ['src/**', 'tests/**'],
+      changed: ['src/export/permissions.ts', 'tests/export/permission.test.ts', 'docs/specs/024-调整导出权限.md', '.agent-router/project.json', 'tests/export/legacy-permission.test.ts'],
+      outside: ['docs/specs/024-调整导出权限.md', '.agent-router/project.json'],
+      protected: ['docs/specs/024-调整导出权限.md', '.agent-router/project.json'],
+      deleted: ['tests/export/legacy-permission.test.ts'],
+    },
+    commands: [
+      { line: 'npm test -- export', argv: ['npm', 'test', '--', 'export'], exit: 0, ms: 4200, output: '✓ 导出权限检查\n✓ 无权限时拒绝\n\n2 passed', truncated: false, error: null },
+    ],
+  },
 };
 // summary 不手写：用核心的 summarizeGate 按协议 12.3 生成，演示数据与真实门禁同一种写法。
 for (const gate of Object.values(gates)) gate.summary = summarizeGate(gate);
+
+// ---------- Stage05 多次尝试演示数据（061，协议第 14 节；形状照界面稿 preview.js 的 ATTEMPTS）----------
+// 每次尝试：offset 是相对任务开始的毫秒，ms 是这次用时（没有 ms = 还在进行）；gateOk 是 attempt-end 的 gate 字段；
+// gate 是这次的 gate.json（attempts/<n>/gate.json，summary 由核心的 summarizeGate 生成）；report 是这次的汇报；events 是这次的进展。
+const attemptGate = (n, ms, { ok, head, changed, outside = [], protectedPaths = [], commands }) => {
+  const gate = { v: 1, attempt: n, ms, ok, base: 'a1b2c3d', head, commit: { required: true, ok: true }, uncommitted: [],
+    scope: { allowed: ['src/**', 'tests/**'], changed, outside, protected: protectedPaths, deleted: [] }, commands };
+  gate.summary = summarizeGate(gate);
+  return gate;
+};
+const cmd = (line, exit, ms, output) => ({ line, argv: line.split(' '), exit, ms, output, truncated: false, error: null });
+const attemptSets = {
+  t25: [
+    { n: 1, total: 3, profile: 'deepseek', reason: 'first', offset: 0, ms: 426000, exit: 0, gateOk: false, usage: { input: 38400, output: 5200 },
+      gate: attemptGate(1, 8100, { ok: false, head: '2c8e017', changed: ['src/export/json.ts', 'tests/export/json.test.ts'], commands: [cmd('npm test -- tests/export', 1, 8100, 'ℹ tests 18\nℹ pass 17\nℹ fail 1')] }),
+      report: '# 完成了什么（第 1 次尝试）\n\n实现了 JSON 导出；日期字段的输出还有 1 条测试没过。\n',
+      events: [['say', '先读任务说明和现有的导出模块。'], ['file', [['add', 'src/export/json.ts']]], ['cmd', 'npm test -- tests/export', 1, 'ℹ tests 18\nℹ pass 17\nℹ fail 1'], ['say', '已提交，汇报写好了。']] },
+    { n: 2, total: 3, profile: 'deepseek', reason: 'gate', offset: 450000,
+      events: [['say', '上一次 tests/export 有 1 条没过：日期没有按 ISO 格式输出。先修这个。'], ['cmd', 'npm test -- tests/export', null]] },
+  ],
+  t26: [
+    { n: 1, total: 3, profile: 'deepseek', reason: 'first', offset: 0, ms: 564000, exit: 0, gateOk: false, usage: { input: 41200, output: 6800 },
+      gate: attemptGate(1, 7600, { ok: false, head: '1a2b3c4', changed: ['src/input/keymap.ts'], commands: [cmd('npm test', 1, 7600, 'ℹ tests 22\nℹ pass 20\nℹ fail 2')] }),
+      report: '# 完成了什么（第 1 次尝试）\n\n实现了快捷键设置页；有 2 条测试没过，我认为是测试本身的问题。\n',
+      events: [['say', '先读任务说明和现有的输入模块。'], ['file', [['add', 'src/input/keymap.ts']]], ['cmd', 'npm test', 1, 'ℹ tests 22\nℹ pass 20\nℹ fail 2'], ['say', '已提交，汇报写好了。']] },
+    { n: 2, total: 3, profile: 'deepseek', reason: 'gate', offset: 600000, ms: 522000, exit: 0, gateOk: false, usage: { input: 29500, output: 4100 },
+      gate: attemptGate(2, 6200, { ok: false, head: '5d6e7f8', changed: ['src/input/keymap.ts', 'docs/specs/026-快捷键设置.md'], outside: ['docs/specs/026-快捷键设置.md'], protectedPaths: ['docs/specs/026-快捷键设置.md'], commands: [cmd('npm test', 0, 6200, 'ℹ tests 22\nℹ pass 22\nℹ fail 0')] }),
+      report: '# 完成了什么（第 2 次尝试）\n\n修好了失败的测试，并把任务说明里的验收命令改短了（门禁判为越界）。\n',
+      events: [['say', '修好了测试；顺手把任务说明里的验收命令改短了。'], ['file', [['update', 'docs/specs/026-快捷键设置.md']]], ['say', '已提交，汇报写好了。']] },
+    { n: 3, total: 3, profile: 'claude-native', reason: 'gate', offset: 1140000, ms: 804000, exit: 0, gateOk: true, usage: { input: 52000, output: 9300 },
+      gate: attemptGate(3, 8400, { ok: true, head: '7c1d2e9', changed: ['src/input/keymap.ts', 'tests/input/keymap.test.ts'], commands: [cmd('npm test', 0, 8400, 'ℹ tests 26\nℹ pass 26\nℹ fail 0')] }),
+      report: '# 完成了什么（第 3 次尝试）\n\n恢复了上一次改动的任务说明；在 keymap 里处理冲突的快捷键，新增 4 条测试，全部通过。\n',
+      events: [['say', '恢复了任务说明；改为在 keymap 里处理冲突的快捷键。'], ['cmd', 'npm test', 0, 'ℹ tests 26\nℹ pass 26\nℹ fail 0'], ['say', '验收命令全部通过，已提交。']] },
+  ],
+};
 const GROUPS = { run: '进行中', today: '今天', yesterday: '昨天' };
 const GROUP_DATE = { today: '10-08', yesterday: '10-07' };
 
@@ -138,4 +200,4 @@ const reportRich = [
   '无。',
 ].join('\n');
 
-export { tasks, gates, plan1, ev1, ev5, ev6, files3, reportRich };
+export { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, reportRich };

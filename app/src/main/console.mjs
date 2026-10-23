@@ -3,6 +3,8 @@
 // 只做参数校验与结果映射：参数一律用数组传给 coreRun（绝不拼命令字符串），
 // 密钥值只经 input 传入，绝不进参数数组，也绝不写进日志或错误信息。
 import path from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
+import { parseJson } from '../../../core/lib/json.mjs';
 
 // 执行者名 / 预设名：字母、数字、下划线、连字符，1～40 个字符。
 const validName = v => typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v);
@@ -39,7 +41,7 @@ export function claudeLaunch({ dir, name, wt }) {
   return { executable: 'cmd.exe', args: ['/c', 'start', `AgentRouter · ${String(name ?? '').replace(/["\r\n]/g, '')}`, '/D', dir, 'cmd.exe', '/k', 'claude'] };
 }
 
-export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null }) {
+export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false }) {
   const invalid = () => { throw new Error(messages.invalid); };
   // 组装参数数组并调用核心，按约定整理结果。
   const run = async (args, { input, timeoutMs, cwd } = {}) => {
@@ -219,6 +221,44 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       await registeredProject(p.project);
       // 软件发起的再派一次同样记为 AgentRouter（软件）。
       return run(['redispatch', p.name, '--host', 'agentrouter', '--detach'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 重试（协议 14.3）：在同一工作区、同一记录里新开一次尝试。profile 省略 = 沿用原执行者；note 可选
+    // （已完成的任务核心要求必填，没写时核心报错，原因原样交给界面）。写法与 tasks:redispatch 相同：参数数组、脱离、60 秒。
+    async 'tasks:retry'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      const args = ['retry', p.name, '--host', 'agentrouter', '--detach'];
+      if (p.profile !== undefined) { if (typeof p.profile !== 'string' || !p.profile || /[\r\n\s]/.test(p.profile)) invalid(); args.push('--profile', p.profile); }
+      if (p.note !== undefined) {
+        if (typeof p.note !== 'string' || p.note.length > 20000) invalid();
+        if (p.note.trim()) args.push('--note', p.note.trim());
+      }
+      await registeredProject(p.project);
+      return run(args, { timeoutMs: 60000, cwd: p.project });
+    },
+    // 某一次尝试的汇报与门禁（attempts/<n>/report.md、gate.json，协议 14.2 第 3 条）：只读文件，不调用核心。
+    // dir 是任务记录目录（<项目>/.agent-runs/<记录名>），n 是尝试序号；没有 attempts/ 目录（旧任务）时 exists 为 false。
+    // dir 还必须是主进程已读到的某个任务的记录目录（knownRunDir，由 index.ts 从 Registry 注入）；不在清单里不读任何文件。
+    async 'tasks:attempt-files'(p) {
+      const n = p?.n;
+      if (!validAbsPath(p?.dir) || p.dir.split(/[\\/]/).includes('..') || path.basename(path.dirname(p.dir)) !== '.agent-runs') invalid();
+      if (!Number.isSafeInteger(n) || n < 1 || n > 999) invalid();
+      if (!(await knownRunDir(p.dir))) invalid();
+      const missing = error => { if (error?.code !== 'ENOENT') throw error; return null; };
+      const attempts = await stat(path.join(p.dir, 'attempts')).catch(missing);
+      if (!attempts?.isDirectory()) return { exists: false, report: '', gate: null };
+      const folder = path.join(p.dir, 'attempts', String(n));
+      const report = await readFile(path.join(folder, 'report.md'), 'utf8').catch(missing);
+      const gateText = await readFile(path.join(folder, 'gate.json'), 'utf8').catch(missing);
+      let gate = null;
+      if (gateText !== null) {
+        try {
+          const parsed = parseJson(gateText);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('内容不是对象');
+          gate = parsed;
+        } catch (error) { gate = { error: error instanceof Error ? error.message : String(error) }; }
+      }
+      return { exists: true, report: report ?? '', gate };
     },
   };
   return {

@@ -10,10 +10,11 @@ import { gt, nt } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
-const GATE_IDS = ['t20', 't21', 't22'];
+const GATE_IDS = ['t20', 't21', 't22', 't24'];
 
-// UI22：Stage04 门禁界面。演示任务 t20～t22 默认写在 tasks.json 的 hidden 里（原有列表计数不变），
+// UI22：Stage04 门禁界面。演示任务 t20～t22、t24 默认写在 tasks.json 的 hidden 里（原有列表计数不变），
 // 这里临时显示、检查完恢复；门禁进行中的任务（t23）用真的假派发进程造出来，避免在演示清单里放一个一直跑的任务。
+// 056：t24 演示受保护路径越界与删除的文件；t21 保留旧式 gate.json（没有 protected / deleted 字段）。
 export async function captureGate(h: Harness, registry: Registry, out: string, save: (name: string) => Promise<void>) {
     const { evaluate, wait, check, verify, press, key, type, tabTo, focusRing, pause, wheel, audit } = h;
     const tasksFile = path.join(registry.data, 'tasks.json');
@@ -95,6 +96,23 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
             await press('[data-task=t21]');
             await press('.dtabs [data-tab=gate]');
         });
+
+        // ---- 056：受保护的路径与删除的文件（t24）；旧式记录（t21）没有"删除的文件"一块 ----
+        const t24 = registry.tasks.find(t => t.id === 't24')!;
+        assert.ok(t24, '受保护路径演示任务应出现在快照里');
+        const file24 = JSON.parse(await readFile(path.join(path.dirname(t24.progress), 'gate.json'), 'utf8'));
+        await press('[data-task=t24]');
+        await press('.dtabs [data-tab=gate]');
+        await wait(`document.querySelector(".tab-body .banner.fail .rt span")?.textContent === ${JSON.stringify(file24.summary)}`, 'UI22 受保护路径演示任务的门禁标签');
+        await check('UI22 受保护的路径行尾写"受保护的路径"且标红', `(() => { const row = [...document.querySelectorAll(".tab-body .grow")].find(r => r.querySelector(".v.mono")?.textContent === 'docs/specs/024-调整导出权限.md'); return !!row && row.classList.contains('bad') && row.querySelector(".meta")?.textContent === ${JSON.stringify(gt.scopeProtected)} && getComputedStyle(row.querySelector(".v.mono")).color === ${failColor}; })()`);
+        await check('UI22 "删除的文件"标题、个数与文件行（delete-bin-line 图标）', `(() => { const sec = [...document.querySelectorAll(".tab-body .sec-t")].find(s => s.textContent.startsWith(${JSON.stringify(gt.deletedSec)})); const row = [...document.querySelectorAll(".tab-body .grow.info")].find(r => r.querySelector(".v.mono")?.textContent === 'tests/export/legacy-permission.test.ts'); return !!sec && sec.textContent.includes(${JSON.stringify(gt.deletedCount(1))}) && !!row && !!row.querySelector('i.ri-delete-bin-line'); })()`);
+        // 截图要同框看到"受保护的路径"标注与"删除的文件"一块：先把受保护行滚到视口中间。
+        await evaluate('[...document.querySelectorAll(".tab-body .grow")].find(r => r.querySelector(".v.mono")?.textContent === \'docs/specs/024-调整导出权限.md\')?.scrollIntoView({ block: "center" })');
+        await pair('gate-protected-tab');
+        // 旧式记录：t21 的 gate.json 没有 deleted 字段——整块不显示（而不是显示"没有"）。
+        await press('[data-task=t21]');
+        await press('.dtabs [data-tab=gate]');
+        await check('UI22 旧式 gate.json 没有 deleted 字段时不显示"删除的文件"一块', `[...document.querySelectorAll(".tab-body .sec-t")].every(s => !s.textContent.includes(${JSON.stringify(gt.deletedSec)})) && !document.querySelector(".tab-body .grow.info")`);
 
         // ---- 门禁通过 ----
         await press('[data-task=t20]');
@@ -224,6 +242,12 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
             assert.equal(file21.ok, false);
             assert.equal(file20.ok, true);
             assert.equal(file20.commands.length, 2);
+            // 056：t21 保留旧式（没有 protected / deleted 字段）；t24 带两个新字段。
+            assert.equal(Object.hasOwn(file21.scope, 'deleted'), false);
+            assert.equal(Object.hasOwn(file21.scope, 'protected'), false);
+            assert.deepEqual(file24.scope.protected, ['docs/specs/024-调整导出权限.md', '.agent-router/project.json']);
+            assert.deepEqual(file24.scope.deleted, ['tests/export/legacy-permission.test.ts']);
+            assert.equal(file24.ok, false);
         });
     }
     finally {

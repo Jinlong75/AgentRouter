@@ -5,6 +5,8 @@ export declare const noWatchEnv: string[];
 export declare function pickName(env: Env, ...keys: string[]): string | undefined;
 export declare function userDirectory(env?: Env, platform?: string): string;
 export declare function homeDirectory(env?: Env, platform?: string): string;
+export declare function unsafeHome(dir: string, options?: { env?: Env; platform?: string; homedir?: string }): string | null;
+export declare function unsafeHomeReason(home: string): string;
 export declare function legacyHomeDirectory(env?: Env, platform?: string): string;
 export declare function legacyHomeFor(home: string): string;
 export declare function dryRun(env: Env): boolean;

@@ -54,9 +54,10 @@ export class AgentsView {
     private hint(state: string, text: string, extra = '') { return `<div class="hint">${mark(state)}<span>${esc(text)}</span>${extra}</div>`; }
     private render() {
         if (!this.container?.isConnected) return;
+        // 读取失败时只显示原因横幅：不显示"还没有导入执行者"的空状态（063：配置读不了≠没有执行者，空状态会误导）。
         const card = this.agents.length
             ? `<div class="card xlist">${this.agents.map(a => this.row(a)).join('')}</div>`
-            : (this.refreshing ? '' : `<div class="card"><div class="empty short">${icon('robot-2-line')}<b>${esc(ag.empty)}</b><p>${esc(ag.emptyHelp)}</p><button class="btn primary sm" data-import-agent>${icon('add-line')}${esc(ag.importFirst)}</button></div></div>`);
+            : (this.refreshing || this.error ? '' : `<div class="card"><div class="empty short">${icon('robot-2-line')}<b>${esc(ag.empty)}</b><p>${esc(ag.emptyHelp)}</p><button class="btn primary sm" data-import-agent>${icon('add-line')}${esc(ag.importFirst)}</button></div></div>`);
         // 重建会丢掉焦点：记下焦点所在按钮的身份，重建后放回同一个（模态框关闭后焦点回到触发按钮也靠它）。
         const focused = document.activeElement instanceof HTMLElement && this.container.contains(document.activeElement) ? document.activeElement : null;
         const identity = focused ? ['data-test', 'data-more-agent', 'data-agent-ack'].filter(k => focused.hasAttribute(k)).map(k => `[${k}="${CSS.escape(focused.getAttribute(k)!)}"]`).join('') : '';

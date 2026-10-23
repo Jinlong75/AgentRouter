@@ -54,7 +54,7 @@ test('v2 新任务写在新公共目录与 .agent-runs/<名>/；与旧任务并�
   const dispatched = f.ar(['只回复 OK', '--name', '新 任务']);
   assert.equal(dispatched.status, 0, dispatched.stderr);
   const rows = fs.readFileSync(join(f.home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-  assert.deepEqual(rows.map(r => [r.event, r.v]), [['start', 2], ['spawned', 1], ['end', 1]]);
+  assert.deepEqual(rows.map(r => [r.event, r.v]), [['start', 2], ['attempt', 1], ['spawned', 1], ['attempt-end', 1], ['end', 1]]);
   assert.equal(rows[0].dir, join(f.repo, '.agent-runs', '新 任务'));
   const report = join(f.repo, '.agent-runs', '新 任务', 'report.md');
   assert.equal(fs.readFileSync(report, 'utf8'), 'OK\n');

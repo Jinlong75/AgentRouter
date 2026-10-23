@@ -11,6 +11,7 @@ import { createPlan, executePlan } from '../../installer/lib/install.mjs';
 import { createManaged } from '../../app/src/main/managed.mjs';
 import { handoff, terminalReader, managedEnvironment, validRequest, viewerApp, managedMessage } from '../../core/lib/managed.mjs';
 import { registryWriter } from '../../core/lib/records.mjs';
+import { captureIdentities, assertIdentitiesGone, cleanupProcesses } from '../fixtures/identity.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const execute = promisify(execFile);
@@ -136,27 +137,21 @@ async function diagnoseWaiter(t, f, kind, child, waited) {
 }
 
 // 有界清理：结束等待者的整棵进程树，总共最多等 TREE_KILL_LIMIT_MS 确认退出；仍未退出如实返回，不无限等。
-async function endTree(pid) {
+// 073：清理改为按身份（PID + 创建时间）逐个结束命令行带本测试临时目录 base 的进程（等待者、执行者、假 agent 的路径都在 base 下），
+// 不再按 PID 对整棵树 taskkill /T；PID 被复用时不会误伤无关进程。
+async function endTree(pid, base) {
   if (!alive(pid)) return '已退出（无需清理）';
   const deadline = Date.now() + TREE_KILL_LIMIT_MS;
-  try {
-    if (process.platform === 'win32') await execute('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: Math.max(1000, deadline - Date.now()) });
-    else process.kill(pid, 'SIGKILL');
-  } catch { /* 进程可能已自己退出，或 taskkill 失败；下面统一确认。 */ }
+  await cleanupProcesses(base);
   while (Date.now() < deadline) { if (!alive(pid)) return '整棵进程树已退出'; await delay(100); }
   return alive(pid) ? `仍未退出（pid ${pid} 及其子进程可能还在）` : '整棵进程树已退出';
 }
 // 027：一次等待涉及多个子进程时共用一个清理总预算：结束所有仍存活的整棵进程树，到期如实报告谁还在。
-async function endTrees(pids) {
+async function endTrees(pids, base) {
   const targets = [...new Set(pids.filter(pid => Number.isSafeInteger(pid) && pid > 0 && alive(pid)))];
   if (!targets.length) return '对应进程都已退出（无需清理）';
   const deadline = Date.now() + TREE_KILL_LIMIT_MS;
-  for (const pid of targets) {
-    try {
-      if (process.platform === 'win32') await execute('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: Math.max(1000, deadline - Date.now()) });
-      else process.kill(pid, 'SIGKILL');
-    } catch { /* 进程可能已自己退出，或 taskkill 失败；下面统一确认。 */ }
-  }
+  await cleanupProcesses(base);
   while (Date.now() < deadline) {
     if (targets.every(pid => !alive(pid))) return '整棵进程树已退出';
     await delay(100);
@@ -177,7 +172,7 @@ async function boundedWait(t, f, condition, entries, ms) {
     finally {
       const pending = entries.filter(([child]) => child.exitCode === null && child.signalCode === null && alive(child.pid));
       const detail = pending.length
-        ? `${pending.map(([child, name]) => `${name}（pid ${child.pid}）`).join('、')} 整棵进程树：${await endTrees(pending.map(([child]) => child.pid))}`
+        ? `${pending.map(([child, name]) => `${name}（pid ${child.pid}）`).join('、')} 整棵进程树：${await endTrees(pending.map(([child]) => child.pid), f.base)}`
         : '对应进程都已退出（无需清理）';
       t.diagnostic(`有界清理：${detail}`);
     }
@@ -223,11 +218,8 @@ setTimeout(()=>{fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'隔
   t.after(async () => {
     services.forEach(s => s.close());
     for (const child of children) if (child.exitCode === null && child.signalCode === null && alive(child.pid)) child.kill();
-    // 只清理本 fixture 启动并记录的执行者，绝不按进程名终止。
-    for (const r of rows(home).filter(r => r.event === 'start' && r.managed)) if (alive(r.pid)) {
-      if (process.platform === 'win32') await execute('taskkill.exe', ['/PID', String(r.pid), '/T', '/F'], { windowsHide: true }).catch(() => {});
-      else process.kill(r.pid);
-    }
+    // 只清理命令行带本 fixture 临时目录的进程（执行者、假 agent、子孙），按身份（PID + 创建时间）逐个结束，绝不按进程名终止。
+    await cleanupProcesses(base, { diagnostic: message => t.diagnostic(message) });
     assert.ok(path.relative(os.tmpdir(), base).startsWith('dispatchdock-managed-'));
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -244,8 +236,8 @@ test('托管完整流程：退出码、唯一清单、执行者 PID、预计算�
   assert.match(result.stdout, /托管：任务已交给 AgentRouter/);
   // 托管时出错原因也要回到等待者的输出里。
   assert.match(result.stdout, /出错：Not inside a trusted directory\r?\n出错：当前目录不是 git 仓库[^\n]*\r?\nexit=7 /);
-  const records = rows(f.home); assert.deepEqual(records.map(r => r.event), ['start','spawned','end']);
-  const [start, spawned, end] = records;
+  const records = rows(f.home); assert.deepEqual(records.map(r => r.event), ['start','attempt','spawned','attempt-end','end']);
+  const [start, , spawned, , end] = records;
   assert.equal(start.managed, true); assert.notEqual(start.pid, waiter.pid); assert.equal(end.exit, 7);
   assert.equal(start.model, 'explicit-model'); assert.equal(start.effort, 'high');
   const echo = json(path.join(f.base, 'echo.json')); assert.equal(spawned.agentPid, echo.pid); assert.equal(echo.prompt, '任务：\n隔离任务\n补充说明'); assert.equal(echo.home, f.env.CODEX_HOME);
@@ -273,11 +265,11 @@ for (const kind of ['outside','modified','node']) test(`托管拒绝 ${kind}：�
     if (!error.waitTimeout) throw error;
     await diagnoseWaiter(t, f, kind, waiter, error.waited);
     try { assert.fail(error.message); }
-    finally { t.diagnostic(`有界清理：等待者 ${waiter.pid} 整棵进程树 ${await endTree(waiter.pid)}`); }
+    finally { t.diagnostic(`有界清理：等待者 ${waiter.pid} 整棵进程树 ${await endTree(waiter.pid, f.base)}`); }
   }
   assert.equal(result.code, 0, result.stderr); assert.ok(Date.now() - before < 4000);
   assert.match(result.stdout, kind === 'node' ? /没有接手（node 路径无效）/ : /没有接手（派发脚本不是由 AgentRouter 安装的，或者被改过）/);
-  const all = rows(f.home); assert.deepEqual(all.map(r => r.event), ['start','spawned','end']); assert.equal(all[0].managed, undefined); assert.equal(all[0].pid, waiter.pid);
+  const all = rows(f.home); assert.deepEqual(all.map(r => r.event), ['start','attempt','spawned','attempt-end','end']); assert.equal(all[0].managed, undefined); assert.equal(all[0].pid, waiter.pid);
   assert.match(fs.readFileSync(all[0].progress, 'utf8'), /改为直接运行/);
 });
 
@@ -309,7 +301,7 @@ test('认领后执行者启动失败写 rejected，等待者立即回退且只�
   const result = await boundedWait(t, f, '认领后执行者启动失败：等待者回退并结束', [[waiter, '等待者']], WAIT_LIMIT_MS);
   assert.equal(result.code, 0, result.stderr); assert.match(result.stdout, /没有接手（启动 Codex 失败/);
   assert.ok(Date.now() - before < 4000);
-  assert.deepEqual(rows(f.home).map(r => r.event), ['start','spawned','end']); assert.equal(rows(f.home)[0].pid, waiter.pid);
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','attempt-end','end']); assert.equal(rows(f.home)[0].pid, waiter.pid);
   assert.equal(rows(f.home)[0].managed, undefined);
 });
 
@@ -427,7 +419,7 @@ test('认领后未启动：超时收回直接运行，迟到执行者不写任�
   assert.equal(late.code, 0); assert.equal(late.stdout, ''); assert.equal(late.stderr, '');
   assert.equal(fs.readFileSync(path.join(f.home, 'runs.jsonl'), 'utf8'), records);
   for (const [name, value] of files) assert.equal(fs.readFileSync(path.join(runs, name), 'utf8'), value);
-  assert.deepEqual(rows(f.home).map(r => r.event), ['start','spawned','end']);
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','attempt-end','end']);
 });
 
 for (const executorFirst of [true, false]) test(`执行者与收回竞争：执行者先取得运行权=${executorFirst}`, async t => {
@@ -440,7 +432,7 @@ for (const executorFirst of [true, false]) test(`执行者与收回竞争：执�
   // 027：上限 10 000 ms——该测试没有显式时间预算（假 agent 只运行 300 ms），沿用 until() 的默认上限；超时信息会写明是哪一个没结束。
   const [a, b] = await boundedWait(t, f, '执行者与收回竞争：等待者与执行者都结束', [[waiter, '等待者'], [executor, '执行者']], WAIT_LIMIT_MS);
   assert.equal(a.code, 0, a.stderr); assert.equal(b.code, 0, b.stderr);
-  assert.deepEqual(rows(f.home).map(r => r.event), ['start','spawned','end']);
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','attempt-end','end']);
   assert.equal(rows(f.home)[0].pid, executorFirst ? executor.pid : waiter.pid);
   assert.equal(fs.existsSync(claimed.replace('.claimed.json', '.running.json')), executorFirst);
 });
@@ -478,7 +470,7 @@ process.send('ready');process.once('message',async file=>{process.disconnect();p
     const [a, b] = await boundedWait(t, f, `收回与改名并发第 ${i + 1} 轮：等待者与执行者都结束`, [[waiter, '等待者'], [executor, '执行者']], WAIT_LIMIT_MS);
     assert.equal(a.code, 0, a.stderr); assert.equal(b.code, 0, b.stderr);
     const records = rows(f.home).filter(r => r.id === request.id);
-    assert.deepEqual(records.map(r => r.event), ['start','spawned','end']);
+    assert.deepEqual(records.map(r => r.event), ['start','attempt','spawned','attempt-end','end']);
     assert.ok([executor.pid,waiter.pid].includes(records[0].pid));
   }
 });
@@ -526,7 +518,7 @@ for (const mode of ['off','dead','legacy','dry']) test(`不满足托管条件 ${
   // 027：上限 10 000 ms——该测试没有显式时间预算，沿用本文件 until() 的默认上限。
   const result = await boundedWait(t, f, `不满足托管条件 ${mode}：派发进程结束`, [[direct, '派发进程']], WAIT_LIMIT_MS);
   assert.equal(result.code,0,result.stderr); assert.doesNotMatch(result.stdout,/托管：/); assert.equal(fs.existsSync(path.join(f.home,'managed')),false);
-  assert.equal(rows(f.home).length,mode==='dry'?0:3);
+  assert.equal(rows(f.home).length,mode==='dry'?0:5);
 });
 
 test('请求校验、环境白名单、完整行读取和启动清理', async t => {
@@ -577,7 +569,7 @@ test('Windows 实测：关闭软件认领进程，托管任务仍正常完成', 
   fs.writeFileSync(monitorFile,`import {createManaged} from ${JSON.stringify(new URL('../../app/src/main/managed.mjs',import.meta.url).href)};import fs from 'node:fs';const service=await createManaged(${JSON.stringify(root)});service.start();fs.writeFileSync(${JSON.stringify(path.join(f.home,'viewer.json'))},JSON.stringify({pid:process.pid,acceptsManaged:true,suppressWatchWindow:true}));process.send('ready');process.on('message',()=>{service.close();fs.unlinkSync(${JSON.stringify(path.join(f.home,'viewer.json'))});process.disconnect();});`);
   const monitor=f.launch(monitorFile,[]);await new Promise(resolve=>monitor.once('message',resolve));
   const waiter=f.launch();await until(()=>fs.existsSync(path.join(f.base,'echo.json')));
-  const [executor,agent]=rows(f.home);monitor.send('close');
+  const [executor, , agent]=rows(f.home);monitor.send('close');
   // 027：上限 10 000 ms——该测试没有显式时间预算，沿用 until() 的默认上限；从发出 close 之后计时。
   assert.equal((await boundedWait(t, f, '关闭软件认领进程后监控进程结束', [[monitor, '监控进程']], WAIT_LIMIT_MS)).code,0);
   assert.equal(alive(executor.pid),true);assert.equal(alive(agent.agentPid),true);
@@ -593,19 +585,21 @@ for (const managed of [false, true]) test(`停止命令结束多层假进程，�
   const name = '停止 中文 任务';
   const waiter = f.launch(f.script, ['隔离任务', '--name', name]);
   await until(() => fs.existsSync(path.join(f.base, 'descendant.json')));
-  const [start, spawned] = rows(f.home), descendant = json(path.join(f.base, 'descendant.json')).pid;
-  t.after(() => { for (const pid of [spawned.agentPid, descendant]) if (alive(pid)) process.kill(pid); });
+  const [start, , spawned] = rows(f.home), descendant = json(path.join(f.base, 'descendant.json')).pid;
+  // 失败时残留的假 agent 与子孙（命令行都带本 fixture 的临时目录）由 fixture 的 cleanupProcesses 按身份结束，这里不再按 PID 结束。
+  const identities = await captureIdentities([start.pid, spawned.agentPid, descendant]);
   // 027：上限 25 000 ms——假 agent 故意运行 60 000 ms、要等停止命令结束它；stopTask 内部的 killProcessTree 有 10 000 ms 总预算
   // （core/lib/process.mjs），取该停止预期的 2.5 倍，从发出停止命令之后计时。
   const stop = f.launch(f.script, ['--stop', name]);
   const result = await boundedWait(t, f, '停止命令结束多层假进程：停止命令结束', [[stop, '停止命令']], STOP_WAIT_LIMIT_MS);
   assert.equal(result.code, 0, result.stderr + result.stdout);
   assert.equal(result.stdout.trim(), `停止：${name} 已停止，工作区里没提交的改动还在`);
-  for (const pid of [start.pid, spawned.agentPid, descendant]) assert.equal(alive(pid), false, `假进程 ${pid} 已退出`);
+  // 069：按身份（停止前记下的 PID + 创建时间）认定"已退出"，PID 被复用不再误判。
+  for (const identity of identities) await assertIdentitiesGone([identity], `假进程 ${identity.pid} 已退出`);
   // 027：上限 25 000 ms——停止命令已返回，等待者要随被杀掉的假 agent 结束；同上的停止预期 10 000 ms × 2.5，从停止命令返回后计时。
   const finished = await boundedWait(t, f, '停止命令结束多层假进程：停止后等待者结束', [[waiter, '等待者']], STOP_WAIT_LIMIT_MS);
   if (managed) assert.equal(finished.code, 1);
-  assert.deepEqual(rows(f.home).map(r => r.event), ['start','spawned','interrupted']);
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','interrupted']);
   assert.equal(rows(f.home).at(-1).signal, 'stopped-by-command');
   // 027：上限 25 000 ms——同一条停止预期（10 000 ms × 2.5），从第二次发出停止命令之后计时。
   const againStop = f.launch(f.script, ['--stop', name]);
@@ -622,13 +616,15 @@ for (const signal of ['SIGINT','SIGTERM','SIGBREAK','SIGHUP']) test(`信号 ${si
   const child = f.launch(wrapper, ['隔离任务']);
   await until(() => fs.existsSync(path.join(f.base, 'descendant.json')));
   const spawned = rows(f.home).find(r => r.event === 'spawned'), descendant = json(path.join(f.base, 'descendant.json')).pid;
-  t.after(() => { for (const pid of [spawned.agentPid, descendant]) if (alive(pid)) process.kill(pid); });
+  // 失败时残留的假 agent 与子孙（命令行都带本 fixture 的临时目录）由 fixture 的 cleanupProcesses 按身份结束，这里不再按 PID 结束。
+  const identities = await captureIdentities([spawned.agentPid, descendant]);
   child.send(signal);
   // 027：上限 25 000 ms——假 agent 故意运行 60 000 ms、要等信号结束它；run.mjs 的信号处理器用 killProcessTree 的 10 000 ms 总预算，
   // 取该停止预期的 2.5 倍，从发出信号之后计时。
   assert.equal((await boundedWait(t, f, `信号 ${signal}：派发进程结束`, [[child, '派发进程']], STOP_WAIT_LIMIT_MS)).code, 1);
-  assert.equal(alive(spawned.agentPid), false); assert.equal(alive(descendant), false);
-  assert.deepEqual(rows(f.home).map(r => r.event), ['start','spawned','interrupted']);
+  // 069：按身份（信号前记下的 PID + 创建时间）认定"已退出"。
+  await assertIdentitiesGone(identities, `信号 ${signal}：假 agent 与子孙进程已退出`);
+  assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','interrupted']);
   assert.equal(rows(f.home).at(-1).signal, signal);
 });
 

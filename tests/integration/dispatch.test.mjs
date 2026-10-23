@@ -55,8 +55,8 @@ test('端到端：参数完整、清单兼容、事件顺序、原始日志和�
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /DEP0190/);
   const rows = jsonl(path.join(s.home, 'runs.jsonl'));
-  assert.deepEqual(rows.map(e => e.event), ['start', 'spawned', 'end']);
-  const [start, spawned, end] = rows;
+  assert.deepEqual(rows.map(e => e.event), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
+  const [start, , spawned, , end] = rows;
   for (const key of ['repo', 'progress', 'report', 'raw', 'events']) assert.ok(path.isAbsolute(start[key]), key);
   assert.equal(start.name, '中文 记录');
   assert.equal(start.progress, path.join(s.root, '.agent-runs', '中文 记录', 'progress.log')); assert.equal(start.report, path.join(s.root, '.agent-runs', '中文 记录', 'report.md'));
@@ -72,7 +72,8 @@ test('端到端：参数完整、清单兼容、事件顺序、原始日志和�
   assert.equal(end.id, start.id); assert.equal(spawned.id, start.id); assert.equal(end.exit, 0);
   assert.equal(fs.readFileSync(start.report, 'utf8'), 'OK\n');
   const echo = JSON.parse(fs.readFileSync(s.env.FAKE_ECHO, 'utf8'));
-  assert.deepEqual(echo.args, ['exec', '--json', '-C', s.root, '-s', 'workspace-write', '-o', start.report, '-']);
+  // 058：汇报路径指到第 1 次尝试的 attempts/1/report.md（顶层 report.md 是复制过去的最新一份）。
+  assert.deepEqual(echo.args, ['exec', '--json', '-C', s.root, '-s', 'workspace-write', '-o', path.join(start.dir, 'attempts', '1', 'report.md'), '-']);
   assert.equal(echo.prompt, '任务：\n只回复 OK');
   const events = jsonl(start.events);
   events.forEach((e, n) => { assert.equal(e.seq, n + 1); assert.equal(e.v, 1); assert.ok(e.at >= start.started); });
@@ -121,15 +122,22 @@ test('配置优先级：命令行 > 环境变量 > 文件 > 默认；null 不传
   assert.ok(!command.args.includes('-m')); assert.ok(!command.args.includes('-c'));
 });
 
-test('配置缺失和解析失败只提示一次，继续完成任务', t => {
+test('配置缺失只提示一次继续完成任务；配置无效拒绝派发（协议第 4 节，063）', t => {
   const s = setup(t);
-  for (const invalid of [null, '{', '{"v":3}']) {
-    if (invalid === null) fs.unlinkSync(path.join(s.home, 'config.json'));
-    else fs.writeFileSync(path.join(s.home, 'config.json'), invalid);
-    const result = s.invoke(); assert.equal(result.status, 0, result.stderr);
-    const start = jsonl(path.join(s.home, 'runs.jsonl')).filter(e => e.event === 'start').at(-1);
-    assert.equal((fs.readFileSync(start.progress, 'utf8').match(/配置：/g) ?? []).length, 1);
-    assert.equal(start.model, null);
+  // 没有 config.json：行为不变，按内置默认继续完成任务，只提示一次。
+  fs.unlinkSync(path.join(s.home, 'config.json'));
+  let result = s.invoke(); assert.equal(result.status, 0, result.stderr);
+  let start = jsonl(path.join(s.home, 'runs.jsonl')).filter(e => e.event === 'start').at(-1);
+  assert.equal((fs.readFileSync(start.progress, 'utf8').match(/配置：/g) ?? []).length, 1);
+  assert.equal(start.model, null);
+  // 文件存在却读不了：不再按内置默认继续，拒绝派发，不留下记录。
+  for (const invalid of ['{', '{"v":3}']) {
+    fs.writeFileSync(path.join(s.home, 'config.json'), invalid);
+    const rows = jsonl(path.join(s.home, 'runs.jsonl')).length;
+    result = s.invoke(); assert.equal(result.status, 2);
+    assert.ok(result.stderr.includes('配置：config.json 无法读取'), result.stderr);
+    assert.ok(result.stderr.includes('这次没有派发'), result.stderr);
+    assert.equal(jsonl(path.join(s.home, 'runs.jsonl')).length, rows, '没有新的清单行');
   }
 });
 
@@ -253,7 +261,7 @@ test('干活方启动即拒绝：stderr 原因进出错事件、进度和标准�
   const result = s.invoke([], { FAKE_REFUSE: refusal });
   assert.equal(result.status, 1, result.stderr);
   const rows = jsonl(path.join(s.home, 'runs.jsonl'));
-  assert.deepEqual(rows.map(e => e.event), ['start', 'spawned', 'end']);
+  assert.deepEqual(rows.map(e => e.event), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   const errors = jsonl(rows[0].events).filter(e => e.kind === 'error').map(e => e.text);
   assert.equal(errors.length, 2);
   assert.equal(errors[0], refusal);
@@ -276,7 +284,7 @@ test('清单不能写入时任务照常完成；找不到 agent 时记录错误�
   const result = s.invoke([], { CODEX_DISPATCH_TEST_AGENT: '', PATH: '', Path: '' });
   assert.equal(result.status, 1, result.stderr);
   const rows = jsonl(path.join(s.home, 'runs.jsonl'));
-  assert.deepEqual(rows.map(e => e.event), ['start', 'end']);
+  assert.deepEqual(rows.map(e => e.event), ['start', 'attempt', 'attempt-end', 'end']);
   assert.equal(jsonl(rows[0].events)[0].kind, 'error');
 });
 
@@ -311,7 +319,7 @@ process.exitCode = await run({ adapter, scriptPath: import.meta.filename });\n`)
   const result = s.invoke([], {}, wrapper);
   assert.equal(result.status, 1, result.stderr);
   const rows = jsonl(path.join(s.home, 'runs.jsonl'));
-  assert.deepEqual(rows.map(e => e.event), ['start', 'spawned', 'interrupted']);
+  assert.deepEqual(rows.map(e => e.event), ['start', 'attempt', 'spawned', 'interrupted']);
   assert.equal(rows.at(-1).signal, 'SIGTERM');
   assert.match(fs.readFileSync(rows[0].progress, 'utf8'), /派发脚本收到 SIGTERM，被外部中断/);
 });
@@ -323,7 +331,7 @@ test('fake 执行者：按 profile 选择适配器，进度首行写执行者名
   const result = s.invoke(['--profile', 'demo']);
   assert.equal(result.status, 3, result.stderr);
   assert.match(result.stdout, /出错：回放里的错误/);
-  const [start, , end] = jsonl(path.join(s.home, 'runs.jsonl'));
+  const [start, , , , end] = jsonl(path.join(s.home, 'runs.jsonl'));
   assert.equal(start.profile, 'demo'); assert.equal(start.adapter, 'fake'); assert.equal(start.agent, 'fake'); assert.equal(start.agentVersion, 'fake-agent 1.0');
   assert.equal(end.exit, 3);
   assert.equal(fs.readFileSync(start.report, 'utf8'), '假汇报\n');

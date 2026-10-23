@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarizeGate } from '../../core/lib/gate.mjs';
+import { explicitlyAllowed, explicitlyAllowedRootSpec, isRootSpecFile, literalPrefixOf, normalizeSpecsDir, summarizeGate } from '../../core/lib/gate.mjs';
 import { parseNameStatusZ, parseStatusPorcelainZ } from '../../core/lib/git.mjs';
 
 // 构造 summarizeGate 的输入；没给的字段按"这一项没问题"处理。
@@ -93,4 +93,113 @@ test('parseNameStatusZ：重命名 / 复制按旧路径、新路径的顺序；�
 test('parseNameStatusZ：空输入返回空数组', () => {
   assert.deepEqual(parseNameStatusZ(''), []);
   assert.deepEqual(parseStatusPorcelainZ(''), []);
+});
+
+// ---- 056：受保护路径的判断与 specsDir 规范化（协议 12.1 第 4 步） ----
+
+// 受保护目录：基线项目配置里的 specsDir（这里直接给规范化后的值）与 .agent-router。
+const PROTECTED = ['.agent-router', 'docs/specs'];
+
+test('literalPrefixOf：第一个通配符之前的字面部分', () => {
+  assert.equal(literalPrefixOf('**'), '');
+  assert.equal(literalPrefixOf('docs/**'), 'docs/');
+  assert.equal(literalPrefixOf('**/*.md'), '');
+  assert.equal(literalPrefixOf('docs/specs/*.md'), 'docs/specs/');
+  assert.equal(literalPrefixOf('docs/specs/012-*.md'), 'docs/specs/012-');
+  assert.equal(literalPrefixOf('docs/specs/012-a?.md'), 'docs/specs/012-a');
+  assert.equal(literalPrefixOf('.agent-router/project.json'), '.agent-router/project.json');
+});
+
+test('explicitlyAllowed：**、docs/**、**/*.md 不算"明确写了这个目录"，不放行', () => {
+  assert.equal(explicitlyAllowed('docs/specs/012-x.md', ['**'], PROTECTED), false);
+  assert.equal(explicitlyAllowed('docs/specs/012-x.md', ['docs/**'], PROTECTED), false);
+  assert.equal(explicitlyAllowed('docs/specs/012-x.md', ['**/*.md'], PROTECTED), false);
+  assert.equal(explicitlyAllowed('.agent-router/project.json', ['**'], PROTECTED), false);
+  assert.equal(explicitlyAllowed('.agent-router/project.json', ['src/**', 'docs/**'], PROTECTED), false);
+});
+
+test('explicitlyAllowed：明确写了目录的模式放行', () => {
+  assert.equal(explicitlyAllowed('docs/specs/012-x.md', ['src/**', 'docs/specs/**'], PROTECTED), true);
+  assert.equal(explicitlyAllowed('docs/specs/012-x.md', ['docs/specs/012-*.md'], PROTECTED), true);
+  assert.equal(explicitlyAllowed('.agent-router/project.json', ['.agent-router/project.json'], PROTECTED), true);
+  assert.equal(explicitlyAllowed('.agent-router/project.json', ['.agent-router/**'], PROTECTED), true);
+  // 模式放行但文件不在受保护目录下时不需要"明确写出"（调用方只对受保护文件问这个问题）。
+  assert.equal(explicitlyAllowed('src/a.js', ['src/**'], PROTECTED), false);
+});
+
+test('explicitlyAllowed：大小写按 glob.mjs 的规则（注入选项，两个方向都验证）', () => {
+  assert.equal(explicitlyAllowed('docs/specs/a.md', ['DOCS/SPECS/**'], PROTECTED, { caseInsensitive: true }), true);
+  assert.equal(explicitlyAllowed('docs/specs/a.md', ['DOCS/SPECS/**'], PROTECTED, { caseInsensitive: false }), false);
+  assert.equal(explicitlyAllowed('DOCS/SPECS/a.md', ['docs/specs/**'], PROTECTED, { caseInsensitive: true }), true);
+});
+
+test('explicitlyAllowed：Windows 上默认不区分大小写', { skip: process.platform !== 'win32' }, () => {
+  assert.equal(explicitlyAllowed('DOCS/SPECS/A.MD', ['docs/specs/**'], PROTECTED), true);
+});
+
+test('normalizeSpecsDir：反斜杠、./ 与末尾 / 都规范化', () => {
+  assert.equal(normalizeSpecsDir('docs/specs'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('specs/'), 'specs');
+  assert.equal(normalizeSpecsDir('./docs/specs/'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('docs\\specs'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('.\\specs\\'), 'specs');
+  assert.equal(normalizeSpecsDir('specs//'), 'specs');
+});
+
+test('normalizeSpecsDir：没写、不是字符串、空、绝对路径、含 .. 时回退 docs/specs', () => {
+  assert.equal(normalizeSpecsDir(undefined), 'docs/specs');
+  assert.equal(normalizeSpecsDir(null), 'docs/specs');
+  assert.equal(normalizeSpecsDir(42), 'docs/specs');
+  assert.equal(normalizeSpecsDir({}), 'docs/specs');
+  assert.equal(normalizeSpecsDir(''), 'docs/specs');
+  // 065 改写（协议 12.1 第 4 步：'.' / './' 是项目根本身）：
+  // 原断言 assert.equal(normalizeSpecsDir('./'), 'docs/specs') → './' 规范化后为项目根 '.'。
+  assert.equal(normalizeSpecsDir('./'), '.');
+  assert.equal(normalizeSpecsDir('/abs/specs'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('C:\\abs\\specs'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('..'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('docs/../specs'), 'docs/specs');
+  assert.equal(normalizeSpecsDir('docs/specs/../x'), 'docs/specs');
+});
+
+// ---- 065：specsDir 为项目根（协议 12.1 第 4 步）时的规范化、命名与放行 ----
+
+test('normalizeSpecsDir：. 与 ./（含尾部 /、反斜杠）规范化后为项目根（.）', () => {
+  assert.equal(normalizeSpecsDir('.'), '.');
+  assert.equal(normalizeSpecsDir('./'), '.');
+  assert.equal(normalizeSpecsDir('.\\'), '.');
+  assert.equal(normalizeSpecsDir('.//'), '.');
+  // 真没写（空串）仍是回退默认目录，不与 './' 混淆。
+  assert.equal(normalizeSpecsDir(''), 'docs/specs');
+});
+
+test('isRootSpecFile：根目录下三位编号加连字符、.md 结尾才算；子目录、其他扩展名不算', () => {
+  assert.equal(isRootSpecFile('065-x.md'), true);
+  assert.equal(isRootSpecFile('065-修复.md'), true);
+  assert.equal(isRootSpecFile('065-.md'), true);
+  assert.equal(isRootSpecFile('999-a.md'), true);
+  assert.equal(isRootSpecFile('065-x.MD'), true, 'Windows 上不区分大小写');
+  assert.equal(isRootSpecFile('65-x.md'), false, '两位编号不算');
+  assert.equal(isRootSpecFile('06-5x.md'), false);
+  assert.equal(isRootSpecFile('1234-x.md'), false, '四位不算三位');
+  assert.equal(isRootSpecFile('065-x.txt'), false);
+  assert.equal(isRootSpecFile('065x.md'), false, '缺连字符不算');
+  assert.equal(isRootSpecFile('README.md'), false);
+  assert.equal(isRootSpecFile('docs/065-x.md'), false, '不在根目录不算');
+  assert.equal(isRootSpecFile('065-x.MD', { caseInsensitive: false }), false, '注入选项时按给定大小写规则');
+});
+
+test('explicitlyAllowedRootSpec：放行的模式要明确写到编号（字面前缀以该文件的 NNN- 开头）', () => {
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['**']), false);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['docs/**']), false);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['*.md']), false);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.md']), true);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-x.md']), true);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*']), true);
+  assert.equal(explicitlyAllowedRootSpec('066-x.md', ['065-*.md']), false, '编号不同不放行');
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.md', 'src/**']), true, '任一模式明确写出即可');
+  // 大小写：注入选项两个方向都验证。
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: false }), false);
+  assert.equal(explicitlyAllowedRootSpec('065-x.MD', ['065-*.md'], { caseInsensitive: false }), false);
+  assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: true }), true);
 });

@@ -111,7 +111,7 @@ test('fake：releaseFile / releaseTimeoutMs 非法值报中文错误；放行字
   assert.throws(() => fake.command({ report: 'x', prompt: '', profile: { releaseFile: 'C:\\r', releaseTimeoutMs: 0 } }), /releaseTimeoutMs 无效/);
   assert.throws(() => fake.command({ report: 'x', prompt: '', profile: { releaseFile: 'C:\\r', releaseTimeoutMs: 1.5 } }), /releaseTimeoutMs 无效/);
   assert.equal(fake.detect({ profile: { releaseFile: 42 } }).installed, false);
-  assert.deepEqual(fake.snapshotKeys, ['events', 'report', 'exit', 'delayMs', 'version', 'releaseFile', 'releaseTimeoutMs', 'writes', 'commit']);
+  assert.deepEqual(fake.snapshotKeys, ['events', 'report', 'exit', 'delayMs', 'version', 'releaseFile', 'releaseTimeoutMs', 'writes', 'commit', 'attempts']);
   assert.deepEqual(profileConfig({ adapter: 'fake', events: [], releaseFile: 'C:\\r\\release', releaseTimeoutMs: 1000, price: { inputPer1M: 1 } }, fake),
     { env: {}, secrets: {}, auth: null, maxTurns: null, label: null, adapter: 'fake', path: null, events: [], releaseFile: 'C:\\r\\release', releaseTimeoutMs: 1000 });
   assert.deepEqual(profileConfig({ adapter: 'fake', writes: [{ path: 'a.txt', content: 'x' }], commit: '假提交', price: { inputPer1M: 1 } }, fake).writes,

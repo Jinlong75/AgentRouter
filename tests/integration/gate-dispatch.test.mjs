@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { cleanupProcesses, recordedStarts } from '../fixtures/identity.mjs';
 
 // 039：门禁接入派发的集成测试。每个用例在系统临时目录里建一个名字含中文与空格的仓库，
 // 用隔离的 AGENT_ROUTER_HOME 与 fake 执行者，通过子进程跑 core/ar.mjs；不碰真实安装、配置与进程。
@@ -37,8 +38,8 @@ async function until(fn, label, timeout = 15000) {
   throw Error(`等待超时：${label}`);
 }
 
-// 任务说明 frontmatter：只写关心的字段。
-function specText({ type = 'code', allowed = ['src/**'], verify = [], expectCommit } = {}) {
+// 任务说明 frontmatter：只写关心的字段；maxRetries 映射成 max_retries（058 起会失败的用例固定为 0，保持原来的单次行为）。
+function specText({ type = 'code', allowed = ['src/**'], verify = [], expectCommit, maxRetries } = {}) {
   const lines = ['---', 'id: 900', 'title: 门禁派发测试', `type: ${type}`];
   if (allowed !== null) {
     lines.push('allowed_paths:');
@@ -49,11 +50,13 @@ function specText({ type = 'code', allowed = ['src/**'], verify = [], expectComm
     for (const line of verify) lines.push(`  - ${line}`);
   }
   if (expectCommit !== undefined) lines.push(`expect_commit: ${expectCommit}`);
+  if (maxRetries !== undefined) lines.push(`max_retries: ${maxRetries}`);
   lines.push('---', '', '测试说明正文。', '');
   return lines.join('\n');
 }
 
 function fixture(t) {
+  const since = Date.now();
   const base = mkdtempSync(path.join(os.tmpdir(), 'ar 门禁派发 '));
   const repo = path.join(base, '项目 仓库');
   const home = path.join(base, '隔离 公共目录');
@@ -71,7 +74,7 @@ function fixture(t) {
   write(path.join(repo, 'README.md'), '# 说明\n');
   commitAll(repo, '初始提交');
   const profile = { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0 };
-  const f = { base, repo, home, env, profile };
+  const f = { base, repo, home, env, profile, since };
   f.setProfile = value => {
     Object.assign(profile, value);
     writeFileSync(path.join(home, 'config.json'), JSON.stringify({
@@ -99,13 +102,8 @@ function fixture(t) {
   f.progress = name => readFileSync(path.join(repo, '.agent-runs', name, 'progress.log'), 'utf8');
   f.gateJson = start => JSON.parse(readFileSync(path.join(start.dir, 'gate.json'), 'utf8'));
   t.after(async () => {
-    // 只结束本 fixture 清单里记录的派发进程，绝不按进程名终止。
-    for (const row of rows(home).filter(r => r.event === 'start')) {
-      if (!Number.isSafeInteger(row.pid)) continue;
-      try { process.kill(row.pid, 0); } catch { continue; }
-      if (process.platform === 'win32') execFileSync('taskkill.exe', ['/PID', String(row.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      else process.kill(row.pid);
-    }
+    // 只结束本 fixture 清单里记录的派发进程及其子孙，按身份（PID + 创建时间）逐个结束，绝不按进程名终止。
+    await cleanupProcesses(base, { recorded: recordedStarts(rows(home), script, since), diagnostic: message => t.diagnostic(message) });
     assert.ok(path.relative(os.tmpdir(), base).startsWith('ar 门禁派发 '));
     rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
@@ -128,7 +126,7 @@ test('全部通过：范围内改动已提交、验收命令通过 → 0，start
   assert.equal(start.gate, true);
   assert.match(start.base, /^[0-9a-f]{40,64}$/, 'base 是完整 SHA');
   const list = rows(f.home).filter(row => row.id === start.id);
-  assert.deepEqual(list.map(row => row.event), ['start', 'spawned', 'gating', 'gate', 'end']);
+  assert.deepEqual(list.map(row => row.event), ['start', 'attempt', 'spawned', 'gating', 'gate', 'attempt-end', 'end']);
   const gate = list.find(row => row.event === 'gate');
   assert.equal(gate.ok, true);
   assert.equal(gate.attempt, 1);
@@ -148,7 +146,7 @@ test('全部通过：范围内改动已提交、验收命令通过 → 0，start
 test('越界：改动超出 allowed_paths → 3，gate.json 记 outside，标准输出有原因', async t => {
   const f = fixture(t);
   f.setProfile({ writes: [{ path: 'src/a.js', content: '改过\n' }, { path: 'README.md', content: '# 说明改过\n' }], commit: '假执行者：两处' });
-  const spec = f.spec('docs/specs/002-越界.md', { allowed: ['src/**'], expectCommit: true });
+  const spec = f.spec('docs/specs/002-越界.md', { allowed: ['src/**'], expectCommit: true, maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '越界任务']);
   assert.equal(result.code, 3, result.stderr + result.stdout);
@@ -166,7 +164,7 @@ test('越界：改动超出 allowed_paths → 3，gate.json 记 outside，标准
 test('未提交：执行者写了文件没提交 → 3，uncommitted 非空', async t => {
   const f = fixture(t);
   f.setProfile({ writes: [{ path: 'src/a.js', content: '没提交\n' }] });
-  const spec = f.spec('docs/specs/003-未提交.md', { allowed: ['src/**'] });
+  const spec = f.spec('docs/specs/003-未提交.md', { allowed: ['src/**'], maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '未提交任务', '--json']);
   assert.equal(result.code, 3, result.stderr + result.stdout);
@@ -179,7 +177,7 @@ test('未提交：执行者写了文件没提交 → 3，uncommitted 非空', as
 
 test('没提交：type code 且执行者什么都不写 → 3，"没有提交任何改动"', async t => {
   const f = fixture(t);
-  const spec = f.spec('docs/specs/004-没提交.md', { type: 'code', allowed: ['src/**'] });
+  const spec = f.spec('docs/specs/004-没提交.md', { type: 'code', allowed: ['src/**'], maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '没提交任务', '--json']);
   assert.equal(result.code, 3, result.stderr + result.stdout);
@@ -194,6 +192,7 @@ test('验收失败：一条失败一条通过，两条都跑了 → 3', async t 
   const spec = f.spec('docs/specs/005-验收失败.md', {
     allowed: ['src/**'],
     expectCommit: false,
+    maxRetries: 0,
     verify: [
       `node -e "require('fs').writeFileSync('first.txt','1');process.exit(1)"`,
       `node -e "require('fs').writeFileSync('second.txt','2')"`,
@@ -221,7 +220,7 @@ test('研究类：没有 verify、allowed_paths 默认、项目配置也没有 �
   const start = startOf(f.home, '研究任务');
   assert.equal(start.gate, false);
   assert.equal(Object.hasOwn(start, 'base'), false);
-  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'spawned', 'end']);
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   const end = rows(f.home).find(row => row.event === 'end' && row.id === start.id);
   assert.equal(end.exit, 0);
   assert.equal(Object.hasOwn(end, 'agentExit'), false);
@@ -236,20 +235,20 @@ test('直接任务文字：不读说明、start 没有 gate 字段，事件与�
   const start = startOf(f.home, '直接任务');
   assert.equal(Object.hasOwn(start, 'gate'), false);
   assert.equal(Object.hasOwn(start, 'base'), false);
-  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'spawned', 'end']);
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   assert.equal(JSON.parse(result.stdout).gate, undefined);
 });
 
 test('执行者失败：exit 5 → 5，不跑门禁、end 没有 agentExit', async t => {
   const f = fixture(t);
   f.setProfile({ exit: 5 });
-  const spec = f.spec('docs/specs/007-执行者失败.md', { allowed: ['src/**'] });
+  const spec = f.spec('docs/specs/007-执行者失败.md', { allowed: ['src/**'], maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '执行者失败任务', '--json']);
   assert.equal(result.code, 5, result.stderr + result.stdout);
   const start = startOf(f.home, '执行者失败任务');
   assert.equal(start.gate, true);
-  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'spawned', 'end']);
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   const end = rows(f.home).find(row => row.event === 'end' && row.id === start.id);
   assert.equal(end.exit, 5);
   assert.equal(Object.hasOwn(end, 'agentExit'), false);
@@ -315,14 +314,14 @@ test('--detach：启用门禁的说明脱离派发，ar wait 等结束并拿到 
   assert.deepEqual(result.gate, { ok: true, summary: '门禁通过' });
   const start = startOf(f.home, '脱离任务');
   assert.equal(start.gate, true);
-  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'spawned', 'gating', 'gate', 'end']);
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'gating', 'gate', 'attempt-end', 'end']);
   assert.equal(rows(f.home).find(row => row.event === 'end' && row.id === start.id).exit, 0);
 });
 
 test('ar wait --json：门禁未通过的任务 exit 3、gate.ok 为假、summary 与 gate.json 一致', async t => {
   const f = fixture(t);
   f.setProfile({ writes: [{ path: 'README.md', content: '# 越界\n' }], commit: '假执行者：只改 README' });
-  const spec = f.spec('docs/specs/012-等待失败.md', { allowed: ['src/**'] });
+  const spec = f.spec('docs/specs/012-等待失败.md', { allowed: ['src/**'], maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '等待失败任务', '--json']);
   assert.equal(result.code, 3, result.stderr + result.stdout);
@@ -342,7 +341,7 @@ test('项目配置兜底：说明没写 verify，project.json 的失败命令仍
   const f = fixture(t);
   f.setProfile({ writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改过' });
   write(path.join(f.repo, '.agent-router/project.json'), `${JSON.stringify({ verify: ['node -e "process.exit(1)"'] })}\n`);
-  const spec = f.spec('docs/specs/013-项目兜底.md', { type: 'code', allowed: null, verify: [] });
+  const spec = f.spec('docs/specs/013-项目兜底.md', { type: 'code', allowed: null, verify: [], maxRetries: 0 });
 
   const result = await f.ar(['dispatch', spec, '--name', '项目兜底任务', '--json']);
   assert.equal(result.code, 3, result.stderr + result.stdout);
@@ -351,4 +350,52 @@ test('项目配置兜底：说明没写 verify，project.json 的失败命令仍
   assert.equal(saved.commands[0].line, 'node -e "process.exit(1)"');
   assert.equal(saved.commands[0].exit, 1);
   assert.match(saved.summary, /^验收命令失败：node -e "process\.exit\(1\)"（exit 1）$/);
+});
+
+// 055：项目配置的 verifyTimeoutMin 作为任务说明没写超时时的默认值，随脱离派发的请求快照
+// 传到执行者进程（args.gate.merged.verify_timeout_min）；任务说明写了就用任务说明的值。
+test('项目级 verifyTimeoutMin：随脱离派发传到执行者请求，任务说明写了就用', async t => {
+  const f = fixture(t);
+  // 假执行者带一个事件与长延时：读取请求快照时任务一定还在跑。
+  f.setProfile({ events: [{ kind: 'say', text: '正在做' }], delayMs: 60000 });
+  write(path.join(f.repo, '.agent-router/project.json'), `${JSON.stringify({ verifyTimeoutMin: 7 })}\n`);
+  const specA = f.spec('docs/specs/014-项目级超时.md', { allowed: ['src/**'] });
+
+  // 派发一次并读公共目录 managed 里这次派发的请求文件（.claimed.json，或执行者已改名的 .running.json）；
+  // 读到快照、等到 start 记录后停止任务，返回请求对象。
+  const dispatchAndRead = async (spec, name) => {
+    const dispatched = await f.ar(['dispatch', spec, '--name', name, '--detach', '--json']);
+    assert.equal(dispatched.code, 0, dispatched.stderr + dispatched.stdout);
+    const id = JSON.parse(dispatched.stdout).id;
+    const readRequest = () => {
+      for (const suffix of ['.running.json', '.claimed.json']) {
+        const file = path.join(f.home, 'managed', `${id}${suffix}`);
+        if (!existsSync(file)) continue;
+        try { return JSON.parse(readFileSync(file, 'utf8')); } catch { /* 正好在改名，下一轮再读。 */ }
+      }
+      return null;
+    };
+    const request = await until(readRequest, `${name} 的请求文件`);
+    await until(() => startOf(f.home, name), `${name} 的 start 记录`);
+    const stopped = await f.ar(['stop', name]);
+    assert.equal(stopped.code, 0, stopped.stderr + stopped.stdout);
+    return request;
+  };
+
+  const fromProject = await dispatchAndRead(specA, '项目级超时任务');
+  assert.equal(fromProject.args.gate.merged.verify_timeout_min, 7, '任务说明没写超时，取项目配置 verifyTimeoutMin: 7');
+
+  // 任务说明写了 verify_timeout_min: 3 → 3（压过项目配置的 7）。
+  const specB = 'docs/specs/015-说明级超时.md';
+  write(path.join(f.repo, specB), [
+    '---', 'id: 900', 'title: 门禁派发测试', 'type: code',
+    'allowed_paths:', '  - src/**', 'verify_timeout_min: 3',
+    '---', '', '测试说明正文。', '',
+  ].join('\n'));
+  commitAll(f.repo, `任务说明 ${path.basename(specB)}`);
+  const fromSpec = await dispatchAndRead(specB, '说明级超时任务');
+  assert.equal(fromSpec.args.gate.merged.verify_timeout_min, 3, '任务说明写了 verify_timeout_min: 3');
+
+  // 清理：只结束命令行带本测试临时路径的进程，按身份（PID + 创建时间）逐个结束，绝不按进程名终止。
+  await cleanupProcesses(f.base, { recorded: recordedStarts(rows(f.home), script, f.since), diagnostic: message => t.diagnostic(message) });
 });

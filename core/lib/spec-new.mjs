@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { requireGitIdentity } from './project.mjs';
 import { parseSpec, validateSpec, SPEC_TYPES, SpecError } from './spec.mjs';
 import { traced } from './trace.mjs';
+import { readJson } from './json.mjs';
 
 const MAX_BYTES = 256 * 1024;
 // 错误提示沿用原有五种类型的顺序，后加的类型排在后面（已有测试断言了前半段）。
@@ -74,7 +75,7 @@ function specsDirPath(root) {
   root = resolve(root);
   let specsDir = 'docs/specs';
   try {
-    const config = JSON.parse(readFileSync(join(root, '.agent-router', 'project.json'), 'utf8'));
+    const config = readJson(join(root, '.agent-router', 'project.json'));
     if (typeof config.specsDir === 'string' && config.specsDir) specsDir = config.specsDir;
   } catch { /* 没有 project.json 或解析失败：用默认。 */ }
   const dir = resolve(root, specsDir);

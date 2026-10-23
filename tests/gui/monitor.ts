@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp,writeFile,readFile,appendFile,mkdir,symlink,readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { parseRegistry, RegistryReader, statusOf, Registry, importTasks, validRecordName } from '../../app/src/main/registry';
+import { parseRegistry, RegistryReader, statusOf, Registry, importTasks, validRecordName, matchTime } from '../../app/src/main/registry';
 import { dispatchMatches } from '../../app/src/main/platform';
 import { parseEvent,readEvents,PAGE_BYTES } from '../../app/src/main/events';
 import { commitFrom,markdown } from '../../app/src/shared/markdown';
@@ -29,6 +29,85 @@ test('停止核对后调用假的 kill，半行隔开、通知只在状态转换
 test('确认后身份变化时不 kill、不写 interrupted',async()=>{const {home}=await fixture();let calls=0,killed=0;const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>++calls<=2?[ps]:[{...ps,created:101000}],killTree:async()=>{killed++;},open:async()=>{}},()=>{},()=>{},()=>{});try{await registry.start();await assert.rejects(registry.stop('sample'),/任务状态已经变了/);assert.equal(killed,0);assert.ok(!(await readFile(registry.file,'utf8')).includes('interrupted'));}finally{await registry.close();}});
 test('导入旧任务只在本地存储；viewer 退出只删除自己的 pid',async()=>{const {home}=await fixture();const dir=path.join(home,'.codex-runs');await mkdir(dir);await writeFile(path.join(dir,'old.progress.log'),'=== Codex 开始：旧任务（角色：工程负责人）  2026/10/8 10:05:00 ===\n[10:06:00] 说：完成\n=== Codex 结束：exit=0，用时 1.0 分钟，汇报在 demo.md ===\n');const imported=await importTasks(home);assert.equal(imported[0].title,'旧任务');assert.equal(imported[0].status,'done');assert.equal(imported[0].imported,true);const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});await registry.start();const original=await readFile(registry.file,'utf8');await registry.import(home);assert.equal(await readFile(registry.file,'utf8'),original);const viewer=JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8'));assert.equal(viewer.suppressWatchWindow,true);assert.equal(viewer.acceptsManaged,true);await writeFile(path.join(home,'viewer.json'),JSON.stringify({pid:99999}));await registry.close();assert.equal(JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8')).pid,99999);});
 test('无效日期与数值不进入渲染 DTO，持久化导入记录重新验证',async()=>{assert.equal(parseRegistry(lines(row({started:1e100}))).length,0);const parsed=parseRegistry(lines(row(),{v:1,event:'end',id:'sample',exit:0,minutes:'<img src=x>',at:'bad'}))[0];assert.equal(parsed.minutes,undefined);assert.equal(parsed.ended,undefined);assert.equal(parseEvent(JSON.stringify({v:1,seq:1,at:1e100,kind:'say',text:'bad'}),0),null);const {home,task}=await fixture();await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[{...task,id:'import-safe',imported:true,status:'done',minutes:'<img src=x>'},{id:'invalid',imported:true,status:'done'}],hidden:[{},1]}));const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});try{await registry.start();assert.ok(!registry.tasks.some(t=>t.id==='invalid'));assert.equal(registry.tasks.find(t=>t.id==='import-safe')?.minutes,undefined);}finally{await registry.close();}});
+
+// ---- 060 跨尝试读取（协议 14.4）：attempt / attempt-end / resume 的清单解析 ----
+test('自动重试三次：尝试列表 3 项、total 正确，状态与最后一个 end 一致',()=>{
+  const attempt=(n:number,at:number)=>({v:1,event:'attempt',id:'sample',n,total:3,profile:'fake',reason:n===1?'first':'gate',at});
+  const attemptEnd=(n:number,ok:boolean,exit:number,at:number)=>({v:1,event:'attempt-end',id:'sample',n,ok,exit,gate:ok?true:null,usage:{input:100,output:50},ms:900,at});
+  const parsed=parseRegistry(lines(row(),attempt(1,101000),attemptEnd(1,false,3,102000),attempt(2,103000),attemptEnd(2,false,3,104000),attempt(3,105000),attemptEnd(3,true,0,106000),{v:1,event:'end',id:'sample',exit:0,at:140000,minutes:2,attempts:3}))[0];
+  assert.equal(parsed.attempts?.length,3);
+  assert.deepEqual(parsed.attempts?.map(a=>[a.n,a.total,a.profile,a.reason,a.ok,a.exit,a.gate,a.usage?.input,a.usage?.output,a.ms]),
+    [[1,3,'fake','first',false,3,null,100,50,900],[2,3,'fake','gate',false,3,null,100,50,900],[3,3,'fake','gate',true,0,true,100,50,900]]);
+  assert.equal(parsed.attempt?.n,3,'当前尝试 = 最后一个 attempt');
+  assert.equal(parsed.status,'done');
+  assert.equal(parsed.exit,0);
+});
+test('失败 → resume → 进行中 → 新 end 完成：pid 与核对时刻换成 resume 的，旧结果清掉',()=>{
+  const first=[
+    {v:1,event:'attempt',id:'sample',n:1,total:3,profile:'fake',reason:'first',at:101000},
+    {v:1,event:'gate',id:'sample',ok:false,attempt:1,at:105000,summary:'第一次没通过'},
+    {v:1,event:'attempt-end',id:'sample',n:1,ok:false,exit:0,gate:false,usage:{input:null,output:null},ms:700,at:106000},
+    {v:1,event:'end',id:'sample',exit:3,at:110000,minutes:1,attempts:1},
+  ];
+  const failed=parseRegistry(lines(row(),...first))[0];
+  assert.equal(failed.status,'fail');
+  assert.equal(failed.exit,3);
+  assert.equal(failed.gateOk,false);
+  const resume={v:1,event:'resume',id:'sample',pid:43,at:120000,n:2};
+  const attempt2={v:1,event:'attempt',id:'sample',n:2,total:null,profile:'strong',reason:'manual',at:121000};
+  const running=parseRegistry(lines(row(),...first,resume,attempt2))[0];
+  assert.equal(running.status,'run','resume 后回到进行中');
+  assert.equal(running.exit,undefined);
+  assert.equal(running.ended,undefined);
+  assert.equal(running.gateOk,undefined,'上一次的门禁结果不再算最终');
+  assert.equal(running.gateSummary,undefined);
+  assert.equal(running.pid,43,'停止按钮与进程核对用 resume.pid');
+  // 065 改写（任务说明第 7 条：resume 不改任务开始时间）：
+  // 原断言 assert.equal(running.started,120000,'身份核对时刻是 resume.at') →
+  // started 保持最初的派发时刻 100000，核对时刻改用 pidSince（= resume.at）。
+  assert.equal(running.started,100000,'resume 不改开始时间');
+  assert.equal(running.pidSince,120000,'身份核对时刻是 resume.at（pidSince）');
+  assert.deepEqual(running.attempt&&[running.attempt.n,running.attempt.total,running.attempt.profile,running.attempt.reason],[2,null,'strong','manual']);
+  const done=parseRegistry(lines(row(),...first,resume,attempt2,
+    {v:1,event:'gate',id:'sample',ok:true,attempt:2,at:125000,summary:'门禁通过'},
+    {v:1,event:'attempt-end',id:'sample',n:2,ok:true,exit:0,gate:true,usage:{input:null,output:null},ms:800,at:126000},
+    {v:1,event:'end',id:'sample',exit:0,at:127000,minutes:1,attempts:2}))[0];
+  assert.equal(done.status,'done');
+  assert.equal(done.exit,0);
+  assert.equal(done.gateOk,true,'resume 之后的 gate 才算');
+  assert.equal(done.gateSummary,'门禁通过');
+  assert.deepEqual(done.attempts?.map(a=>[a.n,a.total,a.ok,a.exit]),[[1,3,false,0],[2,null,true,0]],'尝试列表保留两次');
+});
+test('resume 后被停止：中断（stop），resume 之前的 end 不算',()=>{
+  const parsed=parseRegistry(lines(row(),
+    {v:1,event:'end',id:'sample',exit:1,at:110000,minutes:1},
+    {v:1,event:'resume',id:'sample',pid:43,at:120000,n:2},
+    {v:1,event:'interrupted',id:'sample',at:130000,signal:'stopped-by-command'}))[0];
+  assert.equal(parsed.status,'stop');
+  assert.equal(parsed.exit,undefined,'resume 之前的 end 不参与状态');
+  assert.equal(parsed.signal,'stopped-by-command');
+  assert.equal(parsed.pid,43);
+  // 065 改写（任务说明第 7 条）：原断言 assert.equal(parsed.started,120000) → started 保持 100000，核对时刻在 pidSince。
+  assert.equal(parsed.started,100000);
+  assert.equal(parsed.pidSince,120000);
+});
+test('多条 gate 事件：门禁结果取最后一条',()=>{
+  const parsed=parseRegistry(lines(row(),
+    {v:1,event:'gate',id:'sample',ok:false,attempt:1,at:105000,summary:'第一次没通过'},
+    {v:1,event:'gate',id:'sample',ok:true,attempt:2,at:125000,summary:'门禁通过'},
+    {v:1,event:'end',id:'sample',exit:0,at:130000,minutes:1}))[0];
+  assert.equal(parsed.gateOk,true);
+  assert.equal(parsed.gateSummary,'门禁通过');
+});
+test('Stage04 旧清单（没有 attempt / resume）解析结果不变：与现有用例同一组数据，整个任务对象一致',()=>{
+  const end={v:1,event:'end',id:'sample',exit:0,at:110000,minutes:1},stop={v:1,event:'interrupted',id:'sample',at:105000,signal:'stopped-by-app'};
+  const parsed=parseRegistry(lines(row({future:'ignore'}))+'broken\n'+lines(stop,end)+JSON.stringify(row({id:'half'})));
+  const {v,event,...fields}=row();
+  assert.deepEqual(parsed,[{...fields,status:'done',last:'',managed:false,legacy:true,exit:0,ended:110000,minutes:1,signal:'stopped-by-app'}]);
+  assert.equal('attempts' in parsed[0],false);
+  assert.equal('attempt' in parsed[0],false);
+  assert.equal('future' in parsed[0],false);
+});
 
 // 018 清空任务列表：一次把所有已结束任务的键加入 hidden 并保存一次；进行中的与派发进程仍存活的不动；不改 runs.jsonl。
 test('清空任务列表一次隐藏全部已结束任务（含导入的旧任务），进行中的与派发进程仍存活的不动，不改清单文件',async()=>{
@@ -252,4 +331,42 @@ test('进程查询失败时依赖进程状态的操作受保护：停止不结�
     await assert.rejects(registry.hideFinished(),'清空任务列表在查询失败时拒绝');
     await registry.refresh();assert.deepEqual(registry.tasks.map(t=>t.id).sort(),before,'列表没有变化');
   } finally {await registry.close();}
+});
+
+// ---- 065：软件的停止与 ar stop 同规则（协议第 9 节）；resume 之后核对用 pidSince ----
+test('停止：进程查询前两次抛错、第三次成功 → 正常结束进程树并写 interrupted',async()=>{
+  const {home}=await fixture();let calls=0,killed=0;
+  // 调用顺序：start 的刷新 3 次（都失败）→ stop 的刷新 3 次（都失败）→ 停止核对第 1、2 次失败、第 3 次成功。
+  const platform={processes:async(pids:number[])=>{calls++;if(calls<=8)throw Error('PowerShell 查询失败（偶发）');if(killed)return [];return pids.map(pid=>({pid,name:'node.exe',command:'node "C:\\demo\\codex-task.mjs"',created:99000}));},killTree:async()=>{killed++;},alive:()=>killed===0,open:async()=>{}};
+  const registry=new Registry(home,path.join(home,'monitor'),platform,()=>{},()=>{},e=>{throw e;});
+  try {
+    await registry.start();
+    await registry.stop('sample');
+    assert.equal(killed,1,'第三次查询成功后结束进程树');
+    assert.ok(calls>=9,'停止核对查询了 3 次（前两次失败）');
+    assert.match(await readFile(registry.file,'utf8'),/"event":"interrupted"/);
+    assert.equal(registry.tasks[0].status,'stop');
+  } finally {await registry.close();}
+});
+test('停止：进程查询三次都失败 → 拒绝、不结束进程树、不写 interrupted、报"无法核对进程"',async()=>{
+  const {home}=await fixture();let killed=0;
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>{throw Error('PowerShell 查询失败（偶发）');},killTree:async()=>{killed++;},alive:()=>true,open:async()=>{}},()=>{},()=>{},e=>{throw e;});
+  try {
+    await registry.start();
+    await assert.rejects(registry.stop('sample'),/无法核对进程（进程查询失败：PowerShell 查询失败（偶发））/);
+    assert.equal(killed,0,'不结束进程树');
+    assert.ok(!(await readFile(registry.file,'utf8')).includes('interrupted'),'不写 interrupted');
+  } finally {await registry.close();}
+});
+test('resume 之后停止核对用 pidSince（resume.at），开始时间不变',()=>{
+  const parsed=parseRegistry(lines(row(),
+    {v:1,event:'end',id:'sample',exit:1,at:110000,minutes:1},
+    {v:1,event:'resume',id:'sample',pid:43,at:120000,n:2}))[0];
+  assert.equal(parsed.started,100000,'开始时间保持最初的派发时刻');
+  assert.equal(parsed.pidSince,120000,'核对时刻是 resume.at');
+  // 进程在 started 之后、resume.at 之前创建：按 started 判会把它当成"已经不在"，按 pidSince 判仍是进行中。
+  const resumePs={pid:43,name:'node.exe',command:'node "C:\\demo\\core\\ar.mjs" dispatch',created:115000};
+  assert.equal(dispatchMatches(resumePs,matchTime(parsed)),true,'停止核对用 pidSince ?? started');
+  assert.equal(statusOf(parsed,[resumePs]),'run');
+  assert.equal(statusOf({...parsed,pidSince:undefined},[{...resumePs,created:101000}]),'stop','没有 pidSince 时仍按 started 核对');
 });

@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { scriptNames } from '../../../core/lib/compat.mjs';
-import { killProcessTree } from '../../../core/lib/process.mjs';
+import { killProcessTree, pidAlive } from '../../../core/lib/process.mjs';
 export interface ProcessInfo {
     pid: number;
     name: string;
@@ -10,6 +10,9 @@ export interface ProcessInfo {
 }
 export interface Platform {
     processes(pids: number[]): Promise<ProcessInfo[]>;
+    // 065：区分"查询失败"与"查询成功、进程确实不在"用——本地存活判断（process.kill(pid, 0)），不走平台查询。
+    // 可选：没有实现的平台（测试夹具）维持旧行为，空结果按"进程已经不在"处理。
+    alive?(pid: number): boolean;
     killTree(pid: number): Promise<void>;
     open(file: string): Promise<void>;
 }
@@ -37,6 +40,8 @@ export function windowsPlatform(openFile: (file: string) => Promise<string>): Pl
             const value = JSON.parse(stdout.trim() || '[]');
             return (Array.isArray(value) ? value : [value]).map(p => ({ ...p, command: p.command ?? '' }));
         },
+        // 065：停止的核对用它区分"查询没有结果"与"查询失败"（同核心 pidAlive 的规则）。
+        alive: (pid: number) => pidAlive(pid),
         // 与 ar stop 走同一套结束顺序：先结束派发进程，再结束其余子孙（core/lib/process.mjs）。
         async killTree(pid) { if (!Number.isSafeInteger(pid) || pid <= 0)
             throw Error('Invalid PID'); await killProcessTree(pid, { timeout: 15000 }); },

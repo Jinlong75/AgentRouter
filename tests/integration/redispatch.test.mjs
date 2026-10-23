@@ -4,12 +4,11 @@ import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { cleanupProcesses, recordedStarts } from '../fixtures/identity.mjs';
 
 const script = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
-const execute = promisify(execFile);
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const rows = home => { try { const s = fs.readFileSync(path.join(home, 'runs.jsonl'), 'utf8'); return s.trim().split('\n').filter(Boolean).map(JSON.parse); } catch { return []; } };
 async function until(fn, timeout = 10000) {
@@ -19,6 +18,7 @@ async function until(fn, timeout = 10000) {
 }
 
 function fixture(t, { delayMs = 1000 } = {}) {
+  const since = Date.now();
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-redispatch-'));
   const home = path.join(base, 'home'), repo = path.join(base, 'repo');
   for (const dir of [home, repo, path.join(repo, 'docs', 'roles'), path.join(repo, 'docs', 'specs')]) fs.mkdirSync(dir, { recursive: true });
@@ -42,10 +42,8 @@ function fixture(t, { delayMs = 1000 } = {}) {
   }
   t.after(async () => {
     for (const child of children) if (child.exitCode === null && child.signalCode === null && alive(child.pid)) child.kill();
-    for (const r of rows(home).filter(r => r.event === 'start')) if (alive(r.pid)) {
-      if (process.platform === 'win32') await execute('taskkill.exe', ['/PID', String(r.pid), '/T', '/F'], { windowsHide: true }).catch(() => {});
-      else process.kill(r.pid);
-    }
+    // 只清理本 fixture 记录的执行者进程及其子孙，按身份（PID + 创建时间）逐个结束，绝不按进程名终止。
+    await cleanupProcesses(base, { recorded: recordedStarts(rows(home), script, since), diagnostic: message => t.diagnostic(message) });
     assert.ok(path.relative(os.tmpdir(), base).startsWith('ar-redispatch-'));
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });

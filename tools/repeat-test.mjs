@@ -11,6 +11,11 @@ import { fileURLToPath } from 'node:url';
 
 export const CASES = {
   'agents-test-timeout': { file: 'tests/integration/agents-test.test.mjs', pattern: '^agents test：超时 --timeout 2' },
+  // 065 诊断用：ar stop 相关的四条集成测试（A / B / C 现场出处），只加键、不改已有键与行为。
+  'detach-stop': { file: 'tests/integration/detach.test.mjs', pattern: '^--detach 的任务能被 ar stop 结束' },
+  'stop-order': { file: 'tests/integration/stop-order.test.mjs', pattern: '^--detach 任务被 ar stop 停止' },
+  'legacy-stop': { file: 'tests/integration/legacy.test.mjs', pattern: '^v2 新任务写在新公共目录' },
+  'stop-identity': { file: 'tests/integration/stop.test.mjs', pattern: '^找不到、已经结束和身份不符不结束进程' },
 };
 export const USAGE = `用法：node tools/repeat-test.mjs <用例键> <次数>（可用键：${Object.keys(CASES).join('、')}）`;
 // 失败现场输出超过 600 行时，保留开头 100 行与结尾 500 行，中间注明省略数。
