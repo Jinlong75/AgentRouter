@@ -296,7 +296,19 @@ export async function killProcessTree(pid, { platform = process.platform, list =
           }
         };
         kill(root);
-        for (const p of [...tree].reverse()) if (p.pid !== root.pid) kill(p);
+        trace(`进程树结束 目标 pid=${pid} 结束根 1 个`);
+        // 等根按身份退出（僵尸进程不在快照里，算已退出）；时限内没退出也继续结束子孙，最后按时限抛错。
+        let rootStays = true;
+        while (rootStays && Date.now() < deadline) {
+          try { rootStays = identityAlive(await list(undefined, platform, remaining()), root); }
+          catch { /* 查询失败无法确认，按仍存活处理，到时限为止。 */ }
+          if (rootStays) await delay(Math.min(50, remaining()));
+        }
+        if (rootStays) trace(`进程树结束 目标 pid=${pid} 根在时限内没有退出，继续结束子孙`);
+        else trace(`进程树结束 目标 pid=${pid} 根已结束`);
+        const descendants = [...tree].reverse().filter(p => p.pid !== root.pid);
+        for (const p of descendants) kill(p);
+        if (descendants.length) trace(`进程树结束 目标 pid=${pid} 结束子孙 ${descendants.length} 个`);
       } finally {
         // 权限或查询失败也不能让仍存活的进程永久暂停。
         for (const p of tree) { try { process.kill(p.pid, 'SIGCONT'); } catch { /* 已退出。 */ } }

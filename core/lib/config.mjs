@@ -40,10 +40,13 @@ export const builtinConfig = () => migrateV1({});
 // 首次写入（config init、首次引导）时把默认值显式写进文件，之后来源显示 config.json（继承 v1 的写法）。
 const initialConfig = () => migrateV1({ agents: { codex: { model: null, effort: null, tier: null, sandbox: 'workspace-write' } }, watchWindow: 'auto', managed: false });
 
-function readJson(file) {
+// ENOENT 与 ENOTDIR 都算"没有这个文件"：公共目录被一个文件占着时，Linux 返回 ENOTDIR，Windows 返回 ENOENT。
+const absent = error => error.code === 'ENOENT' || error.code === 'ENOTDIR';
+
+function readJson(file, read = readFileSync) {
   let text;
-  try { text = readFileSync(file, 'utf8'); }
-  catch (error) { return { exists: error.code !== 'ENOENT', reason: error.code === 'ENOENT' ? null : `读取失败：${error.code}` }; }
+  try { text = read(file, 'utf8'); }
+  catch (error) { return { exists: !absent(error), reason: absent(error) ? null : `读取失败：${error.code}` }; }
   let value;
   try { value = parseJson(text); }
   catch { return { exists: true, reason: '不是有效的 JSON' }; }
@@ -52,8 +55,9 @@ function readJson(file) {
 }
 
 // 只读：返回 v2 配置。v1 文件按 v2 解读（upgraded）；新目录没有配置时，带回旧目录里可迁移的 v1 配置（legacy）。
-export function readConfig(home) {
-  const file = join(home, 'config.json'), state = readJson(file);
+// read：读文件的函数，默认 readFileSync，可注入以模拟不同平台的错误码（测试用）。
+export function readConfig(home, read = readFileSync) {
+  const file = join(home, 'config.json'), state = readJson(file, read);
   if (state.value) {
     const upgraded = state.value.v === 1;
     return { file, exists: true, reason: null, config: upgraded ? migrateV1(state.value) : state.value, upgraded };
@@ -61,7 +65,7 @@ export function readConfig(home) {
   if (state.reason) return { file, exists: true, reason: state.reason, config: {} };
   const legacyFile = join(legacyHomeFor(home), 'config.json');
   if (legacyFile !== file) {
-    const legacy = readJson(legacyFile);
+    const legacy = readJson(legacyFile, read);
     if (legacy.value?.v === 1) return { file, exists: false, reason: null, config: {}, legacy: { file: legacyFile, config: migrateV1(legacy.value) } };
   }
   return { file, exists: false, reason: null, config: {} };

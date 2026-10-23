@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { EventEmitter } from 'node:events';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -296,6 +297,8 @@ test('认领后执行者启动失败写 rejected，等待者立即回退且只�
   const before = Date.now();
   await f.service();
   const rejected = requestFile.replace('.request.json', '.rejected.json');
+  // 无执行权限的文件：Linux 上 spawn 以 'error' 事件报 EACCES（稍后触发），Windows 上同步抛出；先等 rejected 文件出现再读。
+  await until(() => fs.existsSync(rejected));
   assert.match(json(rejected).reason, /启动 Codex 失败/);
   // 027：上限 10 000 ms——该测试自带"4 000 ms 内结束"的断言，4 000 × 2.5 = 10 000 ms，与默认上限一致。
   const result = await boundedWait(t, f, '认领后执行者启动失败：等待者回退并结束', [[waiter, '等待者']], WAIT_LIMIT_MS);
@@ -304,6 +307,35 @@ test('认领后执行者启动失败写 rejected，等待者立即回退且只�
   assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','attempt-end','end']); assert.equal(rows(f.home)[0].pid, waiter.pid);
   assert.equal(rows(f.home)[0].managed, undefined);
 });
+
+// 与上一条相同的结果，用注入的 spawn 模拟 Linux 上的两种启动失败路径（Windows 上也能跑）：同步抛出 EACCES；返回子进程对象、稍后触发 'error' 事件。
+for (const [label, fakeSpawn] of [
+  ['spawn 同步抛出 EACCES', () => { throw Object.assign(Error('spawn EACCES'), { code: 'EACCES' }); }],
+  ['spawn 返回后触发 error 事件（EACCES）', () => {
+    const child = new EventEmitter();
+    child.unref = () => {};
+    process.nextTick(() => child.emit('error', Object.assign(Error('spawn EACCES'), { code: 'EACCES' })));
+    return child;
+  }],
+]) {
+  test(`认领后执行者启动失败（${label}）：写 rejected，等待者回退且只运行一份`, async t => {
+    const f = await fixture(t), waiter = f.launch();
+    const requestFile = await requestFrom(f);
+    const calls = [], errors = [];
+    const s = await createManaged(root, f.env, e => errors.push(e), () => {}, (...args) => { calls.push(args); return fakeSpawn(); });
+    t.after(() => s.close());
+    s.start();
+    const rejected = requestFile.replace('.request.json', '.rejected.json');
+    await until(() => fs.existsSync(rejected));
+    assert.match(json(rejected).reason, /启动 Codex 失败：spawn EACCES/);
+    assert.equal(calls.length, 1, '只尝试启动一次');
+    assert.deepEqual(errors, []);
+    const result = await boundedWait(t, f, `认领后执行者启动失败（${label}）：等待者回退并结束`, [[waiter, '等待者']], WAIT_LIMIT_MS);
+    assert.equal(result.code, 0, result.stderr); assert.match(result.stdout, /没有接手（启动 Codex 失败/);
+    assert.deepEqual(rows(f.home).map(r => r.event), ['start','attempt','spawned','attempt-end','end']); assert.equal(rows(f.home)[0].pid, waiter.pid);
+    assert.equal(rows(f.home)[0].managed, undefined);
+  });
+}
 
 async function requestFrom(f) {
   return until(() => {

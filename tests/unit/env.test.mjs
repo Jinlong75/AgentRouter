@@ -131,7 +131,7 @@ test('托管请求的执行者快照只含非密钥部分；secrets 只能是变
   assert.deepEqual(snapshot, { env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_MODEL: 'deepseek-v4-pro' }, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, auth: 'token', maxTurns: null, label: 'DeepSeek V4 Pro', adapter: 'claude-code', path: null });
   // 适配器声明的额外字段（fake 的回放说明）随快照带上，未声明的不带。
   assert.deepEqual(profileConfig({ adapter: 'fake', events: [], exit: 3, price: { inputPer1M: 1 }, enabled: true }, fake), { env: {}, secrets: {}, auth: null, maxTurns: null, label: null, adapter: 'fake', path: null, events: [], exit: 3 });
-  const request = { v: 1, id: 'r1', at: 1, script: 'C:\\s\\ar.mjs', node: 'C:\\n\\node.exe', repo: 'C:\\r', name: 'n', args: { task: 't', extra: '', role: null, spec: null },
+  const request = { v: 1, id: 'r1', at: 1, script: path.resolve('s', 'ar.mjs'), node: path.resolve('n', 'node.exe'), repo: path.resolve('r'), name: 'n', args: { task: 't', extra: '', role: null, spec: null },
     settings: { model: null, effort: null, tier: null, path: null, sandbox: 'workspace-write' }, dispatcher: { host: 'unknown', session: null }, env: {}, profile: 'deepseek', adapter: 'claude-code' };
   assert.equal(validRequest(request), true, '旧请求没有快照仍有效');
   assert.equal(validRequest({ ...request, profileConfig: snapshot }), true);

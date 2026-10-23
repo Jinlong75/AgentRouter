@@ -8,7 +8,8 @@ import { spawn } from 'node:child_process';
 const runtimes = ['node', 'node.exe', 'agentrouter.exe', 'electron.exe'];
 const embedded = node => !['node', 'node.exe'].includes(basename(node).toLowerCase());
 // onWarn：已经自动恢复、不影响使用的情况，只打一行说明（不带堆栈），避免看起来像崩溃。
-export async function createManaged(root, env = process.env, onError = console.error, onWarn = message => console.warn(message)) {
+// spawnProcess：启动执行者的函数，默认 child_process.spawn，可注入以模拟启动失败（Linux 上无执行权限是 'error' 事件，Windows 上多为同步抛出）。
+export async function createManaged(root, env = process.env, onError = console.error, onWarn = message => console.warn(message), spawnProcess = spawn) {
   const load = file => import(pathToFileURL(join(root, file)).href);
   const [install, config, common, options, json] = await Promise.all([
     load('installer/lib/install.mjs'), load('core/lib/config.mjs'), load('core/lib/managed.mjs'),
@@ -59,7 +60,7 @@ export async function createManaged(root, env = process.env, onError = console.e
     childEnv.AGENT_ROUTER_HOME = home;
     if (embedded(r.node)) childEnv.ELECTRON_RUN_AS_NODE = '1';
     try {
-      const child = spawn(r.node, [r.script, '--run-request', claimed], { cwd: r.repo, env: childEnv, detached: true, stdio: 'ignore', shell: false, windowsHide: true });
+      const child = spawnProcess(r.node, [r.script, '--run-request', claimed], { cwd: r.repo, env: childEnv, detached: true, stdio: 'ignore', shell: false, windowsHide: true });
       child.on('error', failed); child.unref();
     } catch (error) { failed(error); }
   }

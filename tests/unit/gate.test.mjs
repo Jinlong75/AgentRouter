@@ -178,7 +178,9 @@ test('isRootSpecFile：根目录下三位编号加连字符、.md 结尾才算�
   assert.equal(isRootSpecFile('065-修复.md'), true);
   assert.equal(isRootSpecFile('065-.md'), true);
   assert.equal(isRootSpecFile('999-a.md'), true);
-  assert.equal(isRootSpecFile('065-x.MD'), true, 'Windows 上不区分大小写');
+  assert.equal(isRootSpecFile('065-x.MD', { caseInsensitive: true }), true, 'Windows 上不区分大小写');
+  assert.equal(isRootSpecFile('065-x.MD', { caseInsensitive: false }), false, '非 Windows 上区分大小写');
+  assert.equal(isRootSpecFile('065-x.md', { caseInsensitive: false }), true);
   assert.equal(isRootSpecFile('65-x.md'), false, '两位编号不算');
   assert.equal(isRootSpecFile('06-5x.md'), false);
   assert.equal(isRootSpecFile('1234-x.md'), false, '四位不算三位');
