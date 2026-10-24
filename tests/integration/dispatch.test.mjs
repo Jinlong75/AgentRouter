@@ -29,6 +29,8 @@ function setup(t) {
   });
   const root = path.join(base, '示例 仓库'), home = path.join(base, '公共 配置');
   fs.mkdirSync(root); fs.mkdirSync(home);
+  // 假执行者的回显文件放进预先建好的子目录：USERPROFILE 就是 base，运行期间直接写在 base 根的第一层会被当作工作区外的新文件。
+  fs.mkdirSync(path.join(base, 'echo'));
   const fake = path.join(base, '假 agent.mjs');
   fs.copyFileSync(fixture('fake-agent.txt'), fake);
   const env = { ...process.env };
@@ -37,7 +39,7 @@ function setup(t) {
   // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
   for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
   Object.assign(env, { USERPROFILE: base, HOME: base, APPDATA: base, CLAUDE_CONFIG_DIR: path.join(base, 'claude'), CODEX_HOME: path.join(base, 'codex'), XDG_CONFIG_HOME: base, CODEX_DISPATCH_HOME: home, CODEX_NO_WATCH: '1', CODEX_DISPATCH_TEST_AGENT: fake,
-    FAKE_ECHO: path.join(base, 'argv.json'), FAKE_FIXTURES: JSON.stringify(samples) });
+    FAKE_ECHO: path.join(base, 'echo', 'argv.json'), FAKE_FIXTURES: JSON.stringify(samples) });
   for (const key of ['USERPROFILE', 'HOME', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'XDG_CONFIG_HOME', 'CODEX_DISPATCH_HOME']) {
     const relative = path.relative(path.resolve(tmpdir()), env[key]);
     assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));

@@ -75,6 +75,28 @@ export function findTerminal(file, id) {
   return interrupted;
 }
 
+// worktree 任务结束之后的状态（协议 15.3）：从尾部往前，先遇到哪个事件就是哪个状态。
+// accepted / rejected / conflict 都写在 end 之后；cleanup 不改变状态，直接跳过；resume 之后重新算。
+// 返回 awaiting / accepted / rejected / conflict / failed / stopped；任务还没结束返回 null。
+export function worktreeOutcome(file, id) {
+  for (const row of reverseRows(file)) {
+    if (row.id !== id) continue;
+    if (row.event === 'accepted') return 'accepted';
+    if (row.event === 'rejected') return 'rejected';
+    if (row.event === 'conflict') return 'conflict';
+    if (row.event === 'end') return (row.exit ?? 1) === 0 ? 'awaiting' : 'failed';
+    if (row.event === 'interrupted') return 'stopped';
+    if (row.event === 'start' || row.event === 'resume') break;
+  }
+  return null;
+}
+
+// 同一任务最近一条指定事件（不限于最近一次 start / resume 之后，如 worktree 事件只在第一次准备时写）。
+export function latestEvent(file, id, event) {
+  for (const row of reverseRows(file)) if (row.id === id && row.event === event) return row;
+  return null;
+}
+
 // 同一任务最近一次门禁结果（gate 事件总在 end 之前，协议第 2 节）；没跑过门禁返回 null。
 // resume 之后才算（协议 14.4）：上一次尝试的门禁不该显示成这一次的结果。
 export function findGate(file, id) {
@@ -149,7 +171,10 @@ export async function locateStartWaiting(homes, root, name) {
   return found;
 }
 
-export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log, onGate } = {}) {
+// worktree 任务等到结束时的状态（协议 15.3）；onState 收到它。待验收（awaiting）时多打印一行怎么处理（协议 15.11）。
+export const awaitingLine = name => `待验收：用 ar accept ${name} 合并，或 ar reject ${name} --reason "…" 驳回`;
+
+export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log, onGate, onState } = {}) {
   const found = await locateStartWaiting(homes, root, name), file = found?.file, start = found?.start;
   if (!start) {
     // 未指定记录名且仓库无记录时省略记录名（设计 2026-10-13 定稿）。
@@ -162,18 +187,26 @@ export async function waitForTask(homes, root, name, { alive = taskAlive, log = 
   terminal ??= findTerminal(file, start.id);
   log(`等待：${start.name}（${terminal || !running ? '已结束' : '进行中'}）`);
   // 门禁结果来自同一任务的 gate 事件，打印在结果行之前（协议 13）。
-  const finishWait = done => {
+  const finishWait = async done => {
     const gate = done.event === 'end' ? findGate(file, start.id) : null;
     if (gate) {
       onGate?.({ ok: gate.ok === true, summary: gate.summary });
       log(gate.ok === true ? '门禁通过' : `门禁未通过：${gate.summary}`);
     }
-    return printCompletion(done.event === 'end' ? done.exit ?? 1 : 1, start, log);
+    const code = await printCompletion(done.event === 'end' ? done.exit ?? 1 : 1, start, log);
+    // worktree 任务（协议 15.11）：多报状态；待验收的退出码是 0，并提示下一步。非 worktree 任务不变。
+    if (start.worktree === true) {
+      const state = worktreeOutcome(file, start.id) ?? (done.event === 'end' ? 'failed' : 'stopped');
+      onState?.(state);
+      if (state === 'awaiting') log(awaitingLine(start.name));
+    }
+    return code;
   };
   while (true) {
     if (terminal) return finishWait(terminal);
     if (!running) {
       log('等待：任务进程已经不在了，没有结束记录，按中断处理');
+      if (start.worktree === true) onState?.('stopped');
       return 1;
     }
     await delay(waitInterval);

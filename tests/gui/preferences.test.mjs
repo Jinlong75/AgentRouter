@@ -157,3 +157,44 @@ test('字标字体 Space Grotesk 缺失或校验不符时构建继续、移除�
   await writeFile(font,'invalid');assert.equal(await copyBrandFont(out,font),false);await assert.rejects(checkBrandFont(font),/SHA-256/);
   assert.equal(brandFontHash,'acad6de1fc93436f5c0f1f4137751ef04f1aea3063e7036535970ffcfbd79f72');
 });
+
+test('同时运行的任务（concurrency）：只收 1～4 的整数，写入 config.json 并保留其余字段；手写的越界值原样显示，保留天数默认 14',async t=>{
+  const {home,service}=await fixture(t),file=path.join(home,'config.json');
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,future:'keep'}},managed:true,extension:{keep:true}}));
+  assert.equal((await service.run('settings')).concurrency,2);assert.equal((await service.run('settings')).retentionDays,14);
+  for(const value of [0,5,1.5,'3','2',null,undefined,NaN,-1,[3]]) await assert.rejects(service.run('save',{key:'concurrency',value}),/Invalid value/,String(value));
+  assert.equal(JSON.parse(await readFile(file,'utf8')).concurrency,undefined,'被拒绝的值不写文件');
+  for(const value of [1,2,3,4]) {
+    assert.equal((await service.run('save',{key:'concurrency',value})).concurrency,value);
+    const disk=JSON.parse(await readFile(file,'utf8'));
+    assert.equal(disk.concurrency,value);assert.equal(disk.managed,true);assert.deepEqual(disk.extension,{keep:true});assert.equal(disk.profiles.codex.future,'keep');
+  }
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',enabled:true}},concurrency:7,sessionRetentionDays:30}));
+  const settings=await service.run('settings');assert.equal(settings.concurrency,7);assert.equal(settings.retentionDays,30);
+  await writeFile(file,'invalid');await assert.rejects(service.run('save',{key:'concurrency',value:3}));assert.equal(await readFile(file,'utf8'),'invalid');
+});
+
+test('统计主导的 token 与用时（leadUsage）：只认布尔值，写入 config.json 并保留其余字段；默认关闭，配置读不了时拒绝',async t=>{
+  const {home,service}=await fixture(t),file=path.join(home,'config.json');
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,future:'keep'}},managed:true,extension:{keep:true}}));
+  assert.equal((await service.run('settings')).leadUsage,false);
+  for(const value of ['true','false',1,0,null,undefined,[true],{}]) await assert.rejects(service.run('save',{key:'leadUsage',value}),/Invalid value/,String(value));
+  assert.equal(JSON.parse(await readFile(file,'utf8')).leadUsage,undefined,'被拒绝的值不写文件');
+  assert.equal((await service.run('save',{key:'leadUsage',value:true})).leadUsage,true);
+  let disk=JSON.parse(await readFile(file,'utf8'));
+  assert.strictEqual(disk.leadUsage,true);assert.equal(disk.managed,true);assert.deepEqual(disk.extension,{keep:true});assert.equal(disk.profiles.codex.future,'keep');
+  assert.equal((await service.run('save',{key:'leadUsage',value:false})).leadUsage,false);
+  disk=JSON.parse(await readFile(file,'utf8'));assert.strictEqual(disk.leadUsage,false);
+  // 手写成非布尔值：设置页按关闭显示（只有 true 才算打开）。
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',enabled:true}},leadUsage:'yes'}));
+  assert.equal((await service.run('settings')).leadUsage,false);
+  await writeFile(file,'invalid');await assert.rejects(service.run('save',{key:'leadUsage',value:true}));assert.equal(await readFile(file,'utf8'),'invalid');
+});
+
+test('任务页排序记在软件偏好里：只收 time / state / project',async t=>{
+  const {service}=await fixture(t);
+  assert.equal((await service.run('settings')).own.taskSort,undefined);
+  for(const value of ['state','project','time']) assert.equal((await service.run('own',{key:'taskSort',value})).own.taskSort,value);
+  for(const value of ['name','',null,3]) await assert.rejects(service.run('own',{key:'taskSort',value}),/Invalid preference/);
+  assert.equal((await service.run('settings')).own.taskSort,'time');
+});

@@ -279,6 +279,141 @@ export const rt = {
     outsideUnchecked: (error: string) => `没能核对工作区外写入：${error}`,
 };
 
+// Stage06 worktree 模式：排队、准备、待验收、冲突、已合并、已驳回与验收页（界面稿 app/design/preview.js 的任务页场景与"验收"页）
+export const wt = {
+    // 状态名（列表标记的悬停提示、状态行开头）
+    state: { queued: '排队中', preparing: '准备中', awaiting: '待验收', conflict: '合并冲突', accepted: '已合并', rejected: '已驳回' } as Record<string, string>,
+    // 任务页分段筛选与列表分组
+    filter: '待验收', filterTip: '待验收与合并冲突', group: '待验收',
+    // 列表第二行（项目名之后）；ahead 是比它先排队、还在排队的任务数
+    subQueued: (ahead: number) => ahead ? `排队中，前面还有 ${ahead} 个任务` : '排队中，下一个就轮到它',
+    subAwaiting: '等你验收', subConflict: (files: number) => `${files} 个文件冲突`, subAccepted: (sha: string) => `已合并 ${sha}`, subRejected: '已驳回',
+    // 详情状态行
+    lineQueued: (waited: string) => `排队中 · 已等 ${waited}`, linePreparing: '准备中 · 建工作区并运行准备命令',
+    lineAwaiting: (waited: string) => `待验收 · 已等 ${waited}`, lineConflict: (files: number) => `合并冲突 · ${files} 个文件`,
+    lineAccepted: (time: string, by: string) => `已合并 · ${time} ${by}批准`, lineRejected: (time: string, by: string) => `已驳回 · ${time} ${by}驳回`,
+    // 批准 / 驳回的人（事件里的 by：human / lead / cli）
+    by: { human: '你', lead: '主导', cli: '命令行' } as Record<string, string>,
+    // 流水线轨道后两段与执行节点的排队 / 准备
+    track: { awaiting: '待验收', merge: '合并' } as Record<string, string>,
+    trackQueued: '排队中', trackPreparing: '准备中', trackWaitYou: '等你', trackApproved: '已批准', trackRejected: '已驳回', trackConflict: '冲突', trackNoMerge: '不合并',
+    nodeQueued: (ahead: number) => ahead ? `排队中，前面还有 ${ahead} 个任务` : '排队中，下一个就轮到它', nodePreparing: '建工作区并运行准备命令',
+    nodeAwaitPending: '门禁通过后等待验收', nodeAwaiting: '待验收：等你批准合并或驳回', nodeApprovedConflict: '已批准，合并时冲突',
+    nodeApprovedBy: (by: string) => `${by}批准`, nodeRejected: (reason: string) => `已驳回：${reason}`,
+    nodeMergePending: (base: string) => `批准后合并到 ${base}`, nodeMerged: (base: string, sha: string) => `已合并到 ${base}：${sha}`,
+    nodeConflict: (files: string[]) => `合并冲突：${files.join('、')}`, nodeNoMerge: '已驳回，不合并',
+    // 进展标签顶部横幅
+    queuedTitle: '排队中', queuedHelp: (limit: number, ahead: number) => `同时最多运行 ${limit} 个任务。${ahead ? `前面还有 ${ahead} 个任务，` : ''}轮到时自动开始；现在停止不会留下任何东西。`,
+    preparingTitle: '准备工作区', preparingNoWorktree: '正在建立独立的 worktree 与分支。', preparingHelp: (branch: string, base: string) => `已在独立的 worktree 里建好分支 ${branch}（基线 ${base}），正在运行准备命令。`,
+    worktreeRow: (branch: string, base: string, sha: string) => `建好 worktree · 分支 ${branch} · 基线 ${base} ${sha}`,
+    setupFailTitle: '准备命令失败，执行者没有启动', setupFailHelp: 'worktree 保留着供排查。修好项目配置里的准备命令后点"重试"会重跑准备命令；不要这个任务了就点"驳回…"，删除 worktree 与分支。', setupFailReject: '驳回…',
+    awaitingTitle: '待验收', awaitingHelp: (base: string) => `门禁通过。改动在这个任务自己的分支里，还没有合并到 ${base}；批准后合并，驳回则丢弃。`, awaitingRow: '门禁通过 · 进入待验收',
+    conflictTitle: '合并冲突，没有合并', conflictHelp: (base: string, files: number) => `批准时和 ${base} 上的新提交冲突（${files} 个文件），已撤回这次合并，${base} 没有变化。`,
+    acceptedTitle: (base: string) => `已合并到 ${base}`, acceptedHelp: (sha: string, time: string, by: string, mode: string) => `合并提交 ${sha}（${time}，${by}批准）；worktree 与分支已删除。撤销整个任务：${mode === 'squash' ? 'git revert' : 'git revert -m 1'} ${sha}`,
+    acceptedCleanup: 'worktree 或分支没能删除，留给"清理"处理；合并结果不受影响。',
+    rejectedTitle: '已驳回', rejectedHelp: (reason: string, time: string, by: string, kept: string | null) => `${reason}（${time}，${by}驳回）。worktree 已删除${kept ? `，分支 ${kept} 保留` : '，分支已删除'}。`,
+    goAccept: '去验收',
+    // 侧栏与验收页
+    nav: '验收', navTip: (n: number) => `${n} 个任务等你验收或处理冲突`,
+    pageTitle: '验收', pageLead: '门禁通过的任务在这里等你批准合并或驳回', listGroup: '待验收与冲突',
+    emptyTitle: '没有待验收的任务', emptyHelp: 'worktree 模式的任务门禁通过后会出现在这里，同时发一条系统通知。',
+    rowWaited: (waited: string) => `已等 ${waited}`,
+    tabs: { overview: '概览', diff: '改动', gate: '门禁', review: '审查' } as Record<string, string>, reviewLater: '交叉审查在后续版本加入',
+    moreTip: '更多：打开 worktree、复制分支名', openWorktree: '打开 worktree 文件夹', copyBranch: '复制分支名',
+    baseToHead: (base: string, from: string, to: string) => `${base} ${from} → ${to}`,
+    specBox: '任务说明', specAllowed: '允许改动', specVerify: '验收命令', specAll: '全部文件', specNone: '没有',
+    // 改动标签（ar diff --json）
+    diffHead: (files: number, add: number, del: number) => `${files} 个文件 · +${add} −${del}`, diffOpen: '在 worktree 打开',
+    diffStatus: { A: '新增', M: '修改', D: '删除', R: '重命名' } as Record<string, string>, diffRenamed: (from: string) => `从 ${from} 重命名`,
+    diffBinary: '二进制文件，不显示内容', diffTruncated: '这个文件的改动太长，只显示前 200 KB', diffAllTruncated: '改动总量超过 2 MB，后面的文件只列出名字',
+    diffLoading: '正在读取改动…', diffNone: '没有改动', diffGone: '改动已不可查：worktree 与分支都已删除',
+    // 底部操作栏
+    noteApprove: (base: string) => `批准：在 ${base} 上新建一个合并提交（--no-ff），然后删除 worktree 与分支；可以用 git revert -m 1 撤销整个任务`,
+    noteApproveSquash: (base: string) => `批准：把改动压成一个提交放到 ${base} 上（--squash），然后删除 worktree 与分支；可以用 git revert 撤销这个提交`,
+    noteConflict: '解决冲突在同一个 worktree 里进行，不占自动重试的次数',
+    reject: '驳回…', retry: '重试…', approve: '批准并合并', resolve: '解决冲突并重试', resolving: '正在开始…',
+    // 批准确认
+    approveTitle: (name: string, base: string) => `合并「${name}」到 ${base}？`,
+    approveBody: (mode: string, branch: string) => `合并方式：${mode === 'squash' ? '--squash（压成一个提交）' : '--no-ff（一个任务一个合并提交）'}。合并后删除 worktree 与分支 ${branch}。`,
+    approving: '正在合并…',
+    mergedToast: (name: string, base: string, from: string, to: string) => `已合并「${name}」到 ${base}：${from} → ${to}`, undoHelp: '撤销说明', undoText: (sha: string, mode: string) => `${mode === 'squash' ? 'git revert' : 'git revert -m 1'} ${sha}`,
+    // 不能合并（核心拒绝，什么都没改）：标题 + 核心返回的原文
+    blockedTitle: '没有合并', blockedHelp: (reason: string) => `${reason}。什么都没有改动。`, copyCommand: '复制命令',
+    // 合并冲突（ar accept 退出码 4）：验收页横幅
+    conflictPageHelp: (base: string, files: string[]) => `和 ${base} 上的新提交冲突，已撤回这次合并，${base} 没有变化。冲突的文件：${files.join('、')}。"解决冲突并重试"会在 worktree 里合并 ${base}：没有冲突就重新跑门禁；有冲突就让执行者解决，再跑门禁，之后回到这里。`,
+    // 驳回弹窗
+    rejectTitle: (name: string) => `驳回 · ${name}`, rejectReason: '原因', rejectReasonHelp: '写给执行者和以后的自己：为什么不合并。会写进任务记录',
+    rejectPh: '例如：方向不对，主题跟随系统即可', rejectKeep: (branch: string) => `保留分支 ${branch}`, rejectKeepHelp: '以后还能看或手动合并；不勾选时分支一起删除',
+    rejectNote: (base: string) => `驳回后删除 worktree；${base} 不受影响`, rejectButton: '驳回', rejecting: '正在驳回…',
+    failed: '操作没有完成',
+    // 系统通知：任务进入待验收；点开到验收页并选中它
+    notifyTitle: (name: string) => `待验收：${name}`, notifyBody: (project: string) => `${project} · 门禁通过，等你批准合并或驳回`,
+    notifyConflict: (name: string) => `合并冲突：${name}`,
+};
+
+// Stage06 搜索与排序、侧栏底部执行者负载、设置页"并行"与"清理"（界面稿 app/design/preview.js 的"搜索 / 排序菜单"场景、nav()、设置页"有可清理项 / 清理确认"）
+export const s6 = {
+    // 任务页搜索与排序
+    taskSearch: '搜索任务名、目标、项目', clearSearch: '清除搜索', clear: '清除',
+    taskFound: (n: number, q: string) => `${n} 个任务包含"${q}"（任务名、目标、项目）`, taskNone: (q: string) => `没有任务包含"${q}"`,
+    sortTip: (label: string) => `排序：${label}`,
+    taskSorts: { time: ['按时间', '最近的在上'], state: ['按状态', '待验收、进行中、失败在上'], project: ['按项目', '同一项目放在一起'] } as Record<string, [string, string]>,
+    // 项目页搜索与排序
+    projectSearch: '搜索项目名、路径', projectFound: (n: number, q: string) => `${n} 个项目包含"${q}"（名称、路径）`, projectNone: (q: string) => `没有项目包含"${q}"`,
+    projectSorts: { recent: ['最近使用', '最近派过任务的在上'], name: ['名称', ''], added: ['添加时间', ''] } as Record<string, [string, string]>,
+    // 分段筛选"失败"的悬停提示写全称；最窄窗口不显示数量时也写在提示里
+    filterTip: (label: string, n: number) => `${label} ${n} 个`, failTip: '失败或中断',
+    // 侧栏底部：每个执行者一行"名字  运行数/上限"，再一行托管
+    loadRow: (n: number, limit: number) => `${n}/${limit}`,
+    loadTip: (label: string, n: number, limit: number) => `${label} 正在运行 ${n} 个任务；同时最多运行 ${limit} 个（设置里的并发上限）`,
+    // 设置页"并行"
+    parallelSec: '并行', parallelLead: '用 worktree 模式的项目，每个任务在自己的工作区里运行，可以同时进行。',
+    concurrency: '同时运行的任务', concurrencyHelp: '超出时排队，轮到时自动开始；门禁同一时间只跑一个。不用 worktree 的项目不受这个限制。',
+    // 设置页"数据"里的"清理"（ar gc）
+    gc: '清理', gcHelp: (days: number) => `已合并、已驳回任务没删掉的 worktree，和超过 ${days} 天的执行者会话记录。`,
+    gcIdle: '软件启动时检查，不会自动删除。没有可清理的内容。', gcFound: (n: number, size: string) => `发现 ${n} 项可以清理，约 ${size}`,
+    gcChecking: '正在检查…', gcCheckFailed: (error: string) => `没能检查：${error}`,
+    gcButton: '清理…', gcRecheck: '重新检查',
+    gcTitle: (n: number) => `清理 ${n} 项？`,
+    gcLead: (size: string) => `会删除下面这些 worktree 与会话记录，约 ${size}。正在运行和待验收的任务不受影响；项目主工作区、任务记录（.agent-runs）不动。`,
+    gcReason: { accepted: '已合并，没删掉', rejected: '已驳回，没删掉', 'unknown-task': '任务记录已找不到', prunable: 'git 记录里的目录已不在', slot: '占用者已退出的名额' } as Record<string, string>,
+    gcSessionReason: (days: number) => `超过 ${days} 天的会话记录`,
+    gcSession: (worker: string, date: string) => `${worker} · ${date}`,
+    gcConfirm: '清理', gcRunning: '正在清理…',
+    gcDone: (n: number, size: string) => `已清理 ${n} 项，约 ${size}`, gcPartial: (failed: number) => `；${failed} 项没删掉（可能正被占用），下次再试`,
+};
+
+// Stage06 链路报告第一版：任务详情"评分"标签与设置页"评分"一节（界面稿 app/design/preview.js 的"评分 / 评分·归因到任务说明"场景）
+export const sc = {
+    tab: '评分', executor: '执行者', lead: '主导', outOf: '/ 100', scoreLabel: (n: number) => `综合分 ${n}`,
+    // 每一项的名称（键同 ar report --json 的 key）
+    items: {
+        attemptGate: '多一次尝试：门禁未通过', attemptAgent: '多一次尝试：执行者异常退出', outsideFile: '越界文件', protectedFile: '动了受保护的路径',
+        outsideWrites: '工作区外写入', escalated: '升级了执行者', toolError: '工具报错', needsScope: '写了"需要越界"',
+        specEdit: '派发后改任务说明', specBlame: '门禁失败归因到任务说明', manualRetry: '手动重试', rejected: '驳回', conflict: '合并时冲突',
+    } as Record<string, string>,
+    // 主导一节里"需要越界"的名称与执行者不同（含义是范围划窄了）
+    leadNeedsScope: '执行者写了"需要越界"',
+    count: (n: number) => `${n} 次`, files: (n: number) => `${n} 个`, none: '没有', yes: '有', needsScopeFree: '（写了也不扣）',
+    escalatedAt: (n: number) => `第 ${n} 次升级`, noAcceptance: '不用 worktree，没有验收', notYet: '还没验收',
+    capFailed: '任务最终失败，执行者最多 40 分', capRejected: '被驳回，执行者最多 60 分',
+    // 性能
+    perfTime: '用时', perfToken: 'token', perfCost: '估算费用', perfTools: '工具调用', perfLeadTime: '派发到结束', perfAwait: '待验收到验收',
+    tokens: (input: string, output: string) => `${input} / ${output}`, toolCalls: (n: number) => `${n} 次`, noPrice: '没有设置价格', noTokens: '没有统计',
+    leadUsageOff: '没有统计（设置里打开后统计）', leadUsageUnavailable: '找不到派发会话的记录',
+    // 门禁失败归因
+    blameSec: '门禁失败归因', blameHelp: '任务说明写错或漏写导致的失败改成"任务说明"，扣分从执行者移到主导',
+    blameRow: (n: number) => `第 ${n} 次`, blameWhy: (summary: string) => `门禁未通过：${summary}`, blameLabel: (n: number) => `第 ${n} 次门禁失败归因`,
+    blameWorker: '执行者', blameSpec: '任务说明', blameFailed: '没有改成归因',
+    // 怎么算
+    how: '综合分怎么算',
+    howText: '满分 100，按上面每一项扣分，最低 0；最终失败时执行者最多 40 分，被驳回时最多 60 分。用时、token、费用只列出来，不进分数（不同模型价格差太多）。每一项扣多少写在 config.json 的 reportWeights 里，可以改。主导的 token 要在设置里打开"统计主导的 token 与用时"才读。',
+    loading: '正在计算…', unavailable: '这个任务没有评分', running: '任务结束后显示评分',
+    // 设置页
+    settingsSec: '评分', leadUsage: '统计主导的 token 与用时',
+    leadUsageHelp: '任务详情"评分"里主导一节要用。只读 Claude Code 自己的会话记录里的数字（按派发会话和任务的时间段），不复制任何内容。默认关闭。',
+};
+
 // Stage03 主进程调用核心（console 通道）的错误文案；核心自己的错误已经是中文，原样显示。
 export const cx = {
     invalid: '参数无效，操作没有执行', noResult: '核心没有返回结果', unknownProject: '这个项目没有登记，先在项目页添加',

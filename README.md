@@ -2,9 +2,9 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：开发中（v0.4.0 候选）。本仓库仅包含运行、构建与测试所需的文件。
+> 状态：v0.6.0。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: in development (v0.4.0 candidate). This repository contains only the files needed to run, build and test the project.
+> Status: v0.6.0. This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 
@@ -27,7 +27,8 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 | 调度中心：任务页、Agent 页（导入向导、测试连接）、项目页（添加、初始化、提交）、新建任务页、再派一次、批量删除 | ✅ |
 | 任务说明规范与机器门禁：执行者结束后，核心自己检查提交、改动范围并逐条运行验收命令；软件显示流水线轨道与门禁结果 | ✅ |
 | 自动重试与升级：失败原因交回执行者、同一工作区再试，每次尝试留档；`ar retry` 与软件"重试"、尝试切换与重试历史 | ✅ |
-| worktree 并行与验收合并、交叉审查、路由 | 🚧 计划中 |
+| worktree 隔离、并行与验收合并：每个任务独立的 worktree 与分支、准备命令、并行与排队、验收页、`ar diff · accept · reject · gc · status`；执行者需要越界时停下、工作区外写入检查；任务评分（`ar report`）；任务与项目的搜索排序 | ✅ |
+| 通用适配器与路由、交叉审查 | 🚧 计划中 |
 
 ### 技术栈
 
@@ -117,6 +118,25 @@ verify:
 3. **每次尝试都留档**：`.agent-runs/<名>/attempts/<n>/` 里有这次实际发出的指令 `prompt.md`、原始输出、汇报和门禁结果；任务目录顶层的 `report.md`、`gate.json` 是最近一次的。软件里，列表行显示"尝试 n/N"；任务详情有尝试切换条，可以按次看进展、汇报和门禁；"重试历史"每次一行。
 4. **手动重试**：自动重试用完仍失败，或者结果不满意，可以在软件里点"重试"（可以换执行者、写补充说明），或运行 `ar retry <记录名> --note "补充说明"`。已完成的任务重试时必须写补充说明。任务还在进行时不能重试，先停止。
 5. **重试不会绕过门禁**：每次都完整跑门禁。`.agent-router/` 与任务说明目录受保护，执行者改它们算越界，除非 `allowed_paths` 明确写了这个目录。删除的文件会单独列出来，方便你检查有没有删测试。
+6. **需要越界时停下**：执行者认为必须改允许范围以外的文件才能完成时，在汇报里写一节 `## 需要越界`，逐行列出路径。核心看到这一节就不再自动重试，任务停下等你决定：扩大允许范围后手动重试、改任务说明，或者放弃。
+7. **工作区外写入**：每次尝试前后各列一遍用户目录根和公共目录根的第一层文件。多出新文件时门禁标红、不再自动重试，提醒你核对。只看文件名和修改时间，不读内容，也不删除。
+
+### 任务是怎样被隔离和合并的
+
+项目配置 `.agent-router/project.json` 写了 `"worktree": true` 时（`ar init` 生成的配置默认如此），用任务说明派发的任务不在你的工作区里改代码：
+
+1. **独立的 worktree 与分支**：每个任务在项目外的 git worktree 里运行（Windows 默认在 `%LOCALAPPDATA%\agent-router\wt\`），分支是 `ar/<记录名>`，基线是项目配置的主分支 `baseBranch`。执行者碰不到你的工作区，你可以照常写代码。任务说明要先提交到主分支，执行者才看得到它。
+2. **准备命令**：新 worktree 里没有依赖。项目配置的 `setup`（例如 `["npm ci"]`）在 worktree 建好后逐条运行。失败时执行者不启动，worktree 留着供排查；修好后点"重试"会重跑准备命令，不要这个任务了就驳回。
+3. **并行与排队**：同时运行的任务默认最多 2 个，可以在设置页"并行"或 `config.json` 的 `concurrency` 里改（1～4）。多出来的任务排队，轮到时自动开始。门禁同一时间只跑一个，免得互相拖慢。
+4. **待验收**：门禁通过后任务进入"待验收"，改动还在任务自己的分支里。在软件的"验收"页看概览、改动和门禁结果，然后选一个：
+   - **批准并合并**（`ar accept <记录名>`）：在主分支上新建一个合并提交（`--no-ff`；项目配置写 `"mergeMode": "squash"` 时压成一个提交），然后删除 worktree 与分支。撤销整个任务用 `git revert -m 1 <合并提交>`。主工作区必须在主分支上而且干净，否则什么都不改，并说明原因。
+   - **驳回**（`ar reject <记录名> --reason "…"`）：写明原因，删除 worktree；分支可以选择保留。
+   - **重试**：和失败后的手动重试一样，在同一个 worktree 里继续。
+5. **合并冲突**：批准时如果和主分支上的新提交冲突，会撤回这次合并，主分支不变，任务标为"合并冲突"。"解决冲突并重试"（`ar retry <记录名> --rebase`）在 worktree 里合并主分支：没有冲突就重新跑门禁；有冲突就让执行者解决、再跑门禁，之后回到待验收。
+6. **清理**：`ar gc` 列出并删除已合并、已驳回、任务记录已找不到的 worktree，以及残留的名额文件。软件启动时检查一次，在设置页"清理"确认后才删除。10 分钟以内新建的目录不算残留。
+7. **评分**：任务结束后，任务详情的"评分"标签（`ar report <记录名>`）给执行者和主导各打一个 0～100 的分。分数按事件扣分，每一项都列出来；门禁失败可以归因到任务说明，扣分就从执行者移到主导。
+
+单个任务不想用 worktree 时，派发加 `--no-worktree`。
 
 ### 开发与测试
 
@@ -154,7 +174,8 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 | Dispatch console: Tasks, Agents (import wizard, connection test), Projects (add, initialise, commit), New Task, re-dispatch, batch delete | ✅ |
 | Task specs and machine gates: after the worker exits, the core itself checks commits and changed files and runs each verify command; the app shows a pipeline track and the gate result | ✅ |
 | Automatic retry and escalation: failures handed back to the worker, retried in the same tree, every attempt kept; `ar retry` and Retry in the app, attempt switcher and retry history | ✅ |
-| Worktree parallelism and accept/merge, cross review, routing | 🚧 Planned |
+| Worktree isolation, parallel runs and accept/merge: one worktree and branch per task, setup commands, parallel runs and a queue, an Accept page, `ar diff · accept · reject · gc · status`; stop when the scope is too narrow, check for writes outside the working tree; task scores (`ar report`); search and sort for tasks and projects | ✅ |
+| Generic adapter and routing, cross review | 🚧 Planned |
 
 ### Tech stack
 
@@ -244,6 +265,25 @@ A task dispatched from a spec does not fail on its first miss. AgentRouter tries
 3. **Every attempt is kept**: `.agent-runs/<name>/attempts/<n>/` holds the exact prompt sent (`prompt.md`), the raw output, the report and the gate result. The top-level `report.md` and `gate.json` are the latest. In the app, the list row shows "attempt n/N"; the task details have an attempt switcher for progress, report and gate; and Retry history shows one row per attempt.
 4. **Manual retry**: when the automatic retries are used up, or you are not happy with the result, click Retry in the app (you can pick another worker and add a note) or run `ar retry <name> --note "…"`. Retrying a finished task requires a note. A task that is still running cannot be retried; stop it first.
 5. **Retries never skip the gate**: the full gate runs every time. `.agent-router/` and the specs folder are protected. A worker that changes them is out of scope unless `allowed_paths` names that folder explicitly. Deleted files are listed separately, so you can check that no tests were removed.
+6. **Stopping when the scope is too narrow**: if the worker decides it must change files outside the allowed paths, it lists them in its report under the exact heading `## 需要越界` ("needs scope"). The core then stops retrying and waits for you: widen the scope and retry, change the spec, or give up.
+7. **Writes outside the working tree**: before and after each attempt, the core lists the top-level files of the user's home folder and of the shared AgentRouter folder. If a new file appears, the gate fails, there is no automatic retry, and you are asked to check it. Only names and modification times are read; nothing is opened or deleted.
+
+### How tasks are isolated and merged
+
+When the project config `.agent-router/project.json` sets `"worktree": true` (the default in configs created by `ar init`), a task dispatched from a spec never edits your working tree:
+
+1. **Its own worktree and branch**: each task runs in a git worktree outside the project (on Windows, under `%LOCALAPPDATA%\agent-router\wt\` by default), on branch `ar/<name>`, based on the project's main branch `baseBranch`. The worker cannot touch your working tree, so you can keep coding. Commit the spec to the main branch first, or the worker cannot see it.
+2. **Setup commands**: a new worktree has no dependencies. The project's `setup` commands (for example `["npm ci"]`) run one by one after the worktree is created. If one fails, the worker does not start and the worktree is kept for inspection. Fix the command and click Retry to run setup again, or reject the task if you no longer need it.
+3. **Parallel runs and the queue**: by default up to 2 tasks run at the same time. Change this under Parallel in Settings or with `concurrency` in `config.json` (1–4). Extra tasks wait in a queue and start on their own. Only one gate runs at a time, so gates do not slow each other down.
+4. **Awaiting acceptance**: after the gate passes, the task waits for acceptance and its changes stay on its own branch. Review the overview, changes and gate result on the Accept page, then choose one:
+   - **Approve and merge** (`ar accept <name>`): creates one merge commit on the main branch (`--no-ff`; with `"mergeMode": "squash"` in the project config, a single squashed commit), then removes the worktree and the branch. To undo the whole task, run `git revert -m 1 <merge commit>`. The main working tree must be on the main branch and clean; otherwise nothing changes and you are told why.
+   - **Reject** (`ar reject <name> --reason "…"`): records why and removes the worktree. You can keep the branch.
+   - **Retry**: same as a manual retry after a failure, in the same worktree.
+5. **Merge conflicts**: if approving conflicts with newer commits on the main branch, the merge is rolled back, the main branch is unchanged and the task is marked as a merge conflict. Resolve and retry (`ar retry <name> --rebase`) merges the main branch into the worktree: with no conflict the gate runs again; with a conflict the worker resolves it, the gate runs again, and the task comes back for acceptance.
+6. **Cleanup**: `ar gc` lists and removes worktrees of merged, rejected or unknown tasks, and stale slot files. The app checks once at start-up and deletes only after you confirm under Cleanup in Settings. Folders created in the last 10 minutes are never treated as leftovers.
+7. **Scores**: after a task ends, the Score tab in the task details (`ar report <name>`) gives the worker and the lead a 0–100 score each. Points are deducted per event, and every item is listed. A failed gate can be blamed on the spec, which moves the deduction from the worker to the lead.
+
+To skip the worktree for a single task, dispatch it with `--no-worktree`.
 
 ### Development & testing
 

@@ -5,11 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { fork, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3 } from './data.mjs';
+import { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, wtReport, wtMerged } from './data.mjs';
 import { legacyRunsDir } from '../../core/lib/compat.mjs';
 export async function demo(){
   const home=await mkdtemp(path.join(os.tmpdir(),'agentrouter-demo-'));const children=[];
-  for(let i=0;i<2;i++){const child=fork(fileURLToPath(new URL('./ar.mjs',import.meta.url)),[],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});await new Promise((resolve,reject)=>{child.once('message',resolve);child.once('error',reject);});children.push(child);}
+  // 087：AR_DEMO_SHOW_WORKTREE=1 时多拉起两个假派发进程，给排队中、准备中的 worktree 演示任务用；平时只有两个。
+  const showWorktree=process.env.AR_DEMO_SHOW_WORKTREE==='1';
+  for(let i=0;i<(showWorktree?4:2);i++){const child=fork(fileURLToPath(new URL('./ar.mjs',import.meta.url)),[],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});await new Promise((resolve,reject)=>{child.once('message',resolve);child.once('error',reject);});children.push(child);}
   // AR_DEMO_NOW（毫秒，界面验收时由 tools/shots.mjs 设）：演示数据的"今天 / 昨天"时间戳按它算，
   // 与软件渲染时用的"现在"一致（037 第 2 项，跨午夜不串组）；没有就用真实当前时间。
   const demoNow=Number(process.env.AR_DEMO_NOW)||Date.now();
@@ -24,7 +26,7 @@ export async function demo(){
     // 演示进程创建时间必须与 started 接近，不能伪造身份时间；同时进程创建时间必须 ≤ started（registry 的 dispatchMatches）。
     // AR_DEMO_NOW 在派发演示子进程之前取得，可能比子进程创建时间早几毫秒，进行中的任务取两者的较大者。
     const started=t.state==='run'?Math.max(now,Date.now()):new Date(new Date(demoNow).setHours(...t.start.split(':').map(Number),0,0)).getTime()-(t.day==='yesterday'?86400000:0);
-    const entry={v:legacy?1:2,event:'start',id:t.id,repo,name,...(legacy?{}:{dir,project:t.project,profile:x.profile,adapter:x.adapter,label:x.label}),title:t.name,spec:t.record?null:`docs/specs/${t.name}.md`,role:t.role,pid:t.state==='run'?children[active++].pid:0,started,progress:path.join(dir,file.progress),report:path.join(dir,file.report),events:path.join(dir,file.events),raw:path.join(dir,file.raw),model:x.model,effort:null,tier:null,sandbox:t.sandbox,managed:t.id==='t1',agent:x.adapter,agentVersion:x.agentVersion,dispatcher:{host:t.dispatcher??'claude-code',session:null},...(t.gate!==undefined?{gate:t.gate,base:t.base??'main'}:{})};
+    const entry={v:legacy?1:2,event:'start',id:t.id,repo,name,...(legacy?{}:{dir,project:t.project,profile:x.profile,adapter:x.adapter,label:x.label}),title:t.name,spec:t.record?null:`docs/specs/${t.name}.md`,role:t.role,pid:t.state==='run'||(showWorktree&&['queued','preparing'].includes(t.wt?.phase))?children[active++].pid:0,started,progress:path.join(dir,file.progress),report:path.join(dir,file.report),events:path.join(dir,file.events),raw:path.join(dir,file.raw),model:x.model,effort:null,tier:null,sandbox:t.sandbox,managed:t.id==='t1',agent:x.adapter,agentVersion:x.agentVersion,dispatcher:{host:t.dispatcher??'claude-code',session:null},...(t.gate!==undefined?{gate:t.gate,base:t.base??'main'}:{}),...(t.wt?{worktree:true,base:(t.base??'a1b2c3d').padEnd(40,'0')}:{})};
     rows.push(entry);
     // Stage05 多次尝试（061，协议 14.2）：每次尝试 attempt →（门禁 gating / gate）→ attempt-end；最后一次进行中的只有 attempt；
     // 整个任务结束才写一次 end（带 attempts）。运行中的 t25 没有存活的派发进程，不写 end 也不写 interrupted。
@@ -48,6 +50,8 @@ export async function demo(){
       if(g)rows.push({v:1,event:'gate',id:t.id,ok:g.ok,attempt:g.attempt,at:endedAt+g.ms,summary:g.summary});
       rows.push({v:1,event:'end',id:t.id,exit:t.exit??0,at:endedAt,minutes:parseFloat(t.dur),...(g?{agentExit:t.agentExit??0}:{})});
     }
+    // 087 worktree 演示任务：事件序列按 wt.phase 生成（协议 15.3 / 15.6 / 15.7）。
+    if(t.wt)rows.push(...wtEvents(t,started,home,showWorktree));
     // t25（state retrying）演示里没有存活的派发进程：写 interrupted，UI23 检查时的 resume 让它回到进行中。
     if(t.state==='stop'||t.state==='retrying')rows.push({v:1,event:'interrupted',id:t.id,at:started+(A?A.at(-1).offset+60000:192000),signal:t.signal??'session-closed'});
     const events=[];let seq=0;const add=e=>events.push({v:1,seq:++seq,at:started+seq*1000,...e});
@@ -65,11 +69,16 @@ export async function demo(){
     await writeFile(entry.events,events.map(e=>JSON.stringify(e)).join('\n')+'\n');await writeFile(entry.raw,'??????\n');
     await writeFile(entry.progress,`=== Codex 开始：${t.name}  ${new Date(started).toLocaleString('zh-CN',{hour12:false})} ===\n[15:39:00] ${t.last??'说：已完成，见汇报。'}\n`+(A?A.filter(a=>a.n>1).map(a=>`=== 第 ${a.n} 次尝试（执行者：${a.profile}；原因：门禁未通过）===\n`).join(''):''));
     // 多次尝试演示任务不写任务说明文件：reader-app 的"已有任务说明"列表保持原样（新建任务页的检查用这个项目）。
-    if(entry.spec&&!A){await mkdir(path.join(repo,'docs/specs'),{recursive:true});await writeFile(path.join(repo,entry.spec??'docs/specs/demo.md'),`# ${t.name}\n`);}
+    if(entry.spec&&!A){await mkdir(path.join(repo,'docs/specs'),{recursive:true});await writeFile(path.join(repo,entry.spec??'docs/specs/demo.md'),t.goal?`# ${t.name}\n\n## 目标\n\n${t.goal}\n`:`# ${t.name}\n`);}
     for(const e of events)for(const f of e.files??[]){const file=path.join(repo,f.path);await mkdir(path.dirname(file),{recursive:true});await writeFile(file,'// 演示文件\n');}
     // 门禁结果文件（协议 12.3）：只给真跑过门禁的任务写；结果原样供软件只读展示。
     if(gates[t.id])await writeFile(path.join(dir,'gate.json'),JSON.stringify({...gates[t.id],at:started+60000*parseFloat(t.dur)},null,2)+'\n');
     if(t.state==='done')await writeFile(entry.report,t.id==='t3'?['# 完成了什么','存档加了版本号，读取时按 v1 → v2 → v3 逐级迁移；旧存档读取后自动写回新格式，并保留一份 `.bak`。','提交：`4f2a9c1`','## 验证','- `npm test` 46/46 通过，新增迁移测试 9 条。','- 用 3 份旧存档样例实际读取，背包、地图、设置都对得上。','## TODO(lead) 2 条','1. 迁移失败时给玩家看的提示文案，现在是占位“【文案待定：存档无法升级】”。','2. 是否在读取旧存档时提示“已升级”。','## 推断清单 3 条','1. 备份文件名用 `<存档名>.bak`，只保留最近一份。','2. 未知字段原样保留，不删除。','3. 版本号写在存档顶层 `v` 字段。','## 已知问题','无。'].join('\n'):t.id==='t4'?'# 完成了什么\n排查结果：白屏是因为首次启动时读取空的设置文件抛错。只读任务，没有改动文件。':`# 完成了什么\n已完成。\n提交：\`${t.commit}\`\n`);
+    // 087：已经进入待验收之后的 worktree 演示任务有汇报与派发参数（概览标签读 dispatch.json 的 gate.merged）。
+    if(t.wt&&['awaiting','conflict','accepted','rejected'].includes(t.wt.phase)){
+      await writeFile(entry.report,t.id==='t32'?wtReport:`# 完成了什么\n已完成。\n提交：\`${t.commit}\`\n`);
+      await writeFile(path.join(dir,'dispatch.json'),JSON.stringify({v:1,task:entry.spec,extra:'',role:null,spec:entry.spec,profile:x.profile,name,gate:{enabled:true,base:entry.base,merged:wtMerged}}));
+    }
     // 每次尝试的指令、汇报与门禁（attempts/<n>/，协议 14.2 第 3 条）；顶层 report.md / gate.json 保持"最新"（这次没有就保留上一次的）。
     if(A){
       for(const a of A){
@@ -108,8 +117,11 @@ export async function demo(){
   const envIds=String(process.env.AR_DEMO_HIDDEN_IDS??'').split(',').map(id=>id.trim()).filter(Boolean);
   // 061：多次尝试演示任务 t25 / t26 在任何模式下默认隐藏（任务数量与打包验收的 16 行都不变）；
   // 想在 npm run demo 里看它们，设 AR_DEMO_SHOW_ATTEMPTS=1（t25 在演示里没有存活的派发进程，显示为中断）。
-  const attemptIds=process.env.AR_DEMO_SHOW_ATTEMPTS==='1'?[]:['t25','t26'];
-  const hiddenIds=[...(envIds.length?[...envIds,'t24']:[]),...attemptIds];
+  // Stage06 评分演示任务 t27 同样默认隐藏（UI26 检查时临时显示、检查完恢复）。
+  const attemptIds=process.env.AR_DEMO_SHOW_ATTEMPTS==='1'?[]:['t25','t26','t27'];
+  // 087：worktree 演示任务 t30～t35 同样在任何模式下默认隐藏（任务数量与打包验收的 16 行不变）；想在 npm run demo 里看它们，设 AR_DEMO_SHOW_WORKTREE=1。
+  const wtIds=showWorktree?[]:tasks.filter(t=>t.wt).map(t=>t.id);
+  const hiddenIds=[...(envIds.length?[...envIds,'t24']:[]),...attemptIds,...wtIds];
   if(hiddenIds.length){
     const keys=rows.filter(r=>r.event==='start'&&hiddenIds.includes(r.id)).map(r=>`${r.id}:${r.started}`);
     await mkdir(path.join(home,'monitor'),{recursive:true});
@@ -126,6 +138,25 @@ export async function demo(){
     else console.warn([`警告：演示临时目录在约 ${Math.round(limitMs/1000)} 秒内没有删完，已停止删除，请关闭占用这些文件的程序后手动删除：${home}`,
       ...result.residue.map(p=>`  残留：${p}`),...result.errors.map(e=>`  错误：${e}`)].join('\n'));
     return result;}};
+}
+
+// 087：worktree 演示任务的事件（协议 15.3 / 15.6 / 15.7）：queued → preparing → worktree → setup → attempt → gating → gate → attempt-end → end，
+// 之后按阶段补 conflict / accepted / rejected。排队与准备中的任务只写到各自的阶段；没有存活的派发进程时再补一行 interrupted（它们才会被隐藏）。
+function wtEvents(t,started,home,live){
+  const w=t.wt,id=t.id,dir=path.join(home,'wt',`${t.project}-${id}`),base=(t.base??'a1b2c3d').padEnd(40,'0');
+  const rows=[{v:1,event:'queued',id,at:started+300}];
+  const stop=()=>live?[]:[{v:1,event:'interrupted',id,at:started+2000,signal:'session-closed'}];
+  if(w.phase==='queued')return [...rows,...stop()];
+  rows.push({v:1,event:'preparing',id,at:started+1000},{v:1,event:'worktree',id,dir,branch:w.branch,base,at:started+1500});
+  if(w.phase==='preparing')return [...rows,...stop()];
+  const endedAt=started+60000*parseFloat(t.dur),g=gates[id];
+  rows.push({v:1,event:'setup',id,ok:true,ms:18000,at:started+20000,summary:'准备命令通过'},{v:1,event:'attempt',id,n:1,total:3,profile:(t.executor?.profile??'codex'),reason:'first',at:started+21000});
+  rows.push({v:1,event:'gating',id,at:endedAt-g.ms},{v:1,event:'gate',id,ok:true,attempt:1,at:endedAt-100,summary:g.summary},{v:1,event:'attempt-end',id,n:1,ok:true,exit:0,gate:true,usage:{input:null,output:null},ms:endedAt-started-21000,at:endedAt-50});
+  rows.push({v:1,event:'end',id,exit:0,at:endedAt,minutes:parseFloat(t.dur),agentExit:0,attempts:1});
+  if(w.phase==='conflict')rows.push({v:1,event:'conflict',id,files:w.files,at:endedAt+60000});
+  if(w.phase==='accepted')rows.push({v:1,event:'accepted',id,merge:w.merge.padEnd(40,'0'),mode:'no-ff',by:w.by,at:endedAt+120000});
+  if(w.phase==='rejected')rows.push({v:1,event:'rejected',id,reason:w.reason,keptBranch:false,by:w.by,at:endedAt+120000});
+  return rows;
 }
 
 // 删除临时目录：总时限 limitMs。每一轮用同步调用把能删的都删掉（遇到被占用的文件跳过、记下原因），

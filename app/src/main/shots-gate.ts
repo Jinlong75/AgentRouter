@@ -1,16 +1,23 @@
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { nativeTheme } from 'electron';
-import type { Harness } from './shots-input';
+import { pollUntil, type Harness } from './shots-input';
 import type { Registry } from './registry';
+import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
-import { gt, nt } from '../shared/copy';
+import { gt, nt, rt } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
 const GATE_IDS = ['t20', 't21', 't22', 't24'];
+// 验收里的 git 也只用隔离环境（GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM 见 tools/demo/preferences.mjs）。
+const git = (cwd: string, args: string[]) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false, windowsHide: true, env: appEnv });
+    assert.equal(r.status, 0, `git ${args.join(' ')}：${r.stderr}`);
+    return String(r.stdout).trim();
+};
 
 // UI22：Stage04 门禁界面。演示任务 t20～t22、t24 默认写在 tasks.json 的 hidden 里（原有列表计数不变），
 // 这里临时显示、检查完恢复；门禁进行中的任务（t23）用真的假派发进程造出来，避免在演示清单里放一个一直跑的任务。
@@ -56,6 +63,12 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
     // 与令牌比较颜色：只在当前主题里取一次 var(--fail)，不写死色值。
     const failColor = `(() => { const s = document.createElement('span'); s.style.color = 'var(--fail)'; document.body.append(s); const c = getComputedStyle(s).color; s.remove(); return c; })()`;
     let gating: ChildProcess | undefined, gatingStarted = 0;
+    // 079 工作区外写入：临时仓库、假执行者与隔离的用户目录（USERPROFILE 在隔离公共目录里）。
+    const outsideHome = appEnv.AGENT_ROUTER_HOME!, outsideUser = appEnv.USERPROFILE!;
+    const outsideConfig = path.join(outsideHome, 'config.json'), outsideRelease = path.join(out, 'outside-release.flag');
+    const outsideStray = 'stray-outside.txt';
+    const originalOutsideConfig = await readFile(outsideConfig, 'utf8').catch(() => null);
+    let outsideRepo = '', outsideId = '', outsideStarted = 0;
     try {
         await reveal(GATE_IDS);
         await wait('!!document.querySelector("[data-task=t21]")', 'UI22 显示门禁演示任务');
@@ -249,8 +262,106 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
             assert.deepEqual(file24.scope.deleted, ['tests/export/legacy-permission.test.ts']);
             assert.equal(file24.ok, false);
         });
+
+        // ---- 079：工作区外写入（协议 12.4）。假执行者运行期间，测试自己往隔离的用户目录根放一个新文件 ----
+        assert.ok(outsideHome && path.isAbsolute(outsideHome) && outsideUser && path.isAbsolute(outsideUser), '截图验收必须在隔离公共目录与隔离用户目录里运行');
+        assert.notEqual(path.resolve(outsideUser).toLowerCase(), path.resolve(outsideHome).toLowerCase(), '隔离用户目录不能等于公共目录');
+        const outsideSpecRel = 'docs/specs/079-工作区外写入.md';
+        const rows = async () => (await readFile(registry.file, 'utf8')).split('\n').filter(Boolean).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean) as any[];
+        const untilRow = async <T,>(fn: () => Promise<T | undefined | null>, label: string, timeoutMs = 30000): Promise<T> => {
+            let value: T | undefined | null;
+            if ((await pollUntil(async () => (value = await fn()), timeoutMs)).ok) return value as T;
+            throw Error(`等待超时：${label}（${timeoutMs} ms）`);
+        };
+        const core = async (args: string[], cwd?: string) => {
+            const r = await coreRun(args, { timeoutMs: 60000, cwd });
+            assert.equal(r.code, 0, `ar ${args.join(' ')}：${r.stderr || r.json?.error}`);
+            assert.equal(r.json?.ok, true, `ar ${args.join(' ')}：${r.json?.error}`);
+            return r.json;
+        };
+        // 假执行者：写完成标记并提交（所以没有工作区外写入时门禁会通过），等放行文件出现才结束。
+        const savedConfig = originalOutsideConfig === null ? {} : JSON.parse(originalOutsideConfig);
+        await rm(outsideRelease, { force: true });
+        await writeFile(outsideConfig, JSON.stringify({
+            v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake', ...savedConfig,
+            profiles: {
+                ...(savedConfig.profiles ?? {}),
+                'outside-fake': { adapter: 'fake', label: '假执行者', enabled: true, events: [{ kind: 'say', text: '假执行者已完成。' }], report: '假汇报\n', exit: 0, version: 'fake-agent 1.0', writes: [{ path: 'src/done.txt', content: '任务完成\n' }], commit: '假执行者：写入完成标记', releaseFile: outsideRelease, releaseTimeoutMs: 60000 },
+            },
+        }, null, 2) + '\n');
+        outsideRepo = path.join(outsideHome, 'shots-outside', 'sample');
+        await mkdir(path.join(outsideRepo, 'docs', 'specs'), { recursive: true });
+        await mkdir(path.join(outsideRepo, 'src'), { recursive: true });
+        git(outsideRepo, ['init', '-b', 'main']);
+        git(outsideRepo, ['config', 'user.name', 'AgentRouter Shots']);
+        git(outsideRepo, ['config', 'user.email', 'shots@example.invalid']);
+        git(outsideRepo, ['config', 'commit.gpgsign', 'false']);
+        git(outsideRepo, ['config', 'core.autocrlf', 'false']);
+        await writeFile(path.join(outsideRepo, '.gitignore'), '.agent-runs/\n');
+        await writeFile(path.join(outsideRepo, 'src', 'a.txt'), '初始\n');
+        await writeFile(path.join(outsideRepo, outsideSpecRel), ['---', 'id: 979', 'title: 工作区外写入验收', 'type: code', 'allowed_paths:', '  - src/**', 'verify:', '  - git cat-file -e HEAD:src/done.txt', 'max_retries: 2', '---', '', '工作区外写入验收正文。', ''].join('\n'));
+        git(outsideRepo, ['add', '--', '.gitignore', 'src/a.txt', outsideSpecRel]);
+        git(outsideRepo, ['commit', '-m', '初始提交', '--', '.gitignore', 'src/a.txt', outsideSpecRel]);
+        await core(['projects', 'add', outsideRepo]);
+        const dispatched = await core(['dispatch', outsideSpecRel, '--name', 'outside-demo', '--profile', 'outside-fake', '--detach'], outsideRepo);
+        outsideId = String(dispatched.id);
+        assert.ok(outsideId, '派发没有返回 id');
+        // 核心写 spawned 时，执行者启动之前的那次列目录已经做完；此时再放新文件，才算"任务进行中新出现的"。
+        await untilRow(async () => (await rows()).find(r => r.id === outsideId && r.event === 'spawned'), '假执行者启动');
+        await writeFile(path.join(outsideUser, outsideStray), '执行者之外的程序写的\n');
+        await writeFile(outsideRelease, 'go\n');
+        await untilRow(async () => (await rows()).find(r => r.id === outsideId && r.event === 'end'), '工作区外写入任务结束');
+        outsideStarted = (await rows()).find(r => r.id === outsideId && r.event === 'start').started;
+        await registry.refresh();
+        const outsideAdded = [{ root: 'user', name: outsideStray, type: 'file' }];
+        await verify('UI22 工作区外写入：max_retries 为 2 也只跑 1 次（清单里只有一个 attempt），门禁未通过、退出码 3，attempt-end 与 gate.json 带 outsideWrites', async () => {
+            const list = (await rows()).filter(r => r.id === outsideId);
+            assert.equal(list.filter(r => r.event === 'attempt').length, 1);
+            assert.equal(list.find(r => r.event === 'gate').ok, false);
+            assert.deepEqual(list.find(r => r.event === 'attempt-end').outsideWrites, { checked: true, added: outsideAdded });
+            assert.equal(list.at(-1).event, 'end');
+            assert.equal(list.at(-1).exit, 3);
+            const gateJson = JSON.parse(await readFile(path.join(outsideRepo, '.agent-runs', 'outside-demo', 'gate.json'), 'utf8'));
+            assert.deepEqual(gateJson.outsideWrites, { checked: true, added: outsideAdded });
+            assert.equal(gateJson.scope.outside.length, 0, '工作区内没有越界，失败只因为工作区外写入');
+            assert.ok(gateJson.summary.endsWith(`工作区外出现新文件：user/${outsideStray}`), gateJson.summary);
+        });
+        await press('[data-page=tasks]');
+        await press('[data-filter=all]');
+        await press('[data-project]');
+        await press('.ctx button');
+        await wait(`!!document.querySelector("[data-task=${outsideId}]")`, 'UI22 工作区外写入任务进列表', 15000);
+        await press(`[data-task=${outsideId}]`);
+        await press('.dtabs [data-tab=flow]');
+        await wait('!!document.querySelector("[data-outside-writes]")', 'UI22 工作区外写入横幅出现', 15000);
+        await check('UI22 工作区外写入横幅：失败横幅的结构（banner fail、role=alert），标题、说明、新文件逐行列出（目录名称 + 等宽的名字）', `(() => { const m = document.createElement('span'); m.className = 'mono'; document.body.append(m); const mono = getComputedStyle(m).fontFamily; m.remove(); const b = document.querySelector('[data-outside-writes]'); const names = [...b.querySelectorAll('[data-outside-name]')]; const roots = [...b.querySelectorAll('[data-outside-root]')]; return b.classList.contains('banner') && b.classList.contains('fail') && b.getAttribute('role') === 'alert' && b.parentElement?.classList.contains('banner-holder') && b.querySelector('.rt b').textContent === ${JSON.stringify(rt.outsideTitle)} && b.querySelector('.rt > span').textContent === ${JSON.stringify(rt.outsideHelp)} && names.map(n => n.textContent).join('|') === ${JSON.stringify(outsideStray)} && names.every(n => n.classList.contains('mono') && getComputedStyle(n).fontFamily === mono) && roots.map(r => r.textContent).join('|') === ${JSON.stringify(rt.outsideRoot.user)} && roots[0].parentElement === names[0].parentElement && b.querySelectorAll('li').length === 1; })()`);
+        await check('UI22 工作区外写入横幅与门禁失败横幅同时出现，工作区外写入在上面', `(() => { const a = document.querySelector('[data-outside-writes]'); const all = [...document.querySelectorAll('.detail .banner-holder .banner.fail')]; return all.length >= 2 && all[0] === a && !all[1].hasAttribute('data-outside-writes') && all[1].querySelector('.rt b').textContent === ${JSON.stringify(gt.failTitle)}; })()`);
+        await pair('outside-writes-banner');
+        await press('.dtabs [data-tab=gate]');
+        await wait(`!!document.querySelector("[data-outside-sec]")`, 'UI22 门禁标签里出现工作区外的新文件一项', 15000);
+        await check('UI22 门禁标签：工作区外的新文件一项在"改动范围"后面、验收命令前面，条目标红并写目录名称', `(() => { const sec = document.querySelector('[data-outside-sec]'); const row = document.querySelector('[data-outside-item]'); const secs = [...document.querySelectorAll('.tab-body .sec-t')]; const at = secs.indexOf(sec); return !!sec && sec.textContent === ${JSON.stringify(rt.outsideGate)} && secs.slice(0, at).some(s => s.textContent.startsWith(${JSON.stringify(gt.scopeSec)})) && secs[at + 1]?.textContent === ${JSON.stringify(gt.commandsSec)} && !!row && row.classList.contains('bad') && row.querySelector('.v.mono')?.textContent === ${JSON.stringify(outsideStray)} && getComputedStyle(row.querySelector('.v.mono')).color === ${failColor} && row.querySelector('.meta')?.textContent === ${JSON.stringify(rt.outsideRoot.user)} && document.querySelectorAll('[data-outside-item]').length === 1; })()`);
+        await check('UI22 门禁标签的失败横幅用核心 summary（末尾带工作区外出现新文件）', `document.querySelector(".tab-body .banner.fail .rt span")?.textContent.endsWith(${JSON.stringify(`工作区外出现新文件：user/${outsideStray}`)}) === true`);
+        await evaluate('document.querySelector("[data-outside-sec]")?.scrollIntoView({ block: "center" })');
+        await pair('outside-writes-gate-tab');
+        await press(`[data-task=t20]`);
+        await wait('!document.querySelector("[data-outside-writes]")', 'UI22 换到没有工作区外写入的任务后横幅消失');
+        await check('UI22 换到没有工作区外写入的任务：没有横幅，门禁标签也没有这一项', `!document.querySelector('[data-outside-writes]') && !document.querySelector('[data-outside-sec]') && !document.querySelector('[data-outside-item]')`);
     }
     finally {
+        // 079：放行假执行者、隐藏临时任务、移除临时项目、恢复配置，删掉测试自己放进隔离用户目录的文件。
+        await writeFile(outsideRelease, 'go\n').catch(() => { });
+        if (outsideId && outsideStarted) {
+            const saved = JSON.parse(await readFile(tasksFile, 'utf8').catch(() => '{"imports":[],"hidden":[]}'));
+            const hidden: string[] = Array.isArray(saved.hidden) ? saved.hidden : [];
+            await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: [...new Set([...hidden, `${outsideId}:${outsideStarted}`])] }) + '\n').catch(() => { });
+            await registry.reloadHidden().catch(() => { });
+        }
+        if (outsideRepo) await coreRun(['projects', 'remove', outsideRepo], { timeoutMs: 60000 }).catch(() => { });
+        if (outsideRepo) await rm(path.join(outsideUser, outsideStray), { force: true }).catch(() => { });
+        if (outsideRepo) {
+            if (originalOutsideConfig === null) await rm(outsideConfig, { force: true }).catch(() => { });
+            else await writeFile(outsideConfig, originalOutsideConfig).catch(() => { });
+        }
         // 门禁进行中的假派发进程与记录：写 end、结束进程，再把任务藏起来，不影响后续检查。
         if (gating?.pid) {
             await appendFile(registry.file, JSON.stringify({ v: 1, event: 'end', id: 't23', exit: 0, at: Date.now(), minutes: 0 }) + '\n').catch(() => { });

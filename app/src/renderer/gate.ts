@@ -47,13 +47,11 @@ export function gateBadge(t: Task) {
 }
 
 // 轨道节点是真正的按钮：点派发 → 参数，点执行 → 进展，点门禁 → 门禁标签（未启用时回参数）。
-function trackNode(step: string, cls: string, glyph: string, sub: string, state: string, tab: string) {
+export function trackNode(step: string, cls: string, glyph: string, sub: string, state: string, tab: string) {
     return `<button class="node ${cls}" data-tab="${tab}" aria-label="${esc(gt.nodeLabel(step, state))}" title="${esc(state)}"><span class="dot">${glyph}</span><span>${esc(step)}</span><span class="sub">${esc(sub)}</span></button>`;
 }
-export function gateTrack(t: Task, file: GateFile | null) {
-    const state = gateState(t);
-    if (state === null)
-        return '';
+// 执行、门禁两个节点的内容（样式类、图标、小字、aria 状态说明）；worktree 任务的五段轨道（wt.ts）也用它。state 是已经算好的门禁状态。
+export function trackParts(t: Task, file: GateFile | null, state: GateState) {
     const exit = t.agentExit ?? t.exit ?? null;
     // Stage05：有多次尝试（当前尝试 total > 1）时，运行中写"第 n/N 次"，完成且不是第 1 次写"第 n 次完成"。
     const attempt = t.attempt, many = attempt && attempt.total && attempt.total > 1 ? attempt : null;
@@ -71,6 +69,13 @@ export function gateTrack(t: Task, file: GateFile | null) {
                 : state === 'fail' ? ['failed', icon('close-line'), gt.trackGateFail, `门禁未通过：${summary}`, '门禁未通过']
                     : state === 'off' ? ['skip', '', gt.trackGateOff, '这个任务没有启用门禁', '未启用']
                         : ['todo', '', '未运行', '执行者没有正常结束，门禁没有运行', '未运行'];
+    return { exec, gate };
+}
+export function gateTrack(t: Task, file: GateFile | null) {
+    const state = gateState(t);
+    if (state === null)
+        return '';
+    const { exec, gate } = trackParts(t, file, state);
     const link2 = state === 'ok' || state === 'fail' || state === 'running' ? 'done' : '';
     return `<div class="track" role="group" aria-label="流水线">${trackNode(gt.track.dispatch, 'done', icon('check-line'), clock(t.started), `${clock(t.started)} 派发`, 'params')}<span class="link done"></span>${trackNode(gt.track.run, exec[0], exec[1], exec[2], exec[3], 'flow')}<span class="link ${link2}"></span>${trackNode(gt.track.gate, gate[0], gate[1], gate[2], `${gate[3]}，${gate[4]}`, state === 'off' ? 'params' : 'gate')}</div>`;
 }
@@ -119,10 +124,18 @@ export function gateTab(t: Task, file: GateFile | null, result: GateResult, atte
         + (deleted.length
             ? deleted.map(path => `<div class="grow info">${icon('delete-bin-line')}<span class="v mono">${esc(path)}</span><span class="meta">${outside.includes(path) ? esc(gt.scopeOutside) : ''}</span></div>`).join('')
             : `<div class="grow info">${icon('delete-bin-line')}<span class="v">${esc(gt.deletedNone)}<span class="note">${esc(gt.deletedNoneHelp)}</span></span><span class="meta"></span></div>`);
+    // 工作区外的新文件（协议 12.4，Stage06）：放在"改动范围"（含删除的文件）后面；有新文件标红，
+    // 没能核对时用次级色的提示行；旧记录没有 outsideWrites 字段，整块不显示。
+    const outsideWrites = file.outsideWrites, outsideAdded = Array.isArray(outsideWrites?.added) ? outsideWrites.added : [];
+    const outsideBlock = outsideAdded.length
+        ? `<div class="sec-t" data-outside-sec>${esc(rt.outsideGate)}</div>` + outsideAdded.map(item => `<div class="grow bad" data-outside-item>${failm}<span class="v mono">${esc(item.name)}</span><span class="meta">${esc(rt.outsideRoot[item.root] ?? item.root)}</span></div>`).join('')
+        : outsideWrites?.checked === false
+            ? `<div class="grow info" data-outside-unchecked>${icon('information-line')}<span class="v">${esc(rt.outsideUnchecked(outsideWrites.error ?? ''))}</span><span class="meta"></span></div>`
+            : '';
     const cmds = commands.length ? commands.map((command, index) => {
         const meta = [command.timedOut ? gt.timedOut : command.exit ? `exit=${command.exit}` : '', gms(command.ms ?? 0)].filter(Boolean).join(' · ');
         const errorNote = command.error ? `<span class="note">${esc(command.error)}</span>` : '';
         return `<div class="grow ${commandOk(command) ? '' : 'bad'}">${commandOk(command) ? okm : failm}<span class="v"><button class="cmd" data-gcmd="${index}" aria-expanded="false">${command.output ? icon('arrow-right-s-line') : ''}<code>${esc(command.line)}</code></button>${command.output ? `<pre class="out selectable" data-gout="${index}" hidden>${esc(command.output)}</pre>${command.truncated ? `<span class="note" data-gnote="${index}" hidden>${esc(gt.truncated)}</span>` : ''}` : errorNote}</span><span class="meta">${esc(meta)}</span></div>`;
     }).join('') : row(true, esc(gt.commandsNone));
-    return `${head}<div class="sec-t">${esc(gt.commitSec)}</div>${commit}<div class="sec-t">${esc(gt.uncommittedSec)}</div>${unc}<div class="sec-t">${esc(gt.scopeSec)}<span class="sp"></span><span>${esc(gt.scopeCount(changed.length, outside.length))}</span></div>${scope}${del}<div class="sec-t">${esc(gt.commandsSec)}</div>${cmds}`;
+    return `${head}<div class="sec-t">${esc(gt.commitSec)}</div>${commit}<div class="sec-t">${esc(gt.uncommittedSec)}</div>${unc}<div class="sec-t">${esc(gt.scopeSec)}<span class="sp"></span><span>${esc(gt.scopeCount(changed.length, outside.length))}</span></div>${scope}${del}${outsideBlock}<div class="sec-t">${esc(gt.commandsSec)}</div>${cmds}`;
 }

@@ -22,5 +22,7 @@ export interface ConsoleOptions {
   // tasks:attempt-files 只读看板任务的记录目录：dir 是否是某个已读到的任务的记录目录（Registry.knownRunDir）。
   knownRunDir?: (dir: string) => boolean | Promise<boolean>;
 }
+export function specGoal(text: string): string | null;
+export function sizeOf(target: unknown): Promise<number>;
 export function claudeLaunch(options: { dir: string; name?: string; wt?: string | null }): { executable: string; args: string[] };
 export function createConsole(options: ConsoleOptions): { call(action: string, payload?: Record<string, unknown>): Promise<any> };

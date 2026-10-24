@@ -43,7 +43,12 @@ export function validRequest(r) {
     && object(r.dispatcher) && ['claude-code','unknown','agentrouter'].includes(r.dispatcher.host) && nullable(r.dispatcher.session)
     && object(r.env) && Object.entries(r.env).every(([key,value]) => environmentKeys.includes(key) && typeof value === 'string' && !value.includes('\0'))
     && ['profile', 'adapter'].every(k => r[k] === undefined || (typeof r[k] === 'string' && !!r[k]))
-    && (r.profileConfig === undefined || validProfileConfig(r.profileConfig));
+    && (r.profileConfig === undefined || validProfileConfig(r.profileConfig))
+    && (r.worktree === undefined || validWorktree(r.worktree));
+}
+// worktree 模式（协议 15.2，可选）：派发进程算好的基线；缺省等于非 worktree 模式，旧请求照常有效。
+function validWorktree(w) {
+  return !!w && typeof w === 'object' && !Array.isArray(w) && typeof w.base === 'string' && /^[0-9a-f]{40,64}$/.test(w.base);
 }
 // 门禁快照（Stage04，可选）：派发进程已经解析并检查过任务说明，执行者进程不再重读、不重新取 base。
 // 缺省等于"没有门禁"，旧请求照常有效；merged 只含门禁用到的字段。

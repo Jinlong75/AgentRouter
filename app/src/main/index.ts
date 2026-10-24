@@ -12,8 +12,8 @@ import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { Registry, reportText } from './registry';
 import { windowsPlatform } from './platform';
 import { readEvents, validCursor } from './events';
-import type { Task, Snapshot, GateResult } from '../shared/types';
-import { c, cx, p } from '../shared/copy';
+import { worktreeState, type Task, type Snapshot, type GateResult } from '../shared/types';
+import { c, cx, p, wt } from '../shared/copy';
 import { coreRun } from './core';
 import { createConsole } from './console.mjs';
 import { runClearCache, secretNames, writeResetMarker, cleanupScript } from './reset.mjs';
@@ -200,16 +200,32 @@ async function cachedGate(dir: string): Promise<GateResult> {
     gateCache.set(file, { stamp, value });
     return value;
 }
-const snapshot = (select?: string): Snapshot => ({ tasks: registry?.tasks ?? [], processCheck: registry?.processCheck, theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light', version: app.getVersion(), select });
-const publish = (select?: string) => { updateTray(); if (win && !win.isDestroyed())
-    win.webContents.send('snapshot', snapshot(select)); };
+const snapshot = (select?: string, selectPage?: 'accept'): Snapshot => ({ tasks: registry?.tasks ?? [], processCheck: registry?.processCheck, theme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light', version: app.getVersion(), select, ...(selectPage ? { selectPage } : {}), concurrency: registry?.concurrency });
+const publish = (select?: string, selectPage?: 'accept') => { updateTray(); if (win && !win.isDestroyed())
+    win.webContents.send('snapshot', snapshot(select, selectPage)); };
 const errors = (e: unknown) => console.error(e instanceof Error ? e.message : String(e));
+// 点通知：显示窗口；待验收与冲突通知还要切到验收页并选中任务。
+const openFromNotice = (id: string, page?: 'accept') => { win.show(); if (win.isMinimized())
+    win.restore(); win.focus(); publish(id, page); };
 function finished(t: Task) {
     if (!notifications)
         return;
-    const project = path.basename(t.repo), body = t.status === 'done' ? `${project} · ${c.elapsed} ${t.minutes ?? Math.round(((t.ended ?? Date.now()) - t.started) / 60000)} ${c.minutes}` : t.status === 'fail' ? `${project} · exit=${t.exit}` : project;
-    effects.notify(`${c.status[t.status]}：${t.title}`, body, () => { win.show(); if (win.isMinimized())
-        win.restore(); win.focus(); publish(t.id); });
+    const project = path.basename(t.repo), state = worktreeState(t);
+    // worktree 任务：门禁通过进入待验收，通知"待验收"取代"已完成"；进入冲突另有通知（conflicted），这里不重复发。
+    if (state === 'awaiting') {
+        effects.notify(wt.notifyTitle(t.title), wt.notifyBody(project), () => openFromNotice(t.id, 'accept'));
+        return;
+    }
+    if (state === 'conflict')
+        return;
+    const body = t.status === 'done' ? `${project} · ${c.elapsed} ${t.minutes ?? Math.round(((t.ended ?? Date.now()) - t.started) / 60000)} ${c.minutes}` : t.status === 'fail' ? `${project} · exit=${t.exit}` : project;
+    effects.notify(`${c.status[t.status]}：${t.title}`, body, () => openFromNotice(t.id));
+}
+// 合并冲突（ar accept 退出码 4）：与"任务结束时通知"同一个开关。
+function conflicted(t: Task) {
+    if (!notifications)
+        return;
+    effects.notify(wt.notifyConflict(t.title), path.basename(t.repo), () => openFromNotice(t.id, 'accept'));
 }
 // 清除缓存（014）：Chromium 自己的缓存交给 session（异步，不阻塞窗口）；其他缓存目录、会话记录
 // 与测试临时目录由内置 Node 子进程删除，主进程只 await 结果。有进行中任务的执行者保留它的会话记录；
@@ -341,7 +357,7 @@ app.whenReady().then(async () => {
     // 验收时把"核对进程"（每次起一个 PowerShell 查 Win32_Process）也记进调用日志，定位删除、隐藏、停止时的等待点。
     // 验收时任何经 Registry 发出的结束进程树调用都打一行（PR #5 CI：退出后实测要知道有没有走到终止路径）。
     const registryPlatform = effects.stub ? { ...platform, killTree: (pid: number) => { console.error(`[终止调用] killTree(${pid}) @${Date.now()}`); return platform.killTree(pid); }, processes: (pids: number[]) => effects.trace('platform', `processes(${pids.length})`, async () => { if (effects.processFail) throw Error(effects.processFail); return platform.processes(pids); }) } : platform;
-    registry = new Registry(home, data, registryPlatform, () => publish(), finished, errors, legacyHome);
+    registry = new Registry(home, data, registryPlatform, () => publish(), finished, errors, legacyHome, conflicted);
     if (effects.stub) registry.onPhase = label => { effects.registryLog.push({ at: Date.now(), label }); };
     managedWorker = new Worker(path.join(__dirname, 'managed.mjs'), { workerData: { root: __dirname }, env });
     await new Promise<void>((resolve, reject) => { managedWorker.once('message', () => resolve()); managedWorker.once('error', reject); });
@@ -378,6 +394,8 @@ app.whenReady().then(async () => {
             notifications = result.own.notifications;
         }
         if (action === 'own' && payload?.key === 'theme') nativeTheme.themeSource = result.own.theme;
+        // 改了“同时运行的任务”：后台马上重读一次（上限变了 Registry 会推送快照），侧栏底部的上限随即变化；不等下一轮定时刷新，也不拖慢这次保存的回复。
+        if (action === 'save' && payload?.key === 'concurrency') void registry.refresh().catch(errors);
         return result;
       };
       // 验收时偏好通道也记入调用日志（PR #5 CI：编辑执行者要先等 preferences('settings')，原来看不到它是否卡住）。
@@ -445,6 +463,13 @@ app.whenReady().then(async () => {
             effects.copy(t.name);
             return;
         }
+        // 验收页的"撤销说明""复制命令""复制分支名"：把界面算好的一行文字写进剪贴板（走与复制记录名同一个桩 / 通道）。
+        if (action === 'copy-text') {
+            if (typeof value !== 'string' || !value || value.length > 2000 || /[\r\n]/.test(value))
+                throw Error('Invalid text');
+            effects.copy(value);
+            return;
+        }
         if (action === 'link') {
             if (typeof value !== 'string' || !/^https?:\/\//i.test(value))
                 throw Error('Invalid link');
@@ -456,6 +481,9 @@ app.whenReady().then(async () => {
             file = t[action as 'repo'];
         if (action === 'spec' && t.spec)
             file = path.resolve(t.repo, t.spec);
+        // worktree 任务的"在 worktree 打开"：最近一条 worktree 事件里的目录。
+        if (action === 'worktree' && t.wt?.dir)
+            file = t.wt.dir;
         if (action === 'file' && typeof value === 'string' && allowedFiles.get(id)?.has(value))
             file = path.resolve(t.repo, value);
         if (!file || !path.isAbsolute(file))

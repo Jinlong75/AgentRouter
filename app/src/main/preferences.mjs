@@ -69,7 +69,9 @@ export async function createPreferences(root, data, env = process.env) {
       if (env[name]) overrides[key] = { name, value: env[name] };
     // profiles：执行者配置原样交给 Agent 页（编辑 claude-code 执行者需要 env / maxTurns / secrets 等预填值）。
     const profiles = state.reason || !state.config?.profiles ? {} : state.config.profiles;
-    return { managed: state.config?.managed === true, values: state.settings, profiles, exists: state.exists, reason: state.reason, file: shorten(state.file),
+    // 并行上限与会话保留天数：按核心的口径取生效值（没写或不合法按默认），手写的越界值（如 7）原样给界面显示。
+    return { managed: state.config?.managed === true, leadUsage: state.config?.leadUsage === true, concurrency: config.slotLimits(state.config).limits.concurrency, retentionDays: config.sessionRetention(state.config).days,
+      values: state.settings, profiles, exists: state.exists, reason: state.reason, file: shorten(state.file),
       home, leftover: leftover(),
       current: { model: current.model, effort: current.model_reasoning_effort, tier: current.service_tier }, overrides, own };
   }
@@ -105,6 +107,10 @@ export async function createPreferences(root, data, env = process.env) {
       if (action === 'detect') return detect();
       if (action === 'save') {
         if (payload.key === 'managed') { if (typeof payload.value !== 'boolean') throw Error('Invalid value'); config.writeConfig(home, { managed: payload.value }); return settings(); }
+        // 同时运行的任务数：config.json 的 concurrency，界面只让选 1～4；writeConfig 不认这个键，走 updateConfig（保留其余字段）。
+        if (payload.key === 'concurrency') { if (!Number.isInteger(payload.value) || payload.value < 1 || payload.value > 4) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.concurrency = payload.value; }); return settings(); }
+        // 统计主导的 token 与用时：config.json 的 leadUsage，只认布尔值；走 updateConfig 保留其余字段。
+        if (payload.key === 'leadUsage') { if (typeof payload.value !== 'boolean') throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.leadUsage = payload.value; }); return settings(); }
         if (!['model', 'effort', 'tier', 'sandbox', 'watchWindow', 'path'].includes(payload.key)) throw Error('Invalid setting');
         if (payload.value !== null && typeof payload.value !== 'string') throw Error('Invalid value');
         const choices = { effort: ['minimal','low','medium','high','xhigh'], tier: ['default','priority','flex'], sandbox: ['workspace-write','read-only'], watchWindow: ['auto','always','never'] };
@@ -115,6 +121,7 @@ export async function createPreferences(root, data, env = process.env) {
         if (payload.key === 'theme' && ['system','light','dark'].includes(payload.value)
           || payload.key === 'notifications' && typeof payload.value === 'boolean'
           || payload.key === 'closeAction' && ['ask','tray','quit'].includes(payload.value)
+          || payload.key === 'taskSort' && ['time','state','project'].includes(payload.value)
           || payload.key === 'trayHintShown' && typeof payload.value === 'boolean') saveOwn({ [payload.key]: payload.value });
         else throw Error('Invalid preference');
         return settings();

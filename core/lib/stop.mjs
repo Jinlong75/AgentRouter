@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { locateStartWaiting, findTerminal } from './wait.mjs';
 import { processInfo, taskAlive, killProcessTree, pidAlive, redactPaths, identityAlive } from './process.mjs';
 import { registryWriter } from './records.mjs';
+import { releaseAllFor } from './slots.mjs';
 import { scriptNames } from './compat.mjs';
 import { tracing } from './trace.mjs';
 
@@ -148,6 +149,8 @@ export async function stopTask(homes, root, name, { info = processInfo, alive = 
     return 1;
   }
   registryWriter(home, { separate: true })({ event: 'interrupted', id: start.id, signal: 'stopped-by-command', at: Date.now() });
+  // 进程是被直接结束的，它的信号处理器没有机会释放并发名额（协议 15.5）：任务名额与门禁名额一起清掉。
+  releaseAllFor({ home, id: start.id });
   log(`停止：${name} 已停止，工作区里没提交的改动还在`);
   return 0;
 }

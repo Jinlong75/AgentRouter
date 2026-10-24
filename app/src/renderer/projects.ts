@@ -2,10 +2,11 @@
 // 详情里可以打开 Claude Code / 文件夹、编辑配置、移除；不是 git 的文件夹可以一键 git init；
 // 未初始化时先预览改动，确认后才写入，写完后可以把这几个文件提交到一个新提交里。
 // 数据都经 window.dock.console 交给核心；会写文件的操作期间按钮忙碌，失败在详情顶部显示核心给的原因。
-import { ag, c, pj } from '../shared/copy';
+import { ag, c, pj, s6 } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { ProjectChange, ProjectRow, ProjectShow, Task } from '../shared/types';
+import type { ProjectChange, ProjectRow, ProjectShow, ProjectSort, Task } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, type Sheet } from './ui';
+import { SearchField, closeSortMenu, foundRow, hit, matches, openSortMenu, paintHeader, sortButton } from './search';
 
 export interface ProjectsHost {
     // 看板里已有的任务，用来按仓库路径筛"最近任务"。
@@ -117,6 +118,9 @@ export class ProjectsView {
     private committed = '';
     private commitTimer: ReturnType<typeof setTimeout> | undefined;
     private container?: HTMLElement;
+    // 搜索（项目名、路径）与排序；搜索框元素只建一次，标题栏重画时原样放回。
+    private search = new SearchField(s6.projectSearch, () => this.render());
+    private sort: ProjectSort = 'recent';
     // 每次刷新 / 选择自增；晚到的结果只应用到仍然对得上的那一次。
     private seq = 0;
     // initial：打开项目页时要选中的项目（首次引导添加完项目后传入）。列表加载完就按它选中、取它的详情，加载多慢都不会丢。
@@ -142,6 +146,16 @@ export class ProjectsView {
     // 看板任务变了：最近任务区跟着重画（不重新拉项目列表）。
     tasksChanged() { this.render(); }
 
+    // 搜索与排序后的项目：搜索项目名与路径（不区分大小写）；“最近使用”按项目最近一次派发的开始时间，没派过任务的排最后、按添加时间。
+    private shown(): ProjectRow[] {
+        const rows = this.rows.filter(p => matches(this.search.query, p.name, p.path));
+        const tasks = this.host.tasks();
+        const lastStart = (p: ProjectRow) => tasks.reduce((latest, t) => samePath(t.repo, p.path) ? Math.max(latest, t.started) : latest, 0);
+        if (this.sort === 'name') return rows.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+        if (this.sort === 'added') return rows.sort((a, b) => b.addedAt - a.addedAt);
+        const starts = new Map(rows.map(p => [p.path, lastStart(p)]));
+        return rows.sort((a, b) => (starts.get(b.path)! - starts.get(a.path)!) || b.addedAt - a.addedAt);
+    }
     private frame() {
         if (!this.container) return;
         this.container.innerHTML = '<div class="page-h"></div><div class="split"><div class="edge"><div class="tlist scroll" data-pj-list></div></div><div class="detail pd" data-pj-detail></div></div>';
@@ -166,14 +180,18 @@ export class ProjectsView {
         }
         else {
             if (!container.querySelector('[data-pj-list]')) this.frame();
-            container.querySelector('.page-h')!.innerHTML = head;
+            // 有项目时标题栏是：标题、搜索框、排序、添加（没有项目时只有标题、说明和添加，见上面的 head）。
+            paintHeader(container.querySelector<HTMLElement>('.page-h')!, this.search, `<h1>${esc(pj.title)}</h1>`,
+                `${sortButton('data-pj="sort"', s6.projectSorts[this.sort][0])}<span class="sp"></span><button class="btn" data-pj="add" ${this.busy ? 'disabled' : ''}>${icon('folder-add-line')}${esc(pj.add)}</button>`);
             const list = container.querySelector<HTMLElement>('[data-pj-list]')!;
-            list.innerHTML = this.rows.map(p => {
+            const query = this.search.query, shown = this.shown();
+            const found = query ? foundRow(shown.length ? s6.projectFound(shown.length, query) : s6.projectNone(query), 'data-pj="search-clear"') : '';
+            list.innerHTML = found + shown.map(p => {
                 const tag = !p.exists ? `<span class="tag fail">${esc(pj.missing)}</span>`
                     : !p.git ? `<span class="tag">${esc(pj.notGit)}</span>`
                         : !p.initialized ? `<span class="tag brand">${esc(pj.notInit)}</span>`
                             : `<span class="mono">${esc(clock(p.lastUsed))}</span>`;
-                return `<button class="trow prow ${this.selected === p.path ? 'on' : ''}" data-pj-row="${esc(p.path)}" aria-pressed="${this.selected === p.path}">${icon('folder-3-line')}<span class="tm"><b>${esc(p.name)}</b><span class="mono">${esc(p.path)}</span></span><span class="ts">${tag}</span></button>`;
+                return `<button class="trow prow ${this.selected === p.path ? 'on' : ''}" data-pj-row="${esc(p.path)}" aria-pressed="${this.selected === p.path}">${icon('folder-3-line')}<span class="tm"><b>${hit(p.name, query)}</b><span class="mono">${hit(p.path, query)}</span></span><span class="ts">${tag}</span></button>`;
             }).join('');
             this.detail();
             list.scrollTop = listTop;
@@ -309,7 +327,9 @@ export class ProjectsView {
         if (!b || b.disabled || this.busy) return;
         const action = b.dataset.pj;
         if (action) {
-            if (action === 'add') void this.add();
+            if (action === 'sort') this.pickSort(b);
+            else if (action === 'search-clear') { this.search.set(''); this.search.focus(); }
+            else if (action === 'add') void this.add();
             else if (action === 'claude') void this.shell('claude');
             else if (action === 'folder') void this.shell('folder');
             else if (action === 'more') this.more(b);
@@ -332,6 +352,13 @@ export class ProjectsView {
         if (b.dataset.pjTask) this.host.openTask(b.dataset.pjTask);
     }
 
+    private pickSort(anchor: HTMLElement) {
+        if (closeSortMenu()) return;
+        openSortMenu(anchor, '[data-pj=sort]', (['recent', 'name', 'added'] as const).map(key => [key, s6.projectSorts[key][0], s6.projectSorts[key][1]] as [string, string, string]), this.sort, key => {
+            this.sort = key as ProjectSort;
+            this.render();
+        });
+    }
     // 添加项目：先选文件夹（验收时由桩返回队列里的路径），再登记；成功后刷新并选中它。
     private async add() {
         this.busy = true; this.error = ''; this.render();

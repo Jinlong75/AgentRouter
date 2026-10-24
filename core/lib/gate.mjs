@@ -7,6 +7,7 @@ import { runCommand } from './command.mjs';
 import { homeEnv } from './compat.mjs';
 import { globToRegExp, matchesAny } from './glob.mjs';
 import { baseProjectConfig, changedFiles, deletedFiles, headSha, uncommittedFiles } from './git.mjs';
+import { outsideSummary } from './outside-writes.mjs';
 
 // summary 里文件最多列 5 个，多了加"等"（协议 12.3）。
 const MAX_SUMMARY_FILES = 5;
@@ -115,12 +116,15 @@ export function summarizeGate(parts = {}) {
   for (const command of failed) {
     reasons.push(`验收命令失败：${command.line}${commandFailureReason(command)}`);
   }
+  // 工作区外的新文件（协议 12.4）放在最后；没有 outsideWrites 或 added 为空时不加这一段。
+  const outsideAdded = Array.isArray(parts.outsideWrites?.added) ? parts.outsideWrites.added : [];
+  if (outsideAdded.length) reasons.push(outsideSummary(outsideAdded));
   return reasons.length ? reasons.join('；') : '门禁通过';
 }
 
 // 去掉 dropEnv 列出的变量名和 AgentRouter 自己的变量（公共目录的新旧名、AR_*）；
 // Windows 上变量名不区分大小写（协议 12.2）。派发进程的公共目录等设置不能漏进项目自己的测试。
-function removeEnv(env, names) {
+export function removeEnv(env, names) {
   const caseInsensitive = process.platform === 'win32';
   const normalize = name => (caseInsensitive ? String(name).toLowerCase() : String(name));
   const dropped = new Set([...(names ?? []), ...homeEnv].map(normalize));
@@ -154,10 +158,12 @@ function writeGateJson(dir, gate) {
 // verifyTimeoutMs 只供测试：给定时代替 verify_timeout_min * 60000（单位是分钟，测试无法表达 1.5 秒）。
 // dir 缺省时写到 <root>/.agent-runs（T6 应显式传本次任务的记录目录）。
 // onSpawn(pid) 可选：每条验收命令启动后拿到子进程 pid，结束时收到 null（T6 停止信号用）；不加时行为不变。
-// TODO(lead): 协议没写 git 出错时是否还要继续跑验收命令；暂时整段中止、commands 记空，summary 只写原因。
+// outsideWrites 可选：工作区外写入的核对结果（协议 12.4，{ checked, added } 或 { checked: false, error }），
+// 原样写进 gate.json；added 非空时门禁不通过，summary 末尾多一段。不给时 gate.json 没有这个字段。
+// git 出错时整个门禁中止：commands 记空，summary 只写原因（协议 12.3 最后一段）。
 export async function runGate({
   root, base, spec = {}, env = process.env, dropEnv = [], dir = join(root, '.agent-runs'),
-  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn,
+  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn, outsideWrites,
 } = {}) {
   const started = now();
   const merged = spec ?? {};
@@ -214,7 +220,7 @@ export async function runGate({
     }
   } catch (error) {
     failure = error;
-    // TODO(lead): git 状态读不到时 commit.ok 该写什么协议没说；暂时按"要提交且没能核对"记失败（保守）。
+    // 读不到 git 状态时，要求提交的任务按"没能核对"把 commit.ok 记为 false（协议 12.3 最后一段）。
     if (required) commit.ok = false;
     commands = [];
   }
@@ -223,6 +229,7 @@ export async function runGate({
     && uncommitted.length === 0
     && commit.ok === true
     && scope.outside.length === 0
+    && !(outsideWrites?.added?.length > 0)
     && commands.every(command => !command.timedOut && command.error == null && command.exit === 0);
   const at = now();
   const gate = {
@@ -237,7 +244,8 @@ export async function runGate({
     uncommitted,
     scope,
     commands,
-    summary: failure ? `无法读取 git 状态：${failure.message}` : summarizeGate({ commit, uncommitted, scope, commands }),
+    ...(outsideWrites ? { outsideWrites } : {}),
+    summary: failure ? `无法读取 git 状态：${failure.message}` : summarizeGate({ commit, uncommitted, scope, commands, outsideWrites }),
   };
   writeGateJson(dir, gate);
   return gate;

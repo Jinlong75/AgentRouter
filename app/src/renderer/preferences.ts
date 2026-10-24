@@ -1,6 +1,6 @@
-import { ag, c, p, pj } from '../shared/copy';
+import { ag, c, p, pj, s6, sc } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { Connections, Settings } from '../shared/types';
+import type { Connections, GcItems, GcRun, Settings } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, trace, type Sheet } from './ui';
 import { AgentsView } from './agents';
 import brand from '../../design/icons/mark.svg';
@@ -41,11 +41,17 @@ export class PreferencesView {
     // 列表一节（018）：清空任务列表 / 项目列表后的行内说明。
     private tasksNote = '';
     private projectsNote = '';
+    // 数据一节的“清理”（ar gc）：启动时在后台检查一次（只列出，不删）；结果、检查状态与上次清理完成的说明。
+    private gcState: 'checking' | 'ready' | 'failed' = 'checking';
+    private gcItems: GcItems | null = null;
+    private gcError = '';
+    private gcDone = '';
     // Agent 页"执行者"区（B）；Codex 的编辑回调到这里复用设置控件（C10）。
     private agentsView = new AgentsView({
         openCodexEdit: trigger => { void this.openCodexEdit(trigger); },
         codexChange: () => this.connections?.codex.change,
         ack: () => { void this.ack(); },
+        settingsLoaded: settings => { this.settings = settings; this.redrawStatus(); },
     });
     private codexSheet?: Sheet;
     // 引导第 3 步：要导入的 Agent（预设、密钥状态、导入与测试结果都在这里，不跨次运行保留）。
@@ -65,7 +71,7 @@ export class PreferencesView {
     constructor(private redrawShell: () => void, private redrawStatus: () => void, private openProject?: (path: string) => void, private running: () => number = () => 0) {}
     focusManaged() { this.container?.querySelector('#managed-section')?.scrollIntoView({block:'start'}); }
     unmount() { this.container=undefined; this.active=''; }
-    async init() { this.settings = await window.dock.preferences('settings'); this.wizard = !this.settings.own.wizardDone; void this.detect(); }
+    async init() { this.settings = await window.dock.preferences('settings'); this.wizard = !this.settings.own.wizardDone; void this.detect(); void this.gcCheck(); }
     mount(container: HTMLElement, page: string, version: string) {
         this.container = container; this.active = page; this.version = version;
         this.error='';
@@ -132,6 +138,8 @@ export class PreferencesView {
     }
     private settingsPage() {
         return `<div id="managed-section">${section(p.managed,p.managedHelp,this.managedToggle())}</div>`+
+        this.parallelSection()+
+        section(sc.settingsSec,'',`<div class="set">${row(sc.leadUsage,esc(sc.leadUsageHelp),`<button class="toggle ${this.settings.leadUsage?'on':''}" data-pref="lead-usage" role="switch" aria-label="${sc.leadUsage}" aria-checked="${this.settings.leadUsage}" ${this.busy||this.settings.reason?'disabled':''}></button>`)}</div>`)+
         section(p.watch,'',`<div class="set">${row(p.watchTitle,this.description('watchWindow',p.watchHelp),this.segment('watchWindow',['auto','always','never'],p.watchOptions,this.settings.values.watchWindow!))}</div>`)+
         section(p.notifications,'',`<div class="set">${row(p.notify,esc(p.notifyHelp),`<button class="toggle ${this.settings.own.notifications?'on':''}" data-pref="notifications" role="switch" aria-label="${p.notify}" aria-checked="${this.settings.own.notifications}" ${this.busy?'disabled':''}></button>`)}</div>`)+
         section(p.appearance,'',`<div class="set">${row(p.theme,'',this.segment('theme',['system','light','dark'],p.themes,this.settings.own.theme,['computer-line','sun-line','moon-line']))}</div>`)+
@@ -139,6 +147,12 @@ export class PreferencesView {
         section(p.config,'',banner(this.settings.reason?p.configError(this.settings.reason):'')+`<div class="set">${row(p.location,`<span class="mono">${esc(this.settings.file)}</span>`,this.button(p.openFolder,'folder','sm quiet'))}</div>`)+
         this.listsSection()+
         this.dataSection();
+    }
+    // 并行一节：同时运行的任务数（config.json 的 concurrency）。分段控件 1～4；配置里手写的越界值不选任何一项，在控件前显示当前值。
+    private parallelSection() {
+        const value = this.settings.concurrency, inRange = Number.isInteger(value) && value >= 1 && value <= 4;
+        const current = inRange ? '' : `<span class="mono muted" data-concurrency-value>${value}</span>`;
+        return section(s6.parallelSec, s6.parallelLead, `<div class="set">${row(s6.concurrency, esc(s6.concurrencyHelp), current + this.segment('concurrency', ['1','2','3','4'], ['1','2','3','4'], inRange ? String(value) : ''))}</div>`);
     }
     // 列表一节（018）：清空任务列表与清空项目列表，放在"数据"一节之前。只清软件里的列表。
     private listsSection() {
@@ -154,7 +168,71 @@ export class PreferencesView {
         const leftover = this.settings.leftover
             ? `<div class="banner info" data-leftover>${mark('info')}<div class="rt"><span>${esc(p.resetLeftover(this.settings.leftover.home))}</span></div><button class="btn sm" data-pref="ack-leftover">${esc(p.ack)}</button></div>`
             : '';
-        return section(p.data, p.dataHelp, leftover + `<div class="set">${row(p.clearCache, esc(p.clearCacheHelp)+note, clear)}${row(p.resetApp, esc(p.resetHelp), `<button class="btn sm danger" data-pref="reset-app" ${this.busy?'disabled':''}>${esc(p.resetButton)}</button>`)}</div>`);
+        return section(p.data, p.dataHelp, leftover + `<div class="set">${this.gcRow()}${row(p.clearCache, esc(p.clearCacheHelp)+note, clear)}${row(p.resetApp, esc(p.resetHelp), `<button class="btn sm danger" data-pref="reset-app" ${this.busy?'disabled':''}>${esc(p.resetButton)}</button>`)}</div>`);
+    }
+    // 清理（ar gc）：KB / MB / GB 写法，一位小数。
+    private sizeText(bytes: number) {
+        const kb = bytes / 1024;
+        return kb < 1024 ? `${kb.toFixed(1)} KB` : kb < 1024 * 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${(kb / 1024 / 1024).toFixed(1)} GB`;
+    }
+    private gcCount() { const g = this.gcItems; return g ? g.worktrees.length + g.slots.length + g.sessions.length : 0; }
+    // 数据一节最上面的“清理”一行：说明末尾写检查结果；有可清理项时品牌色写数量与大小，按钮是“清理…”（点了才打开确认框，不自动删）。
+    private gcRow() {
+        const found = this.gcState === 'ready' && this.gcCount() > 0;
+        // 完成说明后面接检查结果，中间补一个句号。
+        const done = this.gcDone ? ` <span class="ok-text" data-gc-done>${esc(this.gcDone)}</span>。` : '';
+        const tail = this.gcState === 'checking' ? ` ${esc(s6.gcChecking)}`
+            : this.gcState === 'failed' ? ` ${esc(s6.gcCheckFailed(this.gcError))}`
+                : found ? ` <em class="attn" data-gc-found>${esc(s6.gcFound(this.gcCount(), this.sizeText(this.gcItems!.bytes)))}</em>` : ` ${esc(s6.gcIdle)}`;
+        const button = found
+            ? `<button class="btn sm" data-pref="gc" ${this.busy?'disabled':''}>${esc(s6.gcButton)}</button>`
+            : `<button class="btn sm quiet" data-pref="gc-recheck" ${this.busy||this.gcState==='checking'?'disabled':''}>${esc(s6.gcRecheck)}</button>`;
+        return row(s6.gc, esc(s6.gcHelp(this.settings.retentionDays)) + done + tail, button).replace('<div class="set-r">', '<div class="set-r" data-gc-row>');
+    }
+    // 软件启动时在后台检查一次，也供“重新检查”和清理完成后复用；只列出，不删。手动重新检查会清掉上次清理完成的说明。
+    async gcCheck(manual = false) {
+        if (manual) this.gcDone = '';
+        this.gcState = 'checking'; this.gcError = '';
+        this.renderSettings();
+        try { this.gcItems = await window.dock.console('gc:check') as GcItems; this.gcState = 'ready'; }
+        catch (e) { this.gcError = String((e as Error)?.message || e); this.gcState = 'failed'; }
+        this.renderSettings();
+    }
+    private renderSettings() { if (!this.wizard && this.active === 'settings') this.render(); }
+    // 清理确认框：逐项写原因、名字和大小；点“清理”才调用 gc:run。worktree 写目录名，会话记录写“执行者 · 日期”。
+    private openGc(trigger: HTMLElement) {
+        const g = this.gcItems;
+        if (!g) return;
+        const base = (file: string) => file.split(/[\\/]/).filter(Boolean).at(-1) ?? file;
+        const now = window.dock.demoNow ?? Date.now();
+        const line = (iconName: string, reason: string, name: string, size: number) => `<div class="kv" data-gc-item><span class="mk">${icon(iconName)}</span><span class="lb">${esc(reason)}</span><span class="val mono" title="${esc(name)}">${esc(name)}</span><span class="mono muted">${size > 0 ? esc(this.sizeText(size)) : ''}</span></div>`;
+        const rows = [
+            ...g.worktrees.map(w => line('git-branch-line', s6.gcReason[w.reason] ?? w.reason, base(w.dir), w.size)),
+            ...g.slots.map(s => line('git-branch-line', s6.gcReason.slot, base(s.file), s.size)),
+            ...g.sessions.map(s => line('chat-history-line', s6.gcSessionReason(this.settings.retentionDays), s6.gcSession(s.worker, new Date(now - s.ageDays * 86400000).toLocaleDateString('en-CA')), s.size)),
+        ].join('');
+        const sheet = openSheet({ title: s6.gcTitle(this.gcCount()), trigger, body: `<p class="sheet-lead">${esc(s6.gcLead(this.sizeText(g.bytes)))}</p><div class="card"><div class="card-b">${rows}</div></div>`, buttons: [c.cancel, s6.gcConfirm],
+            onButton: (index, s) => {
+                if (index === 0) { s.close(); return; }
+                s.busy(true);
+                s.fail('');
+                s.root.querySelector<HTMLElement>('.sheet-btns button:last-of-type')!.innerHTML = `<span class="mk run">${icon('loader-4-line')}</span>${esc(s6.gcRunning)}`;
+                void (async () => {
+                    try {
+                        const result = await window.dock.console('gc:run') as GcRun;
+                        const failed = result.errors?.length ?? 0, cleaned = (result.worktrees?.length ?? 0) + (result.slots?.length ?? 0) + (result.sessions?.length ?? 0) - failed;
+                        this.gcDone = s6.gcDone(cleaned, this.sizeText(result.bytes ?? 0)) + (failed ? s6.gcPartial(failed) : '');
+                        s.close();
+                        await this.gcCheck();
+                    }
+                    catch (e) { s.busy(false); s.fail(String((e as Error)?.message || e)); }
+                })();
+            } });
+        // 底栏最后一个按钮默认是主按钮：清理换成危险样式；默认焦点在取消。
+        const buttons = sheet.root.querySelectorAll<HTMLButtonElement>('.sheet-btns button');
+        buttons[1]?.classList.remove('primary');
+        buttons[1]?.classList.add('danger');
+        buttons[0]?.focus({ preventScroll: true });
     }
     private secretNames() {
         const names = new Set<string>();
@@ -429,7 +507,7 @@ export class PreferencesView {
         this.wizardProject = '';
         this.wizardOpenInit = true;
     }
-    private async save(key: string, value: string|boolean|null, own = false) {
+    private async save(key: string, value: string|number|boolean|null, own = false) {
         this.busy=true; this.error=''; this.render();
         try { this.settings=await window.dock.preferences(own?'own':'save',{key,value}); }
         catch(e) { this.error=String((e as Error).message||e); }
@@ -442,7 +520,9 @@ export class PreferencesView {
             const key=d.setting;
             menu(b,[{label:p.follow(this.settings.current[key]),run:()=>{void this.save(key,null);}},...(key==='model'?[{label:p.customModel,run:()=>this.modelInput(b)}]:(key==='effort'?['minimal','low','medium','high','xhigh']:['default','priority','flex']).map(value=>({label:value,run:()=>{void this.save(key,value);}})))],true); return;
         }
-        if(d.segment) { await this.save(d.segment,d.value!,d.segment==='theme'||d.segment==='closeAction'); return; }
+        if(d.segment) { await this.save(d.segment,d.segment==='concurrency'?Number(d.value):d.value!,d.segment==='theme'||d.segment==='closeAction'); return; }
+        if(d.pref==='gc') { this.openGc(b); return; }
+        if(d.pref==='gc-recheck') { await this.gcCheck(true); return; }
         if(d.pref==='clear-cache') { await this.clearCache(); return; }
         if(d.pref==='clear-tasks') { await this.clearTasks(b); return; }
         if(d.pref==='clear-projects') { await this.clearProjects(b); return; }
@@ -456,6 +536,7 @@ export class PreferencesView {
         if(d.pref==='wizard-open-init') { this.wizardOpenInit=!this.wizardOpenInit; this.render(); return; }
         if(d.pref==='wizard-finish') { await this.finishWizardProject(); return; }
         if(d.pref==='managed') { await this.save('managed',!this.settings.managed); return; }
+        if(d.pref==='lead-usage') { await this.save('leadUsage',!this.settings.leadUsage); return; }
         if(d.pref==='detect') return this.detect();
         if(b.hasAttribute('data-import-agent')) { this.agentsView.openImport(b); return; }
         if(d.pref==='folder') return window.dock.preferences('openConfig');

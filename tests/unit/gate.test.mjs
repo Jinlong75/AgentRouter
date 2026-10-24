@@ -68,6 +68,20 @@ test('summarizeGate：不要求提交时 commit.ok 为假不算失败', () => {
   assert.equal(summarizeGate(parts({ commit: { required: false, ok: false } })), '门禁通过');
 });
 
+test('summarizeGate：工作区外的新文件放在最后一段，最多列 5 个；没有或 added 为空时输出一字不变', () => {
+  const added = (...names) => ({ checked: true, added: names.map(name => ({ root: 'user', name, type: 'file' })) });
+  assert.equal(summarizeGate({ ...parts(), outsideWrites: added('config.json') }), '工作区外出现新文件：user/config.json');
+  assert.equal(
+    summarizeGate({ ...parts({ outside: ['README.md'], commands: [command({ exit: 1 })] }), outsideWrites: { checked: true, added: [{ root: 'home', name: 'x.txt', type: 'dir' }] } }),
+    '改动超出范围：README.md；验收命令失败：npm test（exit 1）；工作区外出现新文件：home/x.txt',
+  );
+  assert.equal(summarizeGate({ ...parts(), outsideWrites: added('a', 'b', 'c', 'd', 'e', 'f') }), '工作区外出现新文件：user/a、user/b、user/c、user/d、user/e 等');
+  for (const outsideWrites of [undefined, { checked: true, added: [] }, { checked: false, error: '读不了' }]) {
+    assert.equal(summarizeGate({ ...parts(), outsideWrites }), '门禁通过');
+    assert.equal(summarizeGate({ ...parts({ outside: ['README.md'] }), outsideWrites }), '改动超出范围：README.md');
+  }
+});
+
 test('parseStatusPorcelainZ：普通项、未跟踪项；重命名的新旧路径都列出', () => {
   // -z 下每条是 "<XY> <路径>"，重命名后面紧跟旧路径。
   const text = ' M src/中文 文件.js\0?? notes/a b.txt\0R  lib/a.js\0src/a.js\0C  copy/b.js\0src/b.js\0';

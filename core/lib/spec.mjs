@@ -230,8 +230,8 @@ function checkAllowedPath(item, index, fail) {
   if (item.trim() === '') fail('allowed_paths', `第 ${n} 项不能为空`);
   if (item.includes('\\')) fail('allowed_paths', `第 ${n} 项不能包含反斜杠（路径用 / 分隔）`);
   if (item.startsWith('/')) fail('allowed_paths', `第 ${n} 项必须是相对路径（不能以 / 开头）`);
-  // TODO(lead): 协议只写"不得以盘符开头"。这里按 Windows 盘符路径（X:\、X:/、X:）判断；
-  // X:相对路径（如 a:b）当普通 glob 处理，因为现有 spec-new 往返用例用 a:b 作引号示例，任务说明要求不改已有断言。
+  // 盘符只认 X:\、X:/ 和整项正好是 X:（协议第 11 节"写法校验"）；
+  // a:b 这类 X:相对路径按普通路径模式处理。
   if (/^[A-Za-z]:(?:[\\/]|$)/.test(item)) fail('allowed_paths', `第 ${n} 项不能带盘符`);
   if (item.split('/').some(segment => segment === '.' || segment === '..')) {
     fail('allowed_paths', `第 ${n} 项不能包含 . 或 .. 段`);

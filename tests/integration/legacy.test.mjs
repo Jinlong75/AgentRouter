@@ -15,11 +15,13 @@ function fixture(t) {
   t.after(() => { assert.equal(dirname(base), resolve(tmpdir())); fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
   const repo = join(base, '示例 仓库'), appdata = join(base, 'appdata');
   fs.mkdirSync(repo); fs.mkdirSync(appdata);
+  // 回显文件放进预先建好的子目录：USERPROFILE 就是 base，写在 base 根的第一层会被当作工作区外的新文件。
+  fs.mkdirSync(join(base, 'echo'));
   const fake = join(base, '假 agent.mjs'); fs.copyFileSync(join(fixtures, 'fake-agent.txt'), fake);
   const env = { ...process.env };
   for (const k of Object.keys(env)) if (/^(CODEX_|AR_|AGENT_ROUTER_|FAKE_)|^CLAUDECODE$/.test(k)) delete env[k];
   Object.assign(env, { APPDATA: appdata, USERPROFILE: base, HOME: base, XDG_CONFIG_HOME: appdata, CODEX_HOME: join(base, 'codex'), AR_NO_WATCH: '1', AR_TEST_AGENT: fake,
-    FAKE_ECHO: join(base, 'argv.json'), FAKE_FIXTURES: JSON.stringify([join(fixtures, 'codex-sample.jsonl')]) });
+    FAKE_ECHO: join(base, 'echo', 'argv.json'), FAKE_FIXTURES: JSON.stringify([join(fixtures, 'codex-sample.jsonl')]) });
   const home = join(appdata, 'agent-router'), legacy = join(appdata, 'codex-dispatch');
   const ar = args => spawnSync(process.execPath, [entry, ...args], { cwd: repo, env, encoding: 'utf8', timeout: 20000, windowsHide: true, shell: false });
   // v1 旧任务：平铺在 .codex-runs/，清单在旧公共目录。

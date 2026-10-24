@@ -2,13 +2,43 @@ import { watch, type FSWatcher } from 'node:fs';
 import { open, readFile, writeFile, appendFile, mkdir, rename, unlink, readdir, stat, lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { DeleteResult, Task, TaskAttempt } from '../shared/types';
+import { worktreeState, type DeleteResult, type NeedsScopeItem, type OutsideAdded, type OutsideWrites, type Task, type TaskAttempt, type WtInfo } from '../shared/types';
 import { commitFrom } from '../shared/markdown';
 import { c } from '../shared/copy';
 import { dispatchMatches, type Platform, type ProcessInfo } from './platform';
 import type { ProcessCheck } from '../shared/types';
 import { legacyRunsName } from '../../../core/lib/compat.mjs';
 import { parseJson } from '../../../core/lib/json.mjs';
+// needsScope（协议 14.5）：数组、每项 path 是非空字符串、reason 是字符串或 null、最多 50 条；不合法就当没有。
+function readNeedsScope(value: unknown): NeedsScopeItem[] | undefined {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 50)
+        return undefined;
+    const list: NeedsScopeItem[] = [];
+    for (const item of value) {
+        if (!item || typeof item !== 'object' || typeof item.path !== 'string' || item.path === '' || !(item.reason === null || typeof item.reason === 'string'))
+            return undefined;
+        list.push({ path: item.path, reason: item.reason });
+    }
+    return list;
+}
+// outsideWrites（协议 12.4）：{ checked: true, added: [{ root, name, type }] } 或 { checked: false, error }；
+// root 只能是 user / home，type 只能是 file / dir / other，name 非空；不合法就当没有。
+function readOutsideWrites(value: unknown): OutsideWrites | undefined {
+    if (!value || typeof value !== 'object')
+        return undefined;
+    const raw = value as { checked?: unknown; added?: unknown; error?: unknown };
+    if (raw.checked === false)
+        return { checked: false, added: [], error: typeof raw.error === 'string' ? raw.error : '' };
+    if (raw.checked !== true || !Array.isArray(raw.added))
+        return undefined;
+    const added: OutsideAdded[] = [];
+    for (const item of raw.added) {
+        if (!item || typeof item !== 'object' || !['user', 'home'].includes(item.root) || typeof item.name !== 'string' || item.name === '' || !['file', 'dir', 'other'].includes(item.type))
+            return undefined;
+        added.push({ root: item.root, name: item.name, type: item.type });
+    }
+    return { checked: true, added };
+}
 export function mergeLine(tasks: Map<string, Task>, line: string) {
     try {
         const e = JSON.parse(line);
@@ -33,6 +63,8 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
             // 老记录没有这两个字段，任务对象保持与以前一致。
             if (typeof e.gate === 'boolean') t.gate = e.gate;
             if (typeof e.base === 'string') t.base = e.base;
+            // worktree 模式（协议 15.3）：只有 start 就是排队；之后的 queued / preparing / worktree / setup 等事件推进阶段。
+            if (e.worktree === true) { t.worktree = true; t.wt = { phase: 'queued', queuedAt: e.started }; }
             tasks.set(t.id, t);
         }
         else {
@@ -59,6 +91,46 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 t.gateOk = undefined;
                 t.gateSummary = undefined;
                 t.gatingAt = undefined;
+                delete t.needsScope;
+                delete t.outsideWrites;
+                // worktree 任务重试 / 解决冲突之后回到进行中：冲突与准备失败的标记不再算，之后的 queued / preparing 照常覆盖阶段。
+                if (t.wt) { t.wt.phase = 'live'; delete t.wt.conflictFiles; delete t.wt.setupFailed; delete t.wt.awaitingAt; }
+            }
+            // worktree 模式的状态事件（协议 15.3 / 15.6 / 15.7）：不认识的字段忽略；cleanup 不改变阶段。
+            if (t.wt) {
+                const w = t.wt;
+                if (e.event === 'queued') {
+                    w.phase = 'queued';
+                    if (Number.isFinite(e.at)) w.queuedAt = e.at;
+                }
+                else if (e.event === 'preparing')
+                    w.phase = 'preparing';
+                else if (e.event === 'worktree') {
+                    for (const key of ['branch', 'dir', 'base'] as const)
+                        if (typeof e[key] === 'string') w[key] = e[key];
+                    if (Number.isFinite(e.at)) w.worktreeAt = e.at;
+                    w.phase = 'preparing';
+                }
+                else if (e.event === 'setup') {
+                    w.setup = { ok: e.ok === true, ...(typeof e.summary === 'string' ? { summary: e.summary } : {}) };
+                    if (e.ok === true) w.phase = 'preparing';
+                }
+                else if (e.event === 'attempt' || e.event === 'gating')
+                    w.phase = 'live';
+                else if (e.event === 'accepted' && w.phase === 'awaiting') {
+                    w.accepted = { merge: typeof e.merge === 'string' ? e.merge : null, mode: e.mode === 'squash' ? 'squash' : 'no-ff', by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
+                    w.phase = 'accepted';
+                }
+                else if (e.event === 'rejected' && ['awaiting', 'conflict', 'failed'].includes(w.phase)) {
+                    w.rejected = { reason: typeof e.reason === 'string' ? e.reason : '', keptBranch: e.keptBranch === true, by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
+                    w.phase = 'rejected';
+                }
+                else if (e.event === 'conflict' && ['awaiting', 'failed', 'conflict'].includes(w.phase)) {
+                    w.conflictFiles = Array.isArray(e.files) ? e.files.filter((f: unknown): f is string => typeof f === 'string') : [];
+                    w.phase = 'conflict';
+                }
+                else if (e.event === 'cleanup' && e.ok === false && ['accepted', 'rejected'].includes(w.phase))
+                    w.cleanupFailed = true;
             }
             // 尝试记录（协议 14.2 / 14.3）：attempt 记开始信息，attempt-end 补上结果字段；
             // 当前尝试 = 最后一个 attempt。旧记录没有这些事件，任务对象与以前一致。
@@ -79,7 +151,19 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                         item.usage = { input: Number.isFinite(e.usage.input) ? e.usage.input : null, output: Number.isFinite(e.usage.output) ? e.usage.output : null };
                     if (Number.isFinite(e.ms))
                         item.ms = e.ms;
+                    const scope = readNeedsScope(e.needsScope);
+                    if (scope)
+                        item.needsScope = scope;
+                    const outside = readOutsideWrites(e.outsideWrites);
+                    if (outside)
+                        item.outsideWrites = outside;
                 }
+                // 任务上的 outsideWrites 取最后一次尝试的：后一次没有就清掉前一次的。
+                const outside = readOutsideWrites(e.outsideWrites);
+                if (outside)
+                    t.outsideWrites = outside;
+                else
+                    delete t.outsideWrites;
             }
             // 门禁开始：执行者结束后核心写 gating，随后写 gate 结果，最后才写 end。
             if (e.event === 'gating' && Number.isFinite(e.at))
@@ -95,7 +179,18 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 t.minutes = Number.isFinite(e.minutes) && e.minutes >= 0 ? e.minutes : undefined;
                 if (Number.isInteger(e.agentExit))
                     t.agentExit = e.agentExit;
+                const scope = readNeedsScope(e.needsScope);
+                if (scope)
+                    t.needsScope = scope;
+                else
+                    delete t.needsScope;
                 t.status = t.exit === 0 ? 'done' : 'fail';
+                // worktree 模式里 end.exit === 0 是进入待验收；准备失败的 end 带 reason: "setup"。
+                if (t.wt) {
+                    t.wt.phase = t.exit === 0 ? 'awaiting' : 'failed';
+                    if (t.exit === 0 && Number.isFinite(e.at)) t.wt.awaitingAt = e.at;
+                    t.wt.setupFailed = e.reason === 'setup';
+                }
             }
             if (e.event === 'interrupted' && t.exit === undefined) {
                 t.ended = Number.isFinite(e.at) ? e.at : undefined;
@@ -105,6 +200,16 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
         }
     }
     catch { /* 单行损坏不影响后续记录。 */ }
+}
+// 排在它前面的任务数（协议 15.3 / 15.5）：比它先进入排队、现在仍是 queued 的 worktree 任务；先后按进入排队的时刻，相同再按开始时刻与 id。
+export function queuedAhead(tasks: Task[], t: Task): number {
+    const key = (x: Task) => [x.wt?.queuedAt ?? x.started, x.started];
+    const [at, started] = key(t);
+    return tasks.filter(x => {
+        if (x === t || x.id === t.id || worktreeState(x) !== 'queued') return false;
+        const [xat, xstarted] = key(x);
+        return xat < at || (xat === at && (xstarted < started || (xstarted === started && x.id < t.id)));
+    }).length;
 }
 export function parseRegistry(text: string) { const tasks = new Map<string, Task>(); for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n'))
     mergeLine(tasks, line); return [...tasks.values()]; }
@@ -146,7 +251,8 @@ export class RegistryReader {
                     mergeLine(this.rows, line);
                 this.offset += end;
             }
-            return [...this.rows.values()].map(t => ({ ...t }));
+            // worktree 任务的 wt 对象也复制一份：Registry 之后会往上写 ahead / baseBranch，不能改到读取缓存里的那份。
+            return [...this.rows.values()].map(t => t.wt ? { ...t, wt: { ...t.wt } } : { ...t });
         }
         finally {
             await h.close();
@@ -217,7 +323,44 @@ export class Registry {
     // 进程查询的结果（快照里带给界面）：失败时 ok=false，保留错误文字、首次失败时刻与连续失败次数。
     processCheck: ProcessCheck = { ok: true, failures: 0 };
     private mutations: Promise<unknown> = Promise.resolve();
-    constructor(readonly home: string, readonly data: string, readonly platform: Platform, private changed: (tasks: Task[]) => void, private finished: (t: Task) => void, private error: (e: unknown) => void, readonly legacyHome = home) { }
+    // 同时运行的任务数上限（config.json 的 concurrency，没写或不合法为 2）；每次刷新按文件时间戳重读。
+    concurrency = 2;
+    private configStamp = '';
+    private projectCache = new Map<string, { stamp: string; value: Pick<WtInfo, 'baseBranch' | 'mergeMode'> }>();
+    constructor(readonly home: string, readonly data: string, readonly platform: Platform, private changed: (tasks: Task[]) => void, private finished: (t: Task) => void, private error: (e: unknown) => void, readonly legacyHome = home, private conflicted: (t: Task) => void = () => { }) { }
+    private async readConcurrency() {
+        const file = path.join(this.home, 'config.json');
+        const info = await stat(file).catch(() => null);
+        const stamp = info ? `${info.mtimeMs}:${info.size}` : '';
+        if (stamp === this.configStamp) return;
+        this.configStamp = stamp;
+        this.concurrency = 2;
+        if (!info) return;
+        try {
+            const value = parseJson(await readFile(file, 'utf8')).concurrency;
+            if (Number.isSafeInteger(value) && value > 0) this.concurrency = value;
+        }
+        catch { /* 配置读不出来时按默认。 */ }
+    }
+    // 项目配置里的主分支与合并方式（worktree 任务的界面文案用）；读不到就都没有，界面按 main / no-ff。
+    private async projectBits(repo: string): Promise<Pick<WtInfo, 'baseBranch' | 'mergeMode'>> {
+        const file = path.join(repo, '.agent-router', 'project.json');
+        const info = await stat(file).catch(() => null);
+        const stamp = info ? `${info.mtimeMs}:${info.size}` : '';
+        const cached = this.projectCache.get(repo);
+        if (cached?.stamp === stamp) return cached.value;
+        const value: Pick<WtInfo, 'baseBranch' | 'mergeMode'> = {};
+        if (info) {
+            try {
+                const config = parseJson(await readFile(file, 'utf8'));
+                if (typeof config.baseBranch === 'string' && config.baseBranch.trim()) value.baseBranch = config.baseBranch.trim();
+                if (config.mergeMode === 'squash' || config.mergeMode === 'no-ff') value.mergeMode = config.mergeMode;
+            }
+            catch { /* 读不出来就当没有。 */ }
+        }
+        this.projectCache.set(repo, { stamp, value });
+        return value;
+    }
     get file() { return path.join(this.home, 'runs.jsonl'); }
     // 新清单（AgentRouter）与旧清单（DispatchDock 的 codex-dispatch 公共目录）；测试隔离时两者相同。
     get files() { return [...new Set([this.file, path.join(this.legacyHome, 'runs.jsonl')])]; }
@@ -315,20 +458,35 @@ export class Registry {
         }
         const identities = new Set(rows.map(t => `${t.repo.toLowerCase()}:${t.name}:${Math.floor(t.started / 1000)}`));
         const next = [...rows, ...this.imports.filter(t => !identities.has(`${t.repo.toLowerCase()}:${t.name}:${Math.floor(t.started / 1000)}`))].filter(t => t.status === 'run' || !this.hidden.has(this.key(t))).sort((a, b) => b.started - a.started);
+        // worktree 任务：排在前面的任务数、项目配置里的主分支与合并方式；并发上限随快照一起交给界面。
+        const previousLimit = this.concurrency;
+        await this.readConcurrency();
+        for (const t of next) {
+            if (!t.wt) continue;
+            Object.assign(t.wt, await this.projectBits(t.repo));
+            const ahead = worktreeState(t) === 'queued' ? queuedAhead(next, t) : undefined;
+            if (ahead === undefined) delete t.wt.ahead; else t.wt.ahead = ahead;
+        }
         for (const t of next) {
             t.last = (await tail(t.progress)).trimEnd().split('\n').at(-1)?.replace(/^\[.*?\]\s*/, '') ?? '';
             t.commit = commitFrom(await reportText(t.report));
             t.hasReport = await stat(t.report).then(s => s.isFile(), () => false);
         }
         if (this.ready)
-            for (const t of next)
-                if (t.status !== 'run' && this.tasks.find(x => x.id === t.id)?.status === 'run')
+            for (const t of next) {
+                const previous = this.tasks.find(x => x.id === t.id);
+                if (t.status !== 'run' && previous?.status === 'run')
                     this.finished(t);
+                // 进入合并冲突（ar accept 写 conflict 事件时任务已经是"已结束"，不经过 finished）。
+                if (previous && worktreeState(t) === 'conflict' && worktreeState(previous) !== 'conflict')
+                    this.conflicted(t);
+            }
         if (this.closed)
             return;
         const different = JSON.stringify(this.tasks) !== JSON.stringify(next);
         this.tasks = next;
-        if (different)
+        // 同时运行的任务数上限变了（设置里改的，或手改了 config.json）：任务没变也要推送，侧栏底部的“n/上限”才会跟着变。
+        if (different || previousLimit !== this.concurrency)
             this.changed(next);
         const dirs = [...new Set([this.home, this.legacyHome, ...next.map(t => path.dirname(t.progress))])].sort(), signature = dirs.join('\0');
         if (signature !== this.signature) {

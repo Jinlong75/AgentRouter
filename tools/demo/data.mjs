@@ -2,6 +2,9 @@ import { summarizeGate } from '../../core/lib/gate.mjs';
 
 // 多次尝试演示任务的第一个执行者（DeepSeek）；第 3 次升级用的 claude-native 见 attemptSets。
 const DS = { profile: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', agentVersion: '2.1.302 (Claude Code)' };
+// 087 worktree 演示任务的另外两个执行者（界面稿的 MM / CL）。
+const MM = { profile: 'mimo', adapter: 'claude-code', label: 'MiMo V2.6 Flash', model: 'mimo-v2.6-flash', agentVersion: '2.1.304 (Claude Code)' };
+const CL = { profile: 'claude-native', adapter: 'claude-code', label: 'Claude Sonnet 5.5', model: 'claude-sonnet-5-5', agentVersion: '2.1.302 (Claude Code)' };
 const tasks = [
   { id: 't1', day: 'run', name: '012-背包拖拽与堆叠', project: 'pixel-garden', host: 'Claude Code', role: '执行者', state: 'run', start: '15:21', dur: '18:42', last: '运行：npm test -- inventory', sandbox: 'workspace-write' },
   { id: 't2', day: 'run', name: '007-搜索结果分页', project: 'notes-web', host: 'Claude Code', role: '执行者', state: 'run', start: '15:36', dur: '4:05', last: '修改文件：src/search/Results.tsx', sandbox: 'workspace-write' },
@@ -35,6 +38,18 @@ const tasks = [
   // t26 升级后第 3 次完成（第 3 次换用 claude-native）。
   { id: 't25', day: 'today', name: '025-导出 JSON', project: 'reader-app', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: DS, state: 'retrying', start: '15:40', dur: '6:12', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
   { id: 't26', day: 'today', name: '026-快捷键设置', project: 'reader-app', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: DS, state: 'done', start: '12:20', dur: '32.4 分钟', commit: '7c1d2e9', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  // t27（Stage06 评分，UI26）：形状照界面稿评分场景——三次尝试、第 3 次升级换用 claude-native、第 2 次动了受保护的任务说明；默认隐藏，评分由真实核心对这些数据计算。
+  { id: 't27', day: 'today', name: '027-快捷键冲突提示', project: 'reader-app', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: DS, state: 'done', start: '11:10', dur: '31.5 分钟', commit: '3e4f5a6', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  // Stage06 worktree 任务演示（087，UI24 / UI25；默认隐藏，形状照界面稿的 t20～t25）：排队、准备、待验收、合并冲突、已合并、已驳回。
+  // state 写 'wt'：不走上面四态的 end / interrupted 生成，事件序列由 index.mjs 按 wt.phase 生成（见 wtEvents）。
+  // 排队与准备中的任务演示里没有存活的派发进程（运行中的任务不会被隐藏，默认显示会变成"已中断"）；
+  // 设 AR_DEMO_SHOW_WORKTREE=1 时演示额外拉起两个假派发进程，npm run demo 里就能看到它们真的在排队 / 准备。
+  { id: 't30', day: 'today', state: 'wt', wt: { phase: 'queued', branch: 'ar/9c1e07b2a4' }, name: '018-导出 Markdown', project: 'notes-web', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: MM, start: '15:44', dur: '1:12', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't31', day: 'today', state: 'wt', wt: { phase: 'preparing', branch: 'ar/3b7d5f19e0' }, name: '019-夜间模式', project: 'pixel-garden', host: 'Claude Code', role: '执行者', executor: DS, start: '15:46', dur: '0:38', last: '准备：npm ci', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't32', day: 'today', state: 'wt', wt: { phase: 'awaiting', branch: 'ar/5f3a9c1e2d', head: 'c2d4e61' }, name: '020-成就弹窗', project: 'pixel-garden', host: 'Claude Code', role: '执行者', executor: DS, start: '14:31', dur: '18.6 分钟', commit: 'c2d4e61', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d', goal: '解锁成就时弹出提示，自动收起；同时解锁多个时排队显示。' },
+  { id: 't33', day: 'today', state: 'wt', wt: { phase: 'conflict', branch: 'ar/7e2c4d8b91', head: '8a1f2b3', files: ['src/save/schema.ts', 'tests/save-migration.test.ts'] }, name: '021-存档导出 JSON', project: 'pixel-garden', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: CL, start: '13:58', dur: '24.1 分钟', commit: '8a1f2b3', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d', goal: '把存档导出为 JSON 文件，字段与存档版本 v3 一致；导出前先迁移旧存档。' },
+  { id: 't34', day: 'today', state: 'wt', wt: { phase: 'accepted', branch: 'ar/2c6b1d4a77', head: '5e8a0c3', merge: '9b3f0a2', by: 'lead' }, name: '013-音量滑块', project: 'pixel-garden', host: 'Claude Code', role: '执行者', executor: DS, start: '13:20', dur: '11.3 分钟', commit: '5e8a0c3', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
+  { id: 't35', day: 'today', state: 'wt', wt: { phase: 'rejected', branch: 'ar/8d1e5c2f03', head: '4b2c7d9', by: 'human', reason: '方向不对：主题跟随系统即可，不要加手动开关' }, name: '017-换肤主题', project: 'notes-web', host: 'AgentRouter（软件）', dispatcher: 'agentrouter', role: '执行者', executor: MM, start: '12:48', dur: '14.0 分钟', commit: '4b2c7d9', sandbox: 'workspace-write', gate: true, base: 'a1b2c3d' },
 ];
 
 // 门禁结果（文件协议 12.3，写入任务记录目录的 gate.json）。at 由生成器按任务开始时间补。
@@ -74,6 +89,19 @@ const gates = {
     ],
   },
 };
+// 087：worktree 演示任务（t32～t35）门禁都通过；写法同 t20。
+const wtGate = (head, changed) => ({
+  v: 1, attempt: 1, ms: 12300, ok: true, base: 'a1b2c3d', head, commit: { required: true, ok: true }, uncommitted: [],
+  scope: { allowed: ['src/**', 'tests/**'], changed, outside: [], protected: [], deleted: [] },
+  commands: [
+    { line: 'npm test', argv: ['npm', 'test'], exit: 0, ms: 9210, output: 'ℹ tests 51\nℹ pass 51\nℹ fail 0', truncated: false, error: null },
+    { line: 'npm run lint', argv: ['npm', 'run', 'lint'], exit: 0, ms: 2840, output: '', truncated: false, error: null },
+  ],
+});
+gates.t32 = wtGate('c2d4e61', ['src/achievements/popup.ts', 'src/achievements/store.ts', 'src/ui/Toast.ts', 'tests/achievements.test.ts']);
+gates.t33 = wtGate('8a1f2b3', ['src/save/export.ts', 'src/save/schema.ts', 'tests/save-migration.test.ts']);
+gates.t34 = wtGate('5e8a0c3', ['src/audio/volume.ts', 'tests/audio-volume.test.ts']);
+gates.t35 = wtGate('4b2c7d9', ['src/theme/skin.ts', 'tests/theme-skin.test.ts']);
 // summary 不手写：用核心的 summarizeGate 按协议 12.3 生成，演示数据与真实门禁同一种写法。
 for (const gate of Object.values(gates)) gate.summary = summarizeGate(gate);
 
@@ -109,6 +137,22 @@ const attemptSets = {
       gate: attemptGate(3, 8400, { ok: true, head: '7c1d2e9', changed: ['src/input/keymap.ts', 'tests/input/keymap.test.ts'], commands: [cmd('npm test', 0, 8400, 'ℹ tests 26\nℹ pass 26\nℹ fail 0')] }),
       report: '# 完成了什么（第 3 次尝试）\n\n恢复了上一次改动的任务说明；在 keymap 里处理冲突的快捷键，新增 4 条测试，全部通过。\n',
       events: [['say', '恢复了任务说明；改为在 keymap 里处理冲突的快捷键。'], ['cmd', 'npm test', 0, 'ℹ tests 26\nℹ pass 26\nℹ fail 0'], ['say', '验收命令全部通过，已提交。']] },
+  ],
+  // t27：评分演示。第 1 次门禁因测试失败，第 2 次因动了受保护的任务说明，第 3 次升级换用 claude-native 通过；
+  // 事件里有 2 条出错和 1 条失败的命令，评分里"工具报错"是 3 个。
+  t27: [
+    { n: 1, total: 3, profile: 'deepseek', reason: 'first', offset: 0, ms: 540000, exit: 0, gateOk: false, usage: { input: 44800, output: 7100 },
+      gate: attemptGate(1, 7200, { ok: false, head: '4a5b6c7', changed: ['src/input/conflict.ts'], commands: [cmd('npm test', 1, 7200, 'ℹ tests 20\nℹ pass 18\nℹ fail 2')] }),
+      report: '# 完成了什么（第 1 次尝试）\n\n实现了快捷键冲突提示；有 2 条测试没过。\n',
+      events: [['say', '先读任务说明和现有的快捷键模块。'], ['file', [['add', 'src/input/conflict.ts']]], ['cmd', 'npm test', 1, 'ℹ tests 20\nℹ pass 18\nℹ fail 2'], ['error', '读取 tests/input/conflict.test.ts 失败：文件不存在'], ['say', '已提交，汇报写好了。']] },
+    { n: 2, total: 3, profile: 'deepseek', reason: 'gate', offset: 580000, ms: 480000, exit: 0, gateOk: false, usage: { input: 31200, output: 4600 },
+      gate: attemptGate(2, 6400, { ok: false, head: '8d9e0f1', changed: ['src/input/conflict.ts', 'docs/specs/027-快捷键冲突提示.md'], outside: ['docs/specs/027-快捷键冲突提示.md'], protectedPaths: ['docs/specs/027-快捷键冲突提示.md'], commands: [cmd('npm test', 0, 6400, 'ℹ tests 20\nℹ pass 20\nℹ fail 0')] }),
+      report: '# 完成了什么（第 2 次尝试）\n\n修好了失败的测试，并把任务说明里的验收命令改短了（门禁判为越界）。\n',
+      events: [['say', '修好了测试；顺手把任务说明里的验收命令改短了。'], ['file', [['update', 'docs/specs/027-快捷键冲突提示.md']]], ['error', '运行 npm run lint 时被中断'], ['say', '已提交，汇报写好了。']] },
+    { n: 3, total: 3, profile: 'claude-native', reason: 'gate', offset: 1100000, ms: 780000, exit: 0, gateOk: true, usage: { input: 46700, output: 8500 },
+      gate: attemptGate(3, 8100, { ok: true, head: '3e4f5a6', changed: ['src/input/conflict.ts', 'tests/input/conflict.test.ts'], commands: [cmd('npm test', 0, 8100, 'ℹ tests 24\nℹ pass 24\nℹ fail 0')] }),
+      report: '# 完成了什么（第 3 次尝试）\n\n恢复了上一次改动的任务说明；冲突的快捷键在设置页里标红并给出提示，新增 4 条测试，全部通过。\n',
+      events: [['say', '恢复了任务说明；改为在设置页里标出冲突的快捷键。'], ['cmd', 'npm test', 0, 'ℹ tests 24\nℹ pass 24\nℹ fail 0'], ['say', '验收命令全部通过，已提交。']] },
   ],
 };
 const GROUPS = { run: '进行中', today: '今天', yesterday: '昨天' };
@@ -200,4 +244,22 @@ const reportRich = [
   '无。',
 ].join('\n');
 
-export { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, reportRich };
+// 087：worktree 演示任务的派发参数里的门禁设置（dispatch.json 的 gate.merged）：允许改动与验收命令。
+// 放在这里而不是生成器里：生成器的字符串字面量会被"演示文本里没有字面的 **"那条测试逐条扫描，允许路径的通配符不是文本。
+const wtMerged = { allowed_paths: ['src/**', 'tests/**'], verify: ['npm test', 'npm run lint'] };
+
+// 087：t32（待验收）的汇报，含 TODO(lead) 与推断清单两个高亮段落。
+const wtReport = [
+  '# 完成了什么', '',
+  '解锁成就时弹出提示，3 秒后自动收起；同时解锁多个时排队依次显示。`unlock` 现在返回是否新解锁，并发出 `unlocked` 事件。', '',
+  '提交：`c2d4e61`', '',
+  '## 验证', '',
+  '`npm test` 51/51 通过，新增 6 条成就弹窗测试；`npm run lint` 通过。', '',
+  '## TODO(lead) 1 条', '',
+  '1. 弹窗文案"解锁成就：<名称>"是占位，等你定。', '',
+  '## 推断清单 2 条', '',
+  '1. 弹窗显示 3 秒；任务说明没写时长。',
+  '2. 多个成就同时解锁时按解锁顺序排队，不合并成一条。',
+].join('\n');
+
+export { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, reportRich, wtReport, wtMerged };

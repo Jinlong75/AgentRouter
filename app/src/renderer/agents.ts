@@ -15,6 +15,8 @@ export interface AgentsHost {
     openCodexEdit(trigger: HTMLElement): void;
     codexChange(): { old: string; next: string } | undefined;
     ack(): void;
+    // 刷新执行者列表时顺带读到的最新设置：侧栏底部列出启用的执行者，这里变了（启用、停用、导入、删除）它要跟着变。
+    settingsLoaded?(settings: Settings): void;
 }
 
 export class AgentsView {
@@ -46,6 +48,7 @@ export class AgentsView {
             ]);
             this.agents = list.agents;
             this.profiles = settings.profiles;
+            this.host.settingsLoaded?.(settings);
             this.error = '';
         }
         catch (e) { this.error = String((e as Error).message || e); }

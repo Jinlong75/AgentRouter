@@ -3,7 +3,7 @@
 // 只做参数校验与结果映射：参数一律用数组传给 coreRun（绝不拼命令字符串），
 // 密钥值只经 input 传入，绝不进参数数组，也绝不写进日志或错误信息。
 import path from 'node:path';
-import { readFile, stat } from 'node:fs/promises';
+import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import { parseJson } from '../../../core/lib/json.mjs';
 
 // 执行者名 / 预设名：字母、数字、下划线、连字符，1～40 个字符。
@@ -41,10 +41,37 @@ export function claudeLaunch({ dir, name, wt }) {
   return { executable: 'cmd.exe', args: ['/c', 'start', `AgentRouter · ${String(name ?? '').replace(/["\r\n]/g, '')}`, '/D', dir, 'cmd.exe', '/k', 'claude'] };
 }
 
+// 任务说明里的"目标"：去掉 front matter 后，取"## 目标"一节的第一段；没有这一节时取第一个非标题段落。折成一行，最长 300 字符。
+export function specGoal(text) {
+  const body = String(text).replace(/^\uFEFF/, '').replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex(line => /^##\s*目标\s*$/.test(line.trim()));
+  const scope = start >= 0 ? lines.slice(start + 1) : lines;
+  const paragraph = [];
+  for (const line of scope) {
+    if (/^#{1,6}\s/.test(line)) { if (paragraph.length || start >= 0) break; continue; }
+    if (!line.trim()) { if (paragraph.length) break; continue; }
+    paragraph.push(line.trim());
+  }
+  const goal = paragraph.join(' ').replace(/\s+/g, ' ');
+  return goal ? Array.from(goal).slice(0, 300).join('') : null;
+}
+
+// 一项占用的字节数：目录递归累加，不跟随符号链接；读不到的算 0。核心的 ar gc 只给总大小，确认框要逐项显示，所以这里只读地量一遍。
+export async function sizeOf(target) {
+  if (typeof target !== 'string' || !path.isAbsolute(target)) return 0;
+  let info;
+  try { info = await lstat(target); } catch { return 0; }
+  if (!info.isDirectory()) return info.size;
+  let names;
+  try { names = await readdir(target); } catch { return 0; }
+  return (await Promise.all(names.map(name => sizeOf(path.join(target, name))))).reduce((sum, n) => sum + n, 0);
+}
+
 export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false }) {
   const invalid = () => { throw new Error(messages.invalid); };
   // 组装参数数组并调用核心，按约定整理结果。
-  const run = async (args, { input, timeoutMs, cwd } = {}) => {
+  const run = async (args, { input, timeoutMs, cwd, conflict = false } = {}) => {
     let result;
     try { result = await coreRun(args, { input, timeoutMs, cwd }); }
     catch (error) { throw new Error(messages.failed(error instanceof Error ? error.message : String(error))); }
@@ -52,6 +79,8 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
     // coreRun 超时会结束子进程并标出 timedOut（这时 json 是兜底的 { ok:false }，不能当作核心的错误显示）。
     if (timedOut) throw new Error(messages.timeout(Math.round(timeoutMs / 1000)));
     if (json && json.ok === true) { const { lines, ...rest } = json; return rest; }
+    // 合并冲突（ar accept 退出码 4，json 为 { ok:false, conflict:true, files }）不是错误：原样交给界面显示冲突。
+    if (conflict && json && json.ok === false && json.conflict === true) return { conflict: true, files: Array.isArray(json.files) ? json.files.filter(f => typeof f === 'string') : [] };
     if (json && json.ok === false) {
       const error = new Error(json.error || messages.noResult);
       // 核心的错误码（如 NEED_GIT_IDENTITY）原样带给渲染层，界面据此显示对应的指引。
@@ -236,6 +265,86 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       await registeredProject(p.project);
       return run(args, { timeoutMs: 60000, cwd: p.project });
     },
+    // 批准并合并（协议 15.6）：在项目根运行 ar accept，软件发起记为 human；合并方式由核心按项目配置的 mergeMode 决定。
+    // 成功返回 { merge, mode, cleanup }；冲突（退出码 4）返回 { conflict: true, files }；检查不通过时核心的中文原因作为错误抛出。合并大仓库可能较慢，超时 120 秒。
+    async 'tasks:accept'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await registeredProject(p.project);
+      return run(['accept', p.name, '--by', 'human'], { timeoutMs: 120000, cwd: p.project, conflict: true });
+    },
+    // 驳回（协议 15.7）：原因必填（空白不算）；keepBranch 为 true 时保留分支。
+    async 'tasks:reject'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      if (typeof p.reason !== 'string' || !p.reason.trim() || p.reason.length > 2000) invalid();
+      if (p.keepBranch !== undefined && typeof p.keepBranch !== 'boolean') invalid();
+      const args = ['reject', p.name, '--reason', p.reason.trim()];
+      if (p.keepBranch === true) args.push('--keep-branch');
+      args.push('--by', 'human');
+      await registeredProject(p.project);
+      return run(args, { timeoutMs: 60000, cwd: p.project });
+    },
+    // 任务改动（协议 15.9）：只读，每个文件的 patch 最多 200 KB、整体最多 2 MB，超时 60 秒。
+    async 'tasks:diff'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await registeredProject(p.project);
+      return run(['diff', p.name], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 链路报告（协议 16.1）：只读，分数全由核心算；任务还在进行或不是用任务说明派发的，核心拒绝，原因原样交给界面。
+    async 'tasks:report'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await registeredProject(p.project);
+      return run(['report', p.name, '--json'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 门禁失败归因（协议 16.4）：第 n 次尝试的归因改成任务说明（spec）或执行者（worker），核心写 marks.json 并返回重算后的报告。
+    async 'tasks:blame'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      if (!Number.isSafeInteger(p?.n) || p.n < 1 || p.n > 999) invalid();
+      if (p.who !== 'spec' && p.who !== 'worker') invalid();
+      await registeredProject(p.project);
+      return run(['report', p.name, '--blame', `${p.n}=${p.who}`, '--json'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 冲突后继续（协议 15.8）：在原 worktree 里合并主分支，没有冲突就重新跑门禁，有冲突就让执行者解决；脱离派发，写法同 tasks:retry。
+    async 'tasks:rebase'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await registeredProject(p.project);
+      return run(['retry', p.name, '--rebase', '--host', 'agentrouter', '--detach'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 验收页概览用的任务说明摘要：派发参数里的允许改动与验收命令（dispatch.json 的 gate.merged），以及任务说明里"目标"的第一段。
+    // 只读文件，不调用核心；dir 必须是已读到的任务的记录目录，任务说明路径必须在项目里。读不到的项为 null。
+    async 'tasks:overview'(p) {
+      if (!validAbsPath(p?.dir) || p.dir.split(/[\\/]/).includes('..') || path.basename(path.dirname(p.dir)) !== '.agent-runs') invalid();
+      if (!(await knownRunDir(p.dir))) invalid();
+      const missing = error => { if (error?.code !== 'ENOENT') throw error; return null; };
+      const strings = value => Array.isArray(value) && value.every(item => typeof item === 'string') ? value : null;
+      let allowed = null, verify = null;
+      const dispatchText = await readFile(path.join(p.dir, 'dispatch.json'), 'utf8').catch(missing);
+      if (dispatchText !== null) {
+        try { const merged = parseJson(dispatchText)?.gate?.merged; allowed = strings(merged?.allowed_paths); verify = strings(merged?.verify); } catch { /* 读不出来就没有。 */ }
+      }
+      let goal = null;
+      if (p.spec !== undefined && p.spec !== null) {
+        if (!validAbsPath(p.repo) || !validSpecRel(p.spec)) invalid();
+        const file = path.resolve(p.repo, p.spec), relative = path.relative(path.resolve(p.repo), file);
+        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) invalid();
+        const text = await readFile(file, 'utf8').catch(missing);
+        if (text !== null) goal = specGoal(text);
+      }
+      return { allowed, verify, goal };
+    },
+    // 清理（ar gc）：check 是 ar gc --dry-run（只列出，不删），run 是 ar gc（真正删除）；都只作用于公共目录与 worktree 根，超时 120 秒。
+    // check 的每一项多带一个 size（字节，量一遍目录得到），给确认框逐项显示。
+    async 'gc:check'() {
+      const result = await run(['gc', '--dry-run'], { timeoutMs: 120000 });
+      const sized = async (items, key) => Promise.all((Array.isArray(items) ? items : []).map(async item => ({ ...item, size: await sizeOf(item?.[key]) })));
+      return { ...result, worktrees: await sized(result.worktrees, 'dir'), slots: await sized(result.slots, 'file'), sessions: await sized(result.sessions, 'dir') };
+    },
+    async 'gc:run'() { return run(['gc'], { timeoutMs: 120000 }); },
     // 某一次尝试的汇报与门禁（attempts/<n>/report.md、gate.json，协议 14.2 第 3 条）：只读文件，不调用核心。
     // dir 是任务记录目录（<项目>/.agent-runs/<记录名>），n 是尝试序号；没有 attempts/ 目录（旧任务）时 exists 为 false。
     // dir 还必须是主进程已读到的某个任务的记录目录（knownRunDir，由 index.ts 从 Registry 注入）；不在清单里不读任何文件。

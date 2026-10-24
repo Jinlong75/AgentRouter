@@ -20,7 +20,8 @@ const REQUIREMENTS = `要求：
 export function buildPrompt(base, { n, total, failure, note } = {}) {
   if (!failure && !note) return base;
   const paragraphs = [base];
-  if (failure) {
+  if (failure?.kind === 'conflict') paragraphs.push(...conflictParagraphs(failure));
+  else if (failure) {
     paragraphs.push(
       `## 上一次尝试没有通过验收（第 ${n - 1} 次${total == null ? '' : `，共允许 ${total} 次`}）`,
       ...failureParagraphs(failure),
@@ -29,6 +30,21 @@ export function buildPrompt(base, { n, total, failure, note } = {}) {
   }
   if (note) paragraphs.push(`## 主导补充说明\n\n${note}`);
   return paragraphs.join('\n\n');
+}
+
+// 合并冲突（协议 15.8）：主分支有新的提交，合并进当前工作区时有冲突，合并停在冲突状态。
+// failure：{ kind: 'conflict', files: [冲突文件], baseBranch }。
+function conflictParagraphs({ files = [], baseBranch = '主分支' }) {
+  return [
+    `## 需要解决合并冲突`,
+    `${baseBranch} 上有新的提交，把它合并进当前工作区时有冲突，合并停在冲突状态，还没有提交。`,
+    listSection('以下文件有冲突：', files),
+    `要求：
+1. 解决合并冲突，保留双方的意图，不要简单地丢掉任何一方的改动。
+2. 解决后重新运行验收命令，确认通过。
+3. 提交合并结果（不要放弃这次合并，也不要重新建分支）。
+4. 汇报里说明每个冲突文件是怎么取舍的。`,
+  ];
 }
 
 // 失败信息的各段（不含标题与要求）。执行者失败给出错信息；否则按门禁结果分段。

@@ -112,6 +112,102 @@ function validateV2(config) {
   return config;
 }
 
+// 并发名额上限（协议 15.5）：concurrency 是任务名额（默认 2），gateConcurrency 是门禁名额（默认 1）。
+// 不是正整数的值按默认处理，warnings 里写一条提示（ar config 显示）。sources 与 formatConfig 的来源列同一写法。
+export const slotDefaults = { concurrency: 2, gateConcurrency: 1 };
+export function slotLimits(config = {}) {
+  const limits = {}, sources = {}, warnings = [];
+  for (const [key, fallback] of Object.entries(slotDefaults)) {
+    const value = config?.[key];
+    if (Number.isSafeInteger(value) && value > 0) { limits[key] = value; sources[key] = 'config.json'; continue; }
+    limits[key] = fallback; sources[key] = '内置默认';
+    if (value !== undefined) warnings.push(`配置：${key} 必须为正整数，已按默认值 ${fallback} 处理`);
+  }
+  return { limits, sources, warnings };
+}
+
+// 执行者会话记录的保留天数（ar gc 用）：sessionRetentionDays 为正整数，没写为 14；不是正整数的值按默认处理并提示。
+export const sessionRetentionDefault = 14;
+export function sessionRetention(config = {}) {
+  const value = config?.sessionRetentionDays;
+  if (Number.isSafeInteger(value) && value > 0) return { days: value, source: 'config.json', warnings: [] };
+  return {
+    days: sessionRetentionDefault, source: '内置默认',
+    warnings: value === undefined ? [] : [`配置：sessionRetentionDays 必须为正整数，已按默认值 ${sessionRetentionDefault} 处理`],
+  };
+}
+
+// 链路报告的扣分表：每项 { points: 每次扣多少, max: 最多扣多少（null 为不封顶） }。
+// 执行者与主导的 needsScope 同名不同值，所以按角色分开存；capFailed / capRejected 是任务失败、被驳回时执行者分数的上限。
+export const reportWeightDefaults = Object.freeze({
+  executor: Object.freeze({
+    attemptGate: { points: 15, max: null }, attemptAgent: { points: 20, max: null },
+    outsideFile: { points: 10, max: 30 }, protectedFile: { points: 15, max: 30 },
+    outsideWrites: { points: 20, max: null }, escalated: { points: 10, max: null },
+    toolError: { points: 1, max: 10 }, needsScope: { points: 0, max: null },
+  }),
+  lead: Object.freeze({
+    specEdit: { points: 10, max: 30 }, specBlame: { points: 15, max: null },
+    manualRetry: { points: 10, max: 30 }, needsScope: { points: 10, max: null },
+    rejected: { points: 20, max: null }, conflict: { points: 5, max: null },
+  }),
+  capFailed: 40,
+  capRejected: 60,
+});
+const positive = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+// config.json 的 reportWeights：{ "<key>": { "points": 数, "max": 数 } }，只写要改的键；
+// 键同扣分表的 key（needsScope 同时出现在两张表里，这里只作用于主导的那一项）；capFailed / capRejected 直接写数。
+// 形状不对按默认；不是正数的值忽略并按默认，warnings 里各写一条（ar config 显示）。
+export function reportWeights(config = {}) {
+  const weights = { executor: {}, lead: {}, capFailed: reportWeightDefaults.capFailed, capRejected: reportWeightDefaults.capRejected };
+  for (const role of ['executor', 'lead']) for (const [key, value] of Object.entries(reportWeightDefaults[role])) weights[role][key] = { ...value };
+  const raw = config?.reportWeights;
+  if (raw === undefined) return { weights, custom: 0, source: '内置默认', warnings: [] };
+  if (!object(raw)) return { weights, custom: 0, source: '内置默认', warnings: ['配置：reportWeights 必须为对象，已按默认处理'] };
+  const warnings = [];
+  let custom = 0;
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === 'capFailed' || key === 'capRejected') {
+      if (positive(value)) { weights[key] = value; custom += 1; } else warnings.push(`配置：reportWeights.${key} 必须为正数，已按默认值 ${reportWeightDefaults[key]} 处理`);
+      continue;
+    }
+    // 同名的 needsScope 只作用于主导；其余键在哪张表里就改哪一项。
+    const role = Object.hasOwn(reportWeightDefaults.lead, key) ? 'lead' : Object.hasOwn(reportWeightDefaults.executor, key) ? 'executor' : null;
+    if (!role) { warnings.push(`配置：reportWeights.${key} 不是已知的扣分项，已忽略`); continue; }
+    if (!object(value)) { warnings.push(`配置：reportWeights.${key} 必须为对象（points、max），已按默认处理`); continue; }
+    for (const field of ['points', 'max']) {
+      if (value[field] === undefined) continue;
+      if (positive(value[field])) { weights[role][key][field] = value[field]; custom += 1; }
+      else warnings.push(`配置：reportWeights.${key}.${field} 必须为正数，已按默认处理`);
+    }
+  }
+  return { weights, custom, source: custom ? 'config.json' : '内置默认', warnings };
+}
+
+// config.json 的 prices：{ "<执行者配置名>": { "input": 每百万 token 价格, "output": …, "currency": "CNY" | "USD" } }。
+// 不合法的条目整条忽略（该执行者按"没有设置价格"处理），warnings 里写一条。
+export const priceCurrencies = ['CNY', 'USD'];
+export function priceTable(config = {}) {
+  const raw = config?.prices;
+  if (raw === undefined) return { prices: {}, source: '内置默认', warnings: [] };
+  if (!object(raw)) return { prices: {}, source: '内置默认', warnings: ['配置：prices 必须为对象，已忽略'] };
+  const prices = {}, warnings = [];
+  const price = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  for (const [name, item] of Object.entries(raw)) {
+    if (object(item) && price(item.input) && price(item.output) && priceCurrencies.includes(item.currency)) prices[name] = { input: item.input, output: item.output, currency: item.currency };
+    else warnings.push(`配置：prices.${name} 必须是 { input, output, currency }（价格不小于 0，currency 为 CNY 或 USD），已忽略`);
+  }
+  return { prices, source: Object.keys(prices).length ? 'config.json' : '内置默认', warnings };
+}
+
+// config.json 的 leadUsage：布尔，默认 false；为 true 时报告才读主导的会话记录。
+export function leadUsageSetting(config = {}) {
+  const value = config?.leadUsage;
+  if (typeof value === 'boolean') return { enabled: value, source: 'config.json', warnings: [] };
+  return { enabled: false, source: '内置默认', warnings: value === undefined ? [] : ['配置：leadUsage 必须为布尔值，已按默认值 false 处理'] };
+}
+
 // profile 选择：--profile > AR_PROFILE > defaultProfile > 唯一启用的 profile。
 export function selectProfile(config, opts = {}, env = {}) {
   const profiles = config.profiles ?? {};
@@ -220,13 +316,32 @@ export function formatConfig(home, env = process.env) {
   }
   const lines = [`配置文件：${state.file}（${state.exists || state.legacy ? '已存在' : '不存在'}）${profileLine}`];
   if (codexNote) lines.push(codexNote);
-  // 中文字符占两列；保留原有列宽，不引入终端格式化依赖。
-  const padColumn = (text, width) => {
-    const length = [...text].reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 2 : 1), 0);
-    return text + ' '.repeat(Math.max(0, width - length));
-  };
   for (const [key, value] of Object.entries(settings)) lines.push(`${padColumn(key, 13)}${padColumn(String(value ?? (key === 'path' ? '自动查找' : '跟随 Codex')), 22)}${sources[key]}`);
   return lines.join('\n');
+}
+// 中文字符占两列；保留原有列宽，不引入终端格式化依赖。
+const padColumn = (text, width) => {
+  const length = [...text].reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 2 : 1), 0);
+  return text + ' '.repeat(Math.max(0, width - length));
+};
+// ar config 在设置表后面附上两个并发名额上限（gateConcurrency 比其他键长，键列加宽、值列收窄，来源列仍对齐）；
+// 不合法的值按默认处理并提示一行。
+function formatSlotLines(home) {
+  const config = readConfig(home).config;
+  const { limits, sources, warnings } = slotLimits(config);
+  const retention = sessionRetention(config);
+  const weights = reportWeights(config), prices = priceTable(config), usage = leadUsageSetting(config);
+  const priced = Object.keys(prices.prices).length;
+  return [
+    ...Object.entries(limits).map(([key, value]) => `${padColumn(key, 16)}${padColumn(String(value), 19)}${sources[key]}`),
+    // 键名更长，用自己的列宽，来源列仍对齐在第 35 列。
+    `${padColumn('sessionRetentionDays', 21)}${padColumn(String(retention.days), 14)}${retention.source}`,
+    // 链路报告的三项设置。
+    `${padColumn('reportWeights', 16)}${padColumn(weights.custom ? `自定义 ${weights.custom} 项` : '默认', 19)}${weights.source}`,
+    `${padColumn('prices', 16)}${padColumn(priced ? `${priced} 个执行者` : '未设置', 19)}${prices.source}`,
+    `${padColumn('leadUsage', 16)}${padColumn(String(usage.enabled), 19)}${usage.source}`,
+    ...warnings, ...retention.warnings, ...weights.warnings, ...prices.warnings, ...usage.warnings,
+  ];
 }
 export function configCommand(args, env = process.env) {
   const home = homeDirectory(env);
@@ -242,5 +357,5 @@ export function configCommand(args, env = process.env) {
     }
     writeConfig(home, changes);
   }
-  return message + formatConfig(home, env);
+  return `${message}${[formatConfig(home, env), ...formatSlotLines(home)].join('\n')}`;
 }

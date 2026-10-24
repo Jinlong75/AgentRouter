@@ -17,6 +17,8 @@ export async function preferenceFixture(home, { install = true } = {}) {
     CLAUDE_CONFIG_DIR: path.join(user,'.claude'), CODEX_HOME: path.join(user,'.codex'), XDG_CONFIG_HOME: path.join(user,'.config'),
     AR_TEST_AGENT: path.join(home,'fake-codex.cjs'), AR_TEST_SECRETS_FILE: path.join(home,'secrets-test.json'),
     TEMP: temp, TMP: temp,
+    // worktree 模式（协议 15.2）的 worktree 根目录：验收与演示一律放在隔离公共目录里，绝不建在真实的 %LOCALAPPDATA%\agent-router\wt 下。
+    AR_WORKTREE_ROOT: path.join(home,'wt'),
     // git 的全局配置也放进隔离目录：验收绝不读写用户真实的 ~/.gitconfig，"没有提交身份"也能稳定复现。
     GIT_CONFIG_GLOBAL: path.join(home,'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' });
   // 所有检测与安装都在同一个隔离目录，绝不回落到真实 PATH 或宿主。

@@ -10,12 +10,14 @@ import { createInterface } from 'node:readline';
 // - lastSay：最后一条说话事件（没有就是 null），适配器不写汇报时由 pipeline 用作汇报正文。
 // - result：有状态映射（createMapper）留下的最后结果，交给 adapter.finish。
 // - stderrTail：最多 4096 字符的 stderr 尾部（失败原因常只出现在这里）。
+// workdir 是执行者的工作目录：非 worktree 模式就是项目根，worktree 模式是任务自己的 worktree（协议 15.2）；
+// 记录目录（paths）不受影响，始终在项目主工作区。
 // attemptFiles 是这次尝试的目录（attempts/<n>/，prompt.md 已由 pipeline 写好）：
 // 原始输出同时追加到顶层 raw.log 与它下面的 raw.log，汇报路径（command 的 report）指到它下面的 report.md。
 // onSpawn(pid) 在 spawn 成功之后、写 stdin 之前调用（pipeline 在这里装停止信号）；
 // stopped() 为真时（已被外部停止）不再补出错事件，直接交出退出码。
 export async function runOnce({
-  adapter, label, profile, settings, detection, root, childEnv, paths, registry, id,
+  adapter, label, profile, settings, detection, workdir, childEnv, paths, registry, id,
   prompt, envError, emit, errors, mapLine, onSpawn, beforeSpawn, stopped,
   attempt = 1, attemptFiles = null,
 }) {
@@ -27,7 +29,7 @@ export async function runOnce({
   try {
     if (envError) throw envError;
     // report 指到这次的 attempts/<n>/report.md（协议 14.2 第 3 条）；attempt 供假执行者按次回放。
-    command = adapter.command({ root, report: reportPath, prompt, settings, detection, env: childEnv, profile, attempt });
+    command = adapter.command({ root: workdir, report: reportPath, prompt, settings, detection, env: childEnv, profile, attempt });
   } catch (error) {
     emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` });
     return { exit: 1, lastSay: null, result: null, stderrTail: '', startFailed: true };
@@ -37,7 +39,7 @@ export async function runOnce({
   return new Promise(resolve => {
     let child;
     try {
-      child = spawn(command.executable, command.args, { cwd: root, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
+      child = spawn(command.executable, command.args, { cwd: workdir, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true });
     } catch (error) {
       emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` });
       resolve({ exit: 1, lastSay: null, result: null, stderrTail: '', startFailed: true });
@@ -52,7 +54,7 @@ export async function runOnce({
       let event;
       try { event = JSON.parse(line); } catch { /* 非 JSON 行仍保留原文。 */ }
       appendRaw(`${event && typeof event === 'object' && !Array.isArray(event) ? JSON.stringify({ ...event, _at: at }) : line}\n`);
-      for (const mapped of mapLine(line, { root })) {
+      for (const mapped of mapLine(line, { root: workdir })) {
         if (mapped.kind === 'say') lastSay = mapped.text;
         emit(mapped, at);
       }

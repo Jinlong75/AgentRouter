@@ -10,6 +10,7 @@ import { commitFrom,markdown } from '../../app/src/shared/markdown';
 import { combine } from '../../app/src/renderer/timeline';
 import { appDataDir, migrateAppData } from '../../app/src/main/app-data';
 import { executorTag, executorLabel, isCodexTask } from '../../app/src/shared/executor';
+import { worktreeState, type Task } from '../../app/src/shared/types';
 const row=(extra={})=>({v:1,event:'start',id:'sample',repo:path.resolve('/demo/project'),name:'task',title:'演示',spec:null,role:null,pid:42,started:100000,progress:path.resolve('/demo/project/task.progress.log'),report:path.resolve('/demo/project/task.md'),model:null,effort:null,tier:null,...extra});
 const lines=(...rows:unknown[])=>rows.map(r=>JSON.stringify(r)).join('\n')+'\n';
 const ps={pid:42,name:'node.exe',command:'node "C:\\demo\\codex-task.mjs"',created:99000};
@@ -370,4 +371,190 @@ test('resume 之后停止核对用 pidSince（resume.at），开始时间不变'
   assert.equal(dispatchMatches(resumePs,matchTime(parsed)),true,'停止核对用 pidSince ?? started');
   assert.equal(statusOf(parsed,[resumePs]),'run');
   assert.equal(statusOf({...parsed,pidSince:undefined},[{...resumePs,created:101000}]),'stop','没有 pidSince 时仍按 started 核对');
+});
+
+// ---- 078 执行者需要越界（协议 14.5）：end / attempt-end 的 needsScope ----
+test('needsScope：end 与 attempt-end 带合法列表时进任务与尝试；不合法或没有就当没有；resume 清掉',()=>{
+  const list=[{path:'core/lib/gate.mjs',reason:'要加参数'},{path:'tests/unit/gate.test.mjs',reason:null}];
+  const attempt={v:1,event:'attempt',id:'sample',n:1,total:3,profile:'fake',reason:'first',at:101000};
+  const attemptEnd=(extra={})=>({v:1,event:'attempt-end',id:'sample',n:1,ok:false,exit:0,gate:false,usage:{input:1,output:2},ms:900,at:102000,...extra});
+  const end=(extra={})=>({v:1,event:'end',id:'sample',exit:3,at:103000,minutes:1,attempts:1,agentExit:0,...extra});
+  const ok=parseRegistry(lines(row(),attempt,attemptEnd({needsScope:list}),end({needsScope:list})))[0];
+  assert.deepEqual(ok.needsScope,list);
+  assert.deepEqual(ok.attempts?.[0].needsScope,list);
+  assert.equal(ok.status,'fail');
+  const none=parseRegistry(lines(row(),attempt,attemptEnd(),end()))[0];
+  assert.equal(none.needsScope,undefined);
+  assert.equal(none.attempts?.[0].needsScope,undefined);
+  const tooMany=Array.from({length:51},(_,i)=>({path:`f${i}`,reason:null}));
+  for(const bad of ['x',{},[],[{path:'',reason:null}],[{path:'a.js'}],[{path:1,reason:null}],[{path:'a.js',reason:3}],[null],tooMany]){
+    const parsed=parseRegistry(lines(row(),attempt,attemptEnd({needsScope:bad}),end({needsScope:bad})))[0];
+    assert.equal(parsed.needsScope,undefined,JSON.stringify(bad)?.slice(0,40));
+    assert.equal(parsed.attempts?.[0].needsScope,undefined);
+    assert.equal(parsed.status,'fail','不合法的字段不影响状态');
+  }
+  const max=Array.from({length:50},(_,i)=>({path:`f${i}`,reason:null}));
+  assert.equal(parseRegistry(lines(row(),end({needsScope:max})))[0].needsScope?.length,50);
+  // 手动重试的 resume 之后，上一轮的 needsScope 不再算；新的 end 没有就是没有。
+  const resumed=parseRegistry(lines(row(),attempt,attemptEnd({needsScope:list}),end({needsScope:list}),{v:1,event:'resume',id:'sample',pid:43,n:2,at:104000}))[0];
+  assert.equal(resumed.status,'run');
+  assert.equal(resumed.needsScope,undefined);
+  const after=parseRegistry(lines(row(),end({needsScope:list}),{v:1,event:'resume',id:'sample',pid:43,n:2,at:104000},end({exit:0,at:105000})))[0];
+  assert.equal(after.needsScope,undefined);
+});
+
+// ---- 079 工作区外写入（协议 12.4）：attempt-end 的 outsideWrites ----
+test('outsideWrites：attempt-end 带合法值时进任务与尝试，取最后一次尝试的；不合法或没有就当没有；resume 清掉',()=>{
+  const added=[{root:'user',name:'config.json',type:'file'},{root:'home',name:'stray',type:'dir'}];
+  const value={checked:true,added};
+  const attempt=(n:number)=>({v:1,event:'attempt',id:'sample',n,total:3,profile:'fake',reason:n===1?'first':'gate',at:101000+n});
+  const attemptEnd=(n:number,extra:Record<string,unknown>={})=>({v:1,event:'attempt-end',id:'sample',n,ok:false,exit:0,gate:false,usage:{input:1,output:2},ms:900,at:102000+n,...extra});
+  const end=(extra:Record<string,unknown>={})=>({v:1,event:'end',id:'sample',exit:3,at:103000,minutes:1,attempts:1,agentExit:0,...extra});
+  const ok=parseRegistry(lines(row(),attempt(1),attemptEnd(1,{outsideWrites:value}),end()))[0];
+  assert.deepEqual(ok.outsideWrites,value);
+  assert.deepEqual(ok.attempts?.[0].outsideWrites,value);
+  assert.equal(ok.status,'fail');
+  const none=parseRegistry(lines(row(),attempt(1),attemptEnd(1),end()))[0];
+  assert.equal(none.outsideWrites,undefined);
+  assert.equal(none.attempts?.[0].outsideWrites,undefined);
+  // 没能核对：{ checked:false, error } 也进任务（界面只在有新文件时画横幅）。
+  const unchecked=parseRegistry(lines(row(),attempt(1),attemptEnd(1,{outsideWrites:{checked:false,error:'用户目录前读取失败（ENOENT）'}}),end()))[0];
+  assert.deepEqual(unchecked.outsideWrites,{checked:false,added:[],error:'用户目录前读取失败（ENOENT）'});
+  for(const bad of ['x',1,{},{checked:true},{checked:'yes',added},{checked:true,added:'x'},{checked:true,added:[null]},
+    {checked:true,added:[{root:'etc',name:'a',type:'file'}]},{checked:true,added:[{root:'user',name:'',type:'file'}]},
+    {checked:true,added:[{root:'user',name:3,type:'file'}]},{checked:true,added:[{root:'user',name:'a',type:'socket'}]}]){
+    const parsed=parseRegistry(lines(row(),attempt(1),attemptEnd(1,{outsideWrites:bad}),end()))[0];
+    assert.equal(parsed.outsideWrites,undefined,JSON.stringify(bad));
+    assert.equal(parsed.attempts?.[0].outsideWrites,undefined);
+    assert.equal(parsed.status,'fail','不合法的字段不影响状态');
+  }
+  // 任务上的值取最后一次尝试的：后一次没有就清掉前一次的；每次尝试自己的值各自保留。
+  const second=parseRegistry(lines(row(),attempt(1),attemptEnd(1,{outsideWrites:value}),attempt(2),attemptEnd(2),end({attempts:2})))[0];
+  assert.equal(second.outsideWrites,undefined);
+  assert.deepEqual(second.attempts?.[0].outsideWrites,value);
+  assert.equal(second.attempts?.[1].outsideWrites,undefined);
+  // 手动重试的 resume 之后，上一轮的值不再算。
+  const resumed=parseRegistry(lines(row(),attempt(1),attemptEnd(1,{outsideWrites:value}),end(),{v:1,event:'resume',id:'sample',pid:43,n:2,at:104000}))[0];
+  assert.equal(resumed.status,'run');
+  assert.equal(resumed.outsideWrites,undefined);
+});
+
+// ---- 087 worktree 任务的十种状态（协议 15.3 / 15.6 / 15.7 / 15.8）----
+const wtRow=(extra={})=>row({v:2,worktree:true,base:'a'.repeat(40),gate:true,...extra});
+const wtState=(...events:unknown[])=>{const t=parseRegistry(lines(wtRow(),...events))[0];return [worktreeState(t),t] as const;};
+const E={
+  queued:(at=100500)=>({v:1,event:'queued',id:'sample',at}),preparing:(at=101000)=>({v:1,event:'preparing',id:'sample',at}),
+  worktree:(at=101500)=>({v:1,event:'worktree',id:'sample',dir:path.resolve('/wt/demo'),branch:'ar/task',base:'b'.repeat(40),at}),
+  setup:(ok=true,at=102000)=>({v:1,event:'setup',id:'sample',ok,ms:900,at,summary:ok?'准备命令通过':'准备命令失败：npm ci（exit 1）'}),
+  attempt:(at=103000)=>({v:1,event:'attempt',id:'sample',n:1,total:3,profile:'fake',reason:'first',at}),
+  gating:(at=104000)=>({v:1,event:'gating',id:'sample',at}),gate:(at=105000)=>({v:1,event:'gate',id:'sample',ok:true,attempt:1,at,summary:'门禁通过'}),
+  end:(extra={})=>({v:1,event:'end',id:'sample',exit:0,at:106000,minutes:1,...extra}),
+  accepted:(extra={})=>({v:1,event:'accepted',id:'sample',merge:'c'.repeat(40),mode:'no-ff',by:'human',at:107000,...extra}),
+  rejected:(extra={})=>({v:1,event:'rejected',id:'sample',reason:'方向不对',keptBranch:true,by:'lead',at:107000,...extra}),
+  conflict:(files=['src/a.ts','src/b.ts'])=>({v:1,event:'conflict',id:'sample',files,at:107000}),
+  cleanup:(ok=false)=>({v:1,event:'cleanup',id:'sample',ok,error:'目录被占用',at:108000}),
+  resume:(at=120000)=>({v:1,event:'resume',id:'sample',pid:43,n:2,at}),
+};
+test('087 worktree 任务十种状态：排队、准备、进行中、门禁中、待验收、已合并、已驳回、冲突、失败、已中断各一例',()=>{
+  assert.equal(wtState()[0],'queued','只有 start 就是排队');
+  const [queued,qt]=wtState(E.queued());assert.equal(queued,'queued');assert.equal(qt.wt?.queuedAt,100500,'进入排队的时刻取 queued 事件');
+  assert.equal(wtState()[1].wt?.queuedAt,100000,'只有 start 时取开始时刻');
+  assert.equal(wtState(E.queued(),E.preparing())[0],'preparing');
+  const [prep,pt]=wtState(E.queued(),E.preparing(),E.worktree());assert.equal(prep,'preparing','worktree 事件之后仍是准备中');
+  assert.deepEqual([pt.wt?.branch,pt.wt?.dir,pt.wt?.base],['ar/task',path.resolve('/wt/demo'),'b'.repeat(40)]);
+  assert.equal(wtState(E.queued(),E.preparing(),E.worktree(),E.setup(true))[0],'preparing','成功的 setup 之后仍是准备中');
+  assert.equal(wtState(E.preparing(),E.worktree(),E.setup(),E.attempt())[0],'running');
+  assert.equal(wtState(E.preparing(),E.worktree(),E.setup(),E.attempt(),E.gating())[0],'gating');
+  const [awaiting,at]=wtState(E.attempt(),E.gating(),E.gate(),E.end());assert.equal(awaiting,'awaiting');assert.equal(at.status,'done');assert.equal(at.wt?.awaitingAt,106000,'进入待验收的时刻取 end.at');
+  const [accepted,ac]=wtState(E.attempt(),E.end(),E.accepted());assert.equal(accepted,'accepted');
+  assert.deepEqual(ac.wt?.accepted,{merge:'c'.repeat(40),mode:'no-ff',by:'human',at:107000});
+  assert.equal(wtState(E.attempt(),E.end(),E.accepted({mode:'squash',by:'lead'}))[1].wt?.accepted?.mode,'squash');
+  const [rejected,rj]=wtState(E.attempt(),E.end(),E.rejected());assert.equal(rejected,'rejected');
+  assert.deepEqual(rj.wt?.rejected,{reason:'方向不对',keptBranch:true,by:'lead',at:107000});
+  const [conflict,cf]=wtState(E.attempt(),E.end(),E.conflict());assert.equal(conflict,'conflict');assert.deepEqual(cf.wt?.conflictFiles,['src/a.ts','src/b.ts']);
+  assert.deepEqual(wtState(E.attempt(),E.end(),E.conflict(['x']),E.resume(),E.attempt(121000),E.end({at:130000}),E.conflict(['y','z']))[1].wt?.conflictFiles,['y','z'],'files 取最近一条 conflict');
+  const [failed,fl]=wtState(E.attempt(),E.gating(),E.end({exit:3}));assert.equal(failed,'failed');assert.equal(fl.status,'fail');
+  assert.equal(wtState(E.queued(),{v:1,event:'interrupted',id:'sample',signal:'stopped-by-app',at:101000})[0],'stopped','排队中被停止');
+  assert.equal(wtState(E.attempt(),{v:1,event:'interrupted',id:'sample',signal:'session-closed',at:104000})[0],'stopped');
+});
+test('087 worktree：resume 之后回到进行中（冲突、失败、准备失败都一样），再次 end 又进入待验收',()=>{
+  const [after,t]=wtState(E.attempt(),E.end(),E.conflict(),E.resume());
+  assert.equal(after,'running');assert.equal(t.status,'run');assert.equal(t.wt?.conflictFiles,undefined,'冲突标记不再算');
+  assert.equal(wtState(E.attempt(),E.end({exit:3}),E.resume())[0],'running');
+  const [again,t2]=wtState(E.attempt(),E.end(),E.conflict(),E.resume(),E.attempt(121000),E.gating(122000),E.gate(123000),E.end({at:124000}));
+  assert.equal(again,'awaiting');assert.equal(t2.wt?.awaitingAt,124000);
+  assert.equal(wtState(E.attempt(),E.end(),E.conflict(),E.resume(),E.preparing(121000))[0],'preparing','重试先写 preparing（准备失败后重跑准备命令）');
+  assert.equal(wtState(E.attempt(),E.end({exit:1}),E.conflict(),E.resume(),E.attempt(121000),E.end({exit:1,at:122000}),E.conflict(['a']))[0],'conflict','git merge 失败：end 之后再写 conflict，仍是冲突');
+});
+test('087 worktree：cleanup 不改变状态，accepted / rejected 之后 ok:false 的 cleanup 记 cleanupFailed',()=>{
+  const [state,t]=wtState(E.attempt(),E.end(),E.accepted(),E.cleanup(false));assert.equal(state,'accepted');assert.equal(t.wt?.cleanupFailed,true);
+  const [state2,t2]=wtState(E.attempt(),E.end(),E.rejected(),E.cleanup(true));assert.equal(state2,'rejected');assert.equal(t2.wt?.cleanupFailed,undefined,'ok:true 的 cleanup 不算失败');
+  assert.equal(wtState(E.attempt(),E.end(),E.rejected(),E.cleanup(false))[1].wt?.cleanupFailed,true);
+  assert.equal(wtState(E.attempt(),E.end(),E.cleanup(false))[0],'awaiting','没有验收事件时 cleanup 不影响待验收');
+  assert.equal(wtState(E.attempt(),E.end(),E.cleanup(false))[1].wt?.cleanupFailed,undefined);
+});
+test('087 worktree：准备失败（setup ok:false + end reason:"setup"）是失败，能认出 setup；驳回它合法',()=>{
+  const failedEnd=E.end({exit:1,reason:'setup',attempts:0});
+  const [state,t]=wtState(E.queued(),E.preparing(),E.worktree(),E.setup(false),failedEnd);
+  assert.equal(state,'failed');assert.equal(t.status,'fail');assert.equal(t.wt?.setupFailed,true);
+  assert.deepEqual(t.wt?.setup,{ok:false,summary:'准备命令失败：npm ci（exit 1）'});
+  assert.equal(wtState(E.attempt(),E.end({exit:3}))[1].wt?.setupFailed,false,'普通失败不是准备失败');
+  const [rejected,r]=wtState(E.preparing(),E.worktree(),E.setup(false),failedEnd,E.rejected({keptBranch:false}));
+  assert.equal(rejected,'rejected');assert.equal(r.wt?.rejected?.keptBranch,false);
+});
+test('087 旧读取方与不合法的事件：非 worktree 任务忽略这些事件，四态一行不变；字段不合法时取保守值',()=>{
+  const plain=parseRegistry(lines(row(),{v:1,event:'end',id:'sample',exit:0,at:110000,minutes:1}));
+  const noisy=parseRegistry(lines(row(),E.queued(),E.preparing(),E.worktree(),E.setup(),{v:1,event:'future-event',id:'sample'},{v:1,event:'end',id:'sample',exit:0,at:110000,minutes:1},E.accepted(),E.conflict(),E.cleanup()));
+  assert.deepEqual(noisy,plain);assert.equal('wt' in noisy[0],false);assert.equal('worktree' in noisy[0],false);assert.equal(worktreeState(noisy[0]),null);
+  const [,t]=wtState(E.worktree(),{v:1,event:'worktree',id:'sample',dir:3,branch:null,base:undefined,at:1},E.attempt(),E.end(),E.accepted({merge:7,mode:'weird',by:9,at:'x'}));
+  assert.deepEqual(t.wt?.accepted,{merge:null,mode:'no-ff',by:'cli',at:0});assert.equal(t.wt?.branch,'ar/task','不合法的字段保留上一个值');
+  assert.equal(wtState(E.attempt(),E.end(),E.accepted(),E.accepted({merge:'d'.repeat(40)}))[1].wt?.accepted?.merge,'c'.repeat(40),'已经合并后重复的 accepted 不改结果');
+  assert.equal(wtState(E.attempt(),E.end({exit:3}),E.accepted())[0],'failed','失败的任务收到 accepted 不算数');
+});
+test('087 Registry：排在前面的任务数、项目配置里的主分支与合并方式、并发上限、进入冲突回调、待验收走 finished',async()=>{
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-wt-')),home=path.join(base,'home'),repo=path.join(base,'repo');
+  await mkdir(home);await mkdir(path.join(repo,'.agent-router'),{recursive:true});
+  await writeFile(path.join(repo,'.agent-router','project.json'),JSON.stringify({v:1,baseBranch:'trunk',mergeMode:'squash'}));
+  const mk=(id:string,started:number,pid:number)=>row({v:2,worktree:true,id,repo,name:id,started,pid,progress:path.join(repo,id+'.log'),report:path.join(repo,id+'.md')});
+  const file=path.join(home,'runs.jsonl'),ev=(id:string,event:string,extra={})=>({v:1,event,id,at:1,...extra});
+  // a 先排队、b 后排队、c 的 start 最早但 queued 事件最晚；d 已进入准备，不算排队。
+  await writeFile(file,lines(mk('a',100000,42),ev('a','queued',{at:100100}),mk('b',101000,43),ev('b','queued',{at:101100}),mk('c',99000,44),ev('c','queued',{at:102000}),mk('d',99100,45),ev('d','preparing',{at:99200})));
+  await writeFile(path.join(home,'config.json'),JSON.stringify({v:2,concurrency:3}));
+  let finished:Task[]=[],conflicts:Task[]=[];
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async(pids:number[])=>pids.map(pid=>({...ps,pid})),killTree:async()=>{},open:async()=>{}},()=>{},t=>finished.push(t),e=>{throw e;},home,t=>conflicts.push(t));
+  try{
+    await registry.start();
+    const by=(id:string)=>registry.tasks.find(t=>t.id===id)!;
+    assert.deepEqual(['a','b','c','d'].map(id=>[worktreeState(by(id)),by(id).wt?.ahead]),[['queued',0],['queued',1],['queued',2],['preparing',undefined]]);
+    assert.deepEqual([by('a').wt?.baseBranch,by('a').wt?.mergeMode],['trunk','squash']);
+    assert.equal(registry.concurrency,3);
+    // a 开始准备：排在后面的前移；b、c 仍排队。
+    await appendFile(file,lines(ev('a','preparing',{at:103000})));await registry.refresh();
+    assert.deepEqual(['b','c'].map(id=>by(id).wt?.ahead),[0,1]);assert.equal(by('a').wt?.ahead,undefined,'不在排队时没有 ahead');
+    // 门禁通过进入待验收：走 finished（由 index 发"待验收"通知）；批准时冲突：不经 finished，走 conflicted。
+    assert.equal(finished.length,0);
+    await appendFile(file,lines(ev('a','attempt',{n:1,total:1,at:104000}),ev('a','end',{exit:0,at:105000,minutes:1})));await registry.refresh();
+    assert.deepEqual(finished.map(t=>[t.id,worktreeState(t)]),[['a','awaiting']]);assert.equal(conflicts.length,0);
+    await appendFile(file,lines(ev('a','conflict',{files:['x.ts'],at:106000})));await registry.refresh();
+    assert.equal(finished.length,1);assert.deepEqual(conflicts.map(t=>[t.id,t.wt?.conflictFiles]),[['a',['x.ts']]]);
+    await registry.refresh();assert.equal(conflicts.length,1,'同一次冲突只回调一次');
+  }finally{await registry.close();}
+});
+test('088 Registry：只改了同时运行的任务数上限（任务没变）也推送一次，侧栏底部的上限靠它跟着变；不合法的值按默认 2',async()=>{
+  const base=await mkdtemp(path.join(os.tmpdir(),'agentrouter-limit-')),home=path.join(base,'home');
+  await mkdir(home);
+  const file=path.join(home,'runs.jsonl'),config=path.join(home,'config.json');
+  await writeFile(file,'');await writeFile(config,JSON.stringify({v:2,concurrency:2}));
+  let pushes=0;
+  const registry=new Registry(home,path.join(home,'monitor'),{processes:async(pids:number[])=>pids.map(pid=>({...ps,pid})),killTree:async()=>{},open:async()=>{}},()=>{pushes++;},()=>{},e=>{throw e;},home);
+  try{
+    await registry.start();assert.equal(registry.concurrency,2);
+    await registry.refresh();const settled=pushes;
+    await registry.refresh();assert.equal(pushes,settled,'什么都没变不推送');
+    await writeFile(config,JSON.stringify({v:2,concurrency:4,extra:true}));await registry.refresh();
+    assert.equal(registry.concurrency,4);assert.equal(pushes,settled+1,'上限变了推送一次');
+    await registry.refresh();assert.equal(pushes,settled+1,'没再变就不再推送');
+    await writeFile(config,JSON.stringify({v:2,concurrency:'x',extra:true}));await registry.refresh();
+    assert.equal(registry.concurrency,2);assert.equal(pushes,settled+2);
+  }finally{await registry.close();}
 });

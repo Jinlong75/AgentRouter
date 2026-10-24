@@ -96,7 +96,7 @@ export async function captureRetry(h: Harness, registry: Registry, out: string, 
         },
     };
     const originalConfig = await readFile(configFile, 'utf8').catch(() => null);
-    let alive: ChildProcess | undefined, retryName = '', retryStarted = 0, retryId = '', repo = '';
+    let alive: ChildProcess | undefined, retryName = '', retryStarted = 0, retryId = '', repo = '', scopeStarted = 0, scopeId = '';
     try {
         await writeFile(configFile, JSON.stringify(config, null, 2) + '\n');
         await reveal(RETRY_IDS);
@@ -194,7 +194,7 @@ export async function captureRetry(h: Harness, registry: Registry, out: string, 
         await check('UI23 选回最新一次：门禁通过横幅按第 3 次 gate.json 计算', `document.querySelector('.tab-body .banner.ok .rt b').textContent === ${JSON.stringify(gt.okTitle(3, gate26[2].commands.length, (gate26[2].ms / 1000).toFixed(1)))} && document.querySelector('.att-pick .sel span').textContent === ${JSON.stringify(rt.pickOption(3, true, 'Claude Sonnet 5.5'))}`);
 
         // ---- 重试历史 ----
-        await check('UI23 "重试"标签在"改动"之后、"参数"之前，右边的数字是尝试次数 3', `(() => { const keys = [...document.querySelectorAll('.dtabs [data-tab]')].map(b => b.dataset.tab); return keys.join() === 'flow,report,gate,files,retry,params' && document.querySelector('.dtabs [data-tab=retry]').textContent.replace(/\\s+/g, '') === ${JSON.stringify(rt.tab + '3')}; })()`);
+        await check('UI23 "重试"标签在"改动"之后、"参数"之前，右边的数字是尝试次数 3', `(() => { const keys = [...document.querySelectorAll('.dtabs [data-tab]')].map(b => b.dataset.tab); return keys.join() === 'flow,report,gate,files,retry,score,params' && document.querySelector('.dtabs [data-tab=retry]').textContent.replace(/\\s+/g, '') === ${JSON.stringify(rt.tab + '3')}; })()`);
         await press('.dtabs [data-tab=retry]');
         await wait(`document.querySelectorAll('.ahist-r').length === 3 && document.querySelectorAll('.ahist-r .res')[0]?.textContent.startsWith('门禁未通过：')`, 'UI23 重试历史读到各次门禁', 15000);
         const histRow = (n: number, label: string, why: string, res: string, meta: string[]) => ({ nth: rt.nth(n), label, why: `原因：${why}`, res, meta: meta.join('|'), aria: rt.rowLabel(n, res) });
@@ -356,6 +356,42 @@ export async function captureRetry(h: Harness, registry: Registry, out: string, 
         await wait(`document.querySelectorAll('.ahist-r').length === 2 && document.querySelectorAll('.ahist-r .res')[1]?.textContent === ${JSON.stringify(rt.resultGateOk)}`, 'UI23 重试历史（真实重试）', 15000);
         await check('UI23 真实重试的历史：第 1 次门禁未通过（核心 summary），第 2 次是手动重试、换了执行者、门禁通过', `(() => { const r = [...document.querySelectorAll('.ahist-r')]; return r[0].querySelector('.res').textContent === ${JSON.stringify(rt.resultGateFail(gateRow.summary))} && r[0].querySelector('.ex').textContent === '假执行者' && r[1].querySelector('.why').textContent === ${JSON.stringify(`原因：${rt.reason.manual}`)} && r[1].querySelector('.ex').textContent === '强执行者'; })()`);
         await check('UI23 真实重试的历史标题行：共 2 次尝试，自动最多 1 次（派发时 max_retries 为 0）',`document.querySelector('.tab-body .sec-t').textContent.startsWith(${JSON.stringify(rt.histHead(2, 1))})`);
+        await check('UI23 没有"需要越界"的任务详情没有越界横幅', '!document.querySelector("[data-needs-scope]")');
+
+        // ---- 执行者需要越界：假执行者的汇报带"## 需要越界"（2 个路径）且门禁失败；max_retries 为 2 也只跑 1 次 ----
+        const scopeSpecRel = 'docs/specs/072-越界验收.md';
+        const scopeReport = ['# 汇报', '', '做到一半。', '', '## 需要越界', '- `core/lib/gate.mjs`：要在这里加一个参数，否则测试没法注入', '- tests/unit/gate.test.mjs', ''].join('\n');
+        const scopePaths = ['core/lib/gate.mjs', 'tests/unit/gate.test.mjs'];
+        await writeFile(configFile, JSON.stringify({ ...config, profiles: { ...config.profiles, scope: profile('越界执行者', { events: [{ kind: 'say', text: '越界执行者：需要改清单以外的文件。' }], report: scopeReport }) } }, null, 2) + '\n');
+        await writeFile(path.join(repo, scopeSpecRel), ['---', 'id: 972', 'title: 越界验收', 'type: code', 'allowed_paths:', '  - src/**', 'verify:', '  - git cat-file -e HEAD:src/never.txt', 'max_retries: 2', '---', '', '越界验收正文。', ''].join('\n'));
+        git(repo, ['add', '--', scopeSpecRel]);
+        git(repo, ['commit', '-m', '越界验收任务说明', '--', scopeSpecRel]);
+        const scopeDispatched = await core(['dispatch', scopeSpecRel, '--name', 'scope-demo', '--profile', 'scope', '--detach'], repo);
+        scopeId = String(scopeDispatched.id);
+        assert.ok(scopeId, '派发没有返回 id');
+        await untilRow(async () => (await rows()).find(r => r.id === scopeId && r.event === 'end'), '越界任务结束', 30000);
+        scopeStarted = (await rows()).find(r => r.id === scopeId && r.event === 'start').started;
+        await registry.refresh();
+        await verify('UI23 需要越界：max_retries 为 2 也只跑 1 次（清单里只有一个 attempt），attempt-end 与 end 带 needsScope，退出码 3', async () => {
+            const list = (await rows()).filter(r => r.id === scopeId);
+            assert.equal(list.filter(r => r.event === 'attempt').length, 1);
+            const expected = [{ path: scopePaths[0], reason: '要在这里加一个参数，否则测试没法注入' }, { path: scopePaths[1], reason: null }];
+            assert.deepEqual(list.find(r => r.event === 'attempt-end').needsScope, expected);
+            assert.equal(list.at(-1).event, 'end');
+            assert.equal(list.at(-1).exit, 3);
+            assert.deepEqual(list.at(-1).needsScope, expected);
+        });
+        await press('[data-page=tasks]');
+        await wait(`!!document.querySelector("[data-task=${scopeId}]")`, 'UI23 越界任务进列表', 15000);
+        await press(`[data-task=${scopeId}]`);
+        await press('.dtabs [data-tab=flow]');
+        await wait('!!document.querySelector("[data-needs-scope]")', 'UI23 越界横幅出现', 15000);
+        await check('UI23 越界横幅：失败横幅的结构（banner fail、role=alert），标题、说明（2 个路径）、两条路径逐行列出且是等宽字体，原因跟在路径后面', `(() => { const m = document.createElement('span'); m.className = 'mono'; document.body.append(m); const mono = getComputedStyle(m).fontFamily; m.remove(); const b = document.querySelector('[data-needs-scope]'); const paths = [...b.querySelectorAll('[data-scope-path]')]; const reasons = [...b.querySelectorAll('[data-scope-reason]')]; return b.classList.contains('banner') && b.classList.contains('fail') && b.getAttribute('role') === 'alert' && b.querySelector('.rt b').textContent === ${JSON.stringify(rt.needsScopeTitle)} && b.querySelector('.rt > span').textContent === ${JSON.stringify(rt.needsScopeHelp(2))} && paths.map(p => p.textContent).join('|') === ${JSON.stringify(scopePaths.join('|'))} && paths.every(p => p.classList.contains('mono') && getComputedStyle(p).fontFamily === mono) && reasons.length === 1 && reasons[0].textContent === '要在这里加一个参数，否则测试没法注入' && reasons[0].parentElement === paths[0].parentElement && b.querySelectorAll('li').length === 2; })()`);
+        await check('UI23 越界横幅与门禁失败横幅同时出现，越界横幅在上面', `(() => { const a = document.querySelector('[data-needs-scope]'); const all = [...document.querySelectorAll('.detail .banner-holder .banner.fail')]; return all.length >= 2 && all[0] === a && !all[1].hasAttribute('data-needs-scope'); })()`);
+        await pair('needs-scope');
+        await press(`[data-task=${retryId}]`);
+        await wait('!document.querySelector("[data-needs-scope]")', 'UI23 换到没有越界的任务后横幅消失');
+        await check('UI23 换到没有越界的任务，越界横幅消失', '!document.querySelector("[data-needs-scope]")');
     }
     finally {
         // 清理：弹窗、假派发进程、临时项目与临时任务；恢复配置与演示任务的隐藏状态。
@@ -373,6 +409,12 @@ export async function captureRetry(h: Harness, registry: Registry, out: string, 
             const saved = JSON.parse(await readFile(tasksFile, 'utf8').catch(() => '{"imports":[],"hidden":[]}'));
             const hidden: string[] = Array.isArray(saved.hidden) ? saved.hidden : [];
             await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: [...new Set([...hidden, `${retryId}:${retryStarted}`])] }) + '\n').catch(() => { });
+            await registry.reloadHidden().catch(() => { });
+        }
+        if (scopeId && scopeStarted) {
+            const saved = JSON.parse(await readFile(tasksFile, 'utf8').catch(() => '{"imports":[],"hidden":[]}'));
+            const hidden: string[] = Array.isArray(saved.hidden) ? saved.hidden : [];
+            await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: [...new Set([...hidden, `${scopeId}:${scopeStarted}`])] }) + '\n').catch(() => { });
             await registry.reloadHidden().catch(() => { });
         }
         if (repo) await coreRun(['projects', 'remove', repo], { timeoutMs: 60000 }).catch(() => { });

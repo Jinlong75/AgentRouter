@@ -58,7 +58,71 @@ export interface Task {
     attempts?: TaskAttempt[];
     // 当前尝试 = 最后一个 attempt（界面显示"尝试 n/N"、重试历史用）。
     attempt?: TaskAttempt;
+    // 执行者在最后一次尝试的汇报里列出的需要越界的路径（end.needsScope，协议 14.5）；没有或不合法时没有这个字段。
+    needsScope?: NeedsScopeItem[];
+    // 最后一次尝试的 attempt-end.outsideWrites（协议 12.4）：有新文件或没能核对时才有；不合法就当没有。
+    outsideWrites?: OutsideWrites;
+    // worktree 模式（Stage06，协议 15.3）：start 有 worktree: true 的任务才带这两个字段，非 worktree 与旧任务的对象保持原样。
+    worktree?: true;
+    wt?: WtInfo;
     last: string;
+}
+// 清单里 worktree 任务最后一次影响状态的事件所处的阶段；十种状态由 worktreeState 在它之上再按 status / 门禁事件推出。
+export type WtPhase = 'queued' | 'preparing' | 'live' | 'awaiting' | 'accepted' | 'rejected' | 'conflict' | 'failed';
+export type WtState = 'queued' | 'preparing' | 'running' | 'gating' | 'awaiting' | 'accepted' | 'rejected' | 'conflict' | 'failed' | 'stopped';
+export interface WtInfo {
+    phase: WtPhase;
+    // 进入排队的时刻（queued 事件的 at；只有 start 时取开始时刻）与进入待验收的时刻（end.exit === 0 的 at）。
+    queuedAt?: number;
+    awaitingAt?: number;
+    // 最近一条 worktree 事件。
+    worktreeAt?: number;
+    branch?: string;
+    dir?: string;
+    base?: string;
+    // 最近一条 setup 事件；setupFailed 为 end.reason === 'setup'。
+    setup?: { ok: boolean; summary?: string };
+    setupFailed?: boolean;
+    accepted?: { merge: string | null; mode: 'no-ff' | 'squash'; by: string; at: number };
+    rejected?: { reason: string; keptBranch: boolean; by: string; at: number };
+    // 最近一条 conflict 事件的冲突文件。
+    conflictFiles?: string[];
+    // accepted / rejected 之后有 ok: false 的 cleanup。
+    cleanupFailed?: boolean;
+    // 比它先排队、现在仍在排队的任务数（Registry 每次刷新重算；不在排队时没有）。
+    ahead?: number;
+    // 项目配置里的主分支与合并方式（Registry 读 .agent-router/project.json；读不到为空）。
+    baseBranch?: string;
+    mergeMode?: 'no-ff' | 'squash';
+}
+// worktree 任务的十种状态（协议 15.3）；非 worktree 任务返回 null，仍按 status 四态。
+// 进程已经不在（status 为 stop，含 interrupted 与派发进程消失）一律是 stopped；其余按最近一条状态事件的阶段：
+// 进行中的阶段按门禁事件分 running / gating，end 之后的阶段原样返回（awaiting / accepted / rejected / conflict / failed）。
+export function worktreeState(t: Task): WtState | null {
+    const w = t.wt;
+    if (!t.worktree || !w)
+        return null;
+    if (t.status === 'stop')
+        return 'stopped';
+    if (w.phase === 'live')
+        return t.gatingAt !== undefined && t.gateOk === undefined && (!t.attempt || t.gatingAt >= t.attempt.at) ? 'gating' : 'running';
+    return w.phase;
+}
+export interface NeedsScopeItem {
+    path: string;
+    reason: string | null;
+}
+// 工作区外写入（协议 12.4）：root 为 user（用户目录根）或 home（公共目录根）；只有名字，没有完整路径。
+export interface OutsideAdded {
+    root: 'user' | 'home';
+    name: string;
+    type: 'file' | 'dir' | 'other';
+}
+// checked 为 false 表示没能核对（error 为原因），此时 added 为空。
+export interface OutsideWrites {
+    checked: boolean;
+    added: OutsideAdded[];
+    error?: string;
 }
 // 一次尝试：attempt 行先记开始信息（n、total、profile、reason、at），
 // attempt-end 补上结果（ok、exit、gate、usage、ms）；手动重试 total 为 null（协议 14.3）。
@@ -73,6 +137,8 @@ export interface TaskAttempt {
     gate?: boolean | null;
     usage?: { input: number | null; output: number | null };
     ms?: number;
+    needsScope?: NeedsScopeItem[];
+    outsideWrites?: OutsideWrites;
 }
 // 任务记录目录里的 gate.json（文件协议 12.3）；软件只读展示，不写入。
 export interface GateCommand {
@@ -98,6 +164,8 @@ export interface GateFile {
     // protected / deleted 是 Stage05 加的（协议 12.3）：Stage04 写的 gate.json 没有这两个字段，按可选读取。
     scope?: { allowed?: string[]; changed?: string[]; outside?: string[]; protected?: string[]; deleted?: string[] };
     commands?: GateCommand[];
+    // Stage06 加的（协议 12.4）：Stage05 及更早写的 gate.json 没有，按可选读取。
+    outsideWrites?: { checked?: boolean; added?: OutsideAdded[]; error?: string };
     summary?: string;
 }
 // detail 通道里的门禁结果：文件不存在为 null，解析失败为 { error }。
@@ -159,6 +227,10 @@ export interface Snapshot {
     theme: 'dark' | 'light';
     version: string;
     select?: string;
+    // 与 select 一起给出时，选中任务后切到验收页（待验收通知点开用）。
+    selectPage?: 'accept';
+    // 同时运行任务数上限（config.json 的 concurrency，没写为 2），排队中的说明用。
+    concurrency?: number;
 }
 // 批量删除的结果：deleted 真正从列表删掉的；failed 跳过（进行中 / 找不到 / 路径校验没过）；
 // filesLeft 记录目录没删掉的个数（被占用等）。
@@ -257,8 +329,70 @@ export interface API {
     closeShown(): Promise<void>;
     onCloseRequest(callback: () => void): () => void;
 }
+// console 通道 tasks:report / tasks:blame 的返回，字段照核心 ar report --json（协议 16.1）；分数全由核心算，界面只显示。
+export interface ReportItem {
+    key: string;
+    count: number;
+    points: number;
+    detail: string | null;
+}
+export interface ReportUsage {
+    input: number | null;
+    output: number | null;
+}
+export interface ReportAttempt {
+    n: number;
+    reason: string | null;
+    profile: string | null;
+    exit: number | null;
+    gate: boolean | null;
+    summary: string | null;
+    blame: 'worker' | 'spec' | null;
+}
+export interface Report {
+    ok: true;
+    id: string;
+    name: string;
+    state: string;
+    executor: {
+        score: number;
+        cap: 'failed' | 'rejected' | null;
+        items: ReportItem[];
+        perf: { ms: number; usage: ReportUsage | null; cost: { amount: number; currency: string } | null; toolCalls: number; profiles: string[] };
+    };
+    lead: {
+        score: number;
+        items: ReportItem[];
+        perf: { ms: number | null; awaitMs: number | null; usage: ReportUsage | null; usageState: 'off' | 'ok' | 'unavailable' };
+    };
+    attempts: ReportAttempt[];
+    warnings?: string[];
+}
+// 任务页排序（记在软件偏好里，下次打开沿用）与项目页排序。
+export type TaskSort = 'time' | 'state' | 'project';
+export type ProjectSort = 'recent' | 'name' | 'added';
+// ar gc --dry-run 经 gc:check 交给界面的结果（每项多一个 size，字节）。
+export interface GcItems {
+    worktrees: { dir: string; reason: string; size: number }[];
+    slots: { file: string; id: string; pid: number; size: number }[];
+    sessions: { worker: string; dir: string; ageDays: number; size: number }[];
+    bytes: number;
+}
+// ar gc 真正删除后的结果：bytes 是成功清理的大小，errors 是删除失败的项。
+export interface GcRun {
+    worktrees: unknown[];
+    slots: unknown[];
+    sessions: unknown[];
+    bytes: number;
+    errors: { kind: string; path: string; error: string }[];
+}
 export interface Settings {
     managed: boolean;
+    // 是否统计主导的 token 与用时（config.json 的 leadUsage，只认 true）。
+    leadUsage: boolean;
+    // 同时运行的任务数上限与会话保留天数（config.json 的 concurrency / sessionRetentionDays，没写按默认 2 / 14；手写的越界值原样给出）。
+    concurrency: number;
+    retentionDays: number;
     values: Record<string, string | null>;
     // 执行者配置原样交给 Agent 页（编辑 claude-code 执行者需要 env / maxTurns / secrets 等预填值）。
     profiles: Record<string, {
@@ -279,7 +413,7 @@ export interface Settings {
     // 公共目录（重置时显示完整路径）与上次重置没删完的残留标记。
     home: string;
     leftover: { home: string; at?: number } | null;
-    own: { notifications: boolean; theme: 'system' | 'light' | 'dark'; wizardDone: boolean; closeAction: 'ask' | 'tray' | 'quit'; trayHintShown: boolean };
+    own: { notifications: boolean; theme: 'system' | 'light' | 'dark'; wizardDone: boolean; closeAction: 'ask' | 'tray' | 'quit'; trayHintShown: boolean; taskSort?: TaskSort };
 }
 export interface Connections {
     availableVersion: string;

@@ -1,7 +1,10 @@
 import { captureWizard, capturePreferences } from './shots-preferences';
 import { captureProjects } from './shots-projects';
+import { captureSearch } from './shots-search';
 import { captureGate } from './shots-gate';
 import { captureRetry } from './shots-retry';
+import { captureAccept } from './shots-accept';
+import { captureScore } from './shots-score';
 import { captureNewtask, waitNewtaskReady } from './shots-newtask';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
 import { app, BrowserWindow, nativeTheme } from 'electron';
@@ -29,12 +32,12 @@ const appEnv = appEnvironment(process.env);
 /*
  * 界面功能基线与检查的对应；每条检查的标签以编号开头，交接记录直接引用：
  * UI01 侧栏导航到每个已交付页面，当前页高亮，键盘可切换 ——「UI01 …」（本文件）
- * UI02 任务列表：分组、筛选、项目下拉 ——「UI02 …」（本文件）
+ * UI02 任务列表：分组、筛选、项目下拉、搜索与排序 ——「UI02 …」（本文件；搜索与排序在 shots-search.ts）
  * UI03 选中任务显示详情；标签切换；时间线跟随最新进展 ——「UI03 …」（本文件）
  * UI04 停止任务：确认框默认焦点在取消，确认后真实停止 ——「UI04 …」（本文件：假派发进程树真的结束、清单写 interrupted、列表变中断）
  * UI05 更多菜单各项 ——「UI05 …」（本文件：打开类与复制由桩记录参数，隐藏写入 tasks.json）
  * UI06 技能安装、更新、回退、自改版本不替换 ——「UI06 …」（shots-preferences.ts：断言安装记录与备份文件）
- * UI07 设置页每一项写入、失败恢复、环境变量覆盖说明 ——「UI07 …」（shots-preferences.ts：读 config.json 断言）
+ * UI07 设置页每一项写入、失败恢复、环境变量覆盖说明、并行、清理 ——「UI07 …」（shots-preferences.ts：读 config.json 断言；并行与清理在 shots-search.ts）
  * UI08 关于页信息正确；"重新运行首次引导"可用 ——「UI08 …」（shots-preferences.ts）
  * UI09 首次引导完整走一遍 ——「UI09 …」（shots-preferences.ts：断言配置与技能真的写入）
  * UI10 主题：跟随系统 / 深色 / 浅色切换即时生效 ——「UI10 …」（shots-preferences.ts）
@@ -42,7 +45,7 @@ const appEnv = appEnvironment(process.env);
  * UI12 系统通知：任务结束发一条，点开选中该任务 ——「UI12 …」（本文件；通知由桩记录，点开调用与真实通知相同的回调）
  * UI13 导入 Agent 向导 ——「UI13 …」（shots-preferences.ts）
  * UI14 测试连接成功 / 失败 / 超时 ——「UI14 …」（shots-preferences.ts）
- * UI15 项目页：添加、git init、初始化预览 / 写入 / 提交、编辑配置、移除、侧栏分组与执行者负载 ——「UI15 …」（shots-projects.ts）
+ * UI15 项目页：添加、git init、初始化预览 / 写入 / 提交、编辑配置、移除、侧栏分组与执行者负载、搜索与排序 ——「UI15 …」（shots-projects.ts；搜索与排序在 shots-search.ts）
  * UI16 新建任务页：三种来源、预览、派发成功 / 失败、必填校验、无项目 ——「UI16 …」（shots-newtask.ts：假执行者真实派发，读 runs.jsonl 与 git 提交）
  * UI18 在此项目打开 Claude Code / 打开文件夹 ——「UI18 …」（shots-projects.ts：调用由桩记录）
  * UI19 关闭询问与托盘（012 A）：点 × 的三种行为、记住选择、"窗口"设置、托盘状态与提示 ——「UI19 …」（本文件）
@@ -50,6 +53,9 @@ const appEnv = appEnvironment(process.env);
  * UI21 进程查询失败（W4）：注入失败后横幅、"状态未知"、停止 / 隐藏 / 批量删除禁用且主进程拒绝、不推断结束；恢复后横幅消失、操作恢复 ——「UI21 …」（本文件）
  * UI22 门禁界面（Stage04）：轨道、门禁标签、列表徽标、新建任务页的门禁说明 ——「UI22 …」（shots-gate.ts）
  * UI23 多次尝试界面（Stage05）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、真实重试 ——「UI23 …」（shots-retry.ts）
+ * UI24 验收页与 worktree 任务（Stage06）：任务页的排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回、验收页概览 / 改动 / 门禁、批准并合并、驳回、被拒的合并、待验收通知 ——「UI24 …」（shots-accept.ts：真实核心、临时 git 仓库）
+ * UI25 合并冲突与"解决冲突并重试"、并发排队与停止、准备失败 ——「UI25 …」（shots-accept.ts）
+ * UI26 任务详情"评分"标签（两张卡片、每项扣分、门禁失败归因、综合分怎么算）与设置页"统计主导的 token 与用时" ——「UI26 …」（shots-score.ts：真实核心 ar report 对照）
  * 「通用 …」是每页通用检查、真实输入自测与环境检查。
  * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
  */
@@ -242,8 +248,22 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     console.log('验收开始时的 CPU（1 秒采样）：' + await cpuNow());
     await captureWizard(h);
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 单独复现 UI26（AR_SHOTS_FOCUS=score）：引导之后只跑评分标签与设置页开关的检查，演示数据是原样的。
+    if (process.env.AR_SHOTS_FOCUS === 'score') {
+        await captureScore(h, registry, win, save);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'score', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // UI15 / UI18：项目页在 UI01 之前准备好（UI01 的页面清单里加了"项目"），结束后回到任务页。
     await captureProjects(h);
+    // UI02 / UI15 / UI07：任务页与项目页的搜索和排序、侧栏底部的执行者负载、设置页的“并行”与“清理”。
+    // 放在这里是因为演示数据还是原样的（两个进行中的任务、13 条任务）；检查结束时偏好、配置、窗口大小与主题都已恢复。
+    await captureSearch(h, registry, win);
+    // 单独复现搜索 / 排序 / 并行 / 清理的检查（AR_SHOTS_FOCUS=search）：只跑到这里，不做退出后检查与重置。
+    if (process.env.AR_SHOTS_FOCUS === 'search') {
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'search', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 单独复现新建任务页加载（PR #5 CI）：先完整跑一次新建任务页检查，再反复离开、进入新建任务页并等待加载完成，打印每次用时与核心调用。
     if (process.env.AR_SHOTS_FOCUS === 'newtask-load') {
         const rounds = Math.max(1, Math.min(100, Number(process.env.AR_SHOTS_REPEAT) || 10));
@@ -256,6 +276,12 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         }
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'newtask-load', rounds, checks }, null, 2));
         console.log(`只跑新建任务页加载：${rounds} 轮全部在标准内完成。`);
+        return;
+    }
+    // 单独复现 UI24 / UI25（087，AR_SHOTS_FOCUS=accept）：只跑验收页与 worktree 任务的检查，不做退出后检查与重置。
+    if (process.env.AR_SHOTS_FOCUS === 'accept') {
+        await captureAccept(h, registry, out, save, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'accept', checks, focusRestored: progress.focusRestored }, null, 2));
         return;
     }
     if (process.env.AR_SHOTS_FOCUS === 'focus-ring') {
@@ -467,7 +493,9 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         console.log(`UI03 浮动滑块诊断：滚轮输入到检查 ${Math.round(clock() - wheelAt)} ms；${state}`);
         throw error;
     }
-    await check('UI03 滚到底部时保持跟随，不显示"跳到最新"', `(()=>{const v=document.querySelector("${scrollBox}");return v.scrollHeight-v.clientHeight-v.scrollTop<32 && document.querySelector("[data-latest]").hidden;})()`);
+    // 任务页标题栏在宽 < 1280 分两行后，默认窗口里的滚动区矮了一行的高度，上面滚 80 像素不一定到底；再滚一次到底，下面的断言不变。
+    await wheel(scrollBox, 400);
+    await check('UI03 滚到底部时保持跟随，不显示"跳到最新"', `(()=>{const v=document.querySelector("${scrollBox}");return v.scrollHeight-v.clientHeight-v.scrollTop<32 && document.querySelector("[data-latest]").hidden;})()`, async () => evaluate(`(()=>{const v=document.querySelector("${scrollBox}");return JSON.stringify({scrollHeight:v.scrollHeight,clientHeight:v.clientHeight,scrollTop:v.scrollTop,latestHidden:document.querySelector("[data-latest]").hidden,window:[innerWidth,innerHeight]});})()`));
     await wheel(scrollBox, -3000);
     await check('UI03 滚轮向上离开底部后暂停跟随，出现"跳到最新"', '!document.querySelector("[data-latest]").hidden');
     // Tab 经过时间线时浏览器会把焦点元素滚进视野，所以从键盘到达"思考"开关之后再记录滚动位置。
@@ -696,6 +724,10 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await captureGate(h, registry, out, save);
     // UI23（Stage05 多次尝试界面）：演示任务 t25 / t26 默认隐藏，检查时临时显示、检查完恢复；另有一次真实重试。
     await captureRetry(h, registry, out, save);
+    // UI24 / UI25（Stage06 worktree 任务与验收页）：演示任务 t30～t35 默认隐藏，检查时临时显示、检查完恢复；另有真实的合并、驳回、冲突、排队与准备失败。
+    await captureAccept(h, registry, out, save, win);
+    // UI26（Stage06 评分标签与设置页"统计主导的 token 与用时"）：演示任务 t27 默认隐藏，检查时临时显示、检查完恢复。
+    await captureScore(h, registry, win, save);
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
     await captureProcessUnknown(h, registry, save, menuItem, runs);
     const fontLoaded = await capturePreferences(h);
@@ -781,7 +813,7 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // 原 UI10 / UI11 已分别是"主题"与"最小窗口"，所以新增要求改用 UI19、UI20（见汇报）。
     // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
     // UI23 = Stage05 多次尝试界面（061）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、一次真实重试。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23'], '界面功能基线 UI01～UI23 都要有检查');
+    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26'], '界面功能基线 UI01～UI26 都要有检查');
     console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。
@@ -1068,8 +1100,9 @@ async function runningExitProcesses(registry: Registry, label: string, id: strin
 // 024：假执行者也等放行文件才结束（同托管任务），"就绪 → Electron 退出"再久也不会在检查前自然结束。
 async function prepareRedispatchExit(h: Harness, registry: Registry): Promise<ExitCheck> {
     const home = appEnv.AGENT_ROUTER_HOME!, repo = redispatchRepo(), configFile = path.join(home, 'config.json');
-    // 放行文件放在隔离公共目录里；派发前先删掉上一次留下的。
-    const release = path.join(home, 'redispatch-exit-release');
+    // 放行文件放在隔离公共目录下预先建好的 release 子目录里（任务运行期间才写它，写在公共目录根的第一层会被算作工作区外的新文件）；派发前先删掉上一次留下的。
+    const release = path.join(home, 'release', 'redispatch-exit-release');
+    await mkdir(path.dirname(release), { recursive: true });
     await rm(release, { force: true });
     const originalConfig = await readFile(configFile, 'utf8').catch(() => null);
     const source = (await readRows(registry)).find(row => row.event === 'start' && row.name === REDISPATCH_SOURCE);
@@ -1089,7 +1122,8 @@ async function prepareRedispatchExit(h: Harness, registry: Registry): Promise<Ex
         const processes = await runningExitProcesses(registry, '脱离任务', start.id, [start.pid, spawned.agentPid]);
         const node = process.env.AR_TEST_NODE!;
         assert.ok(path.isAbsolute(node) && /^node(?:\.exe)?$/i.test(path.basename(node)));
-        const waiterLog = 'redispatch-exit-waiter.log';
+        // 等待者日志在任务运行期间才创建，同样放进 release 子目录（外部启动器按 home 下的相对路径读它）。
+        const waiterLog = 'release/redispatch-exit-waiter.log';
         const output = await open(path.join(home, waiterLog), 'w');
         try {
             const waiter = spawn(node, [coreScript(), 'wait', start.name], { cwd: repo, env: appEnv, detached: true, stdio: ['ignore', output.fd, output.fd], shell: false, windowsHide: true });
@@ -1617,7 +1651,9 @@ async function prepareManagedExit(registry: Registry): Promise<ExitCheck> {
     const ready = path.join(home, 'managed-exit-agent.json');
     // 假 agent 不再定时自己结束：写完 ready 与一条消息后等外部放行文件（见 tools/shots.mjs 的退出后实测），
     // 这样"托管任务就绪 → Electron 退出"无论花多久，检查存活时它都还在；等待上限 120 秒，超时非 0 退出让 end.exit=0 如实失败。
-    const release = path.join(home, 'managed-exit-release');
+    // 同样放进预先建好的 release 子目录，不写在公共目录根的第一层。
+    const release = path.join(home, 'release', 'managed-exit-release');
+    await mkdir(path.dirname(release), { recursive: true });
     await rm(release, { force: true });
     await mkdir(repo, { recursive: true });
     await writeFile(agent, `const fs=require('node:fs');if(process.argv.includes('--version')){console.log('codex-cli fake-exit');process.exit(0);}process.stdin.resume();process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid}));console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'正在验证软件退出后的托管任务'}}));const started=Date.now();const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'隔离任务完成');process.exit(0);}else if(Date.now()-started>=120000){clearInterval(timer);process.stderr.write('托管任务的假 agent 等待放行超时（120 秒）\\n');process.exit(2);}},100);});`);

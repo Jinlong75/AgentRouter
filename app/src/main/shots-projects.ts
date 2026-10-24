@@ -8,6 +8,7 @@ import type { Harness } from './shots-input';
 import { effects } from './effects';
 import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
+import { s6 } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
@@ -113,7 +114,8 @@ export async function captureProjects(h: Harness) {
     await press('[data-page=tasks]');
     await wait('!!document.querySelector("[data-task=t1]")');
     await check('UI15 侧栏"配置"分组下依次是"项目""Agent"', `(() => { const g = [...document.querySelectorAll('.nav-group')].find(x => x.textContent === '配置'); if (!g) return false; const project = g.nextElementSibling, agent = project?.nextElementSibling; return project?.dataset.page === 'projects' && project.textContent.trim() === '项目' && agent?.dataset.page === 'connect' && agent.textContent.trim() === 'Agent'; })()`);
-    await check('UI15 执行者负载按显示名统计正在运行的任务', `document.querySelector('.nav-foot .mono')?.textContent === 'Codex 2' && document.querySelector('.nav-foot div[title]')?.title === '正在运行的任务数（按执行者）'`);
+    // 改写：侧栏底部改成“每个执行者一行：显示名 + 运行数/上限”（原来是单行“Codex 2”，悬停“正在运行的任务数（按执行者）”）。
+    await check('UI15 执行者负载按显示名统计正在运行的任务', `[...document.querySelectorAll('.nav-foot .load-l')].some(r => r.firstElementChild.textContent === 'Codex' && r.lastElementChild.textContent === ${JSON.stringify(s6.loadRow(2, 2))} && r.title === ${JSON.stringify(s6.loadTip('Codex', 2, 2))})`);
     await tabTo('[data-page=projects]');
     await focusRing('UI15 侧栏「项目」');
     await key('Enter');
