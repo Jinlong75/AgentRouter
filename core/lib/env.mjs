@@ -4,9 +4,22 @@
 // 返回的对象只交给 spawn，调用方绝不打印或写盘。
 import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, parse } from 'node:path';
+import { dirname, join, parse } from 'node:path';
 import { resolveSecret } from './secrets.mjs';
 import { testAgent, testAgentEnv } from './compat.mjs';
+import { readConfig } from './config.mjs';
+import { applyProxyEnv, readSystemProxy, resolveProxy } from './proxy.mjs';
+
+// 网络代理（Stage07 099）：按全局 config.json 的 proxy 算出这一刻的代理，并把代理变量写进基础环境。
+// 每次启动执行者前都要调用（每次尝试、自动重试、手动重试各算一次），然后把返回的 base 交给 buildEnv——
+// 先覆盖代理变量，再经过白名单（白名单本来就放行代理变量）。proxy 不用时（off 或没得到地址）base 就是传入的 env 本身。
+// 配置读不了（无效的配置在派发入口就已拒绝）按不使用处理。readSystem 可注入（测试不读真实注册表）。
+export function withProxy(env, home, { readSystem = () => readSystemProxy({ env }) } = {}) {
+  let proxy;
+  try { proxy = resolveProxy(readConfig(home).config, { readSystem }); }
+  catch { proxy = resolveProxy({}); }
+  return { base: applyProxyEnv(env, proxy), proxy };
+}
 
 // 064：执行者进程的用户目录指向沙箱 <公共目录>/workers/<profile>/home（协议第 7 节"执行者的用户目录"）。
 // 原因：执行者在 PowerShell 里给只读的 $home 赋值失败后，$home 仍是真实用户目录根，脚本随后把文件直接写进去
@@ -24,7 +37,7 @@ const SYSTEM = [
   'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'SystemDrive', 'NUMBER_OF_PROCESSORS', 'OS', 'LANG',
   /^ProgramFiles/i, /^ProgramW6432$/i, /^CommonProgramFiles/i, /^PROCESSOR_/i, /^LC_/i,
   // Node（libuv）在 Windows 上启动子进程时总会补上 USERNAME、USERDOMAIN、LOGONSERVER 等几个必需变量，这里如实列出。
-  'PSModulePath', 'USERNAME', 'USERDOMAIN', 'LOGONSERVER', 'COMPUTERNAME',
+  'PSModulePath', 'PSModuleAnalysisCachePath', 'USERNAME', 'USERDOMAIN', 'LOGONSERVER', 'COMPUTERNAME',
   'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'TZ',
   // 软件里核心用 Electron 自带的 Node 运行（process.execPath 是 AgentRouter.exe / electron.exe）：执行者若是 Node 脚本
   //（npm 装的 CLI、fake 执行者）也用它启动，必须保留这个开关，否则会被当成图形程序打开而一直不结束。
@@ -39,8 +52,8 @@ export const ALLOWED = [...SYSTEM, ...NETWORK];
 const matches = (pattern, key) => pattern instanceof RegExp ? pattern.test(key) : key.toLowerCase() === String(pattern).toLowerCase();
 
 // 只按白名单挑选，不含任何密钥。缺密钥导致 buildEnv 失败时，检测执行者版本也用它。
-export function allowedEnv({ base = process.env, adapter, home, profileName, sources = [] } = {}) {
-  const keep = [...ALLOWED, ...(adapter?.isolate?.({ home, profileName })?.keep ?? []), ...(testAgent(base) ? TEST : [])];
+export function allowedEnv({ base = process.env, adapter, home, profileName, profile, sources = [] } = {}) {
+  const keep = [...ALLOWED, ...(adapter?.isolate?.({ home, profileName, profile })?.keep ?? []), ...(testAgent(base) ? TEST : [])];
   const env = Object.fromEntries(Object.entries(base).filter(([k, v]) => typeof v === 'string' && keep.some(p => matches(p, k))));
   for (const name of sources) for (const k of Object.keys(env)) if (matches(name, k)) delete env[k];
   return env;
@@ -52,8 +65,8 @@ export function buildEnv({ base = process.env, profile = {}, adapter, home, prof
   const lookup = resolve ?? (name => resolveSecret(name, { env: base }));
   const pairs = authOf(profile) === 'token' ? Object.entries(profile.secrets ?? {}) : [];
   const secrets = pairs.map(([key, from]) => [key, lookup(from)]);
-  const iso = adapter?.isolate?.({ home, profileName }) ?? {};
-  const env = allowedEnv({ base, adapter, home, profileName, sources: [...sources, ...pairs.map(([, from]) => from)] });
+  const iso = adapter?.isolate?.({ home, profileName, profile }) ?? {};
+  const env = allowedEnv({ base, adapter, home, profileName, profile, sources: [...sources, ...pairs.map(([, from]) => from)] });
   const del = pattern => { for (const k of Object.keys(env)) if (matches(pattern, k)) delete env[k]; };
   for (const pattern of iso.clear ?? []) del(pattern);
   for (const [k, v] of Object.entries(profile.env ?? {})) { del(k); env[k] = String(v); }
@@ -79,7 +92,12 @@ function applySandboxHome(env, { base, home, profileName, realHomeDefaults = {},
   for (const key of ['USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'GIT_CONFIG_GLOBAL']) del(key);
   pointHome(env, sandbox);
   if (gitGlobal) env.GIT_CONFIG_GLOBAL = gitGlobal;
+  // Windows：调用方（或 profile.env）没设 PSModuleAnalysisCachePath 时指向沙箱里的位置。用户目录换成沙箱后 PowerShell
+  // 有时解析不出本地应用数据目录，会把模块分析缓存写进当前目录（Stage07 097 实测：工作区根多出 Microsoft/Windows/PowerShell/ModuleAnalysisCache）。
+  if (process.platform === 'win32' && !Object.keys(env).some(k => matches('PSModuleAnalysisCachePath', k))) env.PSModuleAnalysisCachePath = psCachePath(sandbox);
 }
+
+const psCachePath = dir => join(dir, 'AppData', 'Local', 'Microsoft', 'Windows', 'PowerShell', 'ModuleAnalysisCache');
 
 function pointHome(env, dir) {
   env.USERPROFILE = dir;
@@ -97,7 +115,10 @@ export function ensureSandboxHome(env, { home, profileName } = {}) {
   try { makeSandbox(env.USERPROFILE); return env.USERPROFILE; }
   catch {
     const dir = mkdtempSync(join(tmpdir(), `ar-sandbox-${String(profileName).replace(/[^\w.-]/g, '_')}-`));
+    // 缓存位置是核心按沙箱算出来的（不是调用方指定的）时，跟着换到一次性目录。
+    const derived = env.PSModuleAnalysisCachePath === psCachePath(env.USERPROFILE);
     pointHome(env, dir);
+    if (derived) env.PSModuleAnalysisCachePath = psCachePath(dir);
     makeSandbox(dir);
     return dir;
   }
@@ -109,7 +130,10 @@ export function ensureSandboxHome(env, { home, profileName } = {}) {
 // 所以建沙箱时一并建好这两个目录，这类缓存留在沙箱里。
 function makeSandbox(dir) {
   mkdirSync(dir, { recursive: true });
-  if (process.platform === 'win32') for (const sub of ['Local', 'Roaming']) mkdirSync(join(dir, 'AppData', sub), { recursive: true });
+  if (process.platform === 'win32') {
+    for (const sub of ['Local', 'Roaming']) mkdirSync(join(dir, 'AppData', sub), { recursive: true });
+    mkdirSync(dirname(psCachePath(dir)), { recursive: true });
+  }
 }
 
 // 配置里所有 profile 的密钥来源变量名。

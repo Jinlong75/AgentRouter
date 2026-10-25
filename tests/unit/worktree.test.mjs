@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { parseWorktreeList, shortName, worktreeDir, worktreeRoot } from '../../core/lib/worktree.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { parseWorktreeList, runSetup, shortName, worktreeDir, worktreeRoot } from '../../core/lib/worktree.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 
@@ -83,4 +86,28 @@ test('parseWorktreeList：解析 porcelain -z，不含主工作区', () => {
 test('parseWorktreeList：空输出与只有主工作区', () => {
   assert.deepEqual(parseWorktreeList(''), []);
   assert.deepEqual(parseWorktreeList('worktree /repo\0HEAD a\0branch refs/heads/main\0\0'), []);
+});
+
+// 093：extraEnv 在 removeEnv 之后合并；不传时命令环境与原来相同。
+const dumpEnv = `node -e "console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k]) => /^(AR_|FOO_093)/i.test(k)))))"`;
+const envOf = result => JSON.parse(result.results[0].output.trim());
+
+test('runSetup：extraEnv 在去掉 AR_ 变量之后合并，同名的父进程变量被它覆盖，其余 AR_ 变量照旧被去掉', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ar-093-setup-'));
+  try {
+    const env = { ...process.env, AR_BASE_REPO: '父进程的值', AR_OTHER: '别的', FOO_093: '保留' };
+    const result = await runSetup({ dir, commands: [dumpEnv], env, extraEnv: { AR_BASE_REPO: '/主工作区', AR_WORKTREE: '/worktree' } });
+    assert.equal(result.ok, true, result.summary);
+    assert.deepEqual(envOf(result), { FOO_093: '保留', AR_BASE_REPO: '/主工作区', AR_WORKTREE: '/worktree' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runSetup：不传 extraEnv 时去掉全部 AR_ 变量，与原来相同', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ar-093-setup-'));
+  try {
+    const env = { ...process.env, AR_BASE_REPO: '父进程的值', AR_WORKTREE: '父进程的值', FOO_093: '保留' };
+    const result = await runSetup({ dir, commands: [dumpEnv], env });
+    assert.equal(result.ok, true, result.summary);
+    assert.deepEqual(envOf(result), { FOO_093: '保留' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

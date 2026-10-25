@@ -5,7 +5,7 @@ import { executorLabel, executorTag } from '../shared/executor';
 import { confirmAction, field, icon, menu, notice, openSheet } from './ui';
 import { gateBadge, gateEnabled, gateFile, gateTab } from './gate';
 import { attemptBadge, lastFailure, openRetrySheet } from './attempts';
-import { baseBranchOf, bannerHtml, needsAccept, sha7, waitedSince, wtMark, wtStateLine, wtTrack } from './wt';
+import { baseBranchOf, bannerHtml, closeBlocked, loadRepoState, needsAccept, readdProject, repoBanner, sha7, waitedSince, writeBlocked, wtMark, wtStateLine, wtTrack } from './wt';
 
 // 验收页（Stage06，协议 15.6～15.9；界面稿 app/design/preview.js 的 acceptRow / diffView / acceptOverview / acceptPage）：
 // 左边是待验收与冲突的任务，右边是详情（概览 · 改动 · 门禁 · 审查）与底部操作栏（驳回 · 重试 · 批准并合并 / 解决冲突并重试）。
@@ -59,7 +59,7 @@ export class AcceptView {
     private blocked = new Map<string, Banner>();
     // 刚批准 / 驳回、界面先隐藏的任务（快照稍后才会更新）；快照里它不再是待验收 / 冲突后清掉。
     private gone = new Set<string>();
-    private busy: { id: string; kind: 'approve' | 'reject' | 'rebase' } | null = null;
+    private busy: { id: string; kind: 'approve' | 'confirm' | 'reject' | 'rebase' } | null = null;
     private toastTimer?: ReturnType<typeof setTimeout>;
     private signature = '';
     private generation = 0;
@@ -100,7 +100,21 @@ export class AcceptView {
     private list() { return this.host.tasks().filter(t => needsAccept(t) && !this.gone.has(t.id)); }
     private current(list = this.list()) { return list.find(t => t.id === this.selected) ?? list[0]; }
     private key(t: Task) { return `${t.id}:${t.wt?.awaitingAt ?? 0}`; }
+    // 调研 / 审查类任务（只读运行）或改动为空的任务：没有东西可合并，主按钮是“确认”（Stage07 T6）。改动为空要等 ar diff 读到结果才知道。
+    private research(t: Task) {
+        if (t.readOnly === true) return true;
+        const diff = this.diffs.get(this.key(t));
+        return !!diff && 'data' in diff && diff.data.files.length === 0;
+    }
+    // 项目被移除 / 文件夹不在了：横幅和底栏按钮随之变化（状态变了才会走到这里）。
+    private repoChanged = () => {
+        const now = this.current();
+        if (!now || !this.root) return;
+        this.renderBody();
+        this.renderActions(now);
+    };
     private async load(t: Task) {
+        loadRepoState(t, this.repoChanged);
         const gen = this.generation, id = t.id, key = this.key(t);
         if (!this.detailData.has(key)) {
             try {
@@ -137,7 +151,12 @@ export class AcceptView {
             this.diffs.set(key, { error: text.includes('不可查') ? w.diffGone : `${w.failed}：${text}` });
         }
         const now = this.current();
-        if (now && this.key(now) === key && this.tab === 'diff') { this.renderTabs(); this.renderBody(); }
+        if (now && this.key(now) === key) {
+            // 改动读到后，标签数量、调研横幅和底栏主按钮可能随之变化。
+            this.renderTabs();
+            this.renderBody();
+            this.renderActions(now);
+        }
     }
 
     // ---- 渲染 ----
@@ -156,13 +175,14 @@ export class AcceptView {
         this.renderList(list);
         this.renderDetail(t);
         void this.load(t);
-        if (this.tab === 'diff') void this.loadDiff(t);
+        // 改动提前读：改动为空的任务要据此换成“确认”流程；读失败的任务不在每次刷新时重读（切到改动标签才重试）。
+        if (this.tab === 'diff' || !this.diffs.has(this.key(t))) void this.loadDiff(t);
         this.restoreFocus(focus);
     }
     private focusKey() {
         const el = document.activeElement;
         if (!(el instanceof HTMLElement) || !this.root?.contains(el)) return '';
-        for (const name of ['acc', 'atab', 'accApprove', 'accReject', 'accRetry', 'accRebase', 'df', 'accMore']) if (name in el.dataset) return `${name}:${el.dataset[name]}`;
+        for (const name of ['acc', 'atab', 'accApprove', 'accConfirm', 'accReject', 'accRetry', 'accRebase', 'df', 'accMore']) if (name in el.dataset) return `${name}:${el.dataset[name]}`;
         return '';
     }
     private restoreFocus(key: string) {
@@ -187,7 +207,8 @@ export class AcceptView {
     }
     private tabItems(t: Task): [TabKey | 'review', string][] {
         const diff = this.diffs.get(this.key(t));
-        const files = diff && 'data' in diff ? ` <span class="n">${diff.data.files.length}</span>` : '';
+        // 只读运行的任务不会有改动（门禁不允许），数量直接是 0。
+        const files = t.readOnly === true ? ' <span class="n">0</span>' : diff && 'data' in diff ? ` <span class="n">${diff.data.files.length}</span>` : '';
         return [['overview', w.tabs.overview], ['diff', w.tabs.diff + files], ['gate', w.tabs.gate], ['review', w.tabs.review]];
     }
     private renderDetail(t: Task) {
@@ -229,7 +250,8 @@ export class AcceptView {
         const blocked = notice ? bannerHtml('fail', notice.title, notice.text, notice.copy ? `<button class="btn sm" data-acc-copy="${esc(notice.copy)}">${esc(w.copyCommand)}</button>` : '') : '';
         const conflictBanner = conflict ? bannerHtml('fail', w.conflictTitle, w.conflictPageHelp(baseBranchOf(t), t.wt?.conflictFiles ?? [])) : '';
         const content = this.tab === 'diff' ? this.diffView(t) : this.tab === 'gate' ? this.gateView(t) : this.overviewView(t);
-        body.innerHTML = blocked + conflictBanner + content;
+        const researchBanner = !conflict && this.research(t) ? bannerHtml('info', w.researchTitle, w.researchHelp) : '';
+        body.innerHTML = repoBanner(t) + blocked + conflictBanner + researchBanner + content;
         scroller.scrollTop = top;
     }
     private gateView(t: Task) {
@@ -286,10 +308,18 @@ export class AcceptView {
         const busy = this.busy?.id === t.id ? this.busy.kind : null, off = busy ? 'disabled' : '';
         const approve = busy === 'approve' ? `${runm}${esc(w.approving)}` : `${icon('git-merge-line')}${esc(w.approve)}`;
         const resolve = busy === 'rebase' ? `${runm}${esc(w.resolving)}` : `${icon('git-merge-line')}${esc(w.resolve)}`;
+        // 调研 / 审查类任务没有改动可合并：主按钮是“确认”（不弹二次确认），驳回与重试照旧。
+        const research = !conflict && this.research(t);
+        const confirm = busy === 'confirm' ? `${runm}${esc(w.confirming)}` : `${icon('check-line')}${esc(w.confirm)}`;
+        // 项目已从列表移除：批准合并、重试、合并主分支后重跑不可用（悬停提示同一句）；文件夹也不在了，驳回和确认同样不可用。
+        const tip = ' data-tip="' + esc(c.projectGoneBlocked) + '"';
+        const writeOff = off || (writeBlocked(t) ? 'disabled' + tip : ''), closeOff = off || (closeBlocked(t) ? 'disabled' + tip : '');
         const acts = conflict
-            ? `<button class="btn" data-acc-reject="${esc(t.id)}" ${off}>${esc(w.reject)}</button><button class="btn primary" data-acc-rebase="${esc(t.id)}" ${off}>${resolve}</button>`
-            : `<button class="btn" data-acc-reject="${esc(t.id)}" ${off}>${esc(w.reject)}</button><button class="btn" data-acc-retry="${esc(t.id)}" ${off}>${icon('arrow-go-forward-line')}${esc(w.retry)}</button><button class="btn primary" data-acc-approve="${esc(t.id)}" ${off}>${approve}</button>`;
-        const note = conflict ? w.noteConflict : t.wt?.mergeMode === 'squash' ? w.noteApproveSquash(base) : w.noteApprove(base);
+            ? `<button class="btn" data-acc-reject="${esc(t.id)}" ${closeOff}>${esc(w.reject)}</button><button class="btn primary" data-acc-rebase="${esc(t.id)}" ${writeOff}>${resolve}</button>`
+            : research
+                ? `<button class="btn" data-acc-reject="${esc(t.id)}" ${closeOff}>${esc(w.reject)}</button><button class="btn" data-acc-retry="${esc(t.id)}" ${writeOff}>${icon('arrow-go-forward-line')}${esc(w.retry)}</button><button class="btn primary" data-acc-confirm="${esc(t.id)}" ${closeOff}>${confirm}</button>`
+                : `<button class="btn" data-acc-reject="${esc(t.id)}" ${closeOff}>${esc(w.reject)}</button><button class="btn" data-acc-retry="${esc(t.id)}" ${writeOff}>${icon('arrow-go-forward-line')}${esc(w.retry)}</button><button class="btn primary" data-acc-approve="${esc(t.id)}" ${writeOff}>${approve}</button>`;
+        const note = conflict ? w.noteConflict : research ? w.noteConfirm : t.wt?.mergeMode === 'squash' ? w.noteApproveSquash(base) : w.noteApprove(base);
         bar.innerHTML = `<span class="note">${esc(note)}</span>${acts}`;
     }
 
@@ -320,10 +350,15 @@ export class AcceptView {
             menu(b, [{ label: w.openWorktree, run: () => void this.action(t, 'worktree') }, { label: w.copyBranch, disabled: !t.wt?.branch, run: () => void this.action(t, 'copy-text', t.wt?.branch ?? '') }]);
             return;
         }
+        if (d.readdProject !== undefined) {
+            readdProject(t, this.repoChanged).catch(error => this.blocked.set(t.id, { title: w.failed, text: messageOf(error) })).finally(() => this.renderBody());
+            return;
+        }
         if (d.accOpen) { void this.action(t, d.accOpen); return; }
         if (d.accCopy) { void this.action(t, 'copy-text', d.accCopy); return; }
         if (d.accUndo) { void this.action(t, 'copy-text', d.accUndo); return; }
         if (d.accApprove) void this.approve(t, b);
+        else if (d.accConfirm) void this.confirm(t);
         else if (d.accReject) this.rejectSheet(t, b);
         else if (d.accRetry) openRetrySheet({ t, trigger: b, failure: lastFailure(t, t.gateSummary ?? ''), gate: gateEnabled(t) });
         else if (d.accRebase) void this.rebase(t);
@@ -376,6 +411,35 @@ export class AcceptView {
         }
         this.busy = null;
         this.render();
+    }
+    // 确认（调研 / 审查类任务）：不合并、不改主分支，撤销风险很小，所以不弹二次确认框。
+    private async confirm(t: Task) {
+        if (this.busy) return;
+        this.blocked.delete(t.id);
+        this.setBusy({ id: t.id, kind: 'confirm' });
+        this.renderBody();
+        try {
+            const result = await window.dock.console('tasks:accept', { project: t.repo, name: t.name, confirm: true }) as { merge?: string | null; mode?: string; conflict?: boolean };
+            // 核心判断分支有新提交时会走合并（任务在界面显示之后又有了提交）：照合并的样子提示。
+            if (!result.conflict) {
+                this.gone.add(t.id);
+                if (result.mode === 'confirm') this.showConfirmedToast(t);
+                else this.showToast(t, sha7(t.commit), result.merge ?? '', result.mode === 'squash' ? 'squash' : 'no-ff');
+            }
+        }
+        catch (error) {
+            this.blocked.set(t.id, { title: w.blockedTitle, text: w.blockedHelp(messageOf(error)) });
+        }
+        this.busy = null;
+        this.render();
+    }
+    private showConfirmedToast(t: Task) {
+        const host = this.root?.querySelector<HTMLElement>('.acc-page');
+        if (!host) return;
+        host.querySelector('.toast')?.remove();
+        clearTimeout(this.toastTimer);
+        host.insertAdjacentHTML('beforeend', `<div class="toast" role="status">${okm}<span>${esc(w.confirmedToast(t.title))}</span></div>`);
+        this.toastTimer = setTimeout(() => host.querySelector('.toast')?.remove(), 15000);
     }
     private showToast(t: Task, from: string, merge: string, mode: 'squash' | 'no-ff') {
         const host = this.root?.querySelector<HTMLElement>('.acc-page');

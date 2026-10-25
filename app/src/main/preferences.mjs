@@ -28,9 +28,9 @@ export function hostActions(skills, backup) {
 export const defaultChecked = state => state === 'missing' || state === 'update';
 export async function createPreferences(root, data, env = process.env) {
   const module = file => import(pathToFileURL(join(root, file)).href);
-  const [install, config, adapter, codexConfig, json] = await Promise.all([
+  const [install, config, adapter, codexConfig, json, proxy] = await Promise.all([
     module('installer/lib/install.mjs'), module('core/lib/config.mjs'),
-    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs'), module('core/lib/json.mjs')]);
+    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs'), module('core/lib/json.mjs'), module('core/lib/proxy.mjs')]);
   const home = config.homeDirectory(env), ownFile = join(data, 'preferences.json');
   let own = { notifications: true, theme: 'system', wizardDone: false, closeAction: 'ask', trayHintShown: false };
   try { own = { ...own, ...json.parseJson(readFileSync(ownFile, 'utf8')) }; } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -70,7 +70,10 @@ export async function createPreferences(root, data, env = process.env) {
     // profiles：执行者配置原样交给 Agent 页（编辑 claude-code 执行者需要 env / maxTurns / secrets 等预填值）。
     const profiles = state.reason || !state.config?.profiles ? {} : state.config.profiles;
     // 并行上限与会话保留天数：按核心的口径取生效值（没写或不合法按默认），手写的越界值（如 7）原样给界面显示。
-    return { managed: state.config?.managed === true, leadUsage: state.config?.leadUsage === true, concurrency: config.slotLimits(state.config).limits.concurrency, retentionDays: config.sessionRetention(state.config).days,
+    // 网络代理（099）：config.json 的 proxy（没写按 off）；system 模式再读一次系统代理，界面据此说明"这一刻读到了什么"。
+    const saved = state.config?.proxy, mode = proxy.PROXY_MODES.includes(saved?.mode) ? saved.mode : 'off';
+    const networkProxy = { mode, url: typeof saved?.url === 'string' ? saved.url : '', system: mode === 'system' && !state.reason ? proxy.readSystemProxy({ env }) : null };
+    return { managed: state.config?.managed === true, leadUsage: state.config?.leadUsage === true, proxy: networkProxy, concurrency: config.slotLimits(state.config).limits.concurrency, retentionDays: config.sessionRetention(state.config).days,
       values: state.settings, profiles, exists: state.exists, reason: state.reason, file: shorten(state.file),
       home, leftover: leftover(),
       current: { model: current.model, effort: current.model_reasoning_effort, tier: current.service_tier }, overrides, own };
@@ -111,6 +114,19 @@ export async function createPreferences(root, data, env = process.env) {
         if (payload.key === 'concurrency') { if (!Number.isInteger(payload.value) || payload.value < 1 || payload.value > 4) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.concurrency = payload.value; }); return settings(); }
         // 统计主导的 token 与用时：config.json 的 leadUsage，只认布尔值；走 updateConfig 保留其余字段。
         if (payload.key === 'leadUsage') { if (typeof payload.value !== 'boolean') throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.leadUsage = payload.value; }); return settings(); }
+        // 网络代理：{ mode, url? }。manual 先用核心的 validateProxyUrl 校验，不合法抛出错误码（PROXY_EMPTY / PROXY_FORMAT / PROXY_CREDENTIALS，
+        // 界面按它显示对应的说明），不写配置；合法才走 updateConfig 保留其余字段。其他模式保留已保存的地址（切回 manual 时还在），但地址里带凭据一律不留。
+        if (payload.key === 'proxy') {
+          const value = payload.value;
+          if (!value || typeof value !== 'object' || !proxy.PROXY_MODES.includes(value.mode)) throw Error('Invalid value');
+          if (value.mode === 'manual') {
+            if (typeof value.url !== 'string') throw Error('Invalid value');
+            const checked = proxy.validateProxyUrl(value.url);
+            if (!checked.ok) throw Error(checked.code);
+            config.updateConfig(home, cfg => { cfg.proxy = { mode: 'manual', url: checked.url }; });
+          } else config.updateConfig(home, cfg => { cfg.proxy = { ...(typeof cfg.proxy?.url === 'string' && cfg.proxy.url && proxy.validateProxyUrl(cfg.proxy.url).ok ? { url: cfg.proxy.url } : {}), mode: value.mode }; });
+          return settings();
+        }
         if (!['model', 'effort', 'tier', 'sandbox', 'watchWindow', 'path'].includes(payload.key)) throw Error('Invalid setting');
         if (payload.value !== null && typeof payload.value !== 'string') throw Error('Invalid value');
         const choices = { effort: ['minimal','low','medium','high','xhigh'], tier: ['default','priority','flex'], sandbox: ['workspace-write','read-only'], watchWindow: ['auto','always','never'] };

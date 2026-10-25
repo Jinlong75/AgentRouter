@@ -1,0 +1,16 @@
+{
+  "name": "openai-compat",
+  "adapter": "codex",
+  "label": "OpenAI 兼容接口",
+  "enabled": true,
+  "auth": "token",
+  "model": null,
+  "provider": { "baseUrl": null, "wireApi": "responses" },
+  "secrets": {},
+  "title": "OpenAI 兼容接口（经 Codex）",
+  "description": "只填接口地址、模型和密钥变量；服务要支持 Responses 接口",
+  "baseUrlOptions": ["https://api.deepseek.com", "https://api.openai.com/v1"],
+  "effortOptions": ["minimal", "low", "medium", "high"],
+  "recommended": false,
+  "order": 9
+}

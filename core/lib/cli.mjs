@@ -1,10 +1,14 @@
 // ar 子命令：dispatch · redispatch · retry · wait · stop · accept · reject · diff · status · report · gc · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs，accept/reject 见 accept.mjs，diff 见 diff.mjs，status 见 status.mjs，report 见 report.mjs，gc 见 gc.mjs）。
 // 所有面向软件的命令支持 --json：标准输出只有一个 JSON 对象；出错时 { ok:false, error } 且退出码非 0。
 import { trace, tracing } from './trace.mjs';
-import { dirname, join } from 'node:path';
-import { run } from './run.mjs';
+import { readFileSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import { run, readProjectConfig } from './run.mjs';
+import { route, routeConfigCommand } from './router.mjs';
+import { parseSpec, validateSpec, SPEC_TYPES } from './spec.mjs';
+import { adapters } from '../adapters/index.mjs';
 import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from './compat.mjs';
-import { configCommand, readConfig } from './config.mjs';
+import { configCommand, readConfig, readEffectiveConfig } from './config.mjs';
 import { waitForTask, locateStart, findTerminal, reverseRows } from './wait.mjs';
 import { readNeedsScope } from './needs-scope.mjs';
 import { readOutsideWrites } from './outside-writes.mjs';
@@ -20,8 +24,10 @@ import { initCommand, projectsCommand } from './project.mjs';
 import { specCommand, readSpecForm } from './spec-new.mjs';
 import { readDispatch, optionArgs } from './records.mjs';
 import { readJson } from './json.mjs';
+import { withProxy } from './env.mjs';
+import { proxyText, readSystemProxy, resolveProxy } from './proxy.mjs';
 
-export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'diff', 'status', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'version', '--run-request'];
+export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'diff', 'status', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'route', 'proxy', 'version', '--run-request'];
 export { listAgents };
 const legacy = { '--wait': 'wait', '--stop': 'stop', '--config': 'config' };
 export const usage = [
@@ -31,12 +37,17 @@ export const usage = [
   '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]（同一工作区手动重试下一次尝试，协议 14.3；--rebase 用于合并冲突的 worktree 任务，协议 15.8）',
   '  ar accept <记录名> [--squash] [--by human]　　ar reject <记录名> --reason "<原因>" [--keep-branch] [--by human]　　ar diff <记录名>（worktree 任务的验收合并、驳回与改动，协议 15.6～15.9）',
   '  ar status <记录名>（任务当前状态，不等待，协议 15.11）　　ar gc [--dry-run]（清理孤立的 worktree、并发名额与过期的执行者会话记录，协议 15.10）',
-  '  ar report <记录名> [--blame <n>=spec|worker]（任务结束后的链路报告与评分：执行者、主导各一组指标；--blame 把第 n 次门禁失败归因到任务说明或执行者，协议第 16 节）',
+  '  ar report <记录名> [--blame <n>=spec|worker|environment]（任务结束后的链路报告与评分：执行者、主导各一组指标；--blame 把第 n 次门禁失败归因到任务说明、执行者或环境，协议第 16 节）',
   '  ar wait [记录名]　　ar stop <记录名>　　ar config [键=值 … | init]',
   '  ar init [项目路径] [--dry-run]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径>|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
-  '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--base-url …] [--secret-var …] [--auth login|token]|update <名> […|--max-turns <正整数>|-]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
+  '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--effort …] [--base-url …] [--secret-var …] [--auth login|token]|add --generic <声明JSON> --name <名> [--label …]|update <名> […|--effort <级别>|""|--max-turns <正整数>|-|--escalate <名>|""]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
+  '  ar agents models <名>（可选的模型）|validate <文件>（校验声明或导出文件，只读）|export <名> [--out <文件>] [--force]|import <文件> [--name <名>] [--force]',
+  '  ar agents validate --decl <声明JSON>|detect --decl <声明JSON>|test --decl <声明JSON> [--timeout <秒>]（只用声明，不读不写配置；软件的自定义 CLI 表单用）',
   '  ar secrets status [变量名 …]|set <变量名>（值从标准输入读入，不回显）|unset <变量名>（删除 Windows 用户环境变量）',
-  '  ar spec list <项目路径>|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>',
+  '  ar spec list <项目路径>|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>|check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]（允许路径会匹配到哪些现有文件，只读）',
+  '  ar route [--spec <任务说明>] [--type <类型>] [--project <路径>] [--profile <名>] [--explain]（只计算会派给谁和为什么，不派发、不写文件）',
+  '  ar route config　　ar route rules set \'<JSON 数组>\'　　ar route fallback set <名>|clear　　ar route reviewer set \'<JSON>\'　　ar route limit set <名> [--tasks <n>|""] [--tokens <n>|""]（路由配置的读取与写入）',
+  '  ar proxy resolve（这一刻的网络代理：config.json 的 proxy 模式、读到的地址与要给执行者设置的变量，只读）',
   '  加 --json 时只输出一个 JSON 对象（供软件调用）',
 ].join('\n');
 
@@ -136,7 +147,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
     if (command !== 'version') assertSafeHome(env);
     switch (command) {
       case 'dispatch': case 'redispatch': case '--run-request': {
-        let detach = null, gate = null;
+        let detach = null, gate = null, inheritRoute = null;
         let runArgs;
         if (command === 'redispatch') {
           // 记录名允许中文、空格等，所以只校验个数与开关，不套用 dispatch 的记录名校验。
@@ -157,10 +168,11 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           if (names.length !== 1 || !names[0] || names[0].startsWith('--')) throw new Error('用法：ar redispatch <记录名> [--detach] [--host <派活方>]');
           const saved = readDispatch(cwd, names[0]);
           if (!saved) throw new Error('这个任务是旧版本派发的，没有保存派发参数，不能再派一次');
+          inheritRoute = saved.route ?? null;
           runArgs = [saved.task, ...(saved.extra ? [saved.extra] : []), '--name', saved.name, '--profile', saved.profile,
             ...(saved.role ? ['--role', saved.role] : []), ...optionArgs(saved.options), ...(saved.noWorktree ? ['--no-worktree'] : []), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
         } else runArgs = command === 'dispatch' ? rest : ['--run-request', ...rest];
-        const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, onDetach: id => { detach = id; }, onGate: value => { gate = value; } }));
+        const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, inheritRoute, onDetach: id => { detach = id; }, onGate: value => { gate = value; } }));
         const name = lines.find(l => l.startsWith('记录名：'))?.slice(4), progress = lines.find(l => l.startsWith('进度：'))?.slice(3);
         const needsScope = json && name && !detach ? scopeOf(name) : null;
         const outsideWrites = json && name && !detach ? outsideOf(name) : null;
@@ -213,7 +225,8 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         }
         if (json) emit({ ok: true, merge: result.merge, mode: result.mode, cleanup: result.cleanup });
         else {
-          out(`已合并：${name}（${result.mode === 'squash' ? '压成一个提交' : '合并提交'} ${result.merge.slice(0, 7)}）`);
+          if (result.mode === 'confirm') out(`已确认：${name}（没有改动，worktree 已删除）`);
+          else out(`已合并：${name}（${result.mode === 'squash' ? '压成一个提交' : '合并提交'} ${result.merge.slice(0, 7)}）`);
           if (!result.cleanup) out('worktree 或分支没能清理干净，合并结果不受影响；稍后用 ar gc 清理');
         }
         return 0;
@@ -256,11 +269,11 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
       }
       // 链路报告：只读；--blame 先写归因标记，再按新归因出报告。记录名允许中文、空格等。
       case 'report': {
-        const reportUsage = '用法：ar report <记录名> [--blame <n>=spec|worker] [--json]';
+        const reportUsage = '用法：ar report <记录名> [--blame <n>=spec|worker|environment] [--json]';
         const { name, options } = taskArgs(rest, { values: ['--blame'] }, reportUsage);
         if (options['--blame'] !== undefined) {
-          const blame = /^([1-9]\d*)=(spec|worker)$/.exec(options['--blame']);
-          if (!blame) throw new Error(reportUsage);
+          const blame = /^([1-9]\d*)=(spec|worker|environment)$/.exec(options['--blame']);
+          if (!blame) throw new Error(`${reportUsage}（归因只能是 spec、worker 或 environment 三种之一）`);
           setBlame({ home: homes, root: cwd, name, n: Number(blame[1]), blame: blame[2] });
         }
         const report = buildReport({ home: homes, root: cwd, name, env });
@@ -297,9 +310,62 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           return 0;
         }
         // test 会真实派发一次：派发过程的普通输出在 --json 时收集起来，只打印最后一个 JSON 对象。
-        const { result, text, code = 0 } = await capture(() => command === 'agents' ? agentsCommand(rest, { home: homes[0], env, scriptPath }) : secretsCommand(rest, { home: homes[0], env, readValue: readSecret, ...(setSecret ? { setSecret } : {}) }));
+        // 测试连接与列出模型会启动执行者（test 在临时公共目录里派发，读不到全局配置的 proxy），所以代理变量在这里先加进环境（099）。
+        const agentEnv = command === 'agents' && ['test', 'models'].includes(rest[0]) ? withProxy(env, homes[0]).base : env;
+        const { result, text, code = 0 } = await capture(() => command === 'agents' ? agentsCommand(rest, { home: homes[0], env: agentEnv, scriptPath, cwd }) : secretsCommand(rest, { home: homes[0], env, readValue: readSecret, ...(setSecret ? { setSecret } : {}) }));
         if (json) emit(result); else out(text);
         return code;
+      }
+      // 网络代理（Stage07 099）：只读。按全局 config.json 的 proxy 算出这一刻的结果；system 模式会读一次 Windows 系统代理。
+      case 'proxy': {
+        if (rest.length !== 1 || rest[0] !== 'resolve') throw new Error('用法：ar proxy resolve [--json]');
+        const resolved = resolveProxy(readEffectiveConfig(homes[0]), { readSystem: () => readSystemProxy({ env }) });
+        if (json) emit({ ok: true, ...resolved }); else out(`proxy  ${proxyText(resolved)}`);
+        return 0;
+      }
+      // 路由试算（Stage07 T4）：只计算，不派发、不写任何文件。
+      case 'route': {
+        // 路由配置的读写：ar route config / rules set / fallback set|clear / reviewer set / limit set。
+        if (['config', 'rules', 'fallback', 'reviewer', 'limit'].includes(rest[0])) {
+          const { result, text } = routeConfigCommand(rest, { home: homes[0] });
+          if (json) emit({ ok: true, ...result }); else out(text);
+          return 0;
+        }
+        const routeUsage ='用法：ar route [--spec <任务说明>] [--type <类型>] [--project <路径>] [--profile <名>] [--explain] [--json]';
+        const given = {};
+        let explain = false;
+        for (let i = 0; i < rest.length; i++) {
+          const a = rest[i];
+          if (a === '--explain') { explain = true; continue; }
+          if (!['--spec', '--type', '--project', '--profile'].includes(a) || rest[i + 1] === undefined || rest[i + 1].startsWith('--')) throw new Error(routeUsage);
+          given[a] = rest[++i];
+        }
+        if (given['--type'] !== undefined && !SPEC_TYPES.includes(given['--type'])) throw new Error(`--type 只能是 ${SPEC_TYPES.join('、')}（当前：${given['--type']}）`);
+        const root = resolvePath(cwd, given['--project'] ?? '.');
+        let spec = null;
+        if (given['--spec'] !== undefined) {
+          let source;
+          try { source = readFileSync(resolvePath(root, given['--spec']), 'utf8'); }
+          catch (error) { throw new Error(`读不到任务说明 ${given['--spec']}：${error.message}`); }
+          const { type, worker, read_only } = validateSpec(parseSpec(source, given['--spec']), given['--spec']);
+          spec = { type, worker, read_only };
+        }
+        if (given['--type'] !== undefined) spec = { ...spec, type: given['--type'] };
+        const config = readEffectiveConfig(homes[0]);
+        let result;
+        try {
+          result = route({ spec, projectConfig: readProjectConfig(root), config, explicit: given['--profile'] ?? (env.AR_PROFILE || undefined), home: homes[0] });
+        } catch (error) {
+          if (!error.code || !Array.isArray(error.trace)) throw error;
+          if (json) { emit({ ok: false, code: error.code, error: error.message, trace: error.trace }); return 2; }
+          throw new Error([error.message, '路由过程：', ...error.trace.map(line => `  ${line}`)].join('\n'));
+        }
+        const chosen = config.profiles[result.profile];
+        const label = chosen.label ?? adapters[chosen.adapter]?.label ?? result.profile;
+        if (json) { emit({ ok: true, ...result, label }); return 0; }
+        out(`将派给 ${label}（${result.trace.at(-1)}）`);
+        if (explain) { out('路由过程：'); for (const line of result.trace) out(`  ${line}`); }
+        return 0;
       }
       case 'version': {
         arity(rest, 0, 'ar version');

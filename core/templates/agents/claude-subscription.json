@@ -11,5 +11,8 @@
   "title": "Claude Code（订阅）",
   "description": "用 Claude 订阅令牌（在终端运行 claude setup-token 获取）",
   "recommended": false,
+  "effortOptions": ["low", "medium", "high", "xhigh", "max"],
+  "card": { "id": "claude-code", "title": "Claude Code", "description": "用 Claude API Key 或订阅令牌" },
+  "variant": { "label": "认证方式", "option": "订阅令牌", "help": "在终端运行 claude setup-token 获取；用量计入你本人的同一份订阅" },
   "order": 5
 }

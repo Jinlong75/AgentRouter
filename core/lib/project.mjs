@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseJson, readJson } from './json.mjs';
+import { gitVersion, gitTooOldMessage, requireModernGit } from './git.mjs';
 
 export const BEGIN = '<!-- agent-router:begin -->', END = '<!-- agent-router:end -->';
 const templateDir = fileURLToPath(new URL('../templates/', import.meta.url));
@@ -296,6 +297,7 @@ export function initCommand(rest, { home, cwd, json }) {
   const dryRun = rest.includes('--dry-run'), positional = rest.filter(a => a !== '--dry-run');
   if (positional.length > 1 || positional.some(a => a.startsWith('--'))) throw new Error('用法：ar init [项目路径] [--dry-run]');
   const root = resolve(cwd, positional[0] ?? '.');
+  requireModernGit('init');
   gitRoot(root);
   const base = detectBaseBranch(root);
   const plan = planInit(root, undefined, base);
@@ -328,6 +330,7 @@ const usageProjects = '用法：ar projects list [--registry-only] | add <路径
 // projects list --json 逐项目 git 核对的并发上限：最多同时 4 个 git 子进程，项目更少时只开项目数个。
 const PROJECT_STATUS_CONCURRENCY = 4;
 const projectListText = projects => projects.length ? ['已添加的项目：', ...projects.map(p => `  ${p.name}  ${p.path}`)].join('\n') : '还没有添加项目：在项目里运行 ar init，或 ar projects add <路径>';
+const withGitNote = text => { const note = gitTooOldMessage('worktree'); return note ? `${text}\n${note}` : text; };
 function projectShowText(p) {
   const lines = [`项目：${p.name}`, `  路径：${p.path}`, `  目录存在：${p.exists ? '是' : '否'}`, `  git 仓库：${p.git ? '是（分支 ' + p.branch + '）' : '否'}`];
   if (p.git) lines.push(`  未提交改动：${p.dirty} 项（不含 .agent-runs/）`);
@@ -354,8 +357,9 @@ export async function projectsCommand(rest, { home, cwd, json }) {
       const projects = readProjects(home);
       if (registryOnly) return json ? { ok: true, projects } : projectListText(projects);
       const rows = json ? await mapLimit(projects, PROJECT_STATUS_CONCURRENCY, projectStatus) : projects;
-      if (json) return { ok: true, projects: rows };
-      return projectListText(rows);
+      // git 版本全局算一次，放在顶层（不在每个项目里重复）；低于 2.40 时文字输出多一句提示。
+      if (json) return { ok: true, projects: rows, git: gitVersion() };
+      return withGitNote(projectListText(rows));
     }
     case 'add': {
       const allowNonGit = args.includes('--allow-non-git');
@@ -381,8 +385,8 @@ export async function projectsCommand(rest, { home, cwd, json }) {
       if (args.length > 1 || args.some(a => a.startsWith('--'))) throw new Error(usageProjects);
       const root = resolve(cwd, args[0] ?? '.');
       const project = projectShow(home, root);
-      if (json) return { ok: true, project };
-      return projectShowText(project);
+      if (json) return { ok: true, project, git: gitVersion() };
+      return withGitNote(projectShowText(project));
     }
     case 'config': {
       const [target, ...assignments] = args;

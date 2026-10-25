@@ -35,7 +35,7 @@ test('白名单 + 清除项（名字或模式、不区分大小写）；覆盖�
   // 064：执行者的用户目录指向沙箱（协议第 7 节），USERPROFILE / HOME（Windows 另有 HOMEDRIVE / HOMEPATH）是沙箱路径。
   const sandbox = sandboxHome(home, 'p');
   assert.deepEqual(env, { Path: 'p', FOO: 'iso', foo2: 'v', BAR: 'resolved:KEY_SRC', USERPROFILE: sandbox, HOME: sandbox,
-    ...(process.platform === 'win32' ? { HOMEDRIVE: 'D:', HOMEPATH: sandbox.slice(2) } : {}) });
+    ...(process.platform === 'win32' ? { HOMEDRIVE: 'D:', HOMEPATH: sandbox.slice(2), PSModuleAnalysisCachePath: path.join(sandbox, 'AppData', 'Local', 'Microsoft', 'Windows', 'PowerShell', 'ModuleAnalysisCache') } : {}) });
   assert.deepEqual(base, snapshot);
 });
 
@@ -170,6 +170,27 @@ test('白名单：codex 保留自己的配置目录与接口地址；claude-code
   assert.equal(codexEnv.CODEX_HOME, 'D:/codex'); assert.equal(codexEnv.OPENAI_BASE_URL, 'https://api.example');
   const deepseekEnv = build('deepseek', base).env;
   assert.ok(!('CODEX_HOME' in deepseekEnv) && !('OPENAI_BASE_URL' in deepseekEnv));
+});
+
+test('provider 执行者（OpenAI 兼容接口）：密钥变量只在它自己的环境里，CODEX_HOME 沿用调用者的（用户的 ~/.codex）', () => {
+  const oai = { adapter: 'codex', label: '兼容接口', enabled: true, auth: 'token', model: 'm', provider: { baseUrl: 'https://api.example.com', wireApi: 'responses' }, secrets: { OAI_COMPAT_KEY: 'OAI_COMPAT_SOURCE' } };
+  const config = { profiles: { oai, codex: { adapter: 'codex', auth: 'login' }, deepseek: loadPreset('deepseek').profile } };
+  const base = { ...FULL, OAI_COMPAT_SOURCE: 'sk-test-oai-compat', OAI_COMPAT_KEY: 'sk-test-leaked-name', CODEX_HOME: 'D:/profiles/real/.codex' };
+  const sources = secretSources(config);
+  const resolve = n => base[n] ?? noRegistry(n);
+  const own = buildEnv({ base, profile: oai, adapter: codex, home, profileName: 'oai', resolve, sources });
+  assert.equal(own.OAI_COMPAT_KEY, 'sk-test-oai-compat', '密钥按 env_key 名注入');
+  assert.equal(own.CODEX_HOME, 'D:/profiles/real/.codex', '与普通 Codex 执行者一样用调用者的 CODEX_HOME');
+  assert.ok(!('OAI_COMPAT_SOURCE' in own), '来源变量名本身不传');
+  const others = [
+    buildEnv({ base, profile: config.profiles.codex, adapter: codex, home, profileName: 'codex', resolve, sources }),
+    buildEnv({ base, profile: config.profiles.deepseek, adapter: claudeCode, home, profileName: 'deepseek', resolve, sources }),
+  ];
+  for (const env of others) {
+    assert.ok(!values(env).includes('sk-test-oai-compat') && !values(env).includes('sk-test-leaked-name'), '别的执行者的环境里没有它的密钥');
+    assert.ok(!('OAI_COMPAT_KEY' in env) && !('OAI_COMPAT_SOURCE' in env));
+  }
+  assert.equal(others[0].CODEX_HOME, 'D:/profiles/real/.codex', '没有 provider 的 codex 执行者照旧用调用者的 CODEX_HOME');
 });
 
 test('白名单：任何 profile 的密钥来源变量即使撞上白名单名字也不原样传；profile.env 可以补充变量', () => {

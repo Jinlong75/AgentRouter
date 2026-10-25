@@ -6,7 +6,7 @@ export const SPEC_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs'
 const COMMIT_TYPES = new Set(['code', 'test', 'fix', 'refactor']);
 const KNOWN_FIELDS = new Set([
   'id', 'title', 'type', 'worker', 'allowed_paths', 'verify', 'expect_commit',
-  'timeout_min', 'verify_timeout_min', 'max_retries', 'review',
+  'timeout_min', 'verify_timeout_min', 'max_retries', 'review', 'read_only',
 ]);
 const FIELD_NAME = /^[a-z_]+$/;
 
@@ -194,7 +194,7 @@ export function validateSpec(parsed, file = '任务说明') {
   const spec = {
     id: undefined, title: undefined, type: undefined, worker: undefined,
     allowed_paths: undefined, verify: undefined, expect_commit: undefined,
-    timeout_min: undefined, verify_timeout_min: undefined, max_retries: undefined, review: undefined,
+    timeout_min: undefined, verify_timeout_min: undefined, max_retries: undefined, review: undefined, read_only: undefined,
   };
   if (has('id')) spec.id = asString('id');
   if (has('title')) spec.title = asString('title');
@@ -221,11 +221,12 @@ export function validateSpec(parsed, file = '任务说明') {
   if (has('verify_timeout_min')) spec.verify_timeout_min = asInteger('verify_timeout_min', 1);
   if (has('max_retries')) spec.max_retries = asInteger('max_retries', 0);
   if (has('review')) spec.review = asBoolean('review');
+  if (has('read_only')) spec.read_only = asBoolean('read_only');
   return spec;
 }
 
 // 允许路径的写法校验（协议第 11.5 节）：相对、/ 分隔、无 \、不以 / 或盘符开头、无 . 或 .. 段、非空。
-function checkAllowedPath(item, index, fail) {
+export function checkAllowedPath(item, index, fail) {
   const n = index + 1;
   if (item.trim() === '') fail('allowed_paths', `第 ${n} 项不能为空`);
   if (item.includes('\\')) fail('allowed_paths', `第 ${n} 项不能包含反斜杠（路径用 / 分隔）`);

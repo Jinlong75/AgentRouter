@@ -103,11 +103,12 @@ export function summarizeGate(parts = {}) {
 
   const reasons = [];
   if (commit.required === true && commit.ok === false) reasons.push('没有提交任何改动');
-  if (uncommitted.length) reasons.push('有未提交的文件');
+  // 只读任务：未提交的文件已经算在 outside 里，合成一段"只读任务改动了文件"，不再单列"有未提交的文件"。
+  if (uncommitted.length && parts.readOnly !== true) reasons.push('有未提交的文件');
   if (outside.length) {
     // 超过 5 个时写成 "a、b、c、d、e 等"（协议 12.3：等前面一个空格）。
     const shown = outside.slice(0, MAX_SUMMARY_FILES).join('、');
-    reasons.push(`改动超出范围：${shown}${outside.length > MAX_SUMMARY_FILES ? ' 等' : ''}`);
+    reasons.push(`${parts.readOnly === true ? '只读任务改动了文件' : '改动超出范围'}：${shown}${outside.length > MAX_SUMMARY_FILES ? ' 等' : ''}`);
   }
   const failed = commands.filter(command => command.timedOut
     || command.error != null
@@ -160,16 +161,19 @@ function writeGateJson(dir, gate) {
 // onSpawn(pid) 可选：每条验收命令启动后拿到子进程 pid，结束时收到 null（T6 停止信号用）；不加时行为不变。
 // outsideWrites 可选：工作区外写入的核对结果（协议 12.4，{ checked, added } 或 { checked: false, error }），
 // 原样写进 gate.json；added 非空时门禁不通过，summary 末尾多一段。不给时 gate.json 没有这个字段。
+// extraEnv 可选：对象，去掉执行者密钥与 AR_ 变量之后再合并进验收命令的环境；不给时环境与原来完全相同。
+// readOnly 可选（调研 / 审查类任务，Stage07 105）：为真时允许路径视为空、不要求提交，base..HEAD 与工作区里任何改动的文件都算越界；
+// scope.allowed 记空数组（实际用于核对的集合），验收命令照常运行；不给时行为与原来完全相同。
 // git 出错时整个门禁中止：commands 记空，summary 只写原因（协议 12.3 最后一段）。
 export async function runGate({
   root, base, spec = {}, env = process.env, dropEnv = [], dir = join(root, '.agent-runs'),
-  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn, outsideWrites,
+  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn, outsideWrites, extraEnv, readOnly = false,
 } = {}) {
   const started = now();
   const merged = spec ?? {};
-  const allowed = Array.isArray(merged.allowed_paths) ? merged.allowed_paths.slice() : ['**'];
+  const allowed = readOnly ? [] : Array.isArray(merged.allowed_paths) ? merged.allowed_paths.slice() : ['**'];
   const verify = Array.isArray(merged.verify) ? merged.verify.slice() : [];
-  const required = merged.expect_commit === true;
+  const required = !readOnly && merged.expect_commit === true;
   const timeoutMs = Number.isFinite(verifyTimeoutMs)
     ? verifyTimeoutMs
     : (Number.isFinite(merged.verify_timeout_min) ? merged.verify_timeout_min : DEFAULT_VERIFY_TIMEOUT_MIN) * 60000;
@@ -193,7 +197,8 @@ export async function runGate({
     const rootSpecs = specsDir === ROOT_SPECS_DIR;
     const changed = changedFiles(root, base, head);
     scope.changed = changed;
-    for (const file of changed) {
+    // 只读任务：工作区里没提交的文件也要核对（它们本来就不该存在）。
+    for (const file of readOnly ? [...new Set([...changed, ...uncommitted])] : changed) {
       const underAgentRouter = isUnderDir(file, '.agent-router', process.platform === 'win32');
       const underSpecsDir = rootSpecs ? isRootSpecFile(file) : isUnderDir(file, specsDir, process.platform === 'win32');
       const underProtected = underAgentRouter || underSpecsDir;
@@ -210,7 +215,8 @@ export async function runGate({
     }
     // 删除的文件（协议 12.1 第 4 步）：只记录，不单独让门禁失败；超出范围的删除照常留在 outside 里。
     scope.deleted = deletedFiles(root, base, head);
-    const commandEnv = removeEnv(env, dropEnv);
+    // extraEnv 在 removeEnv 之后合并，AR_ 前缀规则不会去掉它（worktree 模式的 AR_BASE_REPO、AR_WORKTREE）。
+    const commandEnv = { ...removeEnv(env, dropEnv), ...(extraEnv ?? {}) };
     for (const line of verify) {
       const result = await runCommand(line, { cwd: root, env: commandEnv, timeoutMs, onSpawn });
       commands.push({
@@ -245,7 +251,7 @@ export async function runGate({
     scope,
     commands,
     ...(outsideWrites ? { outsideWrites } : {}),
-    summary: failure ? `无法读取 git 状态：${failure.message}` : summarizeGate({ commit, uncommitted, scope, commands, outsideWrites }),
+    summary: failure ? `无法读取 git 状态：${failure.message}` : summarizeGate({ commit, uncommitted, scope, commands, outsideWrites, readOnly }),
   };
   writeGateJson(dir, gate);
   return gate;

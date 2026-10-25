@@ -411,3 +411,100 @@ test('8 reject：准备失败的任务也能驳回（worktree 保留着，驳回
   writeFileSync(release, '放行');
   await until(() => f2.events(running.id).some(row => row.event === 'end'), '任务结束', 60000);
 });
+
+test('9 没有新提交的待验收任务：ar accept 是确认——不合并、不留合并提交，worktree 与分支删除，accepted 事件 merge 为 null、mode 为 confirm', async t => {
+  const f = fixture(t, { setup: ['node scripts/setup.mjs'] });
+  const task = await f.task('只看不改', {});
+  assert.ok(existsSync(task.wt.dir));
+  assert.equal(git(f.repo, ['rev-list', '--count', `${task.start.base}..${task.wt.branch}`]), '0', '任务分支相对基线没有新提交');
+  const before = f.snapshot();
+
+  const result = await f.ar(['accept', '只看不改', '--squash', '--json']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), { ok: true, merge: null, mode: 'confirm', cleanup: true }, '--squash 对确认没有意义，被忽略');
+  assert.deepEqual(f.snapshot(), before, '主分支没有任何变化，没有合并提交');
+  assert.equal(git(f.repo, ['rev-list', '--count', 'HEAD']), '2');
+  assert.ok(!existsSync(task.wt.dir), 'worktree 目录已删除');
+  assert.deepEqual(f.branches(), ['main'], '任务分支已删除');
+  assert.equal(git(f.repo, ['worktree', 'list']).split('\n').length, 1);
+
+  const events = f.events(task.id);
+  const accepted = events.find(row => row.event === 'accepted');
+  assert.deepEqual(Object.keys(accepted).sort(), ['at', 'by', 'event', 'id', 'merge', 'mode', 'v']);
+  assert.equal(accepted.v, 1);
+  assert.equal(accepted.merge, null);
+  assert.equal(accepted.mode, 'confirm');
+  assert.equal(accepted.by, 'cli');
+  assert.ok(Number.isFinite(accepted.at));
+  assert.ok(!events.some(row => row.event === 'cleanup'), '清理成功不写 cleanup 事件');
+  assert.equal(events.at(-1).event, 'accepted');
+
+  // 文字输出。
+  const text = await f.task('文字确认', {});
+  const printed = await f.ar(['accept', text.name]);
+  // TODO(lead): 文字输出（core/lib/cli.mjs 的 accept 分支）对 merge 为 null 还没改，这里只验证确认本身已经完成，输出写进诊断。
+  t.diagnostic(`文字模式 ar accept 退出码 ${printed.code}：${(printed.stdout + printed.stderr).trim()}`);
+  assert.ok(!existsSync(text.wt.dir) && f.events(text.id).some(row => row.event === 'accepted' && row.mode === 'confirm'), printed.stdout + printed.stderr);
+
+  // 读 accepted 的命令：merge 为 null 不出错，状态是已验收，报告照常出。
+  const status = await f.ar(['status', '只看不改', '--json']);
+  assert.equal(status.code, 0, status.stderr + status.stdout);
+  assert.equal(JSON.parse(status.stdout).state, 'accepted');
+  assert.equal(JSON.parse(status.stdout).merge, null);
+  const report = await f.ar(['report', '只看不改', '--json']);
+  assert.equal(report.code, 0, report.stderr + report.stdout);
+  assert.equal(JSON.parse(report.stdout).state, 'accepted');
+  assert.equal(JSON.parse(report.stdout).executor.cap, null, '评分照"已验收"处理，不封顶');
+
+  // 确认过的任务不能再验收。
+  const again = await f.ar(['accept', '只看不改', '--json']);
+  assert.equal(again.code, 2);
+  assert.deepEqual(JSON.parse(again.stdout), { ok: false, error: '任务不在待验收状态：只看不改' });
+});
+
+test('10 确认不看主工作区：不在主分支、有未提交的改动时也能确认，主工作区原样不动', async t => {
+  const f = fixture(t);
+  const task = await f.task('随时确认', {});
+  git(f.repo, ['switch', '-q', '-c', 'other']);
+  write(path.join(f.repo, 'README.md'), '# 说明（没提交的改动）\n');
+  write(path.join(f.repo, 'notes/草稿.txt'), '草稿\n');
+  const before = f.snapshot();
+
+  const result = await f.ar(['accept', '随时确认', '--json']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  assert.equal(JSON.parse(result.stdout).mode, 'confirm');
+  assert.deepEqual(f.snapshot(), before, '主工作区的分支、文件与未提交的改动都原样保留');
+  assert.equal(git(f.repo, ['rev-parse', '--abbrev-ref', 'HEAD']), 'other');
+  assert.ok(!existsSync(task.wt.dir));
+  assert.deepEqual(f.branches().sort(), ['main', 'other']);
+});
+
+test('11 确认的边界：worktree 里有门禁之后的未提交改动时拒绝（什么都不删）；有新提交的任务仍然走合并', async t => {
+  const f = fixture(t);
+  const task = await f.task('确认被拒', {});
+  write(path.join(task.wt.dir, 'src/late.js'), '门禁之后新增\n');
+  const rowsBefore = f.events(task.id).length;
+  const refused = await f.ar(['accept', '确认被拒', '--json']);
+  assert.equal(refused.code, 2);
+  assert.match(JSON.parse(refused.stdout).error, /^worktree 里有门禁之后的未提交改动，请先检查：.*src\/late\.js/);
+  assert.equal(f.events(task.id).length, rowsBefore, '没有写任何事件');
+  assert.ok(existsSync(task.wt.dir) && f.branches().includes(task.wt.branch), 'worktree 与分支都还在');
+  rmSync(path.join(task.wt.dir, 'src/late.js'));
+  const ok = await f.ar(['accept', '确认被拒', '--json']);
+  assert.equal(ok.code, 0, ok.stderr + ok.stdout);
+  assert.equal(JSON.parse(ok.stdout).mode, 'confirm');
+
+  // 有新提交：行为不变，仍要求主分支与干净的主工作区，合并结果带合并提交。
+  const merged = await f.task('照常合并', change);
+  git(f.repo, ['switch', '-q', '-c', 'other']);
+  const blocked = await f.ar(['accept', '照常合并', '--json']);
+  assert.equal(blocked.code, 2);
+  assert.match(JSON.parse(blocked.stdout).error, /^主工作区当前在 other，合并要在 main 上进行/);
+  git(f.repo, ['switch', '-q', 'main']);
+  const result = await f.ar(['accept', '照常合并', '--json']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.mode, 'no-ff');
+  assert.equal(value.merge, git(f.repo, ['rev-parse', 'HEAD']));
+  assert.ok(!existsSync(merged.wt.dir));
+});

@@ -211,21 +211,22 @@ test('验收失败：一条失败一条通过，两条都跑了 → 3', async t 
   assert.equal(JSON.parse(result.stdout).gate.ok, false);
 });
 
-test('研究类：没有 verify、allowed_paths 默认、项目配置也没有 → 不启用门禁，0', async t => {
+test('研究类：只读任务总是启用门禁（gate: true），没有改动时门禁通过，0', async t => {
   const f = fixture(t);
   const spec = f.spec('docs/specs/006-研究.md', { type: 'research', allowed: null, verify: [], expectCommit: false });
 
   const result = await f.ar(['dispatch', spec, '--name', '研究任务', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);
   const start = startOf(f.home, '研究任务');
-  assert.equal(start.gate, false);
-  assert.equal(Object.hasOwn(start, 'base'), false);
-  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
+  assert.equal(start.gate, true);
+  assert.equal(start.readOnly, true);
+  assert.match(start.base, /^[0-9a-f]{40,64}$/, 'base 是完整 SHA');
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned', 'gating', 'gate', 'attempt-end', 'end']);
   const end = rows(f.home).find(row => row.event === 'end' && row.id === start.id);
   assert.equal(end.exit, 0);
-  assert.equal(Object.hasOwn(end, 'agentExit'), false);
-  assert.equal(JSON.parse(result.stdout).gate, undefined);
-  assert.equal(existsSync(path.join(start.dir, 'gate.json')), false);
+  assert.equal(end.agentExit, 0);
+  assert.equal(JSON.parse(result.stdout).gate.ok, true);
+  assert.equal(f.gateJson(start).ok, true);
 });
 
 test('直接任务文字：不读说明、start 没有 gate 字段，事件与原来一致', async t => {

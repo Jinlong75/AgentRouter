@@ -114,13 +114,14 @@ export function createWorktree({ root, name, base, env = process.env, platform =
 }
 
 // 在 worktree 里逐条运行准备命令，一条失败就停；输出追加写 logFile。
+// extraEnv 可选：对象，去掉执行者密钥与 AR_ 变量之后再合并进命令环境；不给时环境与原来完全相同。
 export async function runSetup({
-  dir, commands = [], env = process.env, dropEnv = [], logFile, timeoutMs = 20 * 60000, onSpawn,
+  dir, commands = [], env = process.env, dropEnv = [], logFile, timeoutMs = 20 * 60000, onSpawn, extraEnv,
 } = {}) {
   const list = Array.isArray(commands) ? commands : [];
   if (!list.length) return { ok: true, ms: 0, summary: '没有准备命令', results: [] };
   const started = Date.now();
-  const commandEnv = removeEnv(env, dropEnv);
+  const commandEnv = { ...removeEnv(env, dropEnv), ...(extraEnv ?? {}) };
   const results = [];
   let summary = '准备命令完成';
   let ok = true;

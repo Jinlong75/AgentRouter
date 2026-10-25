@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { killProcessTree } from '../../core/lib/process.mjs';
+import { KILL_TREE_TIMEOUT_MS, PROCESS_LIST_TIMEOUT_MS, STOP_WAIT_TIMEOUT_MS, TERMINATE_TIMEOUT_MS, killProcessTree, processList, terminateByIdentity } from '../../core/lib/process.mjs';
 
 // 049：结束顺序的确定性测试。list / executeFile / alive 全部注入，不碰真实进程。
 // 固定进程表：根 100 → 执行者 200 → 孙进程 300；可选的 late 是"初次快照之后才出现"的进程。
@@ -118,4 +118,80 @@ test('linux：根在时限内不退出时仍结束子孙，并按时限报错', 
   const [root, stays, descendants] = sequence(trace, [' 结束根 ', ' 根在时限内没有退出，继续结束子孙', ' 结束子孙 ']);
   assert.ok(root >= 0 && stays > root && descendants > stays, `追踪顺序：\n${trace.join('\n')}`);
   assert.equal(trace.findIndex(line => line.includes(' 根已结束')), -1, '根没退出就不写"根已结束"');
+});
+
+// ---- 101：默认超时集中成常量；进程查询超时与普通失败的消息 ----
+
+test('默认超时常量与各处默认值', async () => {
+  assert.equal(PROCESS_LIST_TIMEOUT_MS, 20000);
+  assert.equal(KILL_TREE_TIMEOUT_MS, 30000);
+  assert.equal(TERMINATE_TIMEOUT_MS, 20000);
+  assert.equal(STOP_WAIT_TIMEOUT_MS, 30000);
+  // processList 默认把 PROCESS_LIST_TIMEOUT_MS 交给 execFile；显式传入的 timeout 不变。
+  const seen = [];
+  const executeFile = async (file, args, options) => { seen.push(options.timeout); return { stdout: '[]' }; };
+  await processList(undefined, 'win32', undefined, executeFile);
+  await processList(undefined, 'win32', 1234, executeFile);
+  assert.deepEqual(seen, [PROCESS_LIST_TIMEOUT_MS, 1234]);
+  // terminateByIdentity 默认 20 秒、显式值照旧。
+  const killSeen = [];
+  const kill = async (file, args, options) => { killSeen.push(options.timeout); return { stdout: '[]' }; };
+  await terminateByIdentity([{ pid: 123, created: 1000 }], { executeFile: kill });
+  await terminateByIdentity([{ pid: 123, created: 1000 }], { executeFile: kill, timeout: 777 });
+  assert.deepEqual(killSeen, [TERMINATE_TIMEOUT_MS, 777]);
+});
+
+test('killProcessTree 默认总时限是 KILL_TREE_TIMEOUT_MS，并把剩余时间交给查询与句柄方式', async () => {
+  const f = fixture();
+  const listTimeouts = [], terminateTimeouts = [];
+  await killProcessTree(100, {
+    platform: 'win32', alive: f.alive, executeFile: f.executeFile,
+    list: async (pid, platform, timeout) => { listTimeouts.push(timeout); return f.list(); },
+    terminate: async (targets, { timeout }) => {
+      terminateTimeouts.push(timeout);
+      for (const target of targets) f.live.delete(target.pid);
+      return new Map(targets.map(target => [target.pid, 'killed']));
+    },
+  });
+  assert.ok(listTimeouts[0] <= KILL_TREE_TIMEOUT_MS && listTimeouts[0] > KILL_TREE_TIMEOUT_MS - 2000, `首次查询拿到约 30 秒（${listTimeouts[0]}）`);
+  assert.ok(terminateTimeouts.length > 0 && terminateTimeouts.every(timeout => timeout <= KILL_TREE_TIMEOUT_MS), '句柄方式不超过 killProcessTree 剩余的时间');
+});
+
+test('进程查询超时：中文原因，原始错误放进 cause，不含 PowerShell 命令', async () => {
+  // execFile 因 timeout 结束子进程时的错误：killed 为真并带 signal，message 是 "Command failed: <整段命令>"。
+  const raw = Object.assign(new Error('Command failed: powershell.exe -NoProfile -NonInteractive -Command $ErrorActionPreference=\'Stop\'; Get-CimInstance Win32_Process'), { killed: true, signal: 'SIGTERM', code: null, stdout: '', stderr: '' });
+  await assert.rejects(processList(undefined, 'win32', 20000, async () => { throw raw; }), error => {
+    assert.equal(error.message, '进程查询超时（20 秒）：机器负载很高时可能发生，稍后再试');
+    assert.equal(error.cause, raw);
+    assert.ok(!error.message.includes('powershell.exe') && !error.message.includes('Command failed'));
+    return true;
+  });
+  // 只有 signal（没有 killed）也算；非整数秒保留一位小数；POSIX 分支同样。
+  await assert.rejects(processList(undefined, 'win32', 1500, async () => { throw Object.assign(new Error('x'), { signal: 'SIGKILL' }); }), /^Error: 进程查询超时（1\.5 秒）：机器负载很高时可能发生，稍后再试$/);
+  await assert.rejects(processList(undefined, 'linux', 5000, async () => { throw Object.assign(new Error('Command failed: ps'), { killed: true, signal: 'SIGTERM' }); }), /进程查询超时（5 秒）/);
+});
+
+test('进程查询的普通失败：只写第一行原因，不含整段命令；超出输出上限不算超时', async () => {
+  const exited = Object.assign(new Error('Command failed: powershell.exe -NoProfile -Command 很长的脚本\nGet-CimInstance : 拒绝访问\n第二行'), { code: 1, killed: false, signal: null, stderr: 'Get-CimInstance : 拒绝访问\r\n第二行\r\n' });
+  await assert.rejects(processList(undefined, 'win32', 20000, async () => { throw exited; }), error => {
+    assert.equal(error.message, '进程查询失败：Get-CimInstance : 拒绝访问');
+    assert.equal(error.cause, exited);
+    return true;
+  });
+  // 没有标准错误：用退出码或错误码，不带 "Command failed"。
+  await assert.rejects(processList(undefined, 'win32', 20000, async () => { throw Object.assign(new Error('Command failed: powershell.exe 脚本'), { code: 3, stderr: '' }); }), /^Error: 进程查询失败：退出码 3$/);
+  await assert.rejects(processList(undefined, 'win32', 20000, async () => { throw Object.assign(new Error('spawn powershell.exe ENOENT'), { code: 'ENOENT' }); }), /^Error: 进程查询失败：ENOENT$/);
+  // 超出 maxBuffer 时子进程也被结束（killed 为真），但不是超时。
+  await assert.rejects(processList(undefined, 'win32', 20000, async () => { throw Object.assign(new Error('stdout maxBuffer length exceeded'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed: true, signal: 'SIGTERM' }); }), /^Error: 进程查询失败：ERR_CHILD_PROCESS_STDIO_MAXBUFFER$/);
+  // 成功时返回值不变。
+  const rows = await processList(undefined, 'win32', 20000, async () => ({ stdout: '{"pid":5,"parent":1,"created":9,"name":"a.exe","command":null}' }));
+  assert.deepEqual(rows, [{ pid: 5, parent: 1, created: 9, name: 'a.exe', command: '' }]);
+});
+
+test('killProcessTree：查询超时的原因原样传给调用方', async () => {
+  const raw = Object.assign(new Error('Command failed: powershell.exe …'), { killed: true, signal: 'SIGTERM' });
+  await assert.rejects(
+    killProcessTree(100, { platform: 'win32', alive: () => true, list: (pid, platform, timeout) => processList(pid, platform, timeout, async () => { throw raw; }), timeout: 3000 }),
+    /^Error: 进程查询超时（3 秒）：机器负载很高时可能发生，稍后再试$/,
+  );
 });

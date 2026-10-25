@@ -2,9 +2,9 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：v0.6.0。本仓库仅包含运行、构建与测试所需的文件。
+> 状态：v0.7.0。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: v0.6.0. This repository contains only the files needed to run, build and test the project.
+> Status: v0.7.0. This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 
@@ -23,12 +23,13 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 | 统一入口 `ar`：`dispatch · wait · stop · config · init · projects · agents · secrets · spec · retry · version`，`--json` 供软件调用 | ✅ |
 | `ar init`：在任意 git 仓库生成项目配置与约定文件（幂等、不覆盖） | ✅ |
 | 技能安装器：安装、更新、备份、回退（Claude Code） | ✅ |
-| 执行者：DeepSeek、Xiaomi MiMo（经 Claude Code 外壳）、Codex；密钥只记变量名 | ✅ |
+| 执行者：DeepSeek、Xiaomi MiMo（经 Claude Code 外壳）、Codex、OpenAI 兼容接口、Qoder，以及用通用适配器零代码接入的任意 CLI Agent；密钥只记变量名 | ✅ |
 | 调度中心：任务页、Agent 页（导入向导、测试连接）、项目页（添加、初始化、提交）、新建任务页、再派一次、批量删除 | ✅ |
 | 任务说明规范与机器门禁：执行者结束后，核心自己检查提交、改动范围并逐条运行验收命令；软件显示流水线轨道与门禁结果 | ✅ |
 | 自动重试与升级：失败原因交回执行者、同一工作区再试，每次尝试留档；`ar retry` 与软件"重试"、尝试切换与重试历史 | ✅ |
 | worktree 隔离、并行与验收合并：每个任务独立的 worktree 与分支、准备命令、并行与排队、验收页、`ar diff · accept · reject · gc · status`；执行者需要越界时停下、工作区外写入检查；任务评分（`ar report`）；任务与项目的搜索排序 | ✅ |
-| 通用适配器与路由、交叉审查 | 🚧 计划中 |
+| 接入与路由：通用适配器（零代码接入任意 CLI Agent：导入向导填表、"测试并预览"、声明导出与导入）；Qoder（国内版 / 国际版）与 OpenAI 兼容接口预设；导入与编辑时选模型、推理强度和"升级到"；按任务类型自动选执行者的路由页（规则、兜底、试算、每日上限）；调研 / 审查任务只读运行与"确认"；设置页网络代理；门禁失败可归因到环境；合并主分支后重跑门禁 | ✅ |
+| 软件里提交、推送与拉取、撤销合并；交叉审查 | 🚧 计划中 |
 
 ### 技术栈
 
@@ -36,7 +37,7 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 |---|---|
 | 核心引擎 `core/` | Node.js ESM，零第三方依赖，Node ≥ 24；软件里用 Electron 内置 Node 运行 |
 | 主导接入 | Claude Code Skills（`SKILL.md`） |
-| 执行者 | 经 Claude Code CLI 的模型（`claude-code` 适配器）、Codex CLI；测试与演示用 `fake` |
+| 执行者 | 经 Claude Code CLI 的模型（`claude-code` 适配器）、Codex CLI 与 OpenAI 兼容接口（`codex`）、Qoder 与任意 CLI Agent（`generic`）；测试与演示用 `fake` |
 | 桌面软件 | Electron + TypeScript + esbuild，渲染层原生 HTML/CSS/TS |
 | 打包 | electron-builder（NSIS，x64） |
 | 测试 | `node:test`、假执行者、真实事件样例回放、真实输入的界面检查 |
@@ -51,7 +52,7 @@ AgentRouter 软件（调度中心，内置 Node 运行 core/）─────�
                                                                  <项目>\.agent-runs\<任务>\{progress.log, report.md, events.jsonl, raw.log}
                                                                         │
                                                                         ▼
-                                                              执行者进程（适配器：claude-code / codex / fake）
+                                                              执行者进程（适配器：claude-code / codex / generic / fake）
 ```
 
 适配器写法见 [`core/adapters/README.md`](core/adapters/README.md)。
@@ -138,6 +139,24 @@ verify:
 
 单个任务不想用 worktree 时，派发加 `--no-worktree`。
 
+### 接入新的 Agent 与路由
+
+**接入一个新的 Agent，三步**（Agent 页 → 导入 Agent）：
+
+1. **选类型**：内置预设（DeepSeek、Xiaomi MiMo、Claude、Codex、Qoder 国内版 / 国际版、OpenAI 兼容接口），或者**自定义 CLI**——任何有非交互模式的命令行 Agent，填程序、参数模板（`{prompt}`、`{promptFile}`、`{model}`、`{effort}` 等占位符）和输出格式（文本、JSONL 加事件映射、Claude Code 风格），不写代码。
+2. **选模型和推理强度，保存密钥**：配置里只记环境变量名，密钥值存进 Windows 用户环境变量。
+3. **测试**：预设跑"测试连接"；自定义 CLI 跑"测试并预览"，左边是原始输出，右边是映射出的进展。通过后就能派活。声明可以"导出声明"给别人，对方"从文件导入"；文件里没有密钥。
+
+命令行同样能做（`ar agents add --preset …`、`ar agents import <文件>`），声明的全部字段见 [`core/adapters/README.md`](core/adapters/README.md)。
+
+**路由**：一个任务派给谁，按这个顺序决定——手动指定 → 任务说明的 `worker` → 项目规则 → 全局规则（按任务类型）→ 兜底 → 默认执行者。停用的、今天达到每日上限的、只读任务里不支持只读的执行者会被跳过。"路由"页可以排规则、设兜底与每日上限、"试算"某类任务会派给谁、为什么；命令行是 `ar route --type test --explain`。
+
+**调研任务只读**：`research` / `review` 类型或写了 `read_only: true` 的任务以只读方式运行，门禁要求没有任何改动；验收时点"确认"，只删除 worktree 与分支，不合并。
+
+**网络代理**：设置页"网络代理"可选不使用 / 跟随系统代理 / 手动填写，对派发的执行者与"在此项目打开 Claude Code"都生效。
+
+**评分归因**：门禁失败可以归因到执行者、任务说明或环境（例如机器过载导致的计时失败）。落后于主分支导致的门禁失败可以 `ar retry <记录名> --rebase`：合并主分支后按新基线重跑门禁，不再启动执行者。
+
 ### 开发与测试
 
 ```powershell
@@ -170,12 +189,13 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 | Single entry `ar`: `dispatch · wait · stop · config · init · projects · agents · secrets · spec · retry · version`, `--json` for the app | ✅ |
 | `ar init`: project config and conventions for any git repository (idempotent, never overwrites) | ✅ |
 | Skill installer: install, update, back up, roll back (Claude Code) | ✅ |
-| Workers: DeepSeek, Xiaomi MiMo (through Claude Code), Codex; only key variable names are stored | ✅ |
+| Workers: DeepSeek, Xiaomi MiMo (through Claude Code), Codex, OpenAI-compatible APIs, Qoder, and any CLI agent through the generic adapter without code; only key variable names are stored | ✅ |
 | Dispatch console: Tasks, Agents (import wizard, connection test), Projects (add, initialise, commit), New Task, re-dispatch, batch delete | ✅ |
 | Task specs and machine gates: after the worker exits, the core itself checks commits and changed files and runs each verify command; the app shows a pipeline track and the gate result | ✅ |
 | Automatic retry and escalation: failures handed back to the worker, retried in the same tree, every attempt kept; `ar retry` and Retry in the app, attempt switcher and retry history | ✅ |
 | Worktree isolation, parallel runs and accept/merge: one worktree and branch per task, setup commands, parallel runs and a queue, an Accept page, `ar diff · accept · reject · gc · status`; stop when the scope is too narrow, check for writes outside the working tree; task scores (`ar report`); search and sort for tasks and projects | ✅ |
-| Generic adapter and routing, cross review | 🚧 Planned |
+| Adding agents and routing: a generic adapter (any CLI agent without code — fill in a form in the import wizard, "Test and preview", export and import declarations); Qoder (China / international) and OpenAI-compatible presets; pick a model, reasoning effort and an escalation target when importing or editing; a Routing page that picks the worker by task type (rules, fallback, try-out, daily limits); read-only research and review tasks with Confirm; a network proxy setting; gate failures can be blamed on the environment; re-run the gate after merging the main branch | ✅ |
+| Commit, push and pull, and revert a merge in the app; cross review | 🚧 Planned |
 
 ### Tech stack
 
@@ -183,7 +203,7 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 |---|---|
 | Core engine `core/` | Node.js ESM, zero third-party dependencies, Node ≥ 24; inside the app it runs on Electron's embedded Node |
 | Lead integration | Claude Code Skills (`SKILL.md`) |
-| Workers | Models through the Claude Code CLI (`claude-code` adapter), Codex CLI; `fake` for tests and demos |
+| Workers | Models through the Claude Code CLI (`claude-code` adapter), Codex CLI and OpenAI-compatible APIs (`codex`), Qoder and any CLI agent (`generic`); `fake` for tests and demos |
 | Desktop app | Electron + TypeScript + esbuild, plain HTML/CSS/TS renderer |
 | Packaging | electron-builder (NSIS, x64) |
 | Testing | `node:test`, fake worker, replay of real event samples, real-input UI checks |
@@ -198,7 +218,7 @@ AgentRouter app (console, runs core/ on embedded Node) ───────┘ 
                                                                    <project>\.agent-runs\<task>\{progress.log, report.md, events.jsonl, raw.log}
                                                                           │
                                                                           ▼
-                                                                worker process (adapter: claude-code / codex / fake)
+                                                                worker process (adapter: claude-code / codex / generic / fake)
 ```
 
 The adapter contract is in [`core/adapters/README.md`](core/adapters/README.md).
@@ -284,6 +304,24 @@ When the project config `.agent-router/project.json` sets `"worktree": true` (th
 7. **Scores**: after a task ends, the Score tab in the task details (`ar report <name>`) gives the worker and the lead a 0–100 score each. Points are deducted per event, and every item is listed. A failed gate can be blamed on the spec, which moves the deduction from the worker to the lead.
 
 To skip the worktree for a single task, dispatch it with `--no-worktree`.
+
+### Adding a new agent, and routing
+
+**Add a new agent in three steps** (Agents page → Import agent):
+
+1. **Pick a type**: a built-in preset (DeepSeek, Xiaomi MiMo, Claude, Codex, Qoder China / international, OpenAI-compatible API), or **Custom CLI** — any command-line agent with a non-interactive mode. Fill in the program, an argument template (placeholders such as `{prompt}`, `{promptFile}`, `{model}`, `{effort}`) and the output format (text, JSONL with event mapping, or Claude Code style). No code needed.
+2. **Choose a model and reasoning effort, save the key**: the config stores only the environment variable name; the key itself goes into a Windows user environment variable.
+3. **Test**: presets run "Test connection"; a custom CLI runs "Test and preview", with the raw output on the left and the mapped progress on the right. Once it passes you can dispatch work to it. A declaration can be exported and imported elsewhere; the file never contains keys.
+
+The command line does the same (`ar agents add --preset …`, `ar agents import <file>`); every declaration field is described in [`core/adapters/README.md`](core/adapters/README.md).
+
+**Routing**: who gets a task is decided in this order — an explicit choice → the spec's `worker` → project rules → global rules (by task type) → the fallback → the default worker. Workers that are disabled, have reached today's limit, or cannot run read-only when the task needs it are skipped. The Routing page lets you order rules, set the fallback and daily limits, and "try" a task type to see who would get it and why; on the command line, `ar route --type test --explain`.
+
+**Read-only research**: tasks of type `research` / `review`, or with `read_only: true`, run read-only and the gate requires no changes at all; on the Accept page you click Confirm, which removes the worktree and branch without merging.
+
+**Network proxy**: Settings → Network proxy offers off / follow the system proxy / manual, applied to dispatched workers and to "Open Claude Code in this project".
+
+**Blame**: a failed gate can be blamed on the worker, the spec, or the environment (for example a timing test failing on an overloaded machine). A gate that failed because the branch is behind the main branch can be re-run with `ar retry <name> --rebase`: the main branch is merged in and the gate runs again against the new base, without starting the worker.
 
 ### Development & testing
 

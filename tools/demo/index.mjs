@@ -25,7 +25,9 @@ export async function demo(){
     const file=legacy?{progress:name+'.progress.log',report:name+'.md',events:name+'.events.jsonl',raw:name+'.log'}:{progress:'progress.log',report:'report.md',events:'events.jsonl',raw:'raw.log'};
     // 演示进程创建时间必须与 started 接近，不能伪造身份时间；同时进程创建时间必须 ≤ started（registry 的 dispatchMatches）。
     // AR_DEMO_NOW 在派发演示子进程之前取得，可能比子进程创建时间早几毫秒，进行中的任务取两者的较大者。
-    const started=t.state==='run'?Math.max(now,Date.now()):new Date(new Date(demoNow).setHours(...t.start.split(':').map(Number),0,0)).getTime()-(t.day==='yesterday'?86400000:0);
+    // 096：AR_DEMO_SHOW_WORKTREE=1 时排队中 / 准备中的任务也拿到假派发进程，started 同样取当前时间，进程身份核对才能通过。
+    const liveFake=t.state==='run'||(showWorktree&&['queued','preparing'].includes(t.wt?.phase));
+    const started=liveFake?Math.max(now,Date.now()):new Date(new Date(demoNow).setHours(...t.start.split(':').map(Number),0,0)).getTime()-(t.day==='yesterday'?86400000:0);
     const entry={v:legacy?1:2,event:'start',id:t.id,repo,name,...(legacy?{}:{dir,project:t.project,profile:x.profile,adapter:x.adapter,label:x.label}),title:t.name,spec:t.record?null:`docs/specs/${t.name}.md`,role:t.role,pid:t.state==='run'||(showWorktree&&['queued','preparing'].includes(t.wt?.phase))?children[active++].pid:0,started,progress:path.join(dir,file.progress),report:path.join(dir,file.report),events:path.join(dir,file.events),raw:path.join(dir,file.raw),model:x.model,effort:null,tier:null,sandbox:t.sandbox,managed:t.id==='t1',agent:x.adapter,agentVersion:x.agentVersion,dispatcher:{host:t.dispatcher??'claude-code',session:null},...(t.gate!==undefined?{gate:t.gate,base:t.base??'main'}:{}),...(t.wt?{worktree:true,base:(t.base??'a1b2c3d').padEnd(40,'0')}:{})};
     rows.push(entry);
     // Stage05 多次尝试（061，协议 14.2）：每次尝试 attempt →（门禁 gating / gate）→ attempt-end；最后一次进行中的只有 attempt；

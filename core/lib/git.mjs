@@ -1,5 +1,6 @@
 // 门禁需要的几个 git 调用（文件协议 12.1）。零依赖。
 // 约定：参数数组、shell: false、windowsHide: true；输出按 UTF-8 解码，-z 下路径原样（不转义）。
+// 版本检查：parseGitVersion、gitVersion、requireModernGit（低于 2.40 抛 GIT_TOO_OLD）。
 // 只导出 git、headSha、uncommittedFiles、changedFiles、deletedFiles、baseProjectConfig 与 -z 解析函数（解析函数供单元测试）。
 import { spawnSync } from 'node:child_process';
 import { parseJson } from './json.mjs';
@@ -19,7 +20,52 @@ export function git(root, args) {
   }
 }
 
-const FAILURE_REASON = (result, what) => result.stderr.trim() || `${what}退出码 ${result.status}`;
+// 解析 `git --version` 的输出：git version 2.39.1.windows.1、2.45.2 (Apple Git-152) 等；识别不了返回 null。
+export function parseGitVersion(text) {
+  const match = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(String(text ?? ''));
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3] ?? 0), raw: String(text).trim() };
+}
+
+// worktree 模式与 ar init 需要的最低 git 版本（2.40）。
+const MIN_GIT = { major: 2, minor: 40 };
+let cachedGitVersion = null;
+
+// git 版本：{ version: "2.39.1" | null, ok: true | false | null }。ok 表示是否 ≥ 2.40；识别不了或 git 运行失败时 ok 为 null（未知）。
+// 环境变量 AR_TEST_GIT_VERSION 有值时不运行 git，直接把它当作 `git --version` 的输出解析——只给测试用，和 AR_TEST_AGENT 同类；
+// 测试钩子不进缓存，改环境变量立即生效。真实的 git 结果在同一进程内缓存。
+export function gitVersion() {
+  const forced = process.env.AR_TEST_GIT_VERSION;
+  if (forced) return versionInfo(parseGitVersion(forced));
+  if (!cachedGitVersion) {
+    const result = git(undefined, ['--version']);
+    cachedGitVersion = versionInfo(result.status === 0 ? parseGitVersion(result.stdout) : null);
+  }
+  return cachedGitVersion;
+}
+
+function versionInfo(parsed) {
+  if (!parsed) return { version: null, ok: null };
+  const ok = parsed.major !== MIN_GIT.major ? parsed.major > MIN_GIT.major : parsed.minor >= MIN_GIT.minor;
+  return { version: `${parsed.major}.${parsed.minor}.${parsed.patch}`, ok };
+}
+
+// git 低于 2.40 时抛出（arCode GIT_TOO_OLD，退出码 2）；版本未知时不拦。what: 'init' | 'worktree'，决定说明里的后半句。
+export function requireModernGit(what) {
+  const message = gitTooOldMessage(what);
+  if (message) throw Object.assign(new Error(message), { arCode: 'GIT_TOO_OLD' });
+}
+
+// git 低于 2.40 时的中文说明；版本够新或未知时返回 null。
+export function gitTooOldMessage(what) {
+  const { version, ok } = gitVersion();
+  if (ok !== false) return null;
+  return what === 'init'
+    ? `git 版本太旧：当前 ${version}，ar init 需要 2.40 或更新。到 https://git-scm.com/downloads 下载新版，装好后重试。`
+    : `git 版本太旧：当前 ${version}，worktree 模式需要 2.40 或更新。到 https://git-scm.com/downloads 下载新版后重试；不想用 worktree 的单个任务可以加 --no-worktree 派发。`;
+}
+
+const FAILURE_REASON =(result, what) => result.stderr.trim() || `${what}退出码 ${result.status}`;
 
 // HEAD 的完整 SHA；仓库没有提交时返回 null。git 不可用或不是仓库时抛出原因，由调用方记成门禁失败。
 export function headSha(root) {

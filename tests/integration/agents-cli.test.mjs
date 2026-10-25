@@ -32,7 +32,10 @@ test('agents：add → list → disable → enable → remove；--json 只输出
   const added = await call(['agents', 'add', '--preset', 'deepseek', '--json']);
   assert.equal(added.code, 0); assert.equal(added.out.length, 1);
   assert.deepEqual({ ...added.json, secretStatus: added.json.secretStatus }, { ok: true, name: 'deepseek', preset: 'deepseek', madeDefault: true, secrets: ['DEEPSEEK_API_KEY'], secretStatus: { DEEPSEEK_API_KEY: 'set' } });
-  assert.deepEqual(config().profiles.deepseek, loadPreset('deepseek').profile);
+  // 预设里给界面下拉用的说明字段（modelOptions / effortOptions 等）不写进配置，其余与预设一致。
+  const { modelOptions, effortOptions, ...writtenPreset } = loadPreset('deepseek').profile;
+  assert.ok(modelOptions && effortOptions);
+  assert.deepEqual(config().profiles.deepseek, writtenPreset);
   assert.equal(config().defaultProfile, 'deepseek', '有了 DeepSeek 后默认执行者是它');
   assert.equal(config().profiles.codex.enabled, true, 'Codex 保持启用');
 
@@ -106,18 +109,20 @@ test('agents presets --json：按 order 排序，含 title/description/recommend
   const { call } = setup(t);
   const r = await call(['agents', 'presets', '--json']);
   assert.equal(r.code, 0); assert.equal(r.out.length, 1);
-  assert.deepEqual(r.json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex']);
+  assert.deepEqual(r.json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'openai-compat']);
   assert.deepEqual(r.json.presets.filter(p => p.recommended).map(p => p.name), ['deepseek'], '推荐标记只在 DeepSeek 上');
   const deepseek = r.json.presets[0];
-  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Pro', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' } });
+  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Pro', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' },
+    modelOptions: ['deepseek-v4-pro', 'deepseek-v4-flash'], effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'] });
   const codex = r.json.presets.find(p => p.name === 'codex');
-  assert.deepEqual(codex, { name: 'codex', title: 'Codex', description: '用 ChatGPT 登录或 OpenAI API Key', recommended: false, adapter: 'codex', label: 'Codex', auth: 'login', env: {}, secrets: {} });
+  assert.deepEqual(codex, { name: 'codex', title: 'Codex', description: '用 ChatGPT 登录或 OpenAI API Key', recommended: false, adapter: 'codex', label: 'Codex', auth: 'login', env: {}, secrets: {},
+    effortOptions: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
   const compat = r.json.presets.find(p => p.name === 'compat');
   assert.equal(compat.auth, 'token'); assert.equal(compat.recommended, false);
   assert.deepEqual(compat.env, { ANTHROPIC_BASE_URL: '', ANTHROPIC_MODEL: '' });
   assert.deepEqual(compat.secrets, { ANTHROPIC_AUTH_TOKEN: 'COMPAT_API_KEY' });
   const text = await call(['agents', 'presets']);
-  assert.match(text.out.join('\n'), /^可用预设：deepseek、mimo、mimo-payg、claude-native、claude-subscription、compat、codex$/);
+  assert.match(text.out.join('\n'), /^可用预设：deepseek、mimo、mimo-payg、claude-native、claude-subscription、compat、codex、qoder-cn、qoder、openai-compat$/);
 });
 
 test('预设 mimo / mimo-payg：完整内容与模板文件精确一致', () => {
@@ -125,13 +130,18 @@ test('预设 mimo / mimo-payg：完整内容与模板文件精确一致', () => 
     adapter: 'claude-code', label: 'MiMo V2.6 Pro', enabled: true,
     auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'MIMO_API_KEY' }, maxTurns: null,
     price: { inputPer1M: null, outputPer1M: null, currency: 'CNY' }, recommended: false,
+    effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'],
+    // 导入向导按服务合并卡片用的字段（112）：两个预设同一张卡片、同一个分段标签。
+    card: { id: 'mimo', title: 'Xiaomi MiMo', description: '经 Claude Code 外壳运行，Token Plan 或按量付费' },
   };
   assert.deepEqual(loadPreset('mimo'), { name: 'mimo', profile: { ...shared,
     env: { ANTHROPIC_BASE_URL: 'https://token-plan-cn.xiaomimimo.com/anthropic', ANTHROPIC_MODEL: 'mimo-v2.6-pro' },
-    title: 'Xiaomi MiMo（Token Plan）', description: '经 Claude Code 外壳运行，用 Token Plan 的 API Key（tp- 开头）', order: 2 } });
+    title: 'Xiaomi MiMo（Token Plan）', description: '经 Claude Code 外壳运行，用 Token Plan 的 API Key（tp- 开头）', order: 2,
+    variant: { label: '套餐', option: 'Token Plan', help: '用 Token Plan 的 API Key（tp- 开头）' } } });
   assert.deepEqual(loadPreset('mimo-payg'), { name: 'mimo-payg', profile: { ...shared,
     env: { ANTHROPIC_BASE_URL: 'https://api.xiaomimimo.com/anthropic', ANTHROPIC_MODEL: 'mimo-v2.6-pro' },
-    title: 'Xiaomi MiMo（按量付费）', description: '经 Claude Code 外壳运行，按量付费，用 sk- 开头的 API Key', order: 3 } });
+    title: 'Xiaomi MiMo（按量付费）', description: '经 Claude Code 外壳运行，按量付费，用 sk- 开头的 API Key', order: 3,
+    variant: { label: '套餐', option: '按量付费', help: '按量付费，用 sk- 开头的 API Key' } } });
 });
 
 test('agents add --preset mimo：配置与 list --json 的 env / secrets / auth 正确', async t => {
@@ -189,6 +199,42 @@ test('agents add：兼容后端缺地址或模型报错，且不写入配置', a
   const ok = await call(['agents', 'add', '--preset', 'compat', '--name', 'my-compat', '--base-url', 'https://example.invalid', '--model', 'my-model', '--json']);
   assert.equal(ok.code, 0);
   assert.deepEqual(config().profiles['my-compat'].env, { ANTHROPIC_BASE_URL: 'https://example.invalid', ANTHROPIC_MODEL: 'my-model' });
+});
+
+test('agents add --preset openai-compat：写出有效的 provider 执行者；缺地址、模型或密钥变量就拒绝且不写入；说明字段不进配置', async t => {
+  const { home, call, config, outputs } = setup(t);
+  const profiles = () => { const file = path.join(home, 'config.json'); return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).profiles ?? {} : {}; };
+  const full = ['--base-url', 'https://api.example.com', '--model', 'deepseek-v4-flash', '--secret-var', 'DEEPSEEK_API_KEY'];
+  const without = key => { const at = full.indexOf(key); return [...full.slice(0, at), ...full.slice(at + 2)]; };
+  for (const [key, pattern] of [['--base-url', /缺少接口地址：用 --base-url 指定/], ['--model', /缺少模型：用 --model 指定/], ['--secret-var', /缺少密钥变量：用 --secret-var 指定/]]) {
+    const r = await call(['agents', 'add', '--preset', 'openai-compat', '--name', 'oai', ...without(key), '--json']);
+    assert.equal(r.code, 2, key); assert.match(r.json.error, pattern, key);
+    assert.ok(!profiles().oai, `缺 ${key} 不写入`);
+  }
+  const bad = await call(['agents', 'add', '--preset', 'openai-compat', '--name', 'oai', '--base-url', 'https://u:p@api.example.com', ...without('--base-url'), '--json']);
+  assert.equal(bad.code, 2); assert.match(bad.json.error, /provider\.baseUrl 里不能带用户名和密码/);
+  assert.ok(!profiles().oai, '带凭据的地址不写入');
+
+  const added = await call(['agents', 'add', '--preset', 'openai-compat', '--name', 'oai', '--label', 'DeepSeek（OpenAI 格式）', ...full, '--json']);
+  assert.equal(added.code, 0); assert.deepEqual(added.json.secrets, ['DEEPSEEK_API_KEY']);
+  const p = config().profiles.oai;
+  assert.equal(p.adapter, 'codex'); assert.equal(p.auth, 'token'); assert.equal(p.enabled, true);
+  assert.equal(p.model, 'deepseek-v4-flash'); assert.equal(p.label, 'DeepSeek（OpenAI 格式）');
+  assert.deepEqual(p.provider, { baseUrl: 'https://api.example.com', wireApi: 'responses' });
+  assert.deepEqual(p.secrets, { DEEPSEEK_API_KEY: 'DEEPSEEK_API_KEY' });
+  for (const key of ['baseUrlOptions', 'effortOptions', 'modelOptions']) assert.ok(!(key in p), `${key} 不写进配置`);
+  assert.notEqual(config().defaultProfile, 'oai', 'Codex 外壳的执行者不当默认');
+
+  const row = (await call(['agents', 'list', '--json'])).json.agents.find(a => a.name === 'oai');
+  assert.deepEqual(row, { name: 'oai', adapter: 'codex', label: 'DeepSeek（OpenAI 格式）', enabled: true, supported: true, default: false, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'set' }, login: null, model: 'deepseek-v4-flash', lastTest: null });
+  const preset = (await call(['agents', 'presets', '--json'])).json.presets.find(x => x.name === 'openai-compat');
+  assert.deepEqual(preset.baseUrlOptions, ['https://api.deepseek.com', 'https://api.openai.com/v1']);
+  assert.deepEqual(preset.effortOptions, ['minimal', 'low', 'medium', 'high']);
+
+  const updated = await call(['agents', 'update', 'oai', '--model', 'other-model', '--base-url', 'http://127.0.0.1:9000/v1', '--json']);
+  assert.equal(updated.code, 0);
+  assert.equal(config().profiles.oai.model, 'other-model'); assert.equal(config().profiles.oai.provider.baseUrl, 'http://127.0.0.1:9000/v1');
+  for (const line of outputs) assert.ok(!line.includes(SECRET), '输出里出现了密钥值');
 });
 
 test('agents update：改 label/model/base-url/secret-var/max-turns；至少给一项；- 清空 maxTurns', async t => {

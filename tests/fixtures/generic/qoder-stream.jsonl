@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000000","cwd":"/work/demo","model":"example-model","tools":["Read","Write","Bash"]}
+{"type":"system","subtype":"artifacts_update","session_id":"00000000-0000-4000-8000-000000000000","artifacts":[]}
+{"type":"system","subtype":"hook_started","session_id":"00000000-0000-4000-8000-000000000000","hook_name":"SessionStart"}
+{"type":"assistant","session_id":"00000000-0000-4000-8000-000000000000","message":{"role":"assistant","content":[{"type":"thinking","thinking":"用户要求只回复 OK。"},{"type":"text","text":"OK"}],"usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"00000000-0000-4000-8000-000000000000","usage":{"input_tokens":0,"output_tokens":0}}

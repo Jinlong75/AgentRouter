@@ -38,6 +38,8 @@ export interface Task {
     // 执行者适配器与显示名（Stage02 起写在 start 行；旧记录没有）。
     adapter?: string;
     label?: string;
+    // 路由说明（start.route，Stage07 111）：路由器选这个执行者的那一句，例如"全局规则 2：[research] → qoder-cn"；没经过路由的任务没有。
+    route?: string;
     commit?: string;
     // 汇报文件是否存在（按文件实际存在判断，不按任务是否结束）。
     hasReport?: boolean;
@@ -47,6 +49,8 @@ export interface Task {
     // 没有这个字段的旧任务与直接文字任务显示与以前完全一样。
     gate?: boolean;
     base?: string;
+    // 只读运行（调研 / 审查类任务，start.readOnly）；可写任务没有这个字段。
+    readOnly?: true;
     // 收到 gating 事件的时刻（界面在进展里画"执行者结束 · 门禁开始"分隔用）。
     gatingAt?: number;
     gateOk?: boolean;
@@ -83,7 +87,8 @@ export interface WtInfo {
     // 最近一条 setup 事件；setupFailed 为 end.reason === 'setup'。
     setup?: { ok: boolean; summary?: string };
     setupFailed?: boolean;
-    accepted?: { merge: string | null; mode: 'no-ff' | 'squash'; by: string; at: number };
+    // mode 为 confirm 时是没有改动的确认（调研 / 审查类任务）：merge 为 null，没有合并提交。
+    accepted?: { merge: string | null; mode: 'no-ff' | 'squash' | 'confirm'; by: string; at: number };
     rejected?: { reason: string; keptBranch: boolean; by: string; at: number };
     // 最近一条 conflict 事件的冲突文件。
     conflictFiles?: string[];
@@ -256,6 +261,59 @@ export interface AgentRow {
     version?: string | null;
 }
 export interface AgentsList { ok: true; agents: AgentRow[] }
+// agents:presets 的一项（核心 ar agents presets --json）：除了名字、说明，还有给下拉用的可选值。
+export interface AgentPreset {
+    name: string; title: string; description: string; recommended: boolean; adapter: string; label: string; auth: 'login' | 'token';
+    env?: Record<string, string>; secrets?: Record<string, string>;
+    model?: string | null; effort?: string | null; provider?: { baseUrl?: string | null; wireApi?: string };
+    modelOptions?: string[]; effortOptions?: string[]; baseUrlOptions?: string[]; listModels?: string[]; types?: string[];
+    // 导入向导把同一 card.id 的预设合成一张卡片，第 2 步用 variant 的分段按钮选具体预设（只给界面用）。
+    card?: { id: string; title: string; description: string }; variant?: { label: string; option: string; help: string };
+}
+// 自定义 CLI 预览（agents:test-decl）：原始输出每行带映射出的统一事件。
+export interface PreviewLine { stream: 'stdout' | 'stderr'; text: string; events: { kind: string; [key: string]: unknown }[] }
+export interface PreviewResult {
+    ok: boolean; valid?: boolean; exit: number | null; timedOut: boolean; seconds: number; report: string | null;
+    output: PreviewLine[]; unmatched: number[]; truncated?: boolean; error?: string; errors?: DeclProblem[];
+}
+export interface DeclProblem { path: string; message: string }
+// 路由页（Stage07 T8）：console 通道 route:config / route:rules / route:fallback / route:reviewer / route:limit 的返回，字段照核心 ar route config --json。
+export interface RouteRule { types: string[]; profile: string; escalate?: string | null }
+export interface RouteProfile {
+    name: string;
+    label: string;
+    enabled: boolean;
+    readOnly: boolean;
+    limits: { maxTasksPerDay: number | null; maxTokensPerDay: number | null };
+    usage: { tasks: number; tokens: number };
+}
+export interface RouteConfig {
+    rules: RouteRule[];
+    fallback: string | null;
+    reviewer: { profiles: string[]; mustDiffer: boolean };
+    defaultProfile: string | null;
+    profiles: RouteProfile[];
+    projectRules: { project: string; path: string; count: number }[];
+}
+// route:trial 的返回：成功是路由器的结果，没有可用的执行者时 failed 为 true（带原因和 trace）。
+export interface RouteResult {
+    profile: string;
+    label: string;
+    escalate: string | null;
+    rule: { scope: 'project' | 'global'; index: number } | null;
+    needsReadOnly: boolean;
+    trace: string[];
+}
+export type RouteTrial = (RouteResult & { failed?: undefined }) | { failed: true; code: string | null; error: string; trace: string[] };
+// spec:check-paths 的返回（ar spec check-paths --json）：允许路径会匹配到的现有文件。
+export interface PathCheck {
+    total: number;
+    files: string[];
+    truncated: boolean;
+    patterns: { pattern: string; count: number }[];
+    all: boolean;
+    fileCount: number;
+}
 export interface ProjectRow {
     path: string;
     name: string;
@@ -265,8 +323,9 @@ export interface ProjectRow {
     git: boolean;
     initialized: boolean;
 }
-export interface ProjectsList { ok: true; projects: ProjectRow[] }
-export interface ProjectShow {
+// 核心报告的 git 版本（projects list / show 的顶层 git 字段）：ok 为 false 表示低于 2.40，null 表示未知。
+export interface GitVersionInfo { version: string | null; ok: boolean | null }
+export interface ProjectsList { ok: true; projects: ProjectRow[]; git?: GitVersionInfo }export interface ProjectShow {
     path: string;
     name: string;
     exists: boolean;
@@ -340,6 +399,8 @@ export interface ReportUsage {
     input: number | null;
     output: number | null;
 }
+// 门禁失败的归因：执行者（默认）、任务说明、环境（偶发失败，两边都不扣分）。
+export type ReportBlame = 'worker' | 'spec' | 'environment';
 export interface ReportAttempt {
     n: number;
     reason: string | null;
@@ -347,7 +408,7 @@ export interface ReportAttempt {
     exit: number | null;
     gate: boolean | null;
     summary: string | null;
-    blame: 'worker' | 'spec' | null;
+    blame: ReportBlame | null;
 }
 export interface Report {
     ok: true;
@@ -390,6 +451,9 @@ export interface Settings {
     managed: boolean;
     // 是否统计主导的 token 与用时（config.json 的 leadUsage，只认 true）。
     leadUsage: boolean;
+    // 网络代理（config.json 的 proxy，没写按 off）：模式与已保存的手动地址；mode 为 system 时 system 是这一刻读到的系统代理
+    //（url 为 null 表示没有；reason 取 found / disabled / pac / unreadable / unsupported），其余模式为 null。
+    proxy: { mode: 'off' | 'system' | 'manual'; url: string; system: { url: string | null; reason: string } | null };
     // 同时运行的任务数上限与会话保留天数（config.json 的 concurrency / sessionRetentionDays，没写按默认 2 / 14；手写的越界值原样给出）。
     concurrency: number;
     retentionDays: number;
@@ -404,6 +468,12 @@ export interface Settings {
         // secrets 是"密钥变量名 → 从哪个环境变量读"的映射（值都是字符串，见 core/lib/config.mjs 的 validateV2）。
         secrets?: Record<string, string>;
         maxTurns?: number | null;
+        // generic / OpenAI 兼容接口（codex + provider）的模型写在 model；推理强度 effort；升级目标 escalate 是另一个执行者的名字。
+        model?: string | null;
+        effort?: string | null;
+        escalate?: string | null;
+        provider?: { baseUrl?: string | null; wireApi?: string };
+        generic?: unknown;
     }>;
     exists: boolean;
     reason: string | null;

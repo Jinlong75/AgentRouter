@@ -39,6 +39,18 @@ function readOutsideWrites(value: unknown): OutsideWrites | undefined {
     }
     return { checked: true, added };
 }
+// 任务名（096）：核心把任务说明的路径当作 title；title 与 spec 相同时只显示文件名（去掉结尾 .md），记录里的字段不改。
+function displayTitle(title: unknown, spec: unknown, name: string): string {
+    if (typeof title !== 'string')
+        return name;
+    if (typeof spec === 'string' && spec !== '' && title === spec) {
+        const file = spec.split(/[\\/]/).pop() ?? '';
+        const base = file.replace(/\.md$/i, '');
+        if (base !== '')
+            return base;
+    }
+    return title;
+}
 export function mergeLine(tasks: Map<string, Task>, line: string) {
     try {
         const e = JSON.parse(line);
@@ -47,7 +59,7 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
         if (e.event === 'start') {
             if (!['repo', 'name', 'progress', 'report'].every(k => typeof e[k] === 'string') || !Number.isFinite(e.started) || !Number.isFinite(new Date(e.started).getTime()) || !path.isAbsolute(e.repo) || !path.isAbsolute(e.progress) || !path.isAbsolute(e.report))
                 return;
-            const t: Task = { id: e.id, repo: e.repo, name: e.name, title: typeof e.title === 'string' ? e.title : e.name, spec: typeof e.spec === 'string' ? e.spec : null, role: typeof e.role === 'string' ? e.role : null, pid: Number.isSafeInteger(e.pid) && e.pid > 0 ? e.pid : 0, started: e.started, progress: e.progress, report: e.report, model: typeof e.model === 'string' ? e.model : null, effort: typeof e.effort === 'string' ? e.effort : null, tier: typeof e.tier === 'string' ? e.tier : null, status: 'run', last: '' };
+            const t: Task = { id: e.id, repo: e.repo, name: e.name, title: displayTitle(e.title, e.spec, e.name), spec: typeof e.spec === 'string' ? e.spec : null, role: typeof e.role === 'string' ? e.role : null, pid: Number.isSafeInteger(e.pid) && e.pid > 0 ? e.pid : 0, started: e.started, progress: e.progress, report: e.report, model: typeof e.model === 'string' ? e.model : null, effort: typeof e.effort === 'string' ? e.effort : null, tier: typeof e.tier === 'string' ? e.tier : null, status: 'run', last: '' };
             for (const key of ['raw', 'events', 'sandbox', 'agent', 'agentVersion'] as const)
                 if (typeof e[key] === 'string')
                     t[key] = e[key];
@@ -59,10 +71,13 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
             if (typeof e.profile === 'string') t.profile = e.profile;
             if (typeof e.adapter === 'string') t.adapter = e.adapter;
             if (typeof e.label === 'string') t.label = e.label;
+            // 路由说明（Stage07 111）：只有经过路由的任务才有，旧记录没有。
+            if (typeof e.route === 'string' && e.route !== '') t.route = e.route;
             // 门禁（协议第 2 节）：gate 是布尔；base 是执行者开始时的提交。
             // 老记录没有这两个字段，任务对象保持与以前一致。
             if (typeof e.gate === 'boolean') t.gate = e.gate;
             if (typeof e.base === 'string') t.base = e.base;
+            if (e.readOnly === true) t.readOnly = true;
             // worktree 模式（协议 15.3）：只有 start 就是排队；之后的 queued / preparing / worktree / setup 等事件推进阶段。
             if (e.worktree === true) { t.worktree = true; t.wt = { phase: 'queued', queuedAt: e.started }; }
             tasks.set(t.id, t);
@@ -118,7 +133,7 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 else if (e.event === 'attempt' || e.event === 'gating')
                     w.phase = 'live';
                 else if (e.event === 'accepted' && w.phase === 'awaiting') {
-                    w.accepted = { merge: typeof e.merge === 'string' ? e.merge : null, mode: e.mode === 'squash' ? 'squash' : 'no-ff', by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
+                    w.accepted = { merge: typeof e.merge === 'string' ? e.merge : null, mode: e.mode === 'squash' || e.mode === 'confirm' ? e.mode : 'no-ff', by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
                     w.phase = 'accepted';
                 }
                 else if (e.event === 'rejected' && ['awaiting', 'conflict', 'failed'].includes(w.phase)) {
@@ -370,6 +385,12 @@ export class Registry {
         const norm = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
         const wanted = norm(dir);
         return this.tasks.some(t => norm(path.dirname(t.progress)) === wanted);
+    }
+    // 看板上是否有这个仓库的这条任务记录（仓库路径按 knownRunDir 同样的方式比较；不看项目登记表：项目被移除后任务还要能驳回、确认）。
+    knownTask(repo: string, name: string): boolean {
+        const norm = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+        const wanted = norm(repo);
+        return this.tasks.some(t => t.name === name && norm(t.repo) === wanted);
     }
     private async readAll() {
         const rows: Task[] = [];

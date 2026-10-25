@@ -327,3 +327,37 @@ test('projects list --registry-only：只读登记表（路径与名称），不
   assert.notEqual(bad.status, 0);
   assert.match(JSON.parse(bad.stdout).error, /用法：ar projects list \[--registry-only\]/);
 });
+
+test('projects list / show --json（095）：顶层有 git 字段；AR_TEST_GIT_VERSION 报告旧版本时 ok 为 false，文字输出多一句提示；add 等其他命令不拦', t => {
+  const f = fixture(t);
+  assert.equal(spawnSync('git', ['-C', f.repo, 'init', '-q'], { env: f.env, encoding: 'utf8' }).status, 0);
+  assert.equal(f.ar(['init']).status, 0);
+
+  f.env.AR_TEST_GIT_VERSION = 'git version 2.45.2 (Apple Git-152)';
+  let list = JSON.parse(f.ar(['projects', 'list', '--json'], f.base).stdout);
+  assert.deepEqual(list.git, { version: '2.45.2', ok: true });
+  assert.ok(list.projects.every(p => typeof p.git === 'boolean'), '每个项目里的 git 仍是"是否 git 仓库"，不重复版本对象');
+  let show = JSON.parse(f.ar(['projects', 'show', '--json']).stdout);
+  assert.deepEqual(show.git, { version: '2.45.2', ok: true });
+  assert.ok(!/git 版本太旧/.test(f.ar(['projects', 'list'], f.base).stdout));
+
+  f.env.AR_TEST_GIT_VERSION = 'git version 2.39.1.windows.1';
+  list = JSON.parse(f.ar(['projects', 'list', '--json'], f.base).stdout);
+  assert.deepEqual(list.git, { version: '2.39.1', ok: false });
+  show = JSON.parse(f.ar(['projects', 'show', '--json']).stdout);
+  assert.deepEqual(show.git, { version: '2.39.1', ok: false });
+  assert.equal(show.project.initialized, true);
+  const text = f.ar(['projects', 'list'], f.base);
+  assert.equal(text.status, 0);
+  assert.match(text.stdout, /git 版本太旧：当前 2\.39\.1，worktree 模式需要 2\.40 或更新/);
+  assert.match(f.ar(['projects', 'show']).stdout, /git 版本太旧：当前 2\.39\.1/);
+  // --registry-only 与其他命令不受影响。
+  assert.equal(f.ar(['projects', 'list', '--registry-only', '--json'], f.base).status, 0);
+  const repo2 = path.join(f.base, '另一个仓库');
+  fs.mkdirSync(repo2);
+  assert.equal(spawnSync('git', ['-C', repo2, 'init', '-q'], { env: f.env, encoding: 'utf8' }).status, 0);
+  assert.equal(f.ar(['projects', 'add', repo2, '--json'], f.base).status, 0, 'projects add 不拦');
+
+  f.env.AR_TEST_GIT_VERSION = '乱码';
+  assert.deepEqual(JSON.parse(f.ar(['projects', 'list', '--json'], f.base).stdout).git, { version: null, ok: null });
+});

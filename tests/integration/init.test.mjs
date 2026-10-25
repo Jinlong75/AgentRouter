@@ -21,7 +21,7 @@ function fixture(t) {
   const read = rel => fs.readFileSync(join(repo, rel), 'utf8');
   const snapshot = () => Object.fromEntries(fs.readdirSync(repo, { recursive: true }).filter(n => !n.startsWith('.git' + (process.platform === 'win32' ? '\\' : '/')) && n !== '.git')
     .filter(n => fs.statSync(join(repo, n)).isFile()).map(n => [n.replaceAll('\\', '/'), fs.readFileSync(join(repo, n), 'utf8')]));
-  return { base, repo, home, ar, git, read, snapshot };
+  return { base, repo, home, env, ar, git, read, snapshot };
 }
 
 test('空仓库：--dry-run 只列计划不写文件；init 生成 8 个文件并登记项目；不自动提交', t => {
@@ -125,4 +125,24 @@ test('projects：list / add / remove，重复添加只更新最近使用，路�
   const notRepo = join(f.base, '不是仓库'); fs.mkdirSync(notRepo);
   const bad = f.ar(['projects', 'add', notRepo, '--json']); assert.notEqual(bad.status, 0); assert.match(JSON.parse(bad.stdout).error, /不是 git 仓库/);
   assert.equal(f.ar(['projects', 'what']).status, 2);
+});
+
+test('git 低于 2.40（095，AR_TEST_GIT_VERSION）：ar init 退出码 2、GIT_TOO_OLD、说明里有当前版本，没有写任何文件也没有登记项目', t => {
+  const f = fixture(t); f.git('init', '-q');
+  f.env.AR_TEST_GIT_VERSION = 'git version 2.39.1.windows.1';
+  const json = f.ar(['init', '--json']);
+  assert.equal(json.status, 2, json.stderr + json.stdout);
+  assert.deepEqual(JSON.parse(json.stdout), { ok: false, code: 'GIT_TOO_OLD', error: 'git 版本太旧：当前 2.39.1，ar init 需要 2.40 或更新。到 https://git-scm.com/downloads 下载新版，装好后重试。' });
+  assert.ok(!JSON.parse(json.stdout).error.includes('--no-worktree'), 'ar init 的说明不提 --no-worktree');
+  const dry = f.ar(['init', '--dry-run', '--json']);
+  assert.equal(dry.status, 2); assert.equal(JSON.parse(dry.stdout).code, 'GIT_TOO_OLD');
+  const plain = f.ar(['init']);
+  assert.equal(plain.status, 2); assert.match(plain.stderr, /当前 2\.39\.1/);
+  assert.deepEqual(f.snapshot(), {}, '没有写任何文件');
+  assert.ok(!fs.existsSync(join(f.home, 'projects.json')), '没有登记项目');
+  // 版本未知不拦；恢复后照常。
+  f.env.AR_TEST_GIT_VERSION = '这不是 git 的输出';
+  assert.equal(f.ar(['init', '--dry-run']).status, 0);
+  delete f.env.AR_TEST_GIT_VERSION;
+  assert.equal(f.ar(['init']).status, 0);
 });

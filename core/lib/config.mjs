@@ -3,6 +3,7 @@ import { join, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homeDirectory, legacyHomeFor, userDirectory, noWatchEnv, pickName } from './compat.mjs';
 import { parseJson } from './json.mjs';
+import { PROXY_MODES, validateProxyUrl, resolveProxy, proxyText } from './proxy.mjs';
 
 export { homeDirectory, userDirectory };
 // codex 执行者的派发设置与窗口策略的内置默认值。
@@ -87,7 +88,68 @@ function writeAtomic(home, file, config) {
   } finally { rmSync(temp, { force: true }); }
 }
 
-function validateV2(config) {
+// provider：OpenAI 兼容接口（经 Codex 外壳）。只有 codex 适配器的执行者可以写；
+// secrets 里正好一个变量，它的键就是 Codex 的 env_key（启动时由核心注入）。
+function validateProvider(name, profile) {
+  const at = `config.json 的 profiles.${name}`;
+  const { provider } = profile;
+  if (profile.adapter !== 'codex') throw new Error(`${at}.provider 只能用于 codex 适配器的执行者（OpenAI 兼容接口经 Codex 外壳）`);
+  if (!object(provider)) throw new Error(`${at}.provider 必须为对象`);
+  if (typeof provider.baseUrl !== 'string' || !provider.baseUrl) throw new Error(`${at}.provider.baseUrl 必须填写接口地址（http:// 或 https:// 开头）`);
+  let url;
+  try { url = new URL(provider.baseUrl); } catch { throw new Error(`${at}.provider.baseUrl 不是有效的地址（需要 http:// 或 https:// 开头）`); }
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error(`${at}.provider.baseUrl 只接受 http:// 或 https:// 开头的地址`);
+  if (url.username || url.password) throw new Error(`${at}.provider.baseUrl 里不能带用户名和密码；密钥请放在 secrets 里`);
+  if (provider.wireApi === 'chat') throw new Error(`${at}.provider.wireApi 不能是 chat：Codex 0.163 起不再支持 Chat Completions，只能用 responses；服务只支持 Chat Completions 时，请改用"Claude Code 兼容后端"或通用适配器`);
+  if (provider.wireApi != null && provider.wireApi !== 'responses') throw new Error(`${at}.provider.wireApi 只接受 responses`);
+  if (typeof profile.model !== 'string' || !profile.model) throw new Error(`${at}.model 必须填写（有 provider 时必填）`);
+  if (profile.auth === 'login') throw new Error(`${at} 有 provider 时 auth 必须为 token`);
+  const keys = Object.keys(profile.secrets ?? {});
+  if (keys.length !== 1) throw new Error(`${at}.secrets 有 provider 时必须正好有一个密钥变量（现在有 ${keys.length} 个）`);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keys[0])) throw new Error(`${at}.secrets 的键必须是环境变量名（它就是 Codex 的 env_key）`);
+}
+
+// routing（路由器用）：rules 每条 { types: [字符串], profile: 字符串, escalate?: 字符串 | null }，fallback 是字符串或 null，reviewer 见下。
+function validateRouting(routing) {
+  if (routing == null) return;
+  if (!object(routing)) throw new Error('config.json 的 routing 必须为对象');
+  if (routing.rules != null) {
+    if (!Array.isArray(routing.rules)) throw new Error('config.json 的 routing.rules 必须为数组');
+    routing.rules.forEach((rule, index) => {
+      const at = `config.json 的 routing.rules[${index}]`;
+      if (!object(rule)) throw new Error(`${at} 必须为对象`);
+      if (!Array.isArray(rule.types) || rule.types.some(item => typeof item !== 'string')) throw new Error(`${at}.types 必须为字符串数组`);
+      if (typeof rule.profile !== 'string' || !rule.profile) throw new Error(`${at}.profile 必须为执行者名`);
+      if (rule.escalate != null && typeof rule.escalate !== 'string') throw new Error(`${at}.escalate 必须为字符串或 null`);
+    });
+  }
+  if (routing.fallback != null && typeof routing.fallback !== 'string') throw new Error('config.json 的 routing.fallback 必须为字符串或 null');
+  // reviewer：{ profiles: [执行者名], mustDiffer: 布尔 }；兼容只写一个 profile 的旧写法（对象或字符串）；null 或不写按空处理。
+  const reviewer = routing.reviewer;
+  if (reviewer != null && typeof reviewer !== 'string') {
+    if (!object(reviewer)) throw new Error('config.json 的 routing.reviewer 必须为对象、字符串或 null');
+    if (reviewer.profiles != null && (!Array.isArray(reviewer.profiles) || reviewer.profiles.some(name => typeof name !== 'string'))) throw new Error('config.json 的 routing.reviewer.profiles 必须为字符串数组');
+    if (reviewer.profile != null && typeof reviewer.profile !== 'string') throw new Error('config.json 的 routing.reviewer.profile 必须为字符串');
+    if (reviewer.mustDiffer != null && typeof reviewer.mustDiffer !== 'boolean') throw new Error('config.json 的 routing.reviewer.mustDiffer 必须为布尔值');
+  }
+}
+
+// proxy（网络代理，Stage07 099）：{ mode: off | system | manual, url? }。manual 时 url 必须合法；
+// 地址里带用户名或密码一律拒绝（任何模式下都不允许把凭据留在配置文件里）。
+function validateProxy(proxy) {
+  if (proxy == null) return;
+  if (!object(proxy)) throw new Error('config.json 的 proxy 必须为对象');
+  if (!PROXY_MODES.includes(proxy.mode)) throw new Error(`config.json 的 proxy.mode 必须为 ${PROXY_MODES.join('、')} 之一`);
+  const url = proxy.url;
+  if (proxy.mode === 'manual' || (url != null && url !== '')) {
+    if (url != null && typeof url !== 'string') throw new Error('config.json 的 proxy.url 必须为字符串');
+    const checked = validateProxyUrl(url);
+    if (!checked.ok && (proxy.mode === 'manual' || checked.code === 'PROXY_CREDENTIALS')) throw new Error(`config.json 的 proxy.url ${checked.error}`);
+  }
+}
+
+export function validateV2(config) {
+  validateProxy(config.proxy);
   if (config.profiles != null && !object(config.profiles)) throw new Error('config.json 的 profiles 必须为对象');
   for (const [name, profile] of Object.entries(config.profiles ?? {})) {
     if (!object(profile)) throw new Error(`config.json 的 profiles.${name} 必须为对象`);
@@ -105,7 +167,17 @@ function validateV2(config) {
     if (profile.label != null && typeof profile.label !== 'string') throw new Error(`config.json 的 profiles.${name}.label 必须为字符串`);
     if (profile.adapter === 'codex') for (const key of codexKeys) validate(key, profile[key], 'config.json');
     else validate('path', profile.path, 'config.json');
+    if (profile.provider != null) validateProvider(name, profile);
+    // 每日上限（路由器用）：不写或 null 表示不限；写了必须是正整数。
+    if (profile.limits != null) {
+      if (!object(profile.limits)) throw new Error(`config.json 的 profiles.${name}.limits 必须为对象`);
+      for (const key of ['maxTasksPerDay', 'maxTokensPerDay']) {
+        const value = profile.limits[key];
+        if (value != null && !(Number.isSafeInteger(value) && value > 0)) throw new Error(`config.json 的 profiles.${name}.limits.${key} 必须为正整数或 null`);
+      }
+    }
   }
+  validateRouting(config.routing);
   if (config.defaultProfile != null && typeof config.defaultProfile !== 'string') throw new Error('config.json 的 defaultProfile 必须为字符串或 null');
   if (config.managed !== undefined) validate('managed', config.managed, 'config.json');
   validate('watchWindow', config.watchWindow, 'config.json');
@@ -240,7 +312,16 @@ export function resolveSettings(config, opts = {}, env = {}, profileName) {
   return { settings, sources };
 }
 
-export function loadConfig(home, opts = {}, env = process.env) {
+// 只读取得"实际生效"的配置（ar route 用，不写任何文件，也不迁移旧目录的配置）：
+// 没有配置文件时是旧目录里的 v1 配置（迁移后的样子），再没有就是内置默认；读不了就拒绝。
+export function readEffectiveConfig(home) {
+  const state = readConfig(home);
+  if (state.reason) throw configInvalid(state);
+  return validateV2(state.exists ? state.config : state.legacy?.config ?? builtinConfig());
+}
+
+// choose：派发时用路由器选执行者（config => { profileName, profile, ...附带信息 }），附带信息原样带回；不给就是旧的 selectProfile。
+export function loadConfig(home, opts = {}, env = process.env, { choose } = {}) {
   const state = readConfig(home);
   // 配置无效：在读取任何回退之前就拒绝，不派发、不写入（063）。
   if (state.reason) throw configInvalid(state);
@@ -255,8 +336,8 @@ export function loadConfig(home, opts = {}, env = process.env) {
     config = builtinConfig(); warning = '配置：未找到 config.json，模型、强度、档位跟随 Codex 自己的配置';
   } else if (state.upgraded) warning = '配置：config.json 是旧版本，已按 v2 解读';
   validateV2(config);
-  const { profileName, profile } = selectProfile(config, opts, env);
-  return { ...state, config, profileName, profile, ...resolveSettings(config, opts, env, profileName), warning };
+  const { profileName, profile, ...chosen } = choose ? choose(config) : selectProfile(config, opts, env);
+  return { ...state, config, profileName, profile, ...chosen, ...resolveSettings(config, opts, env, profileName), warning };
 }
 
 export function writeConfig(home, changes = {}, { init = false } = {}) {
@@ -340,6 +421,8 @@ function formatSlotLines(home) {
     `${padColumn('reportWeights', 16)}${padColumn(weights.custom ? `自定义 ${weights.custom} 项` : '默认', 19)}${weights.source}`,
     `${padColumn('prices', 16)}${padColumn(priced ? `${priced} 个执行者` : '未设置', 19)}${prices.source}`,
     `${padColumn('leadUsage', 16)}${padColumn(String(usage.enabled), 19)}${usage.source}`,
+    // 网络代理：模式与地址；system 时写这一刻读到的结果（只读，不写任何东西）。
+    `${padColumn('proxy', 16)}${proxyText(resolveProxy(config))}`,
     ...warnings, ...retention.warnings, ...weights.warnings, ...prices.warnings, ...usage.warnings,
   ];
 }

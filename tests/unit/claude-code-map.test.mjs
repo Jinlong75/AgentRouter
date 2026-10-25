@@ -30,8 +30,19 @@ test('真实样例：命令开始与结束用同一个 id，结果文本作为�
   assert.equal(replay('claude-code-sample.jsonl').lastResult, '完成');
 });
 
+test('多条 result：汇报取最长的一条，一样长取靠后的', () => {
+  const full = replay('claude-code-multi-result.jsonl').lastResult;
+  assert.match(full, /^## 1\. 完成了什么/);
+  assert.match(full, /## 3\. 验证/);
+  const mapper = createMapper();
+  for (const text of ['第一条', '第二条', '短']) mapper(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: text }), { root: ROOT });
+  assert.equal(mapper.lastResult, '第二条');
+  const err = createMapper()(JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: '出错了' }), { root: ROOT });
+  assert.ok(err.some(e => e.kind === 'error' && e.text === '出错了'));
+});
+
 test('样例匿名化：没有真实路径、用户名、真实 ID 或消息通道', () => {
-  for (const name of ['claude-code-sample.jsonl', 'claude-code-extra.jsonl']) {
+  for (const name of ['claude-code-sample.jsonl', 'claude-code-extra.jsonl', 'claude-code-multi-result.jsonl']) {
     const text = readFileSync(path.join(fixtures, name), 'utf8');
     assert.doesNotMatch(text, /[A-Za-z]:\\\\Users\\\\|~1|AppData|cc-msg-|call_\d\d_/i, name);
   }

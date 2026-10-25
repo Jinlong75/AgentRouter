@@ -1,5 +1,5 @@
 import { pollUntil } from './shots-input';
-import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, stat, rm } from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -241,6 +241,30 @@ export async function captureProjects(h: Harness) {
         assert.equal(await readFile(path.join(dir.initialized, '.agent-router', 'project.json'), 'utf8'), beforeInvalid);
     });
 
+    // 095（D41）git 版本检查：核心把 AR_TEST_GIT_VERSION 当作 `git --version` 的输出，用它让核心报告旧版本。
+    // 软件每次调用核心都从主进程的 process.env 重新取环境（appEnvironment(process.env)），所以只在这一项检查里设置、查完删除。
+    // 离开项目页再回来触发重新读取；横幅只是提示，不禁用任何按钮。
+    const reopenProjects = async () => {
+        await press('[data-page=tasks]');
+        await wait('!!document.querySelector("[data-task=t1]")', '回到任务页');
+        await press('[data-page=projects]');
+        await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '重新进入项目页');
+        await pick(dir.initialized);
+        await wait('!!document.querySelector("[data-pj=edit]")', '已初始化项目的详情');
+    };
+    process.env.AR_TEST_GIT_VERSION = 'git version 2.39.1.windows.1';
+    try {
+        await reopenProjects();
+        await wait(`!!document.querySelector('.pj-body > .banner.brand .rt b') && document.querySelector('.pj-body > .banner.brand .rt b').textContent === 'git 版本太旧：2.39.1'`, 'git 版本太旧的横幅出现');
+        await check('UI15 git 低于 2.40：项目详情顶部（项目配置之上）显示横幅"git 版本太旧：2.39.1"', `(() => { const b = document.querySelector('.pj-body > .banner.brand'); return !!b && b.querySelector('.rt b').textContent === 'git 版本太旧：2.39.1' && b.querySelector('.rt span').textContent.includes('git 2.40 或更新') && b === document.querySelector('.pj-body').firstElementChild && !!(b.compareDocumentPosition(document.querySelector('.pj-body .sec-t')) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
+        await check('UI15 git 版本太旧的横幅只是提示：编辑配置、打开文件夹、更多按钮仍可用', `['[data-pj=edit]', '[data-pj=folder]', '[data-pj=more]', '[data-pj=claude]'].every(s => { const b = document.querySelector(s); return !!b && !b.disabled; })`);
+        await shot('projects-oldgit');
+    }
+    finally { delete process.env.AR_TEST_GIT_VERSION; }
+    await reopenProjects();
+    await wait(`!document.querySelector('.pj-body > .banner.brand')`, '恢复后横幅消失');
+    await check('UI15 git 版本恢复后"版本太旧"横幅消失，配置各行仍在', `!document.querySelector('.pj-body > .banner.brand') && document.querySelector('.sec-t')?.textContent.includes('项目配置')`);
+
     // UI18 打开 Claude Code / 文件夹：两个按钮键盘可达，调用参数正确。
     await wait('!!document.querySelector("[data-pj=claude]") && !!document.querySelector("[data-pj=folder]")');
     const launched = effects.launched.length, opened = effects.opened.length, cwd = dir.initialized;
@@ -255,6 +279,39 @@ export async function captureProjects(h: Harness) {
         assert.ok(last.args.includes(cwd), `参数里没有项目目录：${last.args.join(' ')}`);
         assert.equal(last.args.at(-1), 'claude');
     });
+    // 网络代理（099）：不使用时不传 env（终端照旧继承软件的环境）；手动填写时 env 里 HTTPS_PROXY 等于设置的地址，
+    // 并补上 NO_PROXY；每次点击都重新算（改了配置不用重开软件）。写 config.json 前记下原内容，结束后原样恢复。
+    const proxyConfig = path.join(home, 'config.json');
+    const proxyOriginal = await readFile(proxyConfig, 'utf8').catch(() => null);
+    const proxyUrl = 'http://127.0.0.1:7890';
+    try {
+        await verify('UI18 代理不使用（默认）：打开 Claude Code 没有传 env', () => {
+            assert.equal(effects.launched.at(-1)!.env, undefined);
+        });
+        const base = proxyOriginal ? JSON.parse(proxyOriginal) : {};
+        await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'manual', url: proxyUrl } }));
+        const beforeManual = effects.launched.length;
+        await tabTo('[data-pj=claude]'); await key('Enter');
+        await until(() => effects.launched.length > beforeManual, '手动代理下打开 Claude Code 的调用');
+        await verify('UI18 代理手动填写：打开 Claude Code 传的 env 里 HTTPS_PROXY / HTTP_PROXY 等于设置的地址，NO_PROXY 已补上，参数不变', () => {
+            const last = effects.launched.at(-1)!;
+            assert.equal(last.env?.HTTPS_PROXY, proxyUrl);
+            assert.equal(last.env?.HTTP_PROXY, proxyUrl);
+            assert.equal(last.env?.NO_PROXY, 'localhost,127.0.0.1,::1');
+            assert.equal(last.cwd, cwd);
+            assert.equal(last.args.at(-1), 'claude');
+        });
+        await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'off', url: proxyUrl } }));
+        const beforeOff = effects.launched.length;
+        await tabTo('[data-pj=claude]'); await key('Enter');
+        await until(() => effects.launched.length > beforeOff, '代理改回不使用后打开 Claude Code 的调用');
+        await verify('UI18 代理改回不使用：打开 Claude Code 又没有传 env，代理变量没有被加上', () => {
+            assert.equal(effects.launched.at(-1)!.env, undefined);
+        });
+    }
+    finally {
+        if (proxyOriginal === null) await rm(proxyConfig, { force: true }); else await writeFile(proxyConfig, proxyOriginal);
+    }
     await tabTo('[data-pj=folder]');
     await focusRing('UI18 打开文件夹');
     await key('Enter');

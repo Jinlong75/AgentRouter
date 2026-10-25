@@ -1,7 +1,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, writeFileSync, readFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { basename, isAbsolute, relative, join, resolve as resolvePath } from 'node:path';
-import { homeDirectory, loadConfig } from './config.mjs';
+import { homeDirectory, loadConfig, selectProfile } from './config.mjs';
+import { READ_ONLY_TYPES, route, supportsReadOnly } from './router.mjs';
 import { dispatcher, parseArgs, taskDetails } from './options.mjs';
 import { recordPaths, registryWriter, writeDispatch, readDispatch, taskPaths, attemptPaths, explicitOptions, retryOptions, SHARED_OPTIONS, DISPATCH_OPTIONS } from './records.mjs';
 import { progressHeader } from './progress.mjs';
@@ -9,15 +10,17 @@ import { acceptsManaged, viewerApp, managedEnvironment, validRequest, existingPa
 import { printCompletion } from './completion.mjs';
 import { dryRun as dryRunEnv, testStartTimeout, homeEnv, unsafeHome, legacyHomeDirectory } from './compat.mjs';
 import { locateStart, findTerminal, reverseRows, worktreeOutcome } from './wait.mjs';
-import { adapterFor } from '../adapters/index.mjs';
-import { buildEnv, allowedEnv, secretSources, ensureSandboxHome } from './env.mjs';
+import { adapterFor, resolveProfile } from '../adapters/index.mjs';
+import { buildEnv, allowedEnv, secretSources, ensureSandboxHome, withProxy } from './env.mjs';
+import { proxyRecord } from './proxy.mjs';
 import { parseSpec, validateSpec, mergeSpec } from './spec.mjs';
-import { git, headSha, parseStatusPorcelainZ, uncommittedFiles } from './git.mjs';
+import { git, headSha, parseStatusPorcelainZ, uncommittedFiles, requireModernGit } from './git.mjs';
 import { pipeline } from './pipeline.mjs';
 import { requireSpecAt, resolveBase, specRelative, worktreeEnabled } from './worktree.mjs';
 import { readJson } from './json.mjs';
 import { redactPaths } from './process.mjs';
 import { tracing } from './trace.mjs';
+import { checkDispatch, recordProcessGone } from './stop.mjs';
 
 // 托管执行者进程脱离启动、标准错误没人看：认领请求文件失败时留一行痕迹（只记文件名）。写日志失败一律吞掉。
 function claimFailure(env, reason, requestFile) {
@@ -30,7 +33,7 @@ function claimFailure(env, reason, requestFile) {
   } catch { /* 留痕失败不影响返回值 */ }
 }
 
-export async function run({ adapter: adapterOverride, scriptPath, args = process.argv.slice(2), env = process.env, root = process.cwd(), onDetach, onGate, onRetry, retry = null } = {}) {
+export async function run({ adapter: adapterOverride, scriptPath, args = process.argv.slice(2), env = process.env, root = process.cwd(), onDetach, onGate, onRetry, retry = null, inheritRoute = null } = {}) {
   // 公共目录保护（协议第 1 节）：必须在改名请求文件、读写公共目录、启动进程之前检查。
   // 只检查显式设置的新名 / 旧名环境变量；--run-request 执行者进程也走这里。
   if (homeEnv.some(key => env[key])) {
@@ -72,26 +75,36 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   const home = homeDirectory(env);
   const registry = registryWriter(home);
   // 先选执行者再占记录名：进度首行写执行者名；配置出错时不留下空记录。托管执行者用请求里的快照。
-  const { settings, warning, config, profileName, profile } = request
+  // 前台 / 脱离派发的派发进程经路由器选执行者（--profile 与 AR_PROFILE 最先生效）；ar retry / ar redispatch 沿用原任务的执行者（redispatch 带 --profile），不重新路由。
+  const loaded = request
     ? { settings: { ...request.settings, watchWindow: 'never' }, warning: null, config: {}, profileName: request.profile ?? 'codex', profile: { adapter: request.adapter ?? 'codex', ...(request.profileConfig ?? {}) } }
-    : loadConfig(home, parsed.opts, env);
-  const adapter = adapterOverride ?? adapterFor(profile);
+    : loadConfig(home, parsed.opts, env, { choose: routeChooser({ root, home, details, opts: parsed.opts, env }) });
+  const { settings, warning, config, profileName, route: routed } = loaded;
+  // 网络代理（Stage07 099）：派发进程在这里读一次（dispatch.json 要记模式与是否生效，也给下面的执行者环境用）；
+  // 托管 / 脱离的执行者进程在启动执行者前自己读（那时才是启动的这一刻）。
+  const proxyNow = request ? null : withProxy(env, home);
+  // generic 执行者：声明在这里解析进执行者配置（之后随 profileConfig 进托管 / 脱离请求）；声明有问题时适配器的 command 失败，不启动、不重试。
+  const profile = resolveProfile(loaded.profile, config);
+  const adapter = adapterOverride ?? adapterFor(profile, { config, tolerant: true });
   const label = profile.label ?? adapter.label ?? adapter.id;
+  // 写进 dispatch.json 与进度的路由记录。ar redispatch 沿用原任务的记录（执行者没有重新路由），其余用这次路由的结果。
+  const inherited = inheritRoute && inheritRoute.profile === profileName && Array.isArray(inheritRoute.trace) && inheritRoute.trace.length ? inheritRoute : null;
+  const routeRecord = !request && details.spec ? (inherited ?? { profile: profileName, rule: routed.rule, trace: routed.trace }) : null;
   // 升级目标（协议 14.1）：执行者配置的 escalate 指向另一个配置名，只在最后一次自动重试换用它。
   // 前台派发从 config.profiles 找目标（缺失或未启用记 null，进度行由 pipeline 写）；
   // 托管 / 脱离执行者进程用请求里的快照（非密钥部分，同 profileConfig；shape: { profile, config }）。
   const escalateName = request
     ? (request.escalate && typeof request.escalate === 'object' && typeof request.escalate.profile === 'string' && request.escalate.profile !== '' ? request.escalate.profile : null)
-    : (typeof profile.escalate === 'string' && profile.escalate !== '' ? profile.escalate : null);
+    : (routed?.escalate ?? null);
   const escalateTarget = request
     ? (request.escalate?.config && typeof request.escalate.config === 'object'
       ? { adapter: request.escalate.config.adapter ?? request.adapter ?? 'codex', ...request.escalate.config } : null)
-    : (config.profiles?.[escalateName] && config.profiles[escalateName].enabled !== false ? config.profiles[escalateName] : null);
+    : (config.profiles?.[escalateName] && config.profiles[escalateName].enabled !== false ? resolveProfile(config.profiles[escalateName], config) : null);
   const escalate = escalateName ? { name: escalateName, profile: escalateTarget } : null;
   // 请求里的升级快照：形状同 profileConfig（非密钥部分）；目标缺失 / 未启用 / 取不出快照时 config 为 null，
   // 执行者进程据此同样不升级。不含任何密钥值。
   const escalateRequest = escalate
-    ? { profile: escalate.name, config: (() => { try { return escalate.profile ? profileConfig(escalate.profile, adapterFor(escalate.profile)) : null; } catch { return null; } })() }
+    ? { profile: escalate.name, config: (() => { try { return escalate.profile ? profileConfig(escalate.profile, adapterFor(escalate.profile, { config, tolerant: true })) : null; } catch { return null; } })() }
     : null;
   // 用任务说明派发：解析 frontmatter、合并项目配置；启用门禁时先做派发前检查（协议 11.1～11.4）。
   // 全部在占记录名之前完成，失败时不留下空记录；托管 / 脱离派发的执行者进程直接用请求里的快照。
@@ -99,10 +112,13 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   // 托管 / 脱离的执行者进程直接用请求里的 worktree.base，不再读项目配置判断。
   let wt = null;
   if (request) wt = request.worktree ? { base: request.worktree.base } : null;
-  else if (worktreeEnabled({ spec: details.spec, projectConfig: readProjectConfig(root), noWorktree })) wt = prepareWorktreeBase(root, details.spec);
+  else if (worktreeEnabled({ spec: details.spec, projectConfig: readProjectConfig(root), noWorktree })) { requireModernGit('worktree'); wt = prepareWorktreeBase(root, details.spec); }
   let gateInfo = null, specWarnings = [];
   if (request) gateInfo = request.args.gate ?? null;
   else if (details.spec) ({ gate: gateInfo, warnings: specWarnings } = prepareSpecGate(root, details.spec, wt));
+  // 调研 / 审查类任务只读运行（Stage07 105）：路由器会避开不支持只读的执行者，这里给 --profile 显式指定的情况兜底，派发前就拒绝。
+  // 托管 / 脱离的执行者进程用请求里的快照，前台已经检查过。
+  if (!request && gateInfo?.readOnly === true && !supportsReadOnly(profile, config)) throw new Error(`${label} 不支持只读任务`);
   // 自动重试次数（协议 14.1）：只有用任务说明派发的任务（gateInfo 非空）重试，总次数 1 + max_retries；
   // 直接写任务文字派发的任务 maxRetries 为 0（总次数 1）。任务说明与项目配置的合并已在 merged.max_retries 里。
   const mergedRetries = Number.isSafeInteger(gateInfo?.merged?.max_retries) && gateInfo.merged.max_retries >= 0
@@ -122,13 +138,19 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
     profile: profileName,
     name: paths.name,
+    // 路由结果：选了谁、命中哪条规则、为什么（trace 每行一句中文）。只有用任务说明派发的任务记；直接写任务文字的没有这个字段。
+    ...(routeRecord ? { route: routeRecord } : {}),
     // 命令行明确给出的 model / effort / tier / sandbox / watchWindow（067），一个都没给就没有这个字段。
     ...(explicitOptions(parsed.opts) ? { options: explicitOptions(parsed.opts) } : {}),
     // 用任务说明派发的另记门禁设置与基线（协议第 3 节，Stage05），供 ar retry；直接任务文字派发没有这个字段。
     ...(gateInfo ? { gate: gateInfo } : {}),
+    // 只读运行（调研 / 审查类任务）才记 readOnly: true；可写任务没有这个字段。
+    ...(gateInfo?.readOnly === true ? { readOnly: true } : {}),
     // worktree 模式与 --no-worktree 各记一笔，供 ar redispatch 沿用原任务的模式（协议 15.1）；其余任务没有这两个字段。
     ...(wt ? { worktree: true } : {}),
     ...(noWorktree ? { noWorktree: true } : {}),
+    // 网络代理只记模式与是否生效，不记地址（地址可能含内网信息）；没用代理（off）的任务没有这个字段。
+    ...(proxyNow && proxyNow.proxy.mode !== 'off' ? { proxy: proxyRecord(proxyNow.proxy) } : {}),
   });
   const interactive = !!process.stdout.isTTY;
   const progress = (text, at = Date.now()) => {
@@ -137,6 +159,7 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     if (interactive) console.log(line);
   };
   if (warning) { progress(warning); if (!interactive) console.log(warning); }
+  if (routeRecord) progress(`路由：${routeRecord.trace.at(-1)}`);
   // 适配器不支持的设置（claude-code 的 tier）只在前台派发时提示一次；托管 / 脱离的执行者进程不重复，自动重试在 pipeline 里也不重复。
   if (!request) for (const key of adapter.unsupportedSettings ?? []) if (settings[key] != null) {
     const line = `配置：${adapter.id} 执行者不支持 ${key}，已忽略`;
@@ -192,9 +215,14 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   const sources = secretSources(config);
   let childEnv, envError = null;
   // 064：执行者的用户目录是沙箱（协议第 7 节）；启动前建好目录（建不了就用系统临时目录里的一次性目录）。
-  try { childEnv = buildEnv({ base: env, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
-  catch (error) { envError = error; childEnv = allowedEnv({ base: env, adapter, home, profileName, sources }); }
+  // 099：基础环境先加上网络代理变量，再经过白名单。
+  const { base: envBase, proxy } = proxyNow ?? withProxy(env, home);
+  try { childEnv = buildEnv({ base: envBase, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
+  catch (error) { envError = error; childEnv = allowedEnv({ base: envBase, adapter, home, profileName, sources }); }
   const detection = await adapter.detect({ env: childEnv, settings, profile });
+  // 路由说明（trace 最后一句）也记进 start，界面的进展 / 参数标签读它。托管 / 脱离的执行者进程自己没有路由结果，从派发进程写好的 dispatch.json 取。
+  const savedRoute = request ? readDispatch(root, paths.name)?.route : routeRecord;
+  const routeLine = Array.isArray(savedRoute?.trace) && typeof savedRoute.trace.at(-1) === 'string' ? savedRoute.trace.at(-1) : null;
   registry({ event: 'start', v: 2, id, repo: root, name: paths.name, dir: paths.dir, project: basename(root), profile: profileName, adapter: adapter.id, label, spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
     title: details.title, role: details.role?.name ?? null, pid: process.pid, started,
     progress: paths.progress, report: paths.report, raw: paths.raw, model: settings.model ?? adapter.modelName?.({ settings, profile }) ?? null, effort: settings.effort, tier: settings.tier,
@@ -202,13 +230,15 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
     dispatcher: source, ...(request ? { managed: true } : {}),
     // 用任务说明派发的任务记是否启用门禁；启用时记派发时的 HEAD（协议第 2 节、11.4）。其他任务没有这两个字段。
     ...(gateInfo ? { gate: gateInfo.enabled, ...(gateInfo.enabled ? { base: gateInfo.base } : {}) } : {}),
+    ...(gateInfo?.readOnly === true ? { readOnly: true } : {}),
+    ...(routeLine ? { route: routeLine } : {}),
     // worktree 模式另记 worktree: true 与基线（没启用门禁时基线也记，协议 15.1、15.2）。
     ...(wt ? { worktree: true, base: wt.base } : {}),
   });
   // 一次运行的编排（多次尝试的循环 → 门禁 → 收尾）在 pipeline.mjs，单次执行在 runner.mjs。
   return pipeline({
     root, paths, id, registry, progress, started, interactive, home,
-    adapter, label, profile, settings, detection, childEnv, envError, env,
+    adapter, label, profile, settings, detection, childEnv, envError, env, proxy,
     prompt: details.prompt, gateInfo, onGate,
     profileName, maxRetries, escalate, sources,
     ...(wt ? { worktree: { base: wt.base, setup: setupCommands(root), dir: null } } : {}),
@@ -238,8 +268,35 @@ function prepareWorktreeBase(root, specPath) {
   return { base, baseBranch };
 }
 
+// 路由用的任务说明字段（type / worker / read_only）；读不了或解析不过就当没有（真正的错误由后面的派发前检查报出）。
+export function readRouteSpec(root, specPath) {
+  if (!specPath) return null;
+  try {
+    const spec = validateSpec(parseSpec(readFileSync(resolvePath(root, specPath), 'utf8'), specPath), specPath);
+    return { type: spec.type, worker: spec.worker, read_only: spec.read_only };
+  } catch { return null; }
+}
+
+// 派发时给 loadConfig 的选择函数：调用路由器，失败时补上 trace。
+// 没有类型（直接写任务文字）且不是因为每日上限、只读限制而落空时，保留旧的选择错误文案（多个可用的执行者、没有可用的执行者等）。
+function routeChooser({ root, home, details, opts, env }) {
+  return config => {
+    const spec = readRouteSpec(root, details.spec);
+    try {
+      const result = route({ spec, projectConfig: readProjectConfig(root), config, explicit: opts.profile ?? (env.AR_PROFILE || undefined), home });
+      return { profileName: result.profile, profile: config.profiles[result.profile], route: result };
+    } catch (error) {
+      if (error.code === 'NO_PROFILE') {
+        if (!spec?.type && !error.trace.some(line => /每日上限|不支持只读/.test(line))) selectProfile(config, {}, {});
+        error.message = `${error.message}\n${error.trace.map(line => `  ${line}`).join('\n')}`;
+      }
+      throw error;
+    }
+  };
+}
+
 // 项目配置：<项目根>/.agent-router/project.json；不存在、读不了或不是对象都当 {}（协议 11.3）。
-function readProjectConfig(root) {
+export function readProjectConfig(root) {
   try {
     const value = readJson(join(root, '.agent-router', 'project.json'));
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -252,11 +309,19 @@ function readProjectConfig(root) {
 // 派发与手动重试的重新准备共用 readAndMergeSpec / gateFields（任务 059）。
 // worktree 模式（wt = { base }）：任务说明取基线提交里的版本（执行者看到的就是它），基线就是门禁的 base，
 // 不再检查主工作区的 HEAD 与是否干净（协议 15.2；第 11.4 节第 2、3 条只对非 worktree 模式）。
+// 调研 / 审查类任务（readOnly）总是启用门禁（Stage07 105），好让它走完门禁和待验收；gate 里多记 readOnly: true，其余任务没有这个字段。
 function prepareSpecGate(root, specPath, wt = null) {
-  const { parsed, merged } = readAndMergeSpec(root, specPath, wt?.base ?? null);
+  const { parsed, spec, merged } = readAndMergeSpec(root, specPath, wt?.base ?? null);
   const fields = gateFields(merged);
-  if (!merged.gate) return { warnings: parsed.warnings, gate: { enabled: false, base: null, merged: fields } };
-  return { warnings: parsed.warnings, gate: { enabled: true, base: wt ? wt.base : requireGateBase(root, specPath), merged: fields } };
+  const readOnly = needsReadOnly(spec);
+  if (!merged.gate && !readOnly) return { warnings: parsed.warnings, gate: { enabled: false, base: null, merged: fields } };
+  return { warnings: parsed.warnings, gate: { enabled: true, base: wt ? wt.base : requireGateBase(root, specPath), merged: fields, ...(readOnly ? { readOnly: true } : {}) } };
+}
+
+// 任务是否以只读模式运行：任务说明的 type 是 research / review，或写了 read_only: true。
+// 与路由器的 needsReadOnly 同一条规则（router.mjs 的 route() 里是行内表达式，没有单独导出，这里复用它的 READ_ONLY_TYPES）。
+export function needsReadOnly(spec) {
+  return READ_ONLY_TYPES.includes(spec?.type) || spec?.read_only === true;
 }
 
 // 读取 → 解析 → 校验 → 与项目配置合并任务说明（协议 11.1～11.3；派发与手动重试共用）。
@@ -368,16 +433,24 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   const started = Date.now();
   // 定位任务、状态判断、选执行者、取原始指令与门禁、算新编号与上一次的失败（只读；
   // 不通过时抛错，调用方按派发错误退出码 2 处理）。脱离派发的执行者进程不再读配置（按快照运行）。
+  //（任务 102）清单里没有结束记录的任务：先核对原派发进程还在不在。核对是异步的，所以放在同步的 prepareRetry 之前，
+  // 结果交给它参考；prepareRetry 与这一步都只读，补写 interrupted 要等所有检查通过、真的要重试时（下面）才做。
+  const unfinished = await checkUnfinished({ root, env, name: opts.name });
   const plan = prepareRetry({ root, env, name: opts.name, profileOpt: opts.profile, note: opts.note, nOverride: opts.n, skipProfile: !!request, gateSnapshot: request?.args?.gate ?? null,
-    rebase: opts.rebase, rebaseBase: opts.rebaseBase });
+    rebase: opts.rebase, rebaseBase: opts.rebaseBase, unfinished });
   const { paths, id, n, saved, prompt, gateInfo, warnings, baseNote, specNote, optionsNote, failure, rebase } = plan;
   // 执行者配置：执行者进程用请求里的快照（同派发），前台重新读配置（顺便校验 --profile 存在且启用）。
-  const { settings, warning, config, profile } = request
+  const loaded = request
     ? { settings: { ...request.settings, watchWindow: 'never' }, warning: null, config: {}, profile: { adapter: request.adapter ?? 'codex', ...(request.profileConfig ?? {}) } }
     : plan.loaded;
+  const { settings, warning, config } = loaded;
+  // generic 执行者的声明解析进执行者配置（同派发）；脱离重试的执行者进程用请求里带着的声明。
+  const profile = resolveProfile(loaded.profile, config);
   const profileName = plan.profileName;
-  const adapter = adapterOverride ?? adapterFor(profile);
+  const adapter = adapterOverride ?? adapterFor(profile, { config, tolerant: true });
   const label = profile.label ?? adapter.label ?? adapter.id;
+  // 只读任务重试时换了不支持只读的执行者（--profile）：同派发，在启动前拒绝。
+  if (!request && gateInfo?.readOnly === true && !supportsReadOnly(profile, config)) throw new Error(`${label} 不支持只读任务`);
   mkdirSync(paths.dir, { recursive: true });
   const interactive = !!process.stdout.isTTY;
   const progress = (text, at = Date.now()) => {
@@ -386,6 +459,13 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
     if (interactive) console.log(line);
   };
   console.log(`记录名：${paths.name}\n进度：${paths.progress}`);
+  // 原派发进程已经不在了、也没有结束记录（任务 102）：所有检查都通过、真的要重试了，补写 interrupted 再往下走（与 ar stop 同一个函数）。
+  if (plan.processGone) {
+    recordProcessGone(plan.processGone.home, plan.start);
+    const line = '重试：上一次的派发进程意外退出，已记为中断';
+    progress(line);
+    if (!interactive) console.log(line);
+  }
   if (warning) { progress(warning); if (!interactive) console.log(warning); }
   if (!request) for (const key of adapter.unsupportedSettings ?? []) if (settings[key] != null) {
     const line = `配置：${adapter.id} 执行者不支持 ${key}，已忽略`;
@@ -438,8 +518,10 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   // 执行者环境：与派发相同的白名单、密钥、沙箱用户目录（env.mjs）。
   const sources = secretSources(config);
   let childEnv, envError = null;
-  try { childEnv = buildEnv({ base: env, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
-  catch (error) { envError = error; childEnv = allowedEnv({ base: env, adapter, home, profileName, sources }); }
+  // 099：手动重试这一次重新读代理（同派发：先加代理变量，再经过白名单）。
+  const { base: envBase, proxy } = withProxy(env, home);
+  try { childEnv = buildEnv({ base: envBase, profile, adapter, home, profileName, sources }); ensureSandboxHome(childEnv, { home, profileName }); }
+  catch (error) { envError = error; childEnv = allowedEnv({ base: envBase, adapter, home, profileName, sources }); }
   const detection = await adapter.detect({ env: childEnv, settings, profile });
   // 开始前追加 resume（协议 14.3 第 7 条）：pid 是这次运行重试的进程
   //（脱离派发时是执行者进程自己，在上面的 --run-request 里走同一条分支）。
@@ -447,7 +529,7 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   // 之后与协议 14.2 相同，只是只跑这一次（retry），收尾写 attempt-end 与 end（end.attempts === n）。
   return pipeline({
     root, paths, id, registry, progress, started, interactive, home,
-    adapter, label, profile, profileName, settings, detection, childEnv, env, envError,
+    adapter, label, profile, profileName, settings, detection, childEnv, env, envError, proxy,
     prompt, gateInfo, onGate,
     maxRetries: 0, escalate: null, sources,
     retry: { n, note: opts.note, failure, ...(rebase ? { rebase } : {}) },
@@ -456,11 +538,21 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   });
 }
 
+// 清单里这个任务还没有结束记录时，核对原派发进程还在不在（任务 102，与 ar stop 共用 checkDispatch；只读）。
+// 任务找不到或已经结束返回 null（由 prepareRetry 照常处理）。
+async function checkUnfinished({ root, env, name }) {
+  const found = locateStart([homeDirectory(env), legacyHomeDirectory(env)], root, name);
+  if (!found || findTerminal(found.file, found.start.id)) return null;
+  return { id: found.start.id, check: await checkDispatch(found.start) };
+}
+
 // 手动重试的准备（协议 14.3 第 1～6 条）：定位任务 → 状态判断 → 执行者 → 编号 n →
 // 原始指令 → 门禁与基线 → 上一次的失败。只读，不写清单、不启动进程；
 // 不通过时抛出中文原因，调用方按派发错误（退出码 2）处理。
 // skipProfile：脱离派发的执行者进程不读配置（协议：执行者按快照运行），执行者由请求里的快照给出。
-function prepareRetry({ root, env, name, profileOpt = null, note = null, nOverride = null, skipProfile = false, gateSnapshot = null, rebase = false, rebaseBase = null }) {
+// unfinished：checkUnfinished 的结果。原派发进程已经不在了的任务按"中断"往下判断，并在返回值里带 processGone，
+// 由调用方在真正开始重试时补写 interrupted（这里不写）。
+function prepareRetry({ root, env, name, profileOpt = null, note = null, nOverride = null, skipProfile = false, gateSnapshot = null, rebase = false, rebaseBase = null, unfinished = null }) {
   const home = homeDirectory(env);
   // 1. 找任务（协议 14.3 第 1 条，同 ar wait 的规则：新旧公共目录里最近开始的那条）。
   const found = locateStart([home, legacyHomeDirectory(env)], root, name);
@@ -468,12 +560,19 @@ function prepareRetry({ root, env, name, profileOpt = null, note = null, nOverri
   const { file, start } = found;
   const paths = taskPaths(root, start.name);
   // 2. 状态（协议 14.4：最近一条 start / resume 之后有没有 end / interrupted）。
-  const terminal = findTerminal(file, start.id);
-  if (!terminal) throw new Error('任务还在进行，先停止');
-  // 2.0 合并冲突的任务只能用 --rebase 继续（协议 15.8）；--rebase 也只用于冲突的任务。
-  const outcome = start.worktree === true ? worktreeOutcome(file, start.id) : null;
+  let terminal = findTerminal(file, start.id), processGone = null;
+  if (!terminal) {
+    const check = unfinished?.id === start.id ? unfinished.check : null;
+    if (check?.state === 'failed') throw new Error(`无法核对派发进程（${check.reason}），稍后再试`);
+    if (check?.state !== 'gone') throw new Error('任务还在进行，先停止');
+    terminal = { event: 'interrupted', id: start.id, signal: 'process-gone' };
+    processGone = { home: found.home };
+  }
+  // 2.0 合并冲突的任务只能用 --rebase 继续（协议 15.8）；--rebase 还可以用在失败（门禁未通过、执行者异常退出）和已中断的 worktree 任务上。
+  //     原派发进程已经不在的任务（processGone）按已中断算（这时清单里还没有 interrupted）。
+  const outcome = start.worktree === true ? (processGone ? 'stopped' : worktreeOutcome(file, start.id)) : null;
   if (outcome === 'conflict' && !rebase) throw new Error(`任务处于合并冲突状态：用 ar retry ${start.name} --rebase 解决冲突`);
-  if (rebase && outcome !== 'conflict') throw new Error(`任务不在冲突状态，不能用 --rebase：${start.name}`);
+  if (rebase && !['conflict', 'failed', 'stopped'].includes(outcome)) throw new Error(rebaseRefusal(start, outcome));
   // 准备命令失败的任务（协议 15.4）：重试时在原 worktree 里重跑准备命令，执行者还没跑过，所以也没有上一次的失败。
   const setupRetry = terminal.event === 'end' && terminal.reason === 'setup';
   // 2.1 worktree 任务（协议 15.2）在原 worktree 里继续：取最近一条 worktree 事件的 dir，目录已经不在了就拒绝。
@@ -515,13 +614,23 @@ function prepareRetry({ root, env, name, profileOpt = null, note = null, nOverri
   let rebaseInfo = null, gateInfo = gate.gateInfo;
   if (rebase) {
     const baseBranch = readProjectConfig(root).baseBranch;
-    rebaseInfo = { base: rebaseBase ?? resolveBase(root, baseBranch), baseBranch, files: latestRow(file, start.id, 'conflict')?.files ?? [] };
+    const fromConflict = outcome === 'conflict';
+    rebaseInfo = { base: rebaseBase ?? resolveBase(root, baseBranch), baseBranch, fromConflict, files: fromConflict ? latestRow(file, start.id, 'conflict')?.files ?? [] : [] };
     if (gateInfo?.enabled) gateInfo = { ...gateInfo, base: rebaseInfo.base };
   }
   // 7. 上一次的失败（中断、完成后再改一轮没有失败段落，只有补充说明）。
   const failure = setupRetry ? null : previousFailure(file, paths, start.id, n, terminal);
   return { start, paths, id: start.id, n, saved, prompt, gateInfo, warnings: gate.warnings,
-    baseNote: gate.baseNote, specNote: gate.specNote, gateChanged: gate.gateChanged, optionsNote, failure, loaded, profileName: loaded ? loaded.profileName : wanted, worktree, rebase: rebaseInfo };
+    baseNote: gate.baseNote, specNote: gate.specNote, gateChanged: gate.gateChanged, optionsNote, failure, loaded, profileName: loaded ? loaded.profileName : wanted, worktree, rebase: rebaseInfo, processGone };
+}
+
+// --rebase 被拒绝的中文原因（协议 15.8）：非 worktree 任务、待验收、已合并、已驳回。
+// 待验收沿用最初的"任务不在冲突状态"原文（已有测试逐字核对）。
+function rebaseRefusal(start, outcome) {
+  if (start.worktree !== true) return `不是 worktree 任务，不能用 --rebase：${start.name}`;
+  if (outcome === 'accepted') return `任务已合并，不能用 --rebase：${start.name}`;
+  if (outcome === 'rejected') return `任务已驳回，不能用 --rebase：${start.name}`;
+  return `任务不在冲突状态，不能用 --rebase：${start.name}`;
 }
 
 // 最近一次尝试里记录的门禁基线（重新基线之后的 attempt 事件才有 base 字段，协议 15.8）；没有为 null。
@@ -566,13 +675,14 @@ function retryGate(root, saved, start, snapshot = null) {
   }
   // 没有门禁字段：旧任务或直接任务文字派发。有任务说明就重新准备；没有就没有门禁。
   if (saved.spec) {
-    const { parsed, merged } = readAndMergeSpec(root, saved.spec);
+    const { parsed, spec, merged } = readAndMergeSpec(root, saved.spec);
     const fields = gateFields(merged);
-    if (merged.gate) {
+    const readOnly = needsReadOnly(spec);
+    if (merged.gate || readOnly) {
       const hasBase = typeof start.base === 'string' && start.base;
       const base = hasBase ? start.base : headSha(root);
       const baseNote = hasBase ? null : `手动重试：任务开始时没有记录基线，按当前 HEAD ${String(base).slice(0, 7)} 作为门禁基线`;
-      return { gateInfo: { enabled: true, base, merged: fields }, warnings: parsed.warnings, baseNote, specNote: null, gateChanged: false };
+      return { gateInfo: { enabled: true, base, merged: fields, ...(readOnly ? { readOnly: true } : {}) }, warnings: parsed.warnings, baseNote, specNote: null, gateChanged: false };
     }
     return { gateInfo: { enabled: false, base: null, merged: fields }, warnings: parsed.warnings, baseNote: null, specNote: null, gateChanged: false };
   }

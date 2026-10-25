@@ -25,11 +25,52 @@ test('无节、空节、只写"无"都是空数组', () => {
   assert.deepEqual(parseNeedsScope(null), []);
 });
 
-test('标题行恰好是"## 需要越界"（首尾空白不算），别的写法不算', () => {
+// 101 改写：原断言 "### 需要越界" 与 "# 需要越界" 的节数为 0 → 新断言为 1。
+// 原因：任务说明 101 要求标题认 1～6 级（094 的执行者写了 "### 10. 需要越界"，核心没认出来而多重试了一次）。
+test('标题行恰好是"需要越界"（首尾空白不算），别的写法不算', () => {
   assert.equal(parseNeedsScope('  ## 需要越界  \n- a.js\n').length, 1);
   assert.equal(parseNeedsScope('## 需要越界（补充）\n- a.js\n').length, 0);
-  assert.equal(parseNeedsScope('### 需要越界\n- a.js\n').length, 0);
-  assert.equal(parseNeedsScope('# 需要越界\n- a.js\n').length, 0);
+  assert.equal(parseNeedsScope('### 需要越界\n- a.js\n').length, 1);
+  assert.equal(parseNeedsScope('# 需要越界\n- a.js\n').length, 1);
+});
+
+test('标题容忍层级、编号、反引号、加粗与结尾冒号', () => {
+  const titles = [
+    '## 需要越界', '### 10. 需要越界', '## 10、需要越界：', '## `需要越界`', '### **需要越界**',
+    '# 需要越界', '###### 需要越界', '## 10) 需要越界', '## (10) 需要越界', '## （10）需要越界', '## 第 10 节 需要越界', '## 第10节需要越界',
+    '## 需要越界:', '## **10. 需要越界：**', '## `10. 需要越界`', '## 10.需要越界', '## 需要越界 ##',
+    '## `## 需要越界`', // 090 的写法：反引号里又写了一遍标题
+  ];
+  for (const title of titles) {
+    assert.deepEqual(parseNeedsScope(`${title}\n- a.js：甲\n`), [{ path: 'a.js', reason: '甲' }], title);
+  }
+});
+
+test('不是这一节的标题：别的文字、不是标题、围栏里的标题', () => {
+  for (const title of ['## 需要越界的原因', '## 不需要越界', '## 需要越界（补充）', '## 10. 需要越界说明', '## 第 10 节 已知问题', '##需要越界', '####### 需要越界']) {
+    assert.deepEqual(parseNeedsScope(`${title}\n- a.js\n`), [], title);
+  }
+  // 不带 # 的"需要越界"整行不是标题。
+  assert.deepEqual(parseNeedsScope('需要越界\n- a.js\n'), []);
+  assert.deepEqual(parseNeedsScope('10. 需要越界\n- a.js\n'), []);
+  assert.deepEqual(parseNeedsScope('**需要越界**\n- a.js\n'), []);
+  // 围栏代码块里的各种写法都不算。
+  assert.deepEqual(parseNeedsScope(doc('```', '### 10. 需要越界', '- a.js', '```')), []);
+});
+
+test('这一节遇到层级不深于它的标题结束，更深的标题不结束', () => {
+  // ### 开头：遇到 ###、##、# 结束，遇到 #### 不结束。
+  assert.deepEqual(parseNeedsScope(doc('### 10. 需要越界', '- a.js', '#### 细节', '- b.js', '##### 更细', '- c.js')).map(item => item.path), ['a.js', 'b.js', 'c.js']);
+  assert.deepEqual(parseNeedsScope(doc('### 10. 需要越界', '- a.js', '### 11. 已知问题', '- b.js')).map(item => item.path), ['a.js']);
+  assert.deepEqual(parseNeedsScope(doc('### 10. 需要越界', '- a.js', '## 别的章', '- b.js')).map(item => item.path), ['a.js']);
+  assert.deepEqual(parseNeedsScope(doc('### 10. 需要越界', '- a.js', '# 另一章', '- b.js')).map(item => item.path), ['a.js']);
+  // ## 开头：遇到 ### 不结束。
+  assert.deepEqual(parseNeedsScope(doc('## 需要越界', '- a.js', '### 子节', '- b.js', '## 下一节', '- c.js')).map(item => item.path), ['a.js', 'b.js']);
+  // 结束后后面又有一节：继续收集；节内更深层级的同名标题不另起一节。
+  assert.deepEqual(parseNeedsScope(doc('### 需要越界', '- a.js', '### 其他', '- x.js', '### 需要越界', '- b.js')).map(item => item.path), ['a.js', 'b.js']);
+  assert.deepEqual(parseNeedsScope(doc('## 需要越界', '- a.js', '#### 需要越界', '- b.js', '### 子节', '- c.js', '## 结束', '- d.js')).map(item => item.path), ['a.js', 'b.js', 'c.js']);
+  // 更深的标题行本身不当作路径。
+  assert.deepEqual(parseNeedsScope(doc('### 需要越界', '#### - a.js', '- b.js')).map(item => item.path), ['b.js']);
 });
 
 test('代码块里的节标题与节内容不算', () => {

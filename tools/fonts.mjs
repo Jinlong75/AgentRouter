@@ -112,4 +112,61 @@ export async function copyFont(out, source = fontFile) {
   try { const bytes = await checkFont(source); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, bytes); return true; }
   catch (error) { await rm(target, { force: true }); console.warn(`警告：MiSans 字体缺失或 SHA-256 不符，使用系统字体；运行 npm run fonts。${error.code || error.message}`); return false; }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) { await prepareFont(); await prepareBrandFont(); }
+// 默认的字体清单：file 是相对输出根目录的路径，download 是联网下载（成功时写入当前目录下的 file）。
+export const defaultFonts = () => [
+  { name: 'MiSans', file: fontFile, hash: fontHash, download: prepareFont },
+  { name: 'Space Grotesk', file: brandFontFile, hash: brandFontHash, download: prepareBrandFont },
+];
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+// 读文件并核对 SHA-256；文件不存在、读不了或哈希不符都返回 null。
+async function readVerified(file, hash) {
+  try { const bytes = await readFile(file); return sha256(bytes) === hash ? bytes : null; }
+  catch { return null; }
+}
+const samePlace = (a, b) => {
+  const [x, y] = [path.resolve(a), path.resolve(b)];
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+};
+// 每个字体依次：out 下已有且 SHA-256 正确 → 跳过；base 下有且正确 → 复制到 out；否则联网下载。
+// 只读 base，不往里面写任何东西；base 与 out 是同一个目录时不会自己复制给自己。
+// 返回 [{ name, action: 'existing' | 'copied' | 'downloaded' }]；有字体下载失败时全部处理完后抛出带中文原因的错误。
+export async function copyFontsFromBase({ base = process.env.AR_BASE_REPO, out = process.cwd(), fonts = defaultFonts(), log = console.log } = {}) {
+  const results = [];
+  const failures = [];
+  const hasBase = typeof base === 'string' && base !== '' && !samePlace(base, out);
+  for (const { name, file, hash, download } of fonts) {
+    const target = path.join(out, file);
+    if (await readVerified(target, hash)) {
+      log(`${name}：已有（SHA-256 一致）`);
+      results.push({ name, action: 'existing' });
+      continue;
+    }
+    let reason = '';
+    if (hasBase) {
+      const bytes = await readVerified(path.join(base, file), hash);
+      if (bytes) {
+        await mkdir(path.dirname(target), { recursive: true });
+        await writeFile(target, bytes);
+        log(`${name}：从主工作区复制（SHA-256 一致）`);
+        results.push({ name, action: 'copied' });
+        continue;
+      }
+      reason = '（主工作区没有这个字体或 SHA-256 不符）';
+    }
+    try {
+      log(`${name}：联网下载${reason}`);
+      await download();
+      results.push({ name, action: 'downloaded' });
+    } catch (error) {
+      failures.push(`${name}：联网下载失败（${error.message}）`);
+    }
+  }
+  if (failures.length) throw Error(failures.join('；'));
+  return results;
+}
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv.includes('--from-base')) {
+    try { await copyFontsFromBase(); }
+    catch (error) { console.error(error.message); process.exitCode = 1; }
+  } else { await prepareFont(); await prepareBrandFont(); }
+}

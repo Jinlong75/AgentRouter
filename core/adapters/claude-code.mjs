@@ -87,7 +87,8 @@ export function createMapper() {
     }
     if (e.type === 'result') {
       out.push({ kind: 'turn', usage: { input: e.usage?.input_tokens ?? null, output: e.usage?.output_tokens ?? null } });
-      if (typeof e.result === 'string' && e.result) mapper.lastResult = e.result;
+      // 后台任务的通知会让 Claude Code 多开几轮，每轮都有一条 result；后续轮次多是"等通知"之类的短回复，取最长的一条（一样长取靠后的）。
+      if (typeof e.result === 'string' && e.result && (mapper.lastResult === null || e.result.length >= mapper.lastResult.length)) mapper.lastResult = e.result;
       if (e.is_error || String(e.subtype ?? '').startsWith('error')) out.push({ kind: 'error', text: String(e.result || explain(e.subtype)) });
     }
     return out;

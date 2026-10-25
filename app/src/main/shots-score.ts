@@ -134,6 +134,8 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
             assert.equal(row(0, 'toolError'), sc.files(3));
             assert.equal(row(0, 'needsScope'), sc.none + sc.needsScopeFree);
             assert.equal(row(1, 'specBlame'), sc.count(0));
+            assert.equal(row(0, 'envBlame'), sc.none);
+            assert.equal(row(1, 'envBlame'), sc.none);
             assert.equal(row(1, 'rejected'), sc.noAcceptance);
             assert.equal(row(1, 'conflict'), sc.noAcceptance);
             assert.equal(first[1].rows.find(r => r[0] === 'lead:needsScope')![1], sc.leadNeedsScope);
@@ -151,7 +153,7 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
             assert.deepEqual(first[1].perf, [`${sc.perfLeadTime}${minutes(base.lead.perf.ms!)}`, `${sc.perfToken}${sc.leadUsageOff}`]);
             assert.equal(first[0].cap, null);
         });
-        await check('UI26 门禁失败归因：每次门禁未通过一行（第 1、2 次），文案是 sc.blameRow / sc.blameWhy(核心的 summary)，分段控件是 radiogroup，aria-label 是 sc.blameLabel，默认选中"执行者"', `(() => { const rows = [...document.querySelectorAll('[data-sc-fail]')]; const group = n => rows[n - 1].querySelector('[role=radiogroup]'); return rows.length === 2 && rows.map(r => r.dataset.scFail).join() === '1,2' && rows[0].children[0].textContent === ${jsonStr(sc.blameRow(1))} && rows[0].querySelector('.why').textContent === ${jsonStr(sc.blameWhy(base.attempts[0].summary ?? ''))} && rows[1].querySelector('.why').textContent === ${jsonStr(sc.blameWhy(base.attempts[1].summary ?? ''))} && group(1).getAttribute('aria-label') === ${jsonStr(sc.blameLabel(1))} && group(2).getAttribute('aria-label') === ${jsonStr(sc.blameLabel(2))} && [1, 2].every(n => { const radios = [...group(n).querySelectorAll('[role=radio]')]; return radios.map(r => r.textContent).join() === ${jsonStr([sc.blameWorker, sc.blameSpec].join())} && radios.map(r => r.getAttribute('aria-checked')).join() === 'true,false' && radios.map(r => r.tabIndex).join() === '0,-1'; }); })()`);
+        await check('UI26 门禁失败归因：每次门禁未通过一行（第 1、2 次），文案是 sc.blameRow / sc.blameWhy(核心的 summary)，分段控件是 radiogroup，aria-label 是 sc.blameLabel，默认选中"执行者"', `(() => { const rows = [...document.querySelectorAll('[data-sc-fail]')]; const group = n => rows[n - 1].querySelector('[role=radiogroup]'); return rows.length === 2 && rows.map(r => r.dataset.scFail).join() === '1,2' && rows[0].children[0].textContent === ${jsonStr(sc.blameRow(1))} && rows[0].querySelector('.why').textContent === ${jsonStr(sc.blameWhy(base.attempts[0].summary ?? ''))} && rows[1].querySelector('.why').textContent === ${jsonStr(sc.blameWhy(base.attempts[1].summary ?? ''))} && group(1).getAttribute('aria-label') === ${jsonStr(sc.blameLabel(1))} && group(2).getAttribute('aria-label') === ${jsonStr(sc.blameLabel(2))} && [1, 2].every(n => { const radios = [...group(n).querySelectorAll('[role=radio]')]; return radios.map(r => r.textContent).join() === ${jsonStr([sc.blameWorker, sc.blameSpec, sc.blameEnv].join())} && radios.map(r => r.getAttribute('aria-checked')).join() === 'true,false,false' && radios.map(r => r.tabIndex).join() === '0,-1,-1'; }); })()`);
         await check('UI26 归因一节有标题 sc.blameSec 和说明 sc.blameHelp', `(() => { const t = document.querySelector('.sec-t'); return t.firstChild.textContent === ${jsonStr(sc.blameSec)} && t.querySelector('.muted').textContent === ${jsonStr(sc.blameHelp)}; })()`);
         await pair('ui26-score');
 
@@ -171,7 +173,7 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
             assert.equal(blamed.attempts.find(a => a.n === 1)!.blame, 'spec');
             compare(await dom(), blamed);
         });
-        await check('UI26 切换后焦点仍在第 1 次的分段控件上（选中"任务说明"），第 2 次不受影响，tabindex 随选中项移动', `(() => { const r1 = [...document.querySelectorAll('[data-sc-fail="1"] [role=radio]')], r2 = [...document.querySelectorAll('[data-sc-fail="2"] [role=radio]')]; return document.activeElement === r1[1] && r1.map(r => r.getAttribute('aria-checked')).join() === 'false,true' && r1.map(r => r.tabIndex).join() === '-1,0' && r2.map(r => r.getAttribute('aria-checked')).join() === 'true,false'; })()`);
+        await check('UI26 切换后焦点仍在第 1 次的分段控件上（选中"任务说明"），第 2 次不受影响，tabindex 随选中项移动', `(() => { const r1 = [...document.querySelectorAll('[data-sc-fail="1"] [role=radio]')], r2 = [...document.querySelectorAll('[data-sc-fail="2"] [role=radio]')]; return document.activeElement === r1[1] && r1.map(r => r.getAttribute('aria-checked')).join() === 'false,true,false' && r1.map(r => r.tabIndex).join() === '-1,0,-1' && r2.map(r => r.getAttribute('aria-checked')).join() === 'true,false,false'; })()`);
         await check('UI26 主导卡片出现"门禁失败归因到任务说明 1 次 −15"，执行者"多一次尝试：门禁未通过"变成 1 次 −15', `(() => { const row = k => [...document.querySelectorAll('[data-sc-item]')].find(r => r.dataset.scItem === k); return row('lead:specBlame').querySelector('.v').textContent === ${jsonStr(sc.count(1))} && row('lead:specBlame').querySelector('.p').textContent === '−15' && row('executor:attemptGate').querySelector('.v').textContent === ${jsonStr(sc.count(1))} && row('executor:attemptGate').querySelector('.p').textContent === '−15'; })()`);
         await pair('ui26-score-blame');
         await key('Left');
@@ -183,6 +185,41 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
             assert.equal(again.executor.score, base.executor.score);
             assert.equal(again.lead.score, base.lead.score);
             compare(await dom(), again);
+        });
+        // ---- 检查 2b：把第 1 次归因切到"环境"（键盘 Right 两下），两边都不扣分，再用鼠标点回"执行者" ----
+        await key('Right');
+        await wait(`document.querySelector('[data-sc-fail="1"] [role=radio][aria-checked=true]')?.dataset.blameWho === 'spec'`, 'UI26 方向键先到任务说明');
+        await key('Right');
+        await wait(`document.querySelector('[data-sc-fail="1"] [role=radio][aria-checked=true]')?.dataset.blameWho === 'environment'`, 'UI26 方向键再到环境');
+        await wait(`document.querySelector('[data-sc-card=lead] [data-sc-item="lead:envBlame"] .v')?.textContent === ${jsonStr(sc.count(1) + sc.envFree)}`, 'UI26 两张卡片出现"环境原因 1 次（不扣分）"');
+        const envReport = await reportNow();
+        await verify('UI26 归因到环境：执行者比"执行者"归因时高出这一次的扣分（+15）、主导分数不变；两张卡片的"环境原因"都是"1 次（不扣分）"、扣分 0；marks.json 这一键是 environment', async () => {
+            assert.deepEqual(JSON.parse(await readFile(marks, 'utf8')), { v: 1, blame: { 1: 'environment' } });
+            assert.equal(envReport.attempts.find(a => a.n === 1)!.blame, 'environment');
+            const cards = await dom();
+            assert.equal(Number(cards[0].score), base.executor.score + 15);
+            assert.equal(Number(cards[1].score), base.lead.score);
+            assert.equal(envReport.executor.score, base.executor.score + 15);
+            assert.equal(envReport.lead.score, base.lead.score);
+            for (const [i, role] of ['executor', 'lead'].entries()) {
+                const row = cards[i].rows.find(r => r[0] === `${role}:envBlame`)!;
+                assert.deepEqual([row[1], row[2], row[3], row[4]], [sc.items.envBlame, sc.count(1) + sc.envFree, '0', true], `${role} 环境原因`);
+            }
+            assert.equal(cards[1].rows.find(r => r[0] === 'lead:specBlame')![2], sc.count(0), '主导的任务说明归因不增加');
+            compare(cards, envReport);
+        });
+        await check('UI26 归因到环境后：焦点仍在第 1 次的分段控件上（选中"环境"），tabindex 随选中项移动，第 2 次不受影响', `(() => { const r1 = [...document.querySelectorAll('[data-sc-fail="1"] [role=radio]')], r2 = [...document.querySelectorAll('[data-sc-fail="2"] [role=radio]')]; return document.activeElement === r1[2] && r1.map(r => r.getAttribute('aria-checked')).join() === 'false,false,true' && r1.map(r => r.tabIndex).join() === '-1,-1,0' && r2.map(r => r.getAttribute('aria-checked')).join() === 'true,false,false'; })()`);
+        await pair('ui26-score-env');
+        await press('[data-sc-fail="1"] [data-blame-who=worker]');
+        await wait(`document.querySelector('[data-sc-fail="1"] [role=radio][aria-checked=true]')?.dataset.blameWho === 'worker'`, 'UI26 点击把第 1 次归因从环境切回执行者');
+        await wait(`document.querySelector('[data-sc-card=executor] [data-sc-score]').textContent === ${jsonStr(String(base.executor.score))}`, 'UI26 执行者分数复原');
+        await verify('UI26 从环境点回"执行者"：分数复原，marks.json 删掉这个键，两张卡片的"环境原因"变回"没有"', async () => {
+            assert.deepEqual(JSON.parse(await readFile(marks, 'utf8')), { v: 1, blame: {} });
+            const cards = await dom(), again = await reportNow();
+            assert.equal(again.executor.score, base.executor.score);
+            assert.equal(again.lead.score, base.lead.score);
+            for (const [i, role] of ['executor', 'lead'].entries()) assert.equal(cards[i].rows.find(r => r[0] === `${role}:envBlame`)![2], sc.none);
+            compare(cards, again);
         });
         // 点击也能切换（鼠标）：第 2 次归因到任务说明再切回，验证两种输入都走同一条路径。
         await press('[data-sc-fail="2"] [data-blame-who=spec]');

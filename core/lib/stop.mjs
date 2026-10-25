@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { locateStartWaiting, findTerminal } from './wait.mjs';
-import { processInfo, taskAlive, killProcessTree, pidAlive, redactPaths, identityAlive } from './process.mjs';
+import { processInfo, taskAlive, killProcessTree, pidAlive, redactPaths, identityAlive, STOP_WAIT_TIMEOUT_MS } from './process.mjs';
 import { registryWriter } from './records.mjs';
 import { releaseAllFor } from './slots.mjs';
 import { scriptNames } from './compat.mjs';
@@ -36,6 +36,10 @@ async function queryIdentity(info, start, { retryDelayMs, attempts }) {
   }
   return { ok: false };
 }
+
+// 进程查询自己已经写成"进程查询超时…""进程查询失败…"的原因不再重复加前缀。
+const queryReason = error => /^进程查询/.test(error) ? error : `进程查询失败：${error}`;
+const WAIT_SECONDS = STOP_WAIT_TIMEOUT_MS / 1000;
 
 // 065 失败路径的核对明细里附带的查询次数记录（有重试时才写）。
 function attemptLines(attempts) {
@@ -74,6 +78,34 @@ function identityCheck(name, start, { identity, queryNote, queryMs, kind = '进�
   ].join('\n');
 }
 
+// 核对原派发进程（start.pid）还在不在（ar stop 与 ar retry 共用，任务 102）。只读，不写任何文件。
+// 返回 { state, reason, query, attempts }：
+//   'gone'    查询成功，且确认原派发进程已经不在了：没有这个 PID，或 PID 被别的进程复用（创建时间晚于 started、命令行不含派发脚本名）；
+//   'running' 查询成功，身份对得上，原派发进程还在；
+//   'unclear' 查询成功，但创建时间不是有限数，说不准是不是原进程（不当成已经不在，也不当成还在）；
+//   'failed'  查询本身失败（超时、出错）：不能下任何结论，reason 是中文原因。
+export async function checkDispatch(start, { info = processInfo, alive = taskAlive, retryDelayMs = 1000 } = {}) {
+  // 065 A（协议第 9 节）：进程查询失败间隔约 1 秒重试、最多共查 3 次。
+  const attempts = [];
+  const query = await queryIdentity(info, start, { retryDelayMs, attempts });
+  if (!query.ok) return { state: 'failed', reason: queryReason(attempts.at(-1).error), query, attempts };
+  const { identity } = query;
+  const matches = !!identity && Number.isFinite(identity.created) && scriptNames.some(script => identity.command.includes(script))
+    && await alive(start, { created: async () => identity.created });
+  const state = matches ? 'running' : identity && !Number.isFinite(identity.created) ? 'unclear' : 'gone';
+  return { state, reason: null, query, attempts };
+}
+
+// 确认原派发进程已经不在了、清单里又没有结束记录时，补写 interrupted（signal: process-gone）并释放名额。
+// 写之前再看一次清单：别的命令（并发的 ar stop / ar retry）已经写了结束记录就不重复写，返回 false。
+export function recordProcessGone(home, start) {
+  if (findTerminal(join(home, 'runs.jsonl'), start.id)) return false;
+  registryWriter(home, { separate: true })({ event: 'interrupted', id: start.id, signal: 'process-gone', at: Date.now() });
+  // 派发进程是意外死掉的，它的收尾没有机会释放并发名额（协议 15.5）：和 stopped-by-command 一样清掉。
+  releaseAllFor({ home, id: start.id });
+  return true;
+}
+
 export async function stopTask(homes, root, name, { info = processInfo, alive = taskAlive, killTree = killProcessTree, retryDelayMs = 1000, log = console.log, err = text => process.stderr.write(`${text}\n`) } = {}) {
   // 托管请求文件已在而清单还没有 start / resume 时同样等待（协议 14.4 与开工前第 8 条），
   // 否则脱离派发 / 脱离重试的空档里会拿旧 end、旧 pid 判断状态。
@@ -81,13 +113,13 @@ export async function stopTask(homes, root, name, { info = processInfo, alive = 
   if (!start) { log(`停止：在当前仓库找不到记录 ${name}`); return 2; }
   const ended = () => { log(`停止：${name}（已经结束）`); return 0; };
   if (findTerminal(file, start.id)) return ended();
-  // 065 A（协议第 9 节）：进程查询失败间隔约 1 秒重试、最多共查 3 次；3 次都失败不结束任何进程。
-  const attempts = [];
-  const query = await queryIdentity(info, start, { retryDelayMs, attempts });
+  // 3 次查询都失败不结束任何进程，也不写记录。
+  const check = await checkDispatch(start, { info, alive, retryDelayMs });
   if (findTerminal(file, start.id)) return ended();
-  if (!query.ok) {
+  const { attempts, query } = check;
+  if (check.state === 'failed') {
     const last = attempts.at(-1);
-    log(`停止：${name} 无法核对进程（进程查询失败：${last.error}），没有结束任何进程`);
+    log(`停止：${name} 无法核对进程（${check.reason}），没有结束任何进程`);
     err([
       identityCheck(name, start, { identity: null, queryNote: { ok: false, ms: last.ms, error: last.error }, queryMs: last.ms, kind: '无法核对进程' }),
       ...attemptLines(attempts),
@@ -95,16 +127,16 @@ export async function stopTask(homes, root, name, { info = processInfo, alive = 
     return 1;
   }
   const { identity, note, ms } = query;
-  const matches = identity && Number.isFinite(identity.created) && scriptNames.some(script => identity.command.includes(script))
-    && await alive(start, { created: async () => identity.created });
-  if (findTerminal(file, start.id)) return ended();
-  if (!matches) {
-    log(`停止：${name} 的进程已经不在了`);
+  if (check.state !== 'running') {
+    const gone = check.state === 'gone';
+    // 任务 102：确认派发进程已经不在了、又没有结束记录，补写 interrupted，任务不再卡在"进行中"。
+    if (gone && !recordProcessGone(home, start)) return ended();
+    log(gone ? `停止：${name} 的进程已经不在了，已记为中断（派发进程意外退出）` : `停止：${name} 的进程已经不在了`);
     err([
       identityCheck(name, start, { identity, queryNote: note, queryMs: ms }),
       ...attemptLines(attempts),
     ].join('\n'));
-    return 1;
+    return gone ? 0 : 1;
   }
   if (tracing) err([
     identityCheck(name, start, { identity, queryNote: note, queryMs: ms }),
@@ -117,11 +149,11 @@ export async function stopTask(homes, root, name, { info = processInfo, alive = 
     err(`[ar-stop 核对] ${name}：没能停下（结束进程树出错），pid=${start.pid}，错误：${redactPaths(error.message)}`);
     return 1;
   }
-  // 065 B（协议第 9 节）：全部退出后（最多等 10 秒）才追加 interrupted——
+  // 065 B（协议第 9 节）：全部退出后（最多等 STOP_WAIT_TIMEOUT_MS，现为 30 秒）才追加 interrupted——
   // 结束进程树返回后再确认派发进程本身（start.pid）真的退出了。069：退出按身份（PID + 创建时间）认定——
   // pidAlive 为真时查一次进程，同一个创建时间才算还在，PID 被别的进程复用按已退出处理。
   // 复核固定用真实的 processInfo（不走注入的 info）：核对的是系统真实状态。
-  const deadline = Date.now() + 10000, waitStart = Date.now();
+  const deadline = Date.now() + STOP_WAIT_TIMEOUT_MS, waitStart = Date.now();
   let note2 = null, after = null, thrown = null, identityGone = false;
   for (;;) {
     if (!pidAlive(start.pid)) { identityGone = true; break; }
@@ -141,11 +173,11 @@ export async function stopTask(homes, root, name, { info = processInfo, alive = 
   }
   if (!identityGone) {
     const reason = thrown ? `无法核对进程（${thrown.message}）`
-      : after ? '派发进程在 10 秒内没有退出'
-      : note2?.ok === false ? `无法核对进程（进程查询失败：${note2.error ?? '（没有原因）'}）`
-      : '派发进程在 10 秒内没有退出';
+      : after ? `派发进程在 ${WAIT_SECONDS} 秒内没有退出`
+      : note2?.ok === false ? `无法核对进程（${queryReason(note2.error ?? '（没有原因）')}）`
+      : `派发进程在 ${WAIT_SECONDS} 秒内没有退出`;
     log(`停止：${name} 没能停下（${reason}）`);
-    err(`[ar-stop 核对] ${name}：没能停下（等待退出超时），pid=${start.pid}，10 秒后派发进程${after ? `仍存活（created=${after.created}）` : '仍存活'}`);
+    err(`[ar-stop 核对] ${name}：没能停下（等待退出超时），pid=${start.pid}，${WAIT_SECONDS} 秒后派发进程${after ? `仍存活（created=${after.created}）` : '仍存活'}`);
     return 1;
   }
   registryWriter(home, { separate: true })({ event: 'interrupted', id: start.id, signal: 'stopped-by-command', at: Date.now() });

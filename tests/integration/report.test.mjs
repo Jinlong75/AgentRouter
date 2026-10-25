@@ -126,6 +126,32 @@ test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因�
   for (const bad of ['1', '0=spec', '1=lead', 'x=spec']) assert.equal((await f.ar(['report', '链路', '--blame', bad])).code, 2, bad);
   assert.equal((await f.ar(['report', '没有这个任务'])).code, 2);
 
+  // 归因到环境：执行者不扣多一次尝试（越界文件仍扣），主导不扣；marks.json 写 environment；改回 worker 删掉这一键。
+  const env = await f.ar(['report', '链路', '--blame', '1=environment', '--json']);
+  assert.equal(env.code, 0, env.stderr + env.stdout);
+  const envReport = JSON.parse(env.stdout);
+  assert.equal(envReport.executor.score, 90);
+  assert.equal(envReport.lead.score, 100);
+  assert.deepEqual(find(envReport.executor, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
+  assert.deepEqual(find(envReport.lead, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
+  assert.equal(find(envReport.lead, 'specBlame').count, 0);
+  assert.equal(envReport.attempts[0].blame, 'environment');
+  assert.deepEqual(f.marks('链路'), { v: 1, blame: { 1: 'environment' } });
+  t.diagnostic(`--json 环境归因样例：${JSON.stringify({ envBlame: find(envReport.lead, 'envBlame'), blame: envReport.attempts.map(a => a.blame) })}`);
+  const envText = await f.ar(['report', '链路']);
+  assert.ok(envText.stdout.split(/\r?\n/).filter(line => line === '  环境原因：1 次（0）').length === 2, envText.stdout);
+  const envBack = JSON.parse((await f.ar(['report', '链路', '--blame', '1=worker', '--json'])).stdout);
+  assert.equal(envBack.executor.score, 75);
+  assert.equal(find(envBack.lead, 'envBlame').count, 0);
+  assert.deepEqual(f.marks('链路'), { v: 1, blame: {} });
+  // 非法值：退出码 2，中文原因列出三种取值，标记不变。
+  const illegal = await f.ar(['report', '链路', '--blame', '1=lead']);
+  assert.equal(illegal.code, 2);
+  assert.match(illegal.stderr, /spec\|worker\|environment/);
+  assert.match(illegal.stderr, /spec、worker 或 environment/);
+  assert.deepEqual(f.marks('链路'), { v: 1, blame: {} });
+  await f.ar(['report', '链路', '--blame', '1=spec']);
+
   // 不加 --json：两节文字。
   const text = await f.ar(['report', '链路']);
   assert.equal(text.code, 0, text.stderr + text.stdout);

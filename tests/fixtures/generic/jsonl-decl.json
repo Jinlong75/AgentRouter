@@ -1,0 +1,23 @@
+{
+  "label": "JSONL CLI",
+  "executable": "node",
+  "detect": ["@SCRIPT@", "--version"],
+  "args": ["@SCRIPT@", "run"],
+  "stdin": "{prompt}",
+  "output": {
+    "format": "jsonl",
+    "map": [
+      { "when": { "type": "message", "role": "assistant" }, "kind": "say", "text": "content" },
+      { "when": { "type": "thought" }, "kind": "think", "text": "text" },
+      { "when": { "type": "exec" }, "kind": "cmd", "id": "id", "command": "command", "exit": "exit_code", "output": "output" },
+      { "when": { "type": "usage" }, "kind": "turn", "input": "input_tokens", "outputTokens": "output_tokens" },
+      { "when": { "type": "plan" }, "kind": "plan", "items": "items", "itemText": "title", "itemDone": "done" },
+      { "when": { "type": "file" }, "kind": "file", "path": "path", "fileKind": "op" },
+      { "when": { "type": "tool" }, "kind": "tool", "name": "tool", "detail": "args" }
+    ]
+  },
+  "report": "lastSay",
+  "failureHints": [
+    { "match": "rate limit", "text": "触发限流，稍后再试。" }
+  ]
+}

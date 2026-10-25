@@ -420,6 +420,48 @@ test('重试中途 ar stop：写 interrupted，不写第 2 个 attempt-end 与 e
   assert.deepEqual(await sameProcessesAlive(identities), [], '派发进程与第 2 次执行者（同一 PID、同一创建时间）都已退出');
 });
 
+// 102：派发进程意外退出、清单里没有结束记录（实测 094）：ar retry 先补写 interrupted（process-gone）再重试，不再卡在"任务还在进行"。
+test('派发进程意外退出后直接 ar retry：补写 interrupted，resume 与第 2 次尝试正常开始，进度里有那一行', async t => {
+  const f = fixture(t);
+  f.setProfile({
+    attempts: {
+      1: { events: [{ kind: 'say', text: '跑着' }], delayMs: 60000, exit: 1 },
+      2: { events: [{ kind: 'say', text: '第二次完成' }], exit: 0 },
+    },
+  });
+  const spec = f.spec('docs/specs/012-意外退出后重试.md', { type: 'research', allowed: null, verify: [], expectCommit: false, maxRetries: 0 });
+  const name = '意外退出后重试';
+  const dispatching = f.spawnAr(['dispatch', spec, '--name', name]);
+  const start = await until(() => startOf(f.home, name), '意外退出后重试的 start 记录');
+  const spawned = await until(() => rows(f.home).find(row => row.id === start.id && row.event === 'spawned'), 'spawned 记录');
+  // 结束派发进程本身，不写任何结束记录（模拟意外退出）；只结束这次测试自己启动的两个进程，按创建时间核对身份。
+  const before = await f.related([start.pid, spawned.agentPid]);
+  const agentIdentity = before.find(p => p.pid === spawned.agentPid);
+  dispatching.kill();
+  await dispatching.done;
+  if (agentIdentity && identityAlive(await processList(), agentIdentity)) { try { process.kill(spawned.agentPid); } catch { /* 已经退出。 */ } }
+  assert.deepEqual(eventsOf(f.home, start.id), ['start', 'attempt', 'spawned'], '意外退出：没有 end，也没有 interrupted');
+
+  const retried = await f.ar(['retry', name, '--note', '接着做', '--json']);
+  assert.equal(retried.code, 0, retried.stderr + retried.stdout);
+  assert.equal(JSON.parse(retried.stdout).n, 2);
+
+  const events = rows(f.home).filter(row => row.id === start.id);
+  assert.deepEqual(events.map(row => row.event).slice(0, 7), ['start', 'attempt', 'spawned', 'interrupted', 'resume', 'attempt', 'spawned']);
+  const interrupted = events.find(row => row.event === 'interrupted');
+  assert.equal(interrupted.signal, 'process-gone');
+  assert.ok(Number.isFinite(interrupted.at));
+  assert.equal(events.filter(row => row.event === 'interrupted').length, 1);
+  assert.equal(events.find(row => row.event === 'resume').n, 2);
+  assert.deepEqual(events.filter(row => row.event === 'attempt').map(row => row.n), [1, 2]);
+  const end = events.at(-1);
+  assert.equal(end.event, 'end');
+  assert.equal(end.exit, 0);
+  assert.equal(end.attempts, 2);
+  assert.match(f.progress(name), /\] 重试：上一次的派发进程意外退出，已记为中断\n/);
+  assert.ok(existsSync(path.join(f.dir(name), 'attempts', '2', 'prompt.md')), '第 2 次尝试目录存在');
+});
+
 test('密钥扫描：重试时 prompt.md、raw.log、events.jsonl 都不含密钥值', async t => {
   const f = fixture(t);
   const secretValue = '假密钥值-058-绝不能出现在任何文件里-XYZZY';

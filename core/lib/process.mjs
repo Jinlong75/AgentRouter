@@ -32,18 +32,47 @@ export function redactPaths(text, extra = []) {
   return out;
 }
 
-// 单次平台查询同时取得创建时间、可执行文件名与命令行；可由调用方替换以隔离测试。
-export async function processList(pid, platform = process.platform, timeout = 5000) {
+// 各处默认超时集中在这里（101）。机器负载很高时（CPU 100%、可用内存 1 GB 左右）一次 Get-CimInstance 实测要 7.5 秒，
+// 原来的 5 / 10 秒会让 ar stop 与门禁里的停止偶发失败。调用方显式传了 timeout 的地方不受这里影响。
+export const PROCESS_LIST_TIMEOUT_MS = 20000; // processList 单次查询
+export const KILL_TREE_TIMEOUT_MS = 30000; // killProcessTree 总时限（含其中的平台查询）
+export const TERMINATE_TIMEOUT_MS = 20000; // terminateByIdentity 单次调用（killProcessTree 里还会被剩余时间截短）
+export const STOP_WAIT_TIMEOUT_MS = 30000; // stop.mjs 结束进程树后等派发进程退出的总时限
+
+const secondsText = ms => { const s = Math.round(ms / 100) / 10; return Number.isInteger(s) ? String(s) : s.toFixed(1); };
+
+// execFile 因 timeout 结束子进程时 killed 为真并带 signal；超出 maxBuffer 也会 killed，但不是超时。
+const isTimeout = error => !!error && error.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && (error.killed === true || !!error.signal);
+
+// 进程查询失败的原因：不带 PowerShell 整段命令行。超时写成固定的中文原因，原始错误放进 cause。
+function queryFailure(error, timeout) {
+  if (isTimeout(error)) {
+    return new Error(`进程查询超时（${secondsText(timeout)} 秒）：机器负载很高时可能发生，稍后再试`, { cause: error });
+  }
+  // execFile 的 message 第一行是 "Command failed: <整段命令>"，不要；优先取标准错误的第一行。
+  const stderr = String(error?.stderr ?? '').split(/\r?\n/).map(line => line.trim()).find(Boolean);
+  const code = error?.code === undefined || error?.code === null ? '' : typeof error.code === 'number' ? `退出码 ${error.code}` : String(error.code);
+  const first = String(error?.message ?? error).split(/\r?\n/)[0].trim();
+  const reason = stderr || code || (/^Command failed:/.test(first) ? '' : first) || '（没有原因）';
+  return new Error(`进程查询失败：${reason.slice(0, 200)}`, { cause: error });
+}
+
+// 单次平台查询同时取得创建时间、可执行文件名与命令行；可由调用方替换以隔离测试（executeFile 供测试注入）。
+export async function processList(pid, platform = process.platform, timeout = PROCESS_LIST_TIMEOUT_MS, executeFile = execute) {
   if (pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0)) return [];
   const options = { windowsHide: true, shell: false, timeout, maxBuffer: 8 * 1024 * 1024 };
+  const run = async (file, args, extra) => {
+    try { return await executeFile(file, args, { ...options, ...extra }); }
+    catch (error) { throw queryFailure(error, timeout); }
+  };
   if (platform === 'win32') {
     const filter = pid === undefined ? '' : ` -Filter 'ProcessId = ${pid}'`;
     const script = `$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process${filter} | ForEach-Object { @{pid=$_.ProcessId;parent=$_.ParentProcessId;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();name=$_.Name;command=$_.CommandLine} }) | ConvertTo-Json -Compress`;
-    const { stdout } = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], options);
+    const { stdout } = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
     const value = JSON.parse(stdout.trim() || '[]');
     return (Array.isArray(value) ? value : [value]).map(p => ({ ...p, command: p.command ?? '' }));
   }
-  const { stdout } = await execute('ps', [...(pid === undefined ? ['-A'] : ['-p', String(pid)]), '-o', 'pid=,ppid=,stat=,lstart=,args='], { ...options, env: { ...process.env, LC_ALL: 'C' } });
+  const { stdout } = await run('ps', [...(pid === undefined ? ['-A'] : ['-p', String(pid)]), '-o', 'pid=,ppid=,stat=,lstart=,args='], { env: { ...process.env, LC_ALL: 'C' } });
   return stdout.split('\n').flatMap(line => {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/);
     if (!m || m[3].startsWith('Z')) return [];
@@ -118,7 +147,7 @@ $out=@(); foreach($t in @(${list})){ $r='gone'; $h=[ArProc]::OpenProcess(0x1001,
  $out+=@{pid=$t.p;result=$r} }
 $out | ConvertTo-Json -Compress`;
 }
-export async function terminateByIdentity(targets, { timeout = 10000, executeFile = execute } = {}) {
+export async function terminateByIdentity(targets, { timeout = TERMINATE_TIMEOUT_MS, executeFile = execute } = {}) {
   const script = handleKillScript(targets);
   const { stdout } = await executeFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, shell: false, timeout, maxBuffer: 1024 * 1024 });
   const value = JSON.parse(String(stdout).trim() || '[]');
@@ -145,7 +174,7 @@ const traceStillAlive = (pid, tree, surviving) => {
 // settleMs：结束后先只看 PID 存活这么久，之后 PID 仍存活才付一次快照查询的代价去核对身份。
 // terminate（win32）：在同一个进程句柄上核对身份并结束（terminateByIdentity）；没有注入 executeFile 时默认用它，
 // 句柄方式整体失败时退回"结束前立刻重新取快照核对 + taskkill"。注入了 executeFile（测试）时直接走 taskkill 路径。
-export async function killProcessTree(pid, { platform = process.platform, list = processList, executeFile = execute, alive = pidAlive, timeout = 10000, expectedCreated, settleMs = 500, terminate = executeFile === execute ? terminateByIdentity : null } = {}) {
+export async function killProcessTree(pid, { platform = process.platform, list = processList, executeFile = execute, alive = pidAlive, timeout = KILL_TREE_TIMEOUT_MS, expectedCreated, settleMs = 500, terminate = executeFile === execute ? terminateByIdentity : null } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) throw Error('无效的目标进程');
   const deadline = Date.now() + timeout;
   const remaining = () => Math.max(1, deadline - Date.now());

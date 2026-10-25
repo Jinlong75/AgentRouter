@@ -1,5 +1,5 @@
 import { c, sc } from '../shared/copy';
-import type { AgentRow, Report, ReportAttempt, ReportItem, ReportUsage, Task } from '../shared/types';
+import type { AgentRow, Report, ReportAttempt, ReportBlame, ReportItem, ReportUsage, Task } from '../shared/types';
 import { esc } from '../shared/markdown';
 import { executorLabel } from '../shared/executor';
 import { icon } from './ui';
@@ -143,6 +143,7 @@ export class ScoreView {
             return count ? sc.yes : sc.none;
         }
         if (key === 'escalated') return count ? sc.escalatedAt(escalated) : sc.none;
+        if (key === 'envBlame') return count ? sc.count(count) + sc.envFree : sc.none;
         if (key === 'needsScope')
             return role === 'executor' ? (count ? item.detail ?? sc.count(count) : sc.none) + sc.needsScopeFree : count ? sc.yes : sc.none;
         if (key === 'outsideFile' || key === 'protectedFile' || key === 'outsideWrites' || key === 'toolError')
@@ -153,14 +154,16 @@ export class ScoreView {
 
     // 门禁失败归因：每次门禁未通过一行，分段控件是 radiogroup（方向键切换）。
     private failRow(a: ReportAttempt) {
-        const spec = a.blame === 'spec';
-        const radio = (who: 'worker' | 'spec', label: string, on: boolean) => `<button class="${on ? 'on' : ''}" role="radio" aria-checked="${on}" tabindex="${on ? 0 : -1}" data-blame-n="${a.n}" data-blame-who="${who}">${esc(label)}</button>`;
-        return `<div class="sc-f" data-sc-fail="${a.n}"><span class="mono">${esc(sc.blameRow(a.n))}</span><span class="why" title="${esc(sc.blameWhy(a.summary ?? '—'))}">${esc(sc.blameWhy(a.summary ?? '—'))}</span><div class="segm sm" role="radiogroup" aria-label="${esc(sc.blameLabel(a.n))}">${radio('worker', sc.blameWorker, !spec)}${radio('spec', sc.blameSpec, spec)}</div></div>`;
+        const radio = (who: ReportBlame, label: string) => {
+            const on = (a.blame ?? 'worker') === who;
+            return `<button class="${on ? 'on' : ''}" role="radio" aria-checked="${on}" tabindex="${on ? 0 : -1}" data-blame-n="${a.n}" data-blame-who="${who}">${esc(label)}</button>`;
+        };
+        return `<div class="sc-f" data-sc-fail="${a.n}"><span class="mono">${esc(sc.blameRow(a.n))}</span><span class="why" title="${esc(sc.blameWhy(a.summary ?? '—'))}">${esc(sc.blameWhy(a.summary ?? '—'))}</span><div class="segm sm" role="radiogroup" aria-label="${esc(sc.blameLabel(a.n))}">${radio('worker', sc.blameWorker)}${radio('spec', sc.blameSpec)}${radio('environment', sc.blameEnv)}</div></div>`;
     }
     private errorHtml(state: State) { return state.blameError ? bannerHtml('fail', sc.blameFailed, state.blameError) : ''; }
 
     // 切换归因：调用核心后只重画两张卡片和各行的选中状态，焦点和滚动位置都不动。
-    async blame(t: Task, n: number, who: 'worker' | 'spec', root: HTMLElement) {
+    async blame(t: Task, n: number, who: ReportBlame, root: HTMLElement) {
         const state = this.states.get(t.id);
         if (!state?.report || state.busy || state.report.attempts.find(a => a.n === n)?.blame === who)
             return;
@@ -189,7 +192,7 @@ export class ScoreView {
             error.innerHTML = this.errorHtml(state);
         for (const a of report.attempts) {
             for (const button of root.querySelectorAll<HTMLElement>(`[data-sc-fail="${a.n}"] [data-blame-who]`)) {
-                const on = (button.dataset.blameWho === 'spec') === (a.blame === 'spec');
+                const on = button.dataset.blameWho === (a.blame ?? 'worker');
                 button.classList.toggle('on', on);
                 button.setAttribute('aria-checked', String(on));
                 button.tabIndex = on ? 0 : -1;
@@ -197,7 +200,7 @@ export class ScoreView {
         }
     }
 
-    // 方向键在两个选项之间移动并选中（radiogroup 的通常行为）；返回是否处理了这次按键。
+    // 方向键在三个选项之间移动并选中（radiogroup 的通常行为）；返回是否处理了这次按键。
     key(e: KeyboardEvent, t: Task, root: HTMLElement) {
         const button = (e.target as Element | null)?.closest<HTMLElement>('[data-blame-n]');
         if (!button || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key))
@@ -206,7 +209,7 @@ export class ScoreView {
         const group = button.closest('[role=radiogroup]')!, buttons = [...group.querySelectorAll<HTMLElement>('[data-blame-who]')];
         const next = buttons[(buttons.indexOf(button) + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length];
         next.focus({ preventScroll: true });
-        void this.blame(t, Number(next.dataset.blameN), next.dataset.blameWho as 'worker' | 'spec', root);
+        void this.blame(t, Number(next.dataset.blameN), next.dataset.blameWho as ReportBlame, root);
         return true;
     }
 }

@@ -1,9 +1,10 @@
-import { c, cx, nt, pj } from '../shared/copy';
+import { c, cx, nt, pj, ro } from '../shared/copy';
 import { esc, markdown } from '../shared/markdown';
 import { dayGroup } from '../shared/types';
-import type { AgentRow, ProjectRow, ProjectShow, SpecRow, Task } from '../shared/types';
+import type { AgentRow, PathCheck, ProjectRow, ProjectShow, RouteConfig, RouteTrial, SpecRow, Task } from '../shared/types';
 import { field, icon, menu, openSheet } from './ui';
 import { openIdentitySheet } from './projects';
+import { routeWhy } from './routing';
 import { mergeSpec } from '../../../core/lib/spec.mjs';
 
 // 新建任务页：选项目 → 选来源（已有说明 / 新建说明 / 直接写文字）→ 选执行者 → 派发。
@@ -30,6 +31,8 @@ interface NewTaskHost {
 
 const SOURCES: Source[] = ['existing', 'new', 'text'];
 const FALLBACK_SPEC = 'NNN-标题.md';
+// 匹配预览最多列出的文件名个数（也是向核心要的 limit）。
+const PATH_SHOWN = 5;
 const failure = (error: unknown) => String((error as Error)?.message || error);
 // 核心错误码（console 通道失败时随错误带出）：用来识别"没有提交身份"并在失败横幅里给出设置按钮。
 const errorCode = (error: unknown) => (error as Error & { code?: unknown })?.code;
@@ -76,6 +79,15 @@ export class NewTaskView {
     private projectSeq = 0;
     private drySeq = 0;
     private dryTimer?: ReturnType<typeof setTimeout>;
+    // Stage07：执行者选"自动"时，实时显示路由结果（ar route --explain）。routeConfig 是路由配置（有没有规则 / 兜底）；旧请求返回晚了按 routeSeq 丢弃。
+    private routeConfig: RouteConfig | null = null;
+    private route: { result: RouteTrial | null; open: boolean } = { result: null, open: false };
+    private routeSeq = 0;
+    private routeTimer?: ReturnType<typeof setTimeout>;
+    // Stage07 T8b：新建说明下"允许改动的文件"的匹配预览；旧请求返回晚了按 pathSeq 丢弃。
+    private pathCheck: { state: 'checking' } | { state: 'ok'; result: PathCheck } | { state: 'failed'; reason: string } | null = null;
+    private pathSeq = 0;
+    private pathTimer?: ReturnType<typeof setTimeout>;
 
     constructor(private host: NewTaskHost) { }
 
@@ -100,6 +112,12 @@ export class NewTaskView {
         this.drySeq++;
         if (this.dryTimer) clearTimeout(this.dryTimer);
         this.dryTimer = undefined;
+        this.routeSeq++;
+        if (this.routeTimer) clearTimeout(this.routeTimer);
+        this.routeTimer = undefined;
+        this.pathSeq++;
+        if (this.pathTimer) clearTimeout(this.pathTimer);
+        this.pathTimer = undefined;
     }
 
     private enabledAgents() {
@@ -111,10 +129,125 @@ export class NewTaskView {
         return enabled.find(a => a.default) ?? (enabled.length === 1 ? enabled[0] : undefined);
     }
 
+    // 路由配置里有规则、兜底或这个项目自己的规则：这时"自动"按路由规则选执行者，下面显示会派给谁；
+    // 一条都没有时"自动"就是默认执行者，和以前一样，没有路由提示。
+    private routed() {
+        const cfg = this.routeConfig;
+        return !!cfg && (cfg.rules.length > 0 || !!cfg.fallback || cfg.projectRules.some(p => p.path === this.project));
+    }
+
+    private routeActive() {
+        return !this.worker && !!this.autoAgent() && this.routed();
+    }
+
     private workerLabel() {
         const enabled = this.enabledAgents();
         if (this.worker) return enabled.find(a => a.name === this.worker)?.label ?? this.worker;
+        // 底部的后果说明用路由结果的显示名；还没算出来或没有可用的执行者时仍写默认执行者。
+        const result = this.routeActive() ? this.route.result : null;
+        if (result && !result.failed) return result.label;
         return this.autoAgent()?.label ?? '';
+    }
+
+    // "自动"下面的一行：将派给谁（哪条规则），"为什么"按钮展开路由过程。路由失败（没有可用的执行者）时写原因，派发照常可点：核心派发时会给出同样的原因。
+    private routeHint() {
+        if (!this.routeActive()) return '';
+        const result = this.route.result;
+        if (!result) return '';
+        const button = `<button class="btn sm quiet" data-nt-route-why aria-expanded="${this.route.open}" ${this.busy ? 'disabled' : ''}>${esc(ro.hintWhy)}</button>`;
+        const trace = this.route.open ? `<ol class="mono ro-trace route-trace" data-nt-route-trace>${result.trace.map(line => `<li>${esc(line)}</li>`).join('')}</ol>` : '';
+        if (result.failed) return `<div class="route-hint fail" data-nt-route data-nt-route-failed="1" role="status">${icon('error-warning-line')}<span>${esc(ro.hintFail(result.error))}</span>${button}</div>${trace}`;
+        const why = routeWhy(result);
+        const text = esc(ro.hint(result.label, why)).replace(esc(result.label), `<b>${esc(result.label)}</b>`).replace(`（${esc(why)}）`, `<span class="muted">（${esc(why)}）</span>`);
+        return `<div class="route-hint" data-nt-route data-nt-route-profile="${esc(result.profile)}" role="status">${icon('route-line')}<span>${text}</span>${button}</div>${trace}`;
+    }
+
+    private updateRouteHint() {
+        const box = this.container?.querySelector<HTMLElement>('[data-nt-route-box]');
+        if (!box) return;
+        const refocus = document.activeElement instanceof HTMLElement && box.contains(document.activeElement) && document.activeElement.hasAttribute('data-nt-route-why');
+        box.innerHTML = this.routeHint();
+        if (refocus) box.querySelector<HTMLElement>('[data-nt-route-why]')?.focus({ preventScroll: true });
+    }
+
+    // 项目、类型、选中的任务说明改变时重新算；连续输入防抖 300 毫秒，旧请求返回晚了丢弃（routeSeq）。
+    private scheduleRoute(delay = 300) {
+        if (this.routeTimer) clearTimeout(this.routeTimer);
+        this.routeSeq++;
+        // 输入变了，上一次的结果不再适用：先收起提示，新结果出来再显示（底部说明暂时写默认执行者）。
+        if (this.route.result) { this.route.result = null; this.updateRouteHint(); this.updateNote(); }
+        this.routeTimer = setTimeout(() => { this.routeTimer = undefined; void this.refreshRoute(); }, delay);
+    }
+
+    private async refreshRoute() {
+        if (!this.routeActive() || !this.project) {
+            this.route.result = null;
+            this.updateRouteHint();
+            this.updateNote();
+            return;
+        }
+        const token = ++this.routeSeq, project = this.project;
+        // 新建说明按类型；已有说明按选中的说明（说明里的 type / worker 都算）；直接写文字没有类型，结果就是兜底。
+        const payload: Record<string, unknown> = this.source === 'existing' && this.selectedSpec ? { project, spec: this.selectedSpec } : this.source === 'new' ? { project, type: this.form.type } : { project };
+        let result: RouteTrial;
+        try { result = await window.dock.console('route:trial', payload) as RouteTrial; }
+        catch (error) { result = { failed: true, code: null, error: failure(error), trace: [] }; }
+        if (token !== this.routeSeq || project !== this.project || !this.container) return;
+        this.route.result = result;
+        this.updateRouteHint();
+        this.updateNote();
+    }
+
+    private allowedLines() {
+        return lines(this.form.allowed.split(/\r?\n/));
+    }
+
+    // "允许改动的文件"下面的匹配预览（ar spec check-paths）：只在"新建任务说明"来源下、输入框不为空时显示。
+    private pathsHtml() {
+        const paths = this.pathCheck;
+        if (this.source !== 'new' || !paths || !this.allowedLines().length) return '';
+        if (paths.state === 'checking') return `<div class="pm" data-nt-paths="checking" role="status"><span class="muted">${esc(nt.pathsChecking)}</span></div>`;
+        if (paths.state === 'failed') return `<div class="pm warn" data-nt-paths="failed" role="status"><span class="mk fail">${icon('close-circle-line')}</span><span>${esc(nt.pathsFailed(paths.reason))}</span></div>`;
+        const result = paths.result;
+        if (result.all) return `<div class="pm" data-nt-paths="all" role="status"><span class="muted">${esc(nt.pathsAll(result.fileCount))}</span></div>`;
+        // 一个都没匹配到时只留下面每个通配符的提示，不写"匹配到 0 个现有文件："。
+        const head = result.total === 0 ? '' : `<div class="pm" data-nt-paths="matched" role="status"><span class="muted">${esc(nt.pathsMatched(result.total))}</span>${result.files.slice(0, PATH_SHOWN).map(file => `<span class="mono">${esc(file)}</span>`).join('<span class="muted">、</span>')}${result.total > PATH_SHOWN ? `<span class="muted">${esc(nt.pathsMore(result.total - PATH_SHOWN))}</span>` : ''}</div>`;
+        const none = result.patterns.filter(p => p.count === 0).map(p => `<div class="pm warn" data-nt-paths-none="${esc(p.pattern)}"><span class="mk brand">${icon('error-warning-line')}</span><span>${esc(nt.pathsNone(p.pattern)).replace(esc(p.pattern), () => `<span class="mono">${esc(p.pattern)}</span>`)}</span></div>`).join('');
+        return head + none;
+    }
+
+    private updatePaths() {
+        const box = this.container?.querySelector<HTMLElement>('[data-nt-paths-box]');
+        if (box) box.innerHTML = this.pathsHtml();
+    }
+
+    // 项目、来源、输入框内容改变时重新检查；连续输入防抖 300 毫秒，旧请求返回晚了丢弃（pathSeq）。
+    private schedulePaths(delay = 300) {
+        if (this.pathTimer) clearTimeout(this.pathTimer);
+        this.pathTimer = undefined;
+        this.pathSeq++;
+        if (this.source !== 'new' || !this.project || !this.allowedLines().length) {
+            this.pathCheck = null;
+            this.updatePaths();
+            return;
+        }
+        this.pathTimer = setTimeout(() => { this.pathTimer = undefined; void this.refreshPaths(); }, delay);
+    }
+
+    private async refreshPaths() {
+        const paths = this.allowedLines(), project = this.project, token = ++this.pathSeq;
+        if (this.source !== 'new' || !project || !paths.length) { this.pathCheck = null; this.updatePaths(); return; }
+        this.pathCheck = { state: 'checking' };
+        this.updatePaths();
+        let next: NonNullable<NewTaskView['pathCheck']>;
+        try {
+            const result = await window.dock.console('spec:check-paths', { project, paths, limit: PATH_SHOWN }) as PathCheck;
+            next = { state: 'ok', result };
+        }
+        catch (error) { next = { state: 'failed', reason: failure(error) }; }
+        if (token !== this.pathSeq || project !== this.project || !this.container) return;
+        this.pathCheck = next;
+        this.updatePaths();
     }
 
     private ensureWorker() {
@@ -221,10 +354,11 @@ export class NewTaskView {
         this.loading = true;
         this.setReady(false);
         try {
-            const [list, agents] = await Promise.all([window.dock.console('projects:list'), window.dock.console('agents:list')]);
+            const [list, agents, routing] = await Promise.all([window.dock.console('projects:list'), window.dock.console('agents:list'), window.dock.console('route:config').catch(() => null)]);
             if (token !== this.loadSeq || !this.container) return;
             this.projects = Array.isArray(list?.projects) ? list.projects : [];
             this.agents = Array.isArray(agents?.agents) ? agents.agents : [];
+            this.routeConfig = routing && Array.isArray(routing.rules) ? routing as RouteConfig : null;
             if (!this.projects.some(p => p.path === this.project)) this.project = this.projects[0]?.path ?? '';
             this.ensureWorker();
             this.loaded = true;
@@ -263,6 +397,8 @@ export class NewTaskView {
                 this.form.verify = lines(config.verify).join('\n');
             }
             if (this.dataKey() !== before) this.render();
+            this.scheduleRoute(0);
+            this.schedulePaths(0);
         }
         catch (error) {
             if (token !== this.projectSeq || loadToken !== this.loadSeq || this.project !== path) return;
@@ -272,7 +408,7 @@ export class NewTaskView {
     }
 
     private dataKey() {
-        return JSON.stringify([this.loaded, this.projects, this.agents, this.show, this.specs, this.selectedSpec, this.project, this.defaultsFrom]);
+        return JSON.stringify([this.loaded, this.projects, this.agents, this.show, this.specs, this.selectedSpec, this.project, this.defaultsFrom, this.routeConfig]);
     }
 
     private setReady(ready: boolean) {
@@ -337,7 +473,7 @@ export class NewTaskView {
         const enabled = this.enabledAgents(), auto = this.autoAgent();
         const workerCtl = !enabled.length
             ? `<button class="sel" disabled><span class="ph">${esc(nt.noWorker)}</span></button>`
-            : `<button class="sel" data-nt-worker ${disabled} aria-haspopup="listbox" aria-expanded="false"><span>${esc(this.worker ? this.workerLabel() : auto ? nt.auto(auto.label) : this.workerLabel())}</span>${icon('arrow-down-s-line')}</button>`;
+            : `<button class="sel" data-nt-worker ${disabled} aria-haspopup="listbox" aria-expanded="false"><span>${esc(this.worker ? this.workerLabel() : auto ? (this.routeActive() ? ro.autoByRule : nt.auto(auto.label)) : this.workerLabel())}</span>${icon('arrow-down-s-line')}</button>`;
         // "先提交任务说明"只对新建的说明有意义：已有说明本来就在仓库里，直接写文字不生成文件。
         // 会跑门禁时必须先提交说明（门禁从干净的基线比较改动）：勾选并禁用，整行变灰、说明前带锁形图标，说明文字换成原因。
         const plan = this.gatePlan(), commitOn = this.commit || plan.gate;
@@ -346,7 +482,7 @@ export class NewTaskView {
             ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(nt.dispatching)}`
             : `${icon('send-plane-line')}${esc(nt.dispatch)}`;
         const buttons = `<span class="note" data-nt-note aria-live="polite">${esc(this.note())}</span>${this.source === 'new' ? `<button class="btn" data-nt-preview ${disabled}>${esc(nt.preview)}</button>` : ''}<button class="btn primary" data-nt-dispatch ${this.canDispatch() ? '' : 'disabled'}>${dispatch}</button>`;
-        return `<div class="doc with-bar"><div class="scroll doc-scroll"><div class="page-h sticky"><h1>${esc(nt.title)}</h1><span class="lead">${esc(nt.lead)}</span></div><div class="doc-in narrow">${this.identityWarn()}<div class="form">${this.banner()}${field(nt.project, '', projectCtl)}${field(nt.source, '', sourceCtl)}${body}${field(nt.worker, '', workerCtl)}${commitCtl}</div></div></div><div class="actbar">${buttons}</div></div>`;
+        return `<div class="doc with-bar"><div class="scroll doc-scroll"><div class="page-h sticky"><h1>${esc(nt.title)}</h1><span class="lead">${esc(nt.lead)}</span></div><div class="doc-in narrow">${this.identityWarn()}<div class="form">${this.banner()}${field(nt.project, '', projectCtl)}${field(nt.source, '', sourceCtl)}${body}${field(nt.worker, '', `${workerCtl}<div data-nt-route-box>${this.routeHint()}</div>`)}${commitCtl}</div></div></div><div class="actbar">${buttons}</div></div>`;
     }
 
     private existingBody(disabled: string) {
@@ -365,16 +501,16 @@ export class NewTaskView {
     }
 
     private newBody(disabled: string) {
-        const text = (key: FormKey, label: string, help: string, rows: number, mono = false, placeholder = '', req = false) => {
+        const text = (key: FormKey, label: string, help: string, rows: number, mono = false, placeholder = '', req = false, after = '') => {
             const hint = this.invalid === key ? requiredHint(label) : '';
-            return field(label, help ? esc(help) : '', `<textarea class="inp area${mono ? ' mono' : ''}" data-nt-f="${key}" rows="${rows}" aria-label="${esc(label)}" placeholder="${esc(placeholder)}" ${disabled}>${esc(this.form[key])}</textarea>${hint}`, req);
+            return field(label, help ? esc(help) : '', `<textarea class="inp area${mono ? ' mono' : ''}" data-nt-f="${key}" rows="${rows}" aria-label="${esc(label)}" placeholder="${esc(placeholder)}" ${disabled}>${esc(this.form[key])}</textarea>${hint}${after}`, req);
         };
         const titleHint = this.invalid === 'title' ? requiredHint(nt.titleField) : '';
         const goalHint = this.invalid === 'goal' ? requiredHint(nt.goal) : '';
         return `${field(nt.titleField, esc(nt.titleHelp), `<input class="inp" data-nt-f="title" aria-label="${esc(nt.titleField)}" value="${esc(this.form.title)}" ${disabled}>${titleHint}`, true)}
             ${field(nt.goal, esc(nt.goalHelp), `<textarea class="inp area" data-nt-f="goal" rows="3" aria-label="${esc(nt.goal)}" ${disabled}>${esc(this.form.goal)}</textarea>${goalHint}`, true)}
             ${field(nt.type, '', `<div class="segm sm" data-nt-seg="type" role="group" aria-label="${esc(nt.type)}">${nt.types.map(t => `<button data-nt-type="${esc(t)}" class="${this.form.type === t ? 'on' : ''}" aria-pressed="${this.form.type === t}" ${disabled}>${esc(t)}</button>`).join('')}</div>`)}
-            ${text('allowed', nt.allowed, nt.allowedHelp, 2, true)}
+            ${text('allowed', nt.allowed, nt.allowedHelp, 2, true, '', false, `<div data-nt-paths-box>${this.pathsHtml()}</div>`)}
             ${text('verify', nt.verify, nt.verifyHelp, 2, true)}
             ${text('nonGoals', nt.nonGoals, '', 2)}
             ${text('refs', nt.refs, nt.refsHelp, 2, false, nt.refsPlaceholder)}
@@ -388,6 +524,7 @@ export class NewTaskView {
         const d = active.dataset;
         if (d.ntProject !== undefined) return '[data-nt-project]';
         if (d.ntWorker !== undefined) return '[data-nt-worker]';
+        if (d.ntRouteWhy !== undefined) return '[data-nt-route-why]';
         if (d.ntCommit !== undefined) return '[data-nt-commit]';
         if (d.ntPreview !== undefined) return '[data-nt-preview]';
         if (d.ntDispatch !== undefined) return '[data-nt-dispatch]';
@@ -408,18 +545,21 @@ export class NewTaskView {
         const button = (e.target as Element).closest<HTMLButtonElement>('button');
         if (!button || button.disabled || this.busy || !this.container?.contains(button)) return;
         const d = button.dataset;
+        if (d.ntRouteWhy !== undefined) { this.route.open = !this.route.open; this.updateRouteHint(); return; }
         if (d.ntSource && SOURCES.includes(d.ntSource as Source)) { this.setSource(d.ntSource as Source); return; }
         if (d.ntType && this.form.type !== d.ntType) {
             this.form.type = d.ntType;
             this.render();
             this.container?.querySelector<HTMLElement>(`[data-nt-type="${d.ntType}"]`)?.focus({ preventScroll: true });
             this.scheduleDry();
+            this.scheduleRoute();
             return;
         }
         if (d.ntSpec) {
             this.selectedSpec = d.ntSpec;
             this.invalid = '';
             this.render();
+            this.scheduleRoute();
             return;
         }
         if (d.ntProject !== undefined) { this.chooseProject(button); return; }
@@ -437,6 +577,8 @@ export class NewTaskView {
         this.render();
         this.container?.querySelector<HTMLElement>(`[data-nt-source="${source}"]`)?.focus({ preventScroll: true });
         if (source === 'new') this.scheduleDry();
+        this.scheduleRoute();
+        this.schedulePaths();
     }
 
     private chooseProject(anchor: HTMLElement) {
@@ -445,6 +587,8 @@ export class NewTaskView {
             run: () => {
                 if (this.project === p.path) return;
                 this.project = p.path;
+                this.route.result = null;
+                this.pathCheck = null;
                 this.selectedSpec = '';
                 this.show = null;
                 this.specs = [];
@@ -477,7 +621,7 @@ export class NewTaskView {
     private chooseWorker(anchor: HTMLElement) {
         const items: { label: string; run: () => void }[] = [];
         const auto = this.autoAgent();
-        if (auto) items.push({ label: nt.auto(auto.label), run: () => { this.worker = ''; this.render(); this.updateNote(); } });
+        if (auto) items.push({ label: this.routed() ? ro.autoByRule : nt.auto(auto.label), run: () => { this.worker = ''; this.render(); this.updateNote(); this.scheduleRoute(0); } });
         for (const agent of this.enabledAgents()) items.push({ label: agent.label, run: () => { this.worker = agent.name; this.render(); this.updateNote(); } });
         menu(anchor, items, true);
     }
@@ -494,6 +638,7 @@ export class NewTaskView {
         if (this.source === 'new') this.scheduleDry();
         this.updateNote();
         if (key === 'allowed' || key === 'verify') this.updateCommit();
+        if (key === 'allowed') this.schedulePaths();
     }
 
     private keys(e: KeyboardEvent) {
@@ -515,6 +660,7 @@ export class NewTaskView {
                 this.render();
                 this.container?.querySelector<HTMLElement>(`[data-nt-type="${nt.types[next]}"]`)?.focus({ preventScroll: true });
                 this.scheduleDry();
+                this.scheduleRoute();
             }
             return;
         }
@@ -527,6 +673,7 @@ export class NewTaskView {
             this.invalid = '';
             this.render();
             this.container?.querySelector<HTMLElement>(`[data-nt-spec="${CSS.escape(this.selectedSpec)}"]`)?.focus({ preventScroll: true });
+            this.scheduleRoute();
         }
     }
 
@@ -639,6 +786,8 @@ export class NewTaskView {
         this.commit = true;
         this.defaultsFrom = '';
         this.dry = null;
+        this.pathCheck = null;
+        this.pathSeq++;
         this.pendingSpec = null;
         this.invalid = '';
         this.failure = '';

@@ -1,5 +1,5 @@
 // 执行者需要越界（协议 14.5）：从汇报里解析 "## 需要越界" 一节，得到执行者列出的路径与原因。
-const MARK = '## 需要越界';
+const TITLE = '需要越界';
 const MAX_ITEMS = 50;
 // "无"这类表示没有内容的写法（整行只有它时不算一条）。
 const NONE = new Set(['无', '无。', '没有', '没有。']);
@@ -10,6 +10,30 @@ const fenceCloses = (line, open) => {
   const match = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
   return !!match && match[1][0] === open[0] && match[1].length >= open.length;
 };
+
+// ATX 标题（1～6 个 #，后面是空白或行尾）→ { level, title } 或 null。结尾的 # 也一并去掉。
+function parseHeading(text) {
+  const match = /^(#{1,6})(?:\s+(.*))?$/.exec(text);
+  if (!match) return null;
+  return { level: match[1].length, title: (match[2] ?? '').replace(/\s+#+\s*$/, '').trim() };
+}
+
+// 标题文字去掉编号（10. / 10、 / 10) / (10) / 第 10 节）、包住文字的反引号与 **、结尾冒号之后，正好是"需要越界"才算这一节。
+// 执行者照着汇报模板给各节编了号，也有人给标题加反引号；这些写法都认。
+const NUMBER_PREFIX = /^(?:第\s*\d+\s*[节章部分]?|[(（]\s*\d+\s*[)）]|\d+\s*[.、)）])\s*/;
+function isNeedsScopeTitle(title) {
+  let text = title;
+  for (let round = 0; round < 4; round++) {
+    const before = text;
+    text = text.trim()
+      .replace(/\s*[:：]+$/, '')
+      .replace(NUMBER_PREFIX, '')
+      .replace(/^(`+|\*\*)([\s\S]*?)\1$/, '$2')
+      .replace(/^#+\s*/, ''); // 反引号里又写了一遍 "## 需要越界"（090 的写法）
+    if (text === before) break;
+  }
+  return text.trim() === TITLE;
+}
 
 // 列表项：以 -、*、+、1.、1) 开头（后面跟空白），允许缩进；其他行是说明，不算路径。
 const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
@@ -36,7 +60,7 @@ export function parseNeedsScope(markdown) {
   if (typeof markdown !== 'string') return [];
   const found = [];
   let fence = null;
-  let inSection = false;
+  let sectionLevel = 0; // 0 = 不在这一节里；否则是这一节标题的层级（1～6）
   for (const line of markdown.split(/\r?\n/)) {
     if (fence) {
       if (fenceCloses(line, fence)) fence = null;
@@ -45,10 +69,14 @@ export function parseNeedsScope(markdown) {
     const opened = fenceOpen(line);
     if (opened) { fence = opened; continue; }
     const text = line.trim();
-    if (text === MARK) { inSection = true; continue; }
-    // 一级或二级标题结束这一节；更深的标题属于这一节但不当作路径。
-    if (/^#{1,2}(?:\s|$)/.test(text)) { inSection = false; continue; }
-    if (!inSection || !text || /^#{3,}(?:\s|$)/.test(text)) continue;
+    const heading = parseHeading(text);
+    if (heading) {
+      // 层级不深于这一节的标题结束这一节（它自己又是"需要越界"则开始新的一节）；更深的标题属于这一节但不当作路径。
+      if (sectionLevel && heading.level > sectionLevel) continue;
+      sectionLevel = isNeedsScopeTitle(heading.title) ? heading.level : 0;
+      continue;
+    }
+    if (!sectionLevel || !text) continue;
     const item = parseItem(line);
     if (item && !found.some(other => other.path === item.path)) {
       found.push(item);

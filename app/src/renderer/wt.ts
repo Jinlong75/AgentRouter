@@ -1,5 +1,5 @@
 import { worktreeState, type GateFile, type Task, type WtState } from '../shared/types';
-import { gt, wt as w } from '../shared/copy';
+import { c, gt, wt as w } from '../shared/copy';
 import { esc } from '../shared/markdown';
 import { icon } from './ui';
 import { gateState, trackNode, trackParts } from './gate';
@@ -95,6 +95,45 @@ export const bannerHtml = (kind: string, title: string, text: string, button = '
     `<div class="banner ${kind}" role="${kind === 'fail' ? 'alert' : 'status'}">${BANNER_MARK[kind]}<div class="rt"><b>${esc(title)}</b><span>${esc(text)}</span>${extra}</div>${button}</div>`;
 export const goAcceptButton = (t: Task) => `<button class="btn sm" data-go-accept="${esc(t.id)}">${esc(w.goAccept)}</button>`;
 
+// 任务的项目现在的样子（Stage07 116）：ok = 还在项目列表里；gone = 已从项目列表移除（文件夹还在）；missing = 文件夹也没了。
+// 由主进程的 tasks:repo-state 读出（只读），按仓库路径缓存；没读到之前按 ok，不提前锁按钮。
+// 只有 worktree 任务关心它：驳回 / 确认不要求项目已登记，批准合并、重试、再派一次、合并主分支后重跑要。
+export type RepoState = 'ok' | 'gone' | 'missing';
+const repoStates = new Map<string, { state: RepoState; at: number; loading: boolean }>();
+const repoKey = (repo: string) => repo.replace(/\\/g, '/').toLowerCase();
+export const repoState = (t: Task): RepoState => (t.worktree ? repoStates.get(repoKey(t.repo))?.state : undefined) ?? 'ok';
+// 项目页添加 / 移除项目后调用：缓存作废，下一次显示任务时重新读。
+export const forgetRepoStates = () => repoStates.clear();
+// 读一次这个任务的项目状态；状态变了才调用 changed（界面据此重画横幅与按钮）。同一仓库 3 秒内不重复读（force 除外）。
+export function loadRepoState(t: Task, changed: () => void, force = false) {
+    if (!t.worktree) return;
+    const key = repoKey(t.repo), old = repoStates.get(key);
+    if (old && !force && (old.loading || Date.now() - old.at < 3000)) return;
+    repoStates.set(key, { state: old?.state ?? 'ok', at: Date.now(), loading: true });
+    window.dock.console('tasks:repo-state', { project: t.repo, name: t.name }).then((r: { registered?: boolean; exists?: boolean }) => {
+        const state: RepoState = r.exists === false ? 'missing' : r.registered === false ? 'gone' : 'ok';
+        repoStates.set(key, { state, at: Date.now(), loading: false });
+        if (state !== (old?.state ?? 'ok')) changed();
+    }, () => { repoStates.set(key, { state: old?.state ?? 'ok', at: Date.now(), loading: false }); });
+}
+// 项目已移除 / 文件夹已不在的横幅（详情和验收页顶部）；已合并 / 已驳回的任务不需要，返回空。
+export function repoBanner(t: Task): string {
+    const s = repoState(t);
+    const ws = worktreeState(t);
+    if (s === 'ok' || ws === 'accepted' || ws === 'rejected') return '';
+    return bannerHtml('brand', c.projectGoneTitle, s === 'missing' ? c.projectGoneMissing(t.repo) : c.projectGoneHelp(t.repo),
+        s === 'gone' ? `<button class="btn sm" data-readd-project="${esc(t.id)}">${esc(c.projectGoneReAdd)}</button>` : '');
+}
+// 重新添加项目：走项目页同一条 projects:add；成功后马上重读（状态从 gone 变回 ok 时调用 changed）。
+export async function readdProject(t: Task, changed: () => void) {
+    await window.dock.console('projects:add', { path: t.repo });
+    loadRepoState(t, changed, true);
+}
+// 项目已移除时要写项目的操作（批准合并、重试、再派一次、合并主分支后重跑）不可用；
+// 文件夹不在时，驳回和确认也不可用（核心要在仓库里删 worktree 和分支）。
+export const writeBlocked = (t: Task) => repoState(t) !== 'ok';
+export const closeBlocked = (t: Task) => repoState(t) === 'missing';
+
 // 进展顶部横幅：排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回 / 准备失败；其余状态返回 null（用任务页已有的横幅）。
 export function wtBanner(t: Task, limit: number): { html: string; replacesFailure: boolean } | null {
     const s = worktreeState(t), wi = t.wt;
@@ -124,6 +163,8 @@ export function wtHeadRow(t: Task) {
     const wi = t.wt;
     return wi?.branch ? turnRow(wi.worktreeAt, w.worktreeRow(wi.branch, baseBranchOf(t), sha7(wi.base))) : '';
 }
+// 路由结果一行（样式同 worktreeRow），时间取任务开始时间；没有路由结果返回空。
+export const routeHeadRow = (t: Task) => t.route ? turnRow(t.started, w.routeRow(t.route)) : '';
 export function wtTailRow(t: Task) {
     const s = worktreeState(t);
     return s === 'awaiting' || s === 'accepted' || s === 'rejected' || s === 'conflict' ? (t.wt?.awaitingAt ? turnRow(t.wt.awaitingAt, w.awaitingRow) : '') : '';

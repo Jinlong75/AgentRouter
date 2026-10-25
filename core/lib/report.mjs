@@ -23,13 +23,16 @@ const labels = {
   executor: {
     attemptGate: ['多一次尝试：门禁未通过', '次'], attemptAgent: ['多一次尝试：执行者异常退出', '次'], outsideFile: ['越界文件', '个'],
     protectedFile: ['动了受保护的路径', '个'], outsideWrites: ['工作区外写入', '次'], escalated: ['升级了执行者', '次'],
-    toolError: ['工具报错', '个'], needsScope: ['写了"需要越界"', '次'],
+    toolError: ['工具报错', '个'], needsScope: ['写了"需要越界"', '次'], envBlame: ['环境原因', '次'],
   },
   lead: {
     specEdit: ['派发后改任务说明', '次'], specBlame: ['门禁失败归因到任务说明', '次'], manualRetry: ['手动重试', '次'],
-    needsScope: ['执行者写了"需要越界"', '次'], rejected: ['驳回', '次'], conflict: ['合并时冲突', '次'],
+    needsScope: ['执行者写了"需要越界"', '次'], rejected: ['驳回', '次'], conflict: ['合并时冲突', '次'], envBlame: ['环境原因', '次'],
   },
 };
+
+const blameValues = ['spec', 'worker', 'environment'];
+const envCount = blamed => [...blamed.values()].filter(who => who === 'environment').length;
 
 // 纯函数：按扣分表给一组指标打分。items: [{ key, count, detail }]；weights: { <key>: { points, max } }；cap: 分数上限或 null。
 // 每项扣 count × points，最多扣 max（max 为 null 不封顶）；总分 100 起扣，最低 0，再不超过 cap。
@@ -71,16 +74,16 @@ function recordDir(start) {
 
 const marksFile = start => path.join(recordDir(start), 'marks.json');
 
-// 归因标记：{ v: 1, blame: { "<n>": "spec" } }。读不了、格式不对都当作没有。返回被归因到任务说明的尝试编号集合。
+// 归因标记：{ v: 1, blame: { "<n>": "spec" | "environment" } }。读不了、格式不对、未知值都当作没有。返回 Map<尝试编号, 'spec' | 'environment'>。
 function readMarks(start) {
   try {
     const value = readJson(marksFile(start));
-    const blamed = new Set();
+    const blamed = new Map();
     if (value && typeof value.blame === 'object' && value.blame && !Array.isArray(value.blame)) {
-      for (const [key, who] of Object.entries(value.blame)) if (who === 'spec' && /^[1-9]\d*$/.test(key)) blamed.add(Number(key));
+      for (const [key, who] of Object.entries(value.blame)) if ((who === 'spec' || who === 'environment') && /^[1-9]\d*$/.test(key)) blamed.set(Number(key), who);
     }
     return blamed;
-  } catch { return new Set(); }
+  } catch { return new Map(); }
 }
 
 function readGateFile(file) {
@@ -112,7 +115,7 @@ function readAttempts({ start, rows, dir, blamed }) {
     return {
       ...item, gate, gateFile,
       summary: typeof gateFile?.summary === 'string' ? gateFile.summary : null,
-      blame: gate === false ? (blamed.has(item.n) ? 'spec' : 'worker') : null,
+      blame: gate === false ? (blamed.get(item.n) ?? 'worker') : null,
     };
   });
 }
@@ -139,7 +142,7 @@ function readEventCounts(start, dir) {
 
 function executorItems({ attempts, counts, blamed }) {
   const byReason = reason => attempts.filter(item => item.reason === reason);
-  // 第 n 次被归因到任务说明时，第 n+1 次（reason: gate）不算执行者的。
+  // 第 n 次被归因到任务说明或环境时，第 n+1 次（reason: gate）不算执行者的。
   const relieved = byReason('gate').filter(item => blamed.has(item.n - 1)).length;
   const outside = new Set(), protectedPaths = new Set(), added = [];
   const listed = [];
@@ -167,6 +170,7 @@ function executorItems({ attempts, counts, blamed }) {
     { key: 'escalated', count: switched.length ? 1 : 0, detail: switched.length ? `${firstProfile} → ${switched[0].profile}` : null },
     { key: 'toolError', count: counts.toolErrors, detail: null },
     { key: 'needsScope', count: listed.length, detail: needsScopePaths.length ? first5(needsScopePaths) : null },
+    { key: 'envBlame', count: envCount(blamed), detail: null },
   ];
 }
 
@@ -199,11 +203,12 @@ function leadItems({ start, rows, attempts, blamed, state, root, endAt }) {
   const pending = state === 'awaiting' || state === 'conflict';
   return [
     { key: 'specEdit', count: edits.count, detail: edits.detail },
-    { key: 'specBlame', count: blamed.size, detail: null },
+    { key: 'specBlame', count: [...blamed.values()].filter(who => who === 'spec').length, detail: null },
     { key: 'manualRetry', count: attempts.filter(item => item.reason === 'manual').length, detail: null },
     { key: 'needsScope', count: attempts.some(item => readNeedsScope(item.end?.needsScope)) ? 1 : 0, detail: null },
     { key: 'rejected', count: plain ? 0 : rows.some(row => row.event === 'rejected') ? 1 : 0, detail: plain ? noWorktreeNote : pending ? notYetAccepted : null },
     { key: 'conflict', count: plain ? 0 : rows.some(row => row.event === 'conflict') ? 1 : 0, detail: plain ? noWorktreeNote : null },
+    { key: 'envBlame', count: envCount(blamed), detail: null },
   ];
 }
 
@@ -284,7 +289,7 @@ export function buildReport({ home, root, name, env = process.env }) {
   const marks = readMarks(start);
   const attempts = readAttempts({ start, rows, dir, blamed: marks });
   // 只有门禁没通过的尝试才能被归因；标记里多出来的编号不算。
-  const blamed = new Set(attempts.filter(item => item.blame === 'spec').map(item => item.n));
+  const blamed = new Map(attempts.filter(item => item.blame === 'spec' || item.blame === 'environment').map(item => [item.n, item.blame]));
   const counts = readEventCounts(start, dir);
 
   const startedAt = Number.isFinite(start.started) ? start.started : Number.isFinite(start.at) ? start.at : null;
@@ -321,16 +326,16 @@ export function buildReport({ home, root, name, env = process.env }) {
 // 归因（只对门禁没通过的尝试）：写 <记录目录>/marks.json。worker 是默认，写 worker 时删掉这个键。先写临时文件再改名。
 export function setBlame({ home, root, name, n, blame }) {
   if (!Number.isSafeInteger(n) || n < 1) throw new Error(`尝试编号必须是正整数：${n}`);
-  if (blame !== 'spec' && blame !== 'worker') throw new Error(`归因只能是 spec 或 worker：${blame}`);
+  if (!blameValues.includes(blame)) throw new Error(`归因只能是 spec、worker 或 environment：${blame}`);
   const { start, rows } = loadTask({ homes: homesOf(home), root, name });
   const attempt = rows.findLast(row => row.event === 'attempt-end' && row.n === n);
   if (!attempt || attempt.gate !== false) throw new Error(`第 ${n} 次尝试的门禁没有失败，不能归因（只有门禁未通过的尝试才能归因）`);
   const blamed = readMarks(start);
-  if (blame === 'spec') blamed.add(n); else blamed.delete(n);
+  if (blame === 'worker') blamed.delete(n); else blamed.set(n, blame);
   const file = marksFile(start);
   const temp = `${file}.${process.pid}.tmp`;
   try {
-    writeFileSync(temp, `${JSON.stringify({ v: 1, blame: Object.fromEntries([...blamed].sort((a, b) => a - b).map(key => [String(key), 'spec'])) })}\n`, { flag: 'w' });
+    writeFileSync(temp, `${JSON.stringify({ v: 1, blame: Object.fromEntries([...blamed].sort((a, b) => a[0] - b[0]).map(([key, who]) => [String(key), who])) })}\n`, { flag: 'w' });
     renameSync(temp, file);
   } finally { rmSync(temp, { force: true }); }
   return { ok: true, n, blame };

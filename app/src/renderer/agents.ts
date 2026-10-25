@@ -1,18 +1,20 @@
 // Agent 页"执行者"区：列出配置里的执行者，可以测试连接、编辑、设为默认、停用 / 启用、删除。
 // 数据来自 console 通道的 agents:list（detect: true）；Codex 的编辑由 preferences.ts 复用设置控件，
 // 其余执行者（claude-code）用通用模态框表单，保存走 agents:update。
-import { ag, p, c } from '../shared/copy';
+import { ag, gx, p, c } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { AgentRow, Settings } from '../shared/types';
+import type { AgentPreset, AgentRow, Settings } from '../shared/types';
 import { executorTag } from '../shared/executor';
-import { icon, menu, confirmAction, openSheet, field, type Sheet } from './ui';
+import { icon, menu, confirmAction, openSheet, field, toast, type Sheet } from './ui';
+import { bindChoices, choiceHtml, openCustomForm, type Choice, type ChoiceSpec, type Opt } from './agent-custom';
 
 const mark = (state: string) => `<span class="mk ${state}">${icon(({ ok: 'checkbox-circle-line', fail: 'close-circle-line', info: 'information-line', run: 'loader-4-line' } as Record<string, string>)[state])}</span>`;
 const banner = (text: string) => text ? `<div class="banner fail" role="alert">${mark('fail')}<span>${esc(text)}</span></div>` : '';
 
 // preferences.ts 提供的回调：Codex 的编辑在设置视图里复用设置控件，版本变更提示与"知道了"也由它掌管。
 export interface AgentsHost {
-    openCodexEdit(trigger: HTMLElement): void;
+    // name：Codex 执行者的名字；others：可选的升级目标（其他已启用的执行者）。
+    openCodexEdit(trigger: HTMLElement, name: string, others: { name: string; label: string }[]): void;
     codexChange(): { old: string; next: string } | undefined;
     ack(): void;
     // 刷新执行者列表时顺带读到的最新设置：侧栏底部列出启用的执行者，这里变了（启用、停用、导入、删除）它要跟着变。
@@ -128,15 +130,25 @@ export class AgentsView {
     }
     private more(anchor: HTMLElement, a: AgentRow) {
         menu(anchor, [
-            { label: ag.menu.edit, disabled: !['codex', 'claude-code'].includes(a.adapter), run: () => this.edit(a, anchor) },
+            { label: ag.menu.edit, disabled: !['codex', 'claude-code', 'generic'].includes(a.adapter), run: () => this.edit(a, anchor) },
             { label: ag.menu.setDefault, disabled: a.default || !a.enabled, run: () => { void this.act('default', a.name); } },
             { label: a.enabled ? ag.menu.disable : ag.menu.enable, run: () => { void this.act(a.enabled ? 'disable' : 'enable', a.name); } },
+            { label: ag.menu.export, run: () => { void this.export(a); } },
             { label: ag.menu.remove, run: () => { void this.remove(a, anchor); } },
         ]);
     }
+    // 导出声明：主进程弹保存对话框，核心写文件；取消什么都不做。
+    private async export(a: AgentRow) {
+        this.error = '';
+        try {
+            const r = await window.dock.console('agents:export', { name: a.name });
+            if (!r.cancelled) toast(gx.exportDone(r.file));
+        }
+        catch (e) { this.error = String((e as Error).message || e); this.render(); }
+    }
     private edit(a: AgentRow, trigger: HTMLElement) {
-        if (a.adapter === 'codex') { this.host.openCodexEdit(trigger); return; }
-        if (a.adapter === 'claude-code') { this.openClaudeEdit(a, trigger); }
+        if (a.adapter === 'codex') { this.host.openCodexEdit(trigger, a.name, this.agents.filter(x => x.name !== a.name && x.enabled).map(x => ({ name: x.name, label: x.label }))); return; }
+        if (a.adapter === 'claude-code' || a.adapter === 'generic') { void this.openEdit(a, trigger); }
     }
     private async act(action: 'default' | 'enable' | 'disable' | 'remove', name: string) {
         this.busy = true; this.error = ''; this.render();
@@ -159,33 +171,105 @@ export class AgentsView {
         this.testing = null; this.testResult = { name: a.name, result };
         await this.refresh(true);
     }
-    private openClaudeEdit(a: AgentRow, trigger: HTMLElement) {
-        const profile = this.profiles[a.name] ?? {};
+    // 预设列表（取下拉的可选值）：第一次用到时读一次，读失败就当没有可选值。
+    private presetList?: Promise<AgentPreset[]>;
+    private presets(): Promise<AgentPreset[]> {
+        return this.presetList ??= window.dock.console('agents:presets').then((r: { presets: AgentPreset[] }) => r.presets).catch(() => { this.presetList = undefined; return [] as AgentPreset[]; });
+    }
+    // "编辑"：Claude 类和通用适配器（自定义 CLI、Qoder）共用。模型、推理强度是"下拉 + 自定义"，升级到是下拉；
+    // 模型名只取名字相同的预设（不借别的服务商的模型名），推理强度的可选值 Claude 类再按适配器取。
+    private async openEdit(a: AgentRow, trigger: HTMLElement) {
+        const generic = a.adapter === 'generic';
+        const list = await this.presets();
+        const exact = list.find(x => x.name === a.name && x.adapter === a.adapter);
+        const effortOptions = exact?.effortOptions ?? list.find(x => x.adapter === a.adapter)?.effortOptions ?? [];
+        let modelOptions = exact?.modelOptions ?? [];
+        let modelsLoading = generic && !!exact?.listModels, modelsFromCli = false;
+        // 保存后马上再打开时，列表的刷新可能还没读完：预填值直接读最新的配置（读不到再用上次刷新的）。
+        const fresh = await window.dock.preferences('settings').catch(() => null) as Settings | null;
+        const profile = (fresh?.profiles ?? this.profiles)[a.name] ?? {};
         const env = profile.env ?? {};
-        const pre = { label: a.label, model: env.ANTHROPIC_MODEL ?? '', baseUrl: env.ANTHROPIC_BASE_URL ?? '', secretVar: Object.values(profile.secrets ?? {})[0] ?? '', maxTurns: profile.maxTurns == null ? '' : String(profile.maxTurns) };
+        const initial = { label: a.label, model: (generic ? profile.model : env.ANTHROPIC_MODEL) ?? '', baseUrl: env.ANTHROPIC_BASE_URL ?? '', secretVar: Object.values(profile.secrets ?? {})[0] ?? '', maxTurns: profile.maxTurns == null ? '' : String(profile.maxTurns), effort: profile.effort ?? '', escalate: profile.escalate ?? '' };
+        const E = { ...initial };
+        const custom: Record<string, boolean | undefined> = {};
+        const others = this.agents.filter(x => x.name !== a.name && x.enabled);
+        const optsOf = (key: string): string[] => key === 'model' ? modelOptions : key === 'effort' ? effortOptions : [];
+        const spec = (key: string): ChoiceSpec | undefined => {
+            if (key === 'model') return { key, attr: 'data-e', opts: modelOptions.map(value => ({ value })), label: ag.model };
+            if (key === 'effort') return { key, attr: 'data-e', lead: [{ value: '', label: gx.effortDefault, desc: gx.effortDefaultDesc }], opts: effortOptions.map(value => ({ value })), label: gx.effort };
+            if (key === 'escalate') {
+                const opts: Opt[] = others.map(x => ({ value: x.name, label: x.label }));
+                if (E.escalate && !opts.some(x => x.value === E.escalate)) opts.push({ value: E.escalate });
+                return { key, attr: 'data-e', fixed: true, mono: false, lead: [{ value: '', label: gx.escalateNone }], opts, label: gx.escalate };
+            }
+        };
+        const state = (key: string): Choice => {
+            const value = E[key as 'model'];
+            return { value, custom: custom[key] ?? (value !== '' && optsOf(key).length > 0 && !optsOf(key).includes(value)) };
+        };
         const input = (key: string, value: string, mono: boolean) => `<input class="inp${mono ? ' mono' : ''}" data-e="${key}" value="${esc(value)}">`;
-        const body = () => `<div class="form">${field(ag.label, ag.labelHelp, input('label', pre.label, false), true)}${field(ag.model, '', input('model', pre.model, true))}${field(ag.baseUrl, '', input('baseUrl', pre.baseUrl, true))}${field(ag.secretName, ag.secretNameHelp, input('secretVar', pre.secretVar, true))}${field(ag.maxTurns, ag.maxTurnsHelp, input('maxTurns', pre.maxTurns, true))}</div>`;
-        const sheet = openSheet({
+        const model = () => modelsLoading
+            ? `<span class="selw"><button type="button" class="sel" disabled aria-label="${esc(ag.model)}"><span>${esc(gx.modelLoading)}</span>${icon('arrow-down-s-line')}</button></span>`
+            : choiceHtml(spec('model')!, state('model'));
+        const cli = generic ? a.label : a.adapter;
+        const body = () => `<div class="form">${generic ? `<p class="sheet-lead">${esc(gx.genericEditNote)}</p>` : ''}${field(ag.label, ag.labelHelp, input('label', E.label, false), true)}`
+            + field(ag.model, modelsFromCli ? esc(gx.modelHelpCli(a.label)) : modelOptions.length ? esc(gx.modelHelpPreset) : '', model())
+            + (generic ? '' : field(ag.baseUrl, '', input('baseUrl', E.baseUrl, true)))
+            + field(gx.effort, esc(gx.effortHelp(cli)), choiceHtml(spec('effort')!, state('effort')))
+            + (generic ? '' : field(ag.secretName, ag.secretNameHelp, input('secretVar', E.secretVar, true)))
+            + field(gx.escalate, esc(gx.escalateHelp), choiceHtml(spec('escalate')!, state('escalate')))
+            + (generic ? '' : field(ag.maxTurns, ag.maxTurnsHelp, input('maxTurns', E.maxTurns, true))) + '</div>';
+        const read = () => {
+            for (const key of ['label', 'model', 'effort', 'baseUrl', 'secretVar', 'maxTurns'] as const) {
+                const el = sheet.root.querySelector<HTMLInputElement>(`[data-e="${key}"]`);
+                if (el) E[key] = el.value.trim();
+            }
+        };
+        const redraw = (focus?: string) => {
+            if (!sheet.root.isConnected) return;
+            const keep = focus ?? (document.activeElement instanceof HTMLElement && sheet.root.contains(document.activeElement) ? ['data-e', 'data-sel'].filter(k => document.activeElement!.hasAttribute(k)).map(k => `[${k}="${CSS.escape(document.activeElement!.getAttribute(k)!)}"]`).join('') : '');
+            sheet.setBody(body());
+            if (keep) sheet.root.querySelector<HTMLElement>(keep)?.focus({ preventScroll: true });
+        };
+        const changed = () => { read(); return (Object.keys(initial) as (keyof typeof initial)[]).some(key => E[key] !== initial[key]); };
+        const sheet: Sheet = openSheet({
             title: ag.editTitle(a.label), trigger, body: body(), note: ag.editNote(a.name), buttons: [c.cancel, ag.save], wide: true,
-            onButton: (index, s) => { if (index === 0) { s.close(); return; } void this.saveClaudeEdit(s, a); },
+            onButton: (index, s) => { if (index === 0) { s.close(); return; } void this.saveEdit(s, a, generic, () => { read(); return E; }, initial); },
             onClose: () => {
-                const val = (key: string) => (sheet.root.querySelector<HTMLInputElement>(`[data-e="${key}"]`)?.value ?? '').trim();
-                if (['label', 'model', 'baseUrl', 'secretVar', 'maxTurns'].every(key => val(key) === pre[key as keyof typeof pre].trim())) return;
+                if (!changed()) return;
                 const closeBtn = sheet.root.querySelector<HTMLElement>('.sheet-h .btn');
                 return confirmAction(ag.discardTitle, ag.discardBody, ag.discard, closeBtn ?? trigger, true).then(ok => ok ? undefined : false);
             },
         });
+        bindChoices(sheet.root, {
+            spec, state,
+            set: (key, st) => { read(); E[key as 'model'] = st.value; custom[key] = st.custom; },
+            redraw: focus => redraw(focus),
+        });
+        // 通用适配器且预设有 listModels：向程序要模型列表（失败时核心给预设的可选值）。
+        if (modelsLoading) {
+            void window.dock.console('agents:models', { name: a.name }).then((r: { models?: string[]; source?: string }) => {
+                if (Array.isArray(r.models) && r.models.length) modelOptions = r.models;
+                modelsFromCli = r.source === 'cli';
+            }).catch(() => {}).finally(() => { modelsLoading = false; read(); redraw(); });
+        }
+        return sheet;
     }
-    private async saveClaudeEdit(sheet: Sheet, a: AgentRow) {
-        const val = (key: string) => (sheet.root.querySelector<HTMLInputElement>(`[data-e="${key}"]`)?.value ?? '').trim();
-        const label = val('label');
-        if (!label) { sheet.fail(ag.labelRequired); return; }
-        const payload: Record<string, unknown> = { name: a.name, label };
-        const model = val('model'); if (model) payload.model = model;
-        const baseUrl = val('baseUrl'); if (baseUrl) payload.baseUrl = baseUrl;
-        const secretVar = val('secretVar'); if (secretVar) payload.secretVar = secretVar;
-        // 最大轮数：留空按不限制（null → 核心的 -）；其余交给核心校验（0、非数字等会拒绝，文件不变）。
-        const maxTurns = val('maxTurns'); payload.maxTurns = maxTurns === '' ? null : Number(maxTurns);
+    private async saveEdit(sheet: Sheet, a: AgentRow, generic: boolean, current: () => Record<string, string>, initial: Record<string, string>) {
+        const E = current();
+        if (!E.label) { sheet.fail(ag.labelRequired); return; }
+        const payload: Record<string, unknown> = { name: a.name, label: E.label };
+        if (generic) { if (E.model !== initial.model) payload.model = E.model; }
+        else {
+            if (E.model) payload.model = E.model;
+            if (E.baseUrl) payload.baseUrl = E.baseUrl;
+            if (E.secretVar) payload.secretVar = E.secretVar;
+            // 最大轮数：留空按不限制（null → 核心的 -）；其余交给核心校验（0、非数字等会拒绝，文件不变）。
+            payload.maxTurns = E.maxTurns === '' ? null : Number(E.maxTurns);
+        }
+        // 推理强度、升级到：选"默认""不升级"时传空串，核心删掉这一项。
+        if (E.effort !== initial.effort) payload.effort = E.effort;
+        if (E.escalate !== initial.escalate) payload.escalate = E.escalate;
         sheet.busy(true);
         try {
             await window.dock.console('agents:update', payload);
@@ -196,41 +280,88 @@ export class AgentsView {
     }
 }
 
-// ---------- 导入 Agent 向导（任务 005）：选类型 → 填参数 → 测试连接 ----------
-// 预设卡片的名字、说明、"推荐"来自核心（agents:presets），这里不写任何服务商名。
+// ---------- 导入 Agent 向导（任务 005；Stage07 加 OpenAI 兼容接口、Qoder、自定义 CLI、从文件导入、模型与推理强度下拉）----------
+// 预设卡片的名字、说明、"推荐"来自核心（agents:presets），这里不写任何服务商名。"自定义 CLI"和"从文件导入"是固定的两张卡片（名字以 @ 开头，不会和预设重名）。
 // 密钥只在密码框里存在到"保存密钥"为止：调用一返回就清空，值只经 secrets:set（标准输入）交给核心。
-interface Preset { name: string; title: string; description: string; recommended: boolean; adapter: string; label: string; auth: 'login' | 'token'; env?: Record<string, string>; secrets?: Record<string, string> }
+type Preset = AgentPreset;
+// 向导的预设卡片：带 card 的预设按 card.id 合成一张（标题、说明来自 card；位置与默认预设取组里第一个，即 order 最小的）；
+// 其余预设各一张。members 是这张卡片包含的预设，卡片有"推荐"当且仅当其中任何一个是推荐。
+export interface PresetCard { id?: string; name: string; title: string; description: string; recommended: boolean; members: AgentPreset[] }
+export function presetCards(presets: AgentPreset[]): PresetCard[] {
+    const cards: PresetCard[] = [];
+    for (const x of presets) {
+        const group = x.card ? cards.find(c => c.id === x.card!.id) : undefined;
+        if (group) { group.members.push(x); group.recommended ||= x.recommended; }
+        else cards.push({ id: x.card?.id, name: x.name, title: x.card?.title ?? x.title, description: x.card?.description ?? x.description, recommended: x.recommended, members: [x] });
+    }
+    return cards;
+}
+// 第 2 步第一行：合并卡片的分段按钮（套餐 / 认证方式 / 版本）；attr 是按钮上放预设名的属性，字段说明是当前预设的 variant.help。
+export function variantField(card: PresetCard | undefined, selected: string, attr: string, disabled = false): string {
+    if (!card || card.members.length < 2) return '';
+    const current = card.members.find(m => m.name === selected) ?? card.members[0];
+    const buttons = card.members.map(m => `<button ${attr}="${esc(m.name)}" class="${m === current ? 'on' : ''}" aria-pressed="${m === current}" ${disabled ? 'disabled' : ''}>${esc(m.variant?.option ?? m.name)}</button>`).join('');
+    return field(current.variant?.label ?? '', esc(current.variant?.help ?? ''), `<div class="segm">${buttons}</div>`);
+}
 type TestResult = { ok: true; seconds: number; version: string | null; model: string | null; usage: { input: number | null; output: number | null } | null } | { ok: false; reason: string; seconds?: number; exit?: number | null };
+const CUSTOM_CARD = '@custom', FILE_CARD = '@file';
 
-export function openImportWizard(trigger: HTMLElement, existing: string[], done: () => void) {
+export function openImportWizard(trigger: HTMLElement, existing: string[], done: () => void, initialCard?: string) {
     let step = 1, presets: Preset[] = [], selected = '', busy = false;
-    let added = '', madeDefault = false, dirty = false, result: TestResult | null = null, testing = false;
-    const form = { name: '', label: '', model: '', baseUrl: '', secretVar: '', auth: 'token' as 'login' | 'token' };
+    let added = '', madeDefault = false, dirty = false, result: TestResult | null = null, testing = false, fromFile = false;
+    const form = { name: '', label: '', model: '', baseUrl: '', secretVar: '', effort: '', auth: 'token' as 'login' | 'token' };
+    const custom: Record<string, boolean | undefined> = {};
     let secretState: 'set' | 'missing' | null = null, login: string | null = null;
     const preset = () => presets.find(x => x.name === selected);
+    const cardList = () => presetCards(presets);
+    const cards = () => [...cardList().map(x => x.name), CUSTOM_CARD, FILE_CARD];
+    const cardOf = () => cardList().find(c => c.members.some(m => m.name === selected));
     const stepsHtml = () => `<span class="wiz-steps in-sheet">${ag.steps.map((t, i) => `<span class="${i + 1 === step ? 'on' : i + 1 < step ? 'done' : ''}"><b>${i + 1 < step ? icon('check-line') : i + 1}</b>${esc(t)}</span>`).join('<span class="ln"></span>')}</span>`;
     const uniqueName = (base: string) => { let name = base, n = 2; while (existing.includes(name)) name = `${base}-${n++}`; return name; };
     const val = (key: string) => (sheet.root.querySelector<HTMLInputElement>(`[data-w="${key}"]`)?.value ?? '').trim();
-    const readForm = () => { for (const key of ['name', 'label', 'model', 'baseUrl', 'secretVar'] as const) if (sheet.root.querySelector(`[data-w="${key}"]`)) form[key] = val(key); };
+    const readForm = () => { for (const key of ['name', 'label', 'model', 'baseUrl', 'secretVar', 'effort'] as const) if (sheet.root.querySelector(`[data-w="${key}"]`)) form[key] = val(key); };
     const ready = () => form.auth === 'token' ? secretState === 'set' : login === 'in';
     const footBtn = (label: string, action: string, primary = false, disabled = false, tip = '') => `<button class="btn ${primary ? 'primary' : ''}" data-w-act="${action}" ${disabled || busy ? 'disabled' : ''} ${tip ? `title="${esc(tip)}"` : ''}>${esc(label)}</button>`;
-    const preset1 = (x: Preset) => `<button class="preset ${x.name === selected ? 'on' : ''}" role="radio" aria-checked="${x.name === selected}" data-preset="${esc(x.name)}" tabindex="${x.name === selected ? 0 : -1}"><span class="rd ${x.name === selected ? 'on' : ''}"></span><span class="pk"><b>${esc(x.title)}${x.recommended ? `<span class="tag brand">${esc(ag.recommended)}</span>` : ''}</b><span>${esc(x.description)}</span></span></button>`;
+    // name 是卡片的预设名（合并卡片取默认预设）；members 是卡片里的预设名，选中的预设在其中就算这张卡片选中。
+    const preset1 = (name: string, title: string, description: string, recommended: boolean, members: string[] = [name], cardId?: string) => `<button class="preset ${members.includes(selected) ? 'on' : ''}" role="radio" aria-checked="${members.includes(selected)}" data-preset="${esc(name)}" ${cardId ? `data-card="${esc(cardId)}"` : ''} tabindex="${members.includes(selected) ? 0 : -1}"><span class="rd ${members.includes(selected) ? 'on' : ''}"></span><span class="pk"><b>${esc(title)}${recommended ? `<span class="tag brand">${esc(ag.recommended)}</span>` : ''}</b><span>${esc(description)}</span></span></button>`;
     const input = (key: string, value: string, { mono = true, ph = '', type = 'text', label = '' } = {}) => `<input class="inp${mono ? ' mono' : ''}" data-w="${key}" type="${type}" value="${esc(value)}" placeholder="${esc(ph)}" aria-label="${esc(label)}">`;
+    // 下拉的可选值全来自预设（modelOptions / effortOptions / baseUrlOptions）。
+    const spec = (key: string): ChoiceSpec | undefined => {
+        const x = preset(); if (!x) return;
+        if (key === 'model') return { key, attr: 'data-w', opts: (x.modelOptions ?? []).map(value => ({ value })), label: ag.model };
+        if (key === 'effort') return { key, attr: 'data-w', lead: [{ value: '', label: gx.effortDefault, desc: gx.effortDefaultDesc }], opts: (x.effortOptions ?? []).map(value => ({ value })), label: gx.effort };
+        if (key === 'baseUrl') return { key, attr: 'data-w', opts: (x.baseUrlOptions ?? []).map(value => ({ value })), label: gx.baseUrl, ph: 'https://' };
+    };
+    const state = (key: string): Choice => {
+        const value = form[key as 'model'], opts = [...(spec(key)?.opts ?? [])].map(o => o.value);
+        return { value, custom: custom[key] ?? (value !== '' && opts.length > 0 && !opts.includes(value)) };
+    };
+    const qoderSite = (x: Preset) => /qoder\.(cn|com)/.exec(x.description)?.[0] ?? (x.name === 'qoder-cn' ? 'qoder.cn' : 'qoder.com');
     const body = () => {
-        if (step === 1) return `<p class="sheet-lead">${esc(ag.pickHelp)}</p><div class="presets" role="radiogroup" aria-label="${esc(ag.steps[0])}">${presets.map(preset1).join('')}</div>`;
+        if (step === 1) return `<p class="sheet-lead">${esc(ag.pickHelp)}</p><div class="presets" role="radiogroup" aria-label="${esc(ag.steps[0])}">${cardList().map(x => preset1(x.name, x.title, x.description, x.recommended, x.members.map(m => m.name), x.id)).join('')}${preset1(CUSTOM_CARD, gx.custom, gx.customDesc, false)}${preset1(FILE_CARD, gx.fromFile, gx.fromFileDesc, false)}</div>`;
         const x = preset()!;
         if (step === 2) {
             const rows: string[] = [];
-            if (x.adapter === 'codex') rows.push(field(ag.auth, '', `<div class="segm">${[['login', ag.authLogin], ['token', ag.authToken]].map(([k, l]) => `<button data-w-auth="${k}" class="${form.auth === k ? 'on' : ''}" aria-pressed="${form.auth === k}">${esc(l)}</button>`).join('')}</div>`));
-            else rows.push(field(ag.auth, '', `<div class="segm"><button class="on" aria-pressed="true">${esc(ag.authToken)}</button><button disabled title="${esc(ag.authTokenOnly(x.title))}">${esc(ag.authLogin)}</button></div>`));
+            const variant = variantField(cardOf(), selected, 'data-w-variant', !!added);
+            if (variant) rows.push(variant);
+            const openai = x.baseUrlOptions !== undefined, generic = x.adapter === 'generic', claude = x.adapter === 'claude-code';
+            if (x.adapter === 'codex' && !openai) rows.push(field(ag.auth, '', `<div class="segm">${[['login', ag.authLogin], ['token', ag.authToken]].map(([k, l]) => `<button data-w-auth="${k}" class="${form.auth === k ? 'on' : ''}" aria-pressed="${form.auth === k}">${esc(l)}</button>`).join('')}</div>`));
             if (form.auth === 'login') rows.push(field(ag.loginState, '', `<div class="statusline">${login === 'in' ? mark('ok') : mark('fail')}<span>${esc(login === 'in' ? ag.loginIn : login === 'out' ? ag.loginOut(x.adapter === 'codex' ? 'codex login' : 'claude setup-token') : ag.loginUnknown)}</span><button class="btn sm" data-w-act="redetect">${icon('refresh-line')}${esc(ag.redetect)}</button></div>`));
             rows.push(field(ag.name, ag.nameHelp, input('name', form.name, { label: ag.name })));
             rows.push(field(ag.label, ag.labelHelp, input('label', form.label, { mono: false, label: ag.label })));
-            if (x.adapter === 'claude-code') { rows.push(field(ag.model, '', input('model', form.model, { label: ag.model }))); rows.push(field(ag.baseUrl, '', input('baseUrl', form.baseUrl, { label: ag.baseUrl }))); }
-            else rows.push(field(ag.model, ag.modelFollow, input('model', form.model, { ph: ag.followCodex, label: ag.model })));
+            if (openai) {
+                rows.push(field(gx.baseUrl, esc(gx.baseUrlHelp), choiceHtml(spec('baseUrl')!, state('baseUrl')), true));
+                rows.push(field(ag.model, '', input('model', form.model, { label: ag.model }), true));
+                rows.push(field(gx.wireApi, '', `<div class="statusline"><span class="mono">${esc(gx.wireApiValue)}</span><span class="muted">${esc(gx.wireApiHelp)}</span></div>`));
+            } else if (claude || generic) {
+                rows.push(field(ag.model, esc(gx.modelHelpPreset), choiceHtml(spec('model')!, state('model'))));
+                if (claude) rows.push(field(ag.baseUrl, '', input('baseUrl', form.baseUrl, { label: ag.baseUrl })));
+                rows.push(field(gx.effort, esc(gx.effortHelp(generic ? x.title : x.adapter)), choiceHtml(spec('effort')!, state('effort'))));
+            } else rows.push(field(ag.model, ag.modelFollow, input('model', form.model, { ph: ag.followCodex, label: ag.model })));
             if (form.auth === 'token') {
                 const tag = secretState === 'set' ? `<span class="tag ok" data-w-status>${esc(ag.keySet)}</span>` : `<span class="tag fail" data-w-status>${esc(ag.keyMissing)}</span>`;
-                rows.push(field(ag.secretName, ag.secretNameHelp, `<div class="statusline">${input('secretVar', form.secretVar, { label: ag.secretName })}${tag}</div>`));
+                const help = generic && /^qoder/.test(x.name) ? esc(gx.qoderTokenHelp(qoderSite(x), form.secretVar || '…')) : ag.secretNameHelp;
+                rows.push(field(ag.secretName, help, `<div class="statusline">${input('secretVar', form.secretVar, { label: ag.secretName })}${tag}</div>`));
                 rows.push(field(ag.secretSet, ag.secretSetHelp, `<div class="statusline">${input('secret', '', { mono: false, type: 'password', ph: ag.secretPlaceholder, label: ag.secretSet })}<button class="btn" data-w-act="save-secret" ${busy ? 'disabled' : ''}>${esc(ag.secretSave)}</button></div>`));
             }
             return `<div class="form">${rows.join('')}</div>`;
@@ -245,9 +376,10 @@ export function openImportWizard(trigger: HTMLElement, existing: string[], done:
         if (step === 1) return footBtn(c.cancel, 'cancel') + footBtn(p.next, 'next', true, !selected);
         if (step === 2) return footBtn(p.previous, 'back', false, !!added) + footBtn(p.next, 'next', true, !ready(), ready() ? '' : form.auth === 'token' ? ag.needSecret : ag.needLogin);
         if (testing) return footBtn(p.previous, 'back', false, true) + footBtn(ag.testing, 'none', true, true);
-        return result?.ok ? footBtn(ag.done, 'done', true) : footBtn(ag.back, 'edit') + footBtn(ag.retest, 'retest', true);
+        // 从文件导入的执行者没有"第 2 步"可回：失败时只能完成（配置已保存）或重新测试。
+        return result?.ok ? footBtn(ag.done, 'done', true) : (fromFile ? footBtn(ag.done, 'done') : footBtn(ag.back, 'edit')) + footBtn(ag.retest, 'retest', true);
     };
-    const note = () => step === 3 && result && !result.ok ? ag.savedNote : step === 2 && form.auth === 'login' ? ag.subscriptionShare : '';
+    const note = () => step === 3 && result && !result.ok ? ag.savedNote : step === 2 && form.auth === 'login' ? ag.subscriptionShare : step === 2 && preset()?.baseUrlOptions !== undefined ? gx.openaiNote : '';
     const draw = (focus?: string) => {
         if (!sheet.root.isConnected) return;
         sheet.root.querySelector('.sheet-h .wiz-steps')?.replaceWith(Object.assign(document.createElement('span'), { innerHTML: stepsHtml() }).firstElementChild!);
@@ -262,15 +394,29 @@ export function openImportWizard(trigger: HTMLElement, existing: string[], done:
     };
     const refreshLogin = async () => { try { login = (await window.dock.preferences('detect')).codex.login; } catch { login = 'unknown'; } };
     const choose = async (name: string) => {
-        selected = name; const x = preset()!;
-        form.name = uniqueName(x.name); form.label = x.label; form.model = x.env?.ANTHROPIC_MODEL ?? ''; form.baseUrl = x.env?.ANTHROPIC_BASE_URL ?? '';
-        form.secretVar = Object.values(x.secrets ?? {})[0] ?? (x.adapter === 'codex' ? 'OPENAI_API_KEY' : ''); form.auth = x.auth;
+        selected = name;
+        for (const key of Object.keys(custom)) delete custom[key];
+        const x = preset(); if (!x) return;
+        form.name = uniqueName(x.name); form.label = x.label; form.model = x.env?.ANTHROPIC_MODEL ?? x.model ?? ''; form.baseUrl = x.env?.ANTHROPIC_BASE_URL ?? x.baseUrlOptions?.[0] ?? '';
+        form.effort = x.effort ?? '';
+        form.secretVar = Object.values(x.secrets ?? {})[0] ?? (x.adapter === 'codex' && x.baseUrlOptions === undefined ? 'OPENAI_API_KEY' : ''); form.auth = x.auth;
     };
     const toTest = async () => {
         step = 3; testing = true; result = null; draw();
         try { const r = await window.dock.console('agents:test', { name: added }); result = { ok: true, seconds: r.seconds, version: r.version ?? null, model: r.model ?? null, usage: r.usage ?? null }; }
         catch (e) { result = { ok: false, reason: String((e as Error).message || e) }; }
         testing = false; draw();
+    };
+    const problems = (r: { errors?: { path: string; message: string }[]; error?: string }) => (r.errors?.length ? r.errors.slice(0, 3).map(e => `${e.path}：${e.message}`).join('；') : r.error) ?? '';
+    const importFile = async () => {
+        busy = true; draw();
+        try {
+            const r = await window.dock.console('agents:import-file');
+            if (r.cancelled) { busy = false; draw(); return; }
+            if (r.ok === false) { busy = false; draw(); sheet.fail(problems(r)); return; }
+            added = r.name; madeDefault = !!r.madeDefault; fromFile = true; form.label = r.name;
+            busy = false; await toTest();
+        } catch (e) { busy = false; draw(); fail(e); }
     };
     const act = async (action: string) => {
         sheet.fail('');
@@ -296,6 +442,13 @@ export function openImportWizard(trigger: HTMLElement, existing: string[], done:
         }
         if (action === 'next' && step === 1) {
             if (!selected) return;
+            if (selected === CUSTOM_CARD) {
+                // 自定义 CLI 是另一张宽表单：关掉向导（不刷新列表），"上一步"回到向导并选中这张卡片。
+                finished = true; sheet.close();
+                openCustomForm({ trigger, existing, onDone: () => done(), onBack: () => { openImportWizard(trigger, existing, done, CUSTOM_CARD); } });
+                return;
+            }
+            if (selected === FILE_CARD) return importFile();
             step = 2; busy = true; draw();
             if (form.auth === 'token') await refreshSecret(); else await refreshLogin();
             busy = false; draw(); return;
@@ -303,12 +456,19 @@ export function openImportWizard(trigger: HTMLElement, existing: string[], done:
         if (action === 'next' && step === 2) {
             readForm(); const x = preset()!;
             const fields: Record<string, unknown> = { label: form.label };
-            if (x.adapter === 'claude-code') { if (form.model) fields.model = form.model; if (form.baseUrl) fields.baseUrl = form.baseUrl; }
+            if (x.baseUrlOptions !== undefined) { fields.baseUrl = form.baseUrl; fields.model = form.model; }
+            else if (x.adapter === 'claude-code') { if (form.model) fields.model = form.model; if (form.baseUrl) fields.baseUrl = form.baseUrl; }
             else if (form.model) fields.model = form.model;
+            // 推理强度：选"默认"时新增不传；回到这一步改回"默认"后再保存，要把已写进去的 effort 清掉。
+            if (['claude-code', 'generic'].includes(x.adapter) && (form.effort || added)) fields.effort = form.effort;
             if (form.auth === 'token' && form.secretVar) fields.secretVar = form.secretVar;
             busy = true; draw();
             try {
-                if (!added) { const r = await window.dock.console('agents:add', { preset: x.name, name: form.name, ...fields, ...(x.adapter === 'codex' ? { auth: form.auth } : {}) }); added = r.name; madeDefault = !!r.madeDefault; }
+                if (!added) {
+                    const { effort, ...rest } = fields;
+                    const r = await window.dock.console('agents:add', { preset: x.name, name: form.name, ...rest, ...(effort ? { effort } : {}), ...(x.adapter === 'codex' && x.baseUrlOptions === undefined ? { auth: form.auth } : {}) });
+                    added = r.name; madeDefault = !!r.madeDefault;
+                }
                 else await window.dock.console('agents:update', { name: added, ...fields });
                 dirty = false; busy = false; await toTest();
             } catch (e) { busy = false; draw(); fail(e); }
@@ -325,25 +485,58 @@ export function openImportWizard(trigger: HTMLElement, existing: string[], done:
         if (added && !finished) done();
         return true;
     };
+    const mark = (state: string) => `<span class="mk ${state}">${icon(({ ok: 'checkbox-circle-line', fail: 'close-circle-line', info: 'information-line', run: 'loader-4-line' } as Record<string, string>)[state])}</span>`;
     const sheet: Sheet = openSheet({ title: ag.wizardTitle, trigger, steps: stepsHtml(), body: `<div class="testbox">${mark('run')}<div><b>${esc(p.detecting)}</b></div></div>`, buttons: [c.cancel], wide: true,
         // 底栏按钮由下面的点击监听按 data-w-act 处理；只有打开时那个还没换掉的"取消"走这里。
         onButton: () => { if (!sheet.root.querySelector('[data-w-act]')) void close(); }, onClose });
     sheet.root.addEventListener('click', e => {
         const b = (e.target as Element).closest<HTMLButtonElement>('button'); if (!b || b.disabled) return;
-        if (b.dataset.preset) { void choose(b.dataset.preset).then(() => draw(`[data-preset="${CSS.escape(b.dataset.preset!)}"]`)); return; }
+        if (b.dataset.preset) {
+            // 点已选中的合并卡片：保留第 2 步里已选的那个预设，不重置回默认。
+            if (b.dataset.card && cardOf()?.id === b.dataset.card) { draw(`[data-preset="${CSS.escape(b.dataset.preset)}"]`); return; }
+            void choose(b.dataset.preset).then(() => draw(`[data-preset="${CSS.escape(b.dataset.preset!)}"]`)); return;
+        }
+        // 第 2 步的分段按钮：等于改选这个预设，整张表单按它重新填默认值并重新检测密钥 / 登录，焦点留在刚点的按钮上。
+        if (b.dataset.wVariant) {
+            const name = b.dataset.wVariant;
+            if (name === selected) return;
+            void choose(name).then(async () => { dirty = true; if (form.auth === 'token') await refreshSecret(); else await refreshLogin(); draw(`[data-w-variant="${CSS.escape(name)}"]`); });
+            return;
+        }
         if (b.dataset.wAuth) { readForm(); form.auth = b.dataset.wAuth as 'login' | 'token'; dirty = true; void (form.auth === 'token' ? refreshSecret() : refreshLogin()).then(() => draw(`[data-w-auth="${form.auth}"]`)); return; }
         if (b.dataset.wAct) { e.stopPropagation(); void act(b.dataset.wAct).catch(fail); }
     });
+    // 模型、推理强度、接口地址的下拉：选完把值记进 form（先读走输入框里已经敲的内容），重画并把焦点放回这个控件。
+    bindChoices(sheet.root, {
+        spec, state,
+        set: (key, st) => { readForm(); form[key as 'model'] = st.value; custom[key] = st.custom; dirty = true; },
+        redraw: focus => draw(focus),
+    });
     sheet.root.addEventListener('input', e => { const t = e.target as HTMLElement; if (t.matches('[data-w]') && (t as HTMLInputElement).type !== 'password') dirty = true; });
-    sheet.root.addEventListener('change', e => { if ((e.target as HTMLElement).matches('[data-w="secretVar"]')) { readForm(); void refreshSecret().then(() => draw('[data-w="secretVar"]')); } });
+    // 密钥变量名改了：重新读一次状态再重画。这段时间里用户可能已经 Tab 到别的输入框并开始敲字，所以重画前再读一次表单，焦点留在现在的输入框。
+    sheet.root.addEventListener('change', e => {
+        if (!(e.target as HTMLElement).matches('[data-w="secretVar"]')) return;
+        readForm();
+        void refreshSecret().then(() => {
+            readForm();
+            const now = document.activeElement instanceof HTMLElement && sheet.root.contains(document.activeElement) ? document.activeElement.dataset.w : undefined;
+            draw(`[data-w="${now ?? 'secretVar'}"]`);
+        });
+    });
     // 方向键在预设卡片之间移动并选中（单选组的键盘约定）。
     sheet.root.addEventListener('keydown', e => {
         const card = (e.target as Element).closest<HTMLElement>('[data-preset]'); if (!card || !['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
-        e.preventDefault(); const i = presets.findIndex(x => x.name === card.dataset.preset), next = presets[(i + (['ArrowDown', 'ArrowRight'].includes(e.key) ? 1 : -1) + presets.length) % presets.length];
-        void choose(next.name).then(() => draw(`[data-preset="${CSS.escape(next.name)}"]`));
+        e.preventDefault(); const names = cards(), i = names.indexOf(card.dataset.preset!), next = names[(i + (['ArrowDown', 'ArrowRight'].includes(e.key) ? 1 : -1) + names.length) % names.length];
+        void choose(next).then(() => draw(`[data-preset="${CSS.escape(next)}"]`));
     });
     void (async () => {
-        try { presets = (await window.dock.console('agents:presets')).presets; const rec = presets.find(x => x.recommended) ?? presets[0]; if (rec) await choose(rec.name); draw(); }
+        try {
+            presets = (await window.dock.console('agents:presets')).presets;
+            const list = cardList();
+            const first = initialCard && (cards().includes(initialCard) || presets.some(x => x.name === initialCard)) ? initialCard : (list.find(x => x.recommended) ?? list[0])?.name;
+            if (first) await choose(first);
+            draw();
+        }
         catch (e) { draw(); fail(e); }
     })();
     return sheet;

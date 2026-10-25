@@ -2,7 +2,7 @@
 // （汇报、进度页脚、gate / end 事件、退出码）。规则见文件协议第 14 节（14.1、14.2）。
 // 停止信号放在这里：它要同时覆盖执行者运行与门禁验收命令，从第一次启动执行者起一直有效到任务结束。
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { clip, formatProgress, progressFooter } from './progress.mjs';
 import { killProcessTree } from './process.mjs';
 import { runGate } from './gate.mjs';
@@ -11,7 +11,8 @@ import { runOnce } from './runner.mjs';
 import { attemptPaths } from './records.mjs';
 import { buildPrompt } from './retry-prompt.mjs';
 import { adapterFor } from '../adapters/index.mjs';
-import { buildEnv, ensureSandboxHome } from './env.mjs';
+import { supportsReadOnly } from './router.mjs';
+import { buildEnv, ensureSandboxHome, withProxy } from './env.mjs';
 import { reverseRows } from './wait.mjs';
 import { needsScopeLine, parseNeedsScope } from './needs-scope.mjs';
 import { readConfig, slotLimits } from './config.mjs';
@@ -39,6 +40,8 @@ export async function pipeline(ctx) {
   const {
     root, paths, id, registry, progress, started, interactive, home,
     adapter, label, profile, profileName, settings, detection, childEnv, env, envError,
+    // 派发 / 手动重试启动前算出的网络代理（Stage07 099）；没传时按"没有代理"。
+    proxy = null,
     prompt, gateInfo, onGate,
     maxRetries = 0, escalate = null, sources = [], retry = null, worktree = null,
     // 工作区外写入检查列的用户目录根：核心进程的 os.homedir()（不是交给执行者的沙箱目录），ctx 里可替换（测试用）。
@@ -72,8 +75,13 @@ export async function pipeline(ctx) {
     for (const line of formatProgress(unified)) progress(line, at);
   };
 
+  // 调研 / 审查类任务（Stage07 105）：以只读模式运行，门禁不允许任何改动。信息来自门禁信息的 readOnly 字段（派发时算好，重试沿用）。
+  const readOnly = gateInfo?.readOnly === true;
+
   // 当前执行者：最后一次自动重试可以换成 escalate（协议 14.1）；每次尝试用它构造命令与环境。
   let run = { adapter, label, profile, profileName, settings, detection, childEnv, envError };
+  // 上一次启动执行者用的代理变量（比较用）：变了才重建环境，所以不用代理（off）时环境永远是原来那份。
+  let lastProxyEnv = proxy?.env ?? {};
   let stopping = false;
   let agentPid = null;
   // 门禁进行中当前验收命令的 pid；没有门禁命令在跑时是 null（回调见 runGate 的 onSpawn）。
@@ -117,6 +125,9 @@ export async function pipeline(ctx) {
     }
   };
 
+  // 准备命令与验收命令的额外环境变量（只在 worktree 模式）：主工作区（项目根）与这个任务的 worktree 的绝对路径。
+  const worktreeEnv = dir => (worktree ? { AR_BASE_REPO: resolve(root), AR_WORKTREE: resolve(dir) } : undefined);
+
   // 工作目录：非 worktree 模式就是项目根；worktree 模式先排队占任务名额，建 worktree、跑准备命令，之后换成 worktree 目录（协议 15.2、15.4、15.5）。
   let workdir = root;
   if (worktree) {
@@ -142,13 +153,16 @@ export async function pipeline(ctx) {
       for (const [signal, handler] of handlers) process.off(signal, handler);
       emit({ kind: 'error', text: `合并 ${baseBranch} 失败：${merged.error}` });
       const code = finish({ exitCode: 1, attempts: 0, label: run.label });
-      registry({ event: 'conflict', id, files: retry.rebase.files ?? [], at: Date.now() });
+      // 失败 / 已中断的任务（不是从冲突来的）不补 conflict 事件：它们以这次失败结束，状态仍是失败。
+      if (retry.rebase.fromConflict !== false) registry({ event: 'conflict', id, files: retry.rebase.files ?? [], at: Date.now() });
       return code;
     }
     rebased = merged.conflicts;
     progress(rebased.length
       ? `合并 ${baseBranch}（${newBase.slice(0, 7)}）：${rebased.length} 个文件有冲突（${rebased.slice(0, 5).join('、')}），交给执行者解决`
-      : `合并 ${baseBranch}（${newBase.slice(0, 7)}）：没有冲突，只重跑门禁`);
+      : retry.rebase.fromConflict === false
+        ? `合并 ${baseBranch}（${newBase.slice(0, 7)}）后重跑门禁`
+        : `合并 ${baseBranch}（${newBase.slice(0, 7)}）：没有冲突，只重跑门禁`);
   }
 
   let ranGate = false;   // 整个任务是否跑过门禁（跑过的 end 另有 agentExit，协议第 2 节）
@@ -167,13 +181,27 @@ export async function pipeline(ctx) {
     const reason = rebased && n === firstN ? (rebased.length ? 'conflict' : 'rebase')
       : retry && n === firstN ? 'manual' : n === 1 ? 'first' : failure?.kind === 'gate' ? 'gate' : 'agent';
 
+    // 网络代理（Stage07 099）：这个进程里的第 2 次起的每次尝试都重新读一次（system 模式下系统代理可能已经变了）。
+    // 第一次尝试用启动前算好的环境；之后算出的代理变量和上一次不同才重建环境（没变就沿用，off 时永远不重建）。
+    const fresh = n > firstN ? withProxy(env, home) : null;
+    const proxyChanged = !!fresh && JSON.stringify(fresh.proxy.env) !== JSON.stringify(lastProxyEnv);
+    if (fresh) lastProxyEnv = fresh.proxy.env;
+    let upgradedNow = false;
+
     // 升级：只在最后一次自动重试换用 escalate（协议 14.1）；手动重试不升级。
     // 换执行者失败的其他原因（适配器不支持、缺密钥、检测出错）与"目标不存在或未启用"
     // 用同一行进度文案，不另写（协议 14.1）。
     if (!retry && n > 1 && n === total && escalate?.name) {
-      const upgraded = await tryEscalate(escalate, { run, env, home, settings, sources });
-      if (upgraded) run = upgraded;
+      const upgraded = await tryEscalate(escalate, { run, env: fresh.base, home, settings, sources, readOnly });
+      if (upgraded) { run = upgraded; upgradedNow = true; }
       else progress(`升级：${escalate.name} 没有启用，继续用 ${run.label}`);
+    }
+    if (proxyChanged && !upgradedNow && !run.envError) {
+      try {
+        const rebuilt = buildEnv({ base: fresh.base, profile: run.profile, adapter: run.adapter, home, profileName: run.profileName, sources });
+        ensureSandboxHome(rebuilt, { home, profileName: run.profileName });
+        run = { ...run, childEnv: rebuilt };
+      } catch { /* 重建失败（例如密钥后来被删了）：沿用上一次的环境。 */ }
     }
 
     // attempt 事件（协议 14.2 第 1 条）：第 1 次也写（reason: "first"），在 spawned 之前；
@@ -201,10 +229,10 @@ export async function pipeline(ctx) {
     // 工作区外写入检查（协议 12.4）：启动执行者之前先列一遍用户目录根与公共目录根的第一层。
     const rootsBefore = snapshotRoots({ userHome, home });
     lastRun = rebaseOnly ? { exit: 0, lastSay: null, result: null, stderrTail: '', startFailed: false } : await runOnce({
-      adapter: run.adapter, label: run.label, profile: run.profile, settings: run.settings, detection: run.detection,
-      workdir, childEnv: run.childEnv, paths, registry, id,
+      adapter: run.adapter, label: run.label, profile: run.profile, profileName: run.profileName, settings: run.settings, detection: run.detection,
+      workdir, childEnv: run.childEnv, paths, registry, id, progress,
       prompt: attemptPrompt, envError: run.envError, emit, errors: attemptErrors, mapLine, stopped,
-      attempt: n, attemptFiles: attempt,
+      attempt: n, attemptFiles: attempt, readOnly,
       onSpawn: installSignals,
       // 只弹一次进度窗口（本进程的第一次尝试；手动重试是新进程，从第 firstN 次起弹一次）。
       beforeSpawn: n === firstN ? () => {
@@ -245,7 +273,7 @@ export async function pipeline(ctx) {
             root: workdir, base: gateInfo.base, spec: gateInfo.merged, env,
             // 去掉当前执行者配置 secrets 里的键与来源变量名（协议 12.2）。
             dropEnv: Object.entries(run.profile.secrets ?? {}).flatMap(([key, value]) => [key, value]),
-            dir: attempt.dir, attempt: n, outsideWrites: outsideField(outside),
+            dir: attempt.dir, attempt: n, outsideWrites: outsideField(outside), extraEnv: worktreeEnv(workdir), readOnly,
             onSpawn: pid => {
               gatePid = pid;
               // 停止信号已经到达时，刚启动的命令立即结束（门禁循环随后由进程退出结束）。
@@ -281,7 +309,7 @@ export async function pipeline(ctx) {
     // 这次的汇报写到 attempts/<n>/report.md，顶层 report.md 保持"最新"（协议 14.2 第 3、4 条）：
     // 不自己写汇报的执行者由核心写（同样写这里）；这次没有汇报就保留上一次的。
     if (!run.adapter.writesReport && !rebaseOnly) {
-      const text = run.adapter.finish ? run.adapter.finish({ lastSay: lastRun.lastSay, result: lastRun.result }) : lastRun.lastSay;
+      const text = run.adapter.finish ? run.adapter.finish({ lastSay: lastRun.lastSay, result: lastRun.result, stdoutText: lastRun.stdoutText }) : lastRun.lastSay;
       if (text != null) writeFileSync(attempt.report, text);
     }
     if (existsSync(attempt.report)) copyFileSync(attempt.report, paths.report);
@@ -380,7 +408,7 @@ export async function pipeline(ctx) {
       dir: created.dir, commands: worktree.setup, env,
       // 去掉当前执行者配置 secrets 里的键与来源变量名（同门禁，协议 15.4）。
       dropEnv: Object.entries(run.profile.secrets ?? {}).flatMap(([key, value]) => [key, value]),
-      logFile,
+      logFile, extraEnv: worktreeEnv(created.dir),
       onSpawn: pid => {
         setupPid = pid;
         // 停止信号已经到达时，刚启动的命令立即结束。
@@ -417,11 +445,14 @@ export async function pipeline(ctx) {
 
 // 升级（协议 14.1）：换成 escalate 指向的执行者配置，重新构建它的环境（密钥由它自己的 secrets 解析，
 // 064 起随后调用 ensureSandboxHome，用户目录是沙箱）、适配器与 detect。失败返回 null（不升级）。
-async function tryEscalate(escalate, { run, env, home, settings, sources }) {
+async function tryEscalate(escalate, { run, env, home, settings, sources, readOnly = false }) {
   try {
     const target = escalate.profile;
     if (!target || typeof target !== 'object') return null;
+    // 只读任务不能升级到不支持只读的执行者（与派发前的检查同一规则）。
+    if (readOnly && !supportsReadOnly(target)) return null;
     const adapter = adapterFor(target);
+    // 升级目标是 generic 时，声明已由派发进程解析进 target.genericDecl（见 run.mjs 的 resolveProfile）。
     const childEnv = buildEnv({ base: env, profile: target, adapter, home, profileName: escalate.name, sources });
     ensureSandboxHome(childEnv, { home, profileName: escalate.name });
     const detection = await adapter.detect({ env: childEnv, settings, profile: target });

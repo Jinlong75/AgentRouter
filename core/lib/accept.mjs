@@ -6,7 +6,7 @@ import { git, uncommittedFiles } from './git.mjs';
 import { readJson } from './json.mjs';
 import { registryWriter } from './records.mjs';
 import { parseSpec, validateSpec } from './spec.mjs';
-import { findTerminal, latestEvent, locateStart, worktreeOutcome } from './wait.mjs';
+import { findTerminal, latestEvent, locateStart, reverseRows, worktreeOutcome } from './wait.mjs';
 import { branchExists, removeWorktree, unmergedFiles } from './worktree.mjs';
 
 // 项目配置：<项目根>/.agent-router/project.json；不存在、读不了或不是对象都当 {}。
@@ -62,7 +62,7 @@ function cleanUp({ root, registry, id, worktree, force, deleteBranch, forceBranc
   }
 }
 
-// ar accept：检查 → 合并 → accepted 事件 → 清理。
+// ar accept：检查 → 合并 → accepted 事件 → 清理。任务分支没有新提交时不合并，改为确认（merge 为 null，mode 为 confirm）。
 // 返回 { ok: true, merge, mode, cleanup } 或冲突时 { ok: false, conflict: true, files }；检查不通过时抛出中文原因（退出码 2）。
 export function accept({ homes, root, name, squash = false, by = null, env = process.env } = {}) {
   const { file, home, start, worktree } = locateWorktreeTask(homes, root, name, '验收');
@@ -70,6 +70,8 @@ export function accept({ homes, root, name, squash = false, by = null, env = pro
   const registry = registryWriter(home);
   // 检查 1：待验收（end.exit === 0，之后没有验收事件；冲突解决后的再次待验收也是这个状态）。
   if (worktreeOutcome(file, id) !== 'awaiting') throw new Error(`任务不在待验收状态：${start.name}`);
+  // 任务分支相对基线没有新提交（调研 / 审查类任务）：没有东西可合并，改为确认（Stage07 105）。
+  if (noNewCommits({ root, file, start, worktree })) return confirm({ root, registry, id, worktree, by, env });
   const config = projectConfig(root);
   const baseBranch = config.baseBranch;
   if (typeof baseBranch !== 'string' || baseBranch.trim() === '') throw new Error('项目配置没有写 baseBranch，不知道该合并到哪个分支');
@@ -119,6 +121,37 @@ export function accept({ homes, root, name, squash = false, by = null, env = pro
   registry({ event: 'accepted', id, merge, mode, by: actor({ by, env }), at: Date.now() });
   const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: mode === 'squash' });
   return { ok: true, merge, mode, cleanup };
+}
+
+// 门禁用的基线：重新基线之后（协议 15.8）新基线写在 attempt 事件上，取最近一条带 base 的，没有就是 start.base。
+function currentBase(file, start) {
+  for (const row of reverseRows(file)) {
+    if (row.id !== start.id) continue;
+    if (row.event === 'attempt' && typeof row.base === 'string' && row.base) return row.base;
+    if (row.event === 'start') break;
+  }
+  return start.base ?? null;
+}
+
+// 任务分支相对基线是否没有新提交。基线、worktree 或分支读不到时返回 false，交给后面的合并流程报原来的错误。
+function noNewCommits({ root, file, start, worktree }) {
+  const base = currentBase(file, start);
+  if (typeof base !== 'string' || base === '' || !worktree || typeof worktree.branch !== 'string' || !branchExists(root, worktree.branch)) return false;
+  const counted = git(root, ['rev-list', '--count', `${base}..refs/heads/${worktree.branch}`]);
+  return counted.status === 0 && counted.stdout.trim() === '0';
+}
+
+// 确认（没有新提交的待验收任务）：不合并，不看主工作区在哪个分支、是否干净；worktree 里有门禁之后的未提交改动时同样拒绝；
+// 写 accepted 事件（merge 为 null，mode 为 confirm），删除 worktree 与分支（分支上没有新提交，直接 -D）。
+function confirm({ root, registry, id, worktree, by, env }) {
+  if (typeof worktree.dir !== 'string' || !existsSync(worktree.dir)) throw new Error(`worktree 已经不在了：${worktree.dir ?? '（清单里没有记录）'}`);
+  let dirtyWorktree;
+  try { dirtyWorktree = uncommittedFiles(worktree.dir); }
+  catch (error) { throw new Error(`无法检查 worktree 是否干净：${error.message}`); }
+  if (dirtyWorktree.length) throw new Error(`worktree 里有门禁之后的未提交改动，请先检查：${firstFive(dirtyWorktree)}`);
+  registry({ event: 'accepted', id, merge: null, mode: 'confirm', by: actor({ by, env }), at: Date.now() });
+  const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: true });
+  return { ok: true, merge: null, mode: 'confirm', cleanup };
 }
 
 // 撤销没做完的合并：--no-ff 用 merge --abort，squash 用 reset --merge（并删掉 squash 留下的提交信息草稿）。

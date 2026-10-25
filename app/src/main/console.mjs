@@ -2,9 +2,11 @@
 // 主进程把每个操作翻译成一条核心命令，用 coreRun 运行 core/ar.mjs … --json，结果原样或整理后交回。
 // 只做参数校验与结果映射：参数一律用数组传给 coreRun（绝不拼命令字符串），
 // 密钥值只经 input 传入，绝不进参数数组，也绝不写进日志或错误信息。
+import os from 'node:os';
 import path from 'node:path';
 import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import { parseJson } from '../../../core/lib/json.mjs';
+import { applyProxyEnv } from '../../../core/lib/proxy.mjs';
 
 // 执行者名 / 预设名：字母、数字、下划线、连字符，1～40 个字符。
 const validName = v => typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v);
@@ -20,6 +22,8 @@ const validAbsPath = v => typeof v === 'string' && !/[\r\n]/.test(v) && path.isA
 // 相对路径不能以 / 、\ 或盘符开头（Windows 下 \foo 会逃出项目根）。
 const validSpecRel = v => typeof v === 'string' && !/[\r\n]/.test(v) && v.toLowerCase().endsWith('.md') && !/^[/\\]/.test(v) && !/^[A-Za-z]:/.test(v);
 const AUTH = ['login', 'token'];
+// 任务类型（与核心 spec.mjs 的 SPEC_TYPES 一致；路由规则与试算只认这些）。
+const ROUTE_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review'];
 // 任务记录名：核心 taskDetails 的规则（可含中文与空格；不含 <>:"/\|?* 与控制字符；不以点或空格结尾；不是保留设备名）。
 // 再派一次只读取已有记录，这里再挡一次目录穿越与非法文件名。
 const validRecord = v => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[<>:"/\\|?*\x00-\x1f]/.test(v) && !/[. ]$/.test(v) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(v);
@@ -68,10 +72,34 @@ export async function sizeOf(target) {
   return (await Promise.all(names.map(name => sizeOf(path.join(target, name))))).reduce((sum, n) => sum + n, 0);
 }
 
-export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false }) {
+// 文件对话框（导入声明、导出声明、浏览程序）：默认在主进程里用 Electron 的 dialog；测试注入桩，
+// 界面验收（AR_SHOTS）把 stub 打开，对话框不弹出，改取检查预先放进 open / save 的路径（用完返回 null，相当于取消）。
+export const fileDialogs = { stub: false, open: [], save: [], openRequests: [], saveRequests: [] };
+async function electronFile(kind, options) {
+  if (fileDialogs.stub) {
+    (kind === 'open' ? fileDialogs.openRequests : fileDialogs.saveRequests).push(options);
+    return (kind === 'open' ? fileDialogs.open : fileDialogs.save).shift() ?? null;
+  }
+  const { dialog, BrowserWindow } = await import('electron');
+  if (!dialog) throw new Error('当前环境没有文件对话框');
+  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+  const args = win ? [win, options] : [options];
+  if (kind === 'open') {
+    const r = await dialog.showOpenDialog(...args);
+    return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
+  }
+  const r = await dialog.showSaveDialog(...args);
+  return r.canceled || !r.filePath ? null : r.filePath;
+}
+
+// 声明 JSON 走命令行参数：Windows 整条命令行最多 32767 个字符，留出余量。
+const MAX_DECL_CHARS = 24000;
+
+export function createConsole({ coreRun, chooseFolder, chooseFile = options => electronFile('open', options), saveFile = options => electronFile('save', options), messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false, knownTask = () => false }) {
   const invalid = () => { throw new Error(messages.invalid); };
   // 组装参数数组并调用核心，按约定整理结果。
-  const run = async (args, { input, timeoutMs, cwd, conflict = false } = {}) => {
+  // soft：核心的 ok:false 结果带着逐条的 errors / 原始输出时原样交给界面（校验、预览），不当作异常。
+  const run = async (args, { input, timeoutMs, cwd, conflict = false, soft = false, routeFailure = false } = {}) => {
     let result;
     try { result = await coreRun(args, { input, timeoutMs, cwd }); }
     catch (error) { throw new Error(messages.failed(error instanceof Error ? error.message : String(error))); }
@@ -79,8 +107,11 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
     // coreRun 超时会结束子进程并标出 timedOut（这时 json 是兜底的 { ok:false }，不能当作核心的错误显示）。
     if (timedOut) throw new Error(messages.timeout(Math.round(timeoutMs / 1000)));
     if (json && json.ok === true) { const { lines, ...rest } = json; return rest; }
+    if (soft && json && json.ok === false && (Array.isArray(json.errors) || Array.isArray(json.output))) { const { lines, ...rest } = json; return rest; }
     // 合并冲突（ar accept 退出码 4，json 为 { ok:false, conflict:true, files }）不是错误：原样交给界面显示冲突。
     if (conflict && json && json.ok === false && json.conflict === true) return { conflict: true, files: Array.isArray(json.files) ? json.files.filter(f => typeof f === 'string') : [] };
+    // 路由试算失败（没有可用的执行者，退出码 2，json 带 code / error / trace）不是通道错误：原样交给界面显示原因和 trace。
+    if (routeFailure && json && json.ok === false && Array.isArray(json.trace)) return { failed: true, code: typeof json.code === 'string' ? json.code : null, error: String(json.error ?? ''), trace: json.trace.filter(line => typeof line === 'string') };
     if (json && json.ok === false) {
       const error = new Error(json.error || messages.noResult);
       // 核心的错误码（如 NEED_GIT_IDENTITY）原样带给渲染层，界面据此显示对应的指引。
@@ -91,11 +122,36 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
   };
   // "已登记项目"的判断：调用一次 projects list --registry-only（只读登记表，不对每个项目跑 git），
   // 路径按 Windows 不区分大小写匹配；不在列表里抛 unknownProject。语义与原来调用完整 projects list 相同。
-  const registeredProject = async project => {
+  const isRegistered = async project => {
     const { projects } = await run(['projects', 'list', '--registry-only'], { timeoutMs: 60000 });
-    if (!Array.isArray(projects) || !projects.some(p => typeof p?.path === 'string' && samePath(p.path, project))) throw new Error(messages.unknownProject);
+    return Array.isArray(projects) && projects.some(p => typeof p?.path === 'string' && samePath(p.path, project));
+  };
+  // blocked：任务类的写操作（合并、重试、再派一次、合并主分支后重跑）项目被移除后换成 projectGoneBlocked 的提示。
+  const registeredProject = async (project, { blocked = false } = {}) => {
+    if (!(await isRegistered(project))) throw new Error(blocked ? messages.projectGoneBlocked : messages.unknownProject);
+  };
+  // 只"收尾"的任务操作（驳回、确认、读改动）不要求项目还在列表里：任务是主进程已读到的（仓库路径与记录名都对得上）即可；
+  // 项目仍登记着时保持原来的行为。两者都不满足仍按参数无效处理。
+  const closableTask = async (project, name) => {
+    if (await knownTask(project, name)) return;
+    if (!(await isRegistered(project))) invalid();
+  };
+  // 在此项目打开 Claude Code 的环境（Stage07 099）：核心（ar proxy resolve）算出这一刻的代理，有地址时在软件自己的环境上加代理变量。
+  // Clash 等"系统代理"模式不设环境变量，而 Claude Code 只认环境变量。算不出来（配置无效、核心没返回）不挡着打开终端，按没有代理处理。
+  const proxyLaunchEnv = async () => {
+    try {
+      const resolved = await run(['proxy', 'resolve'], { timeoutMs: 15000 });
+      return typeof resolved?.url === 'string' && resolved.url ? applyProxyEnv(process.env, resolved) : null;
+    } catch { return null; }
   };
   const oneName = p => { if (!validName(p?.name)) invalid(); return p.name; };
+  // 声明对象 → 命令行参数里的 JSON 文本（对象、单行 JSON、不超过命令行长度的余量）。
+  const declArg = decl => {
+    if (!decl || typeof decl !== 'object' || Array.isArray(decl)) invalid();
+    const text = JSON.stringify(decl);
+    if (text.length > MAX_DECL_CHARS) invalid();
+    return text;
+  };
   // 提交身份：校验规则与核心一致（用户名非空、单行、≤100 字符；邮箱含 @、没有空白与换行、≤200 字符）。
   const identityInput = (name, email) => {
     const user = typeof name === 'string' ? name.trim() : '';
@@ -117,17 +173,61 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       if (p.name !== undefined) { if (!validName(p.name)) invalid(); args.push('--name', p.name); }
       if (p.label !== undefined) { if (!validSingle(p.label)) invalid(); args.push('--label', p.label); }
       if (p.model !== undefined) { if (!validSingle(p.model)) invalid(); args.push('--model', p.model); }
+      if (p.effort !== undefined) { if (!validSingle(p.effort) || !p.effort) invalid(); args.push('--effort', p.effort); }
       if (p.baseUrl !== undefined) { if (!validSingle(p.baseUrl)) invalid(); args.push('--base-url', p.baseUrl); }
       if (p.secretVar !== undefined) { if (!validVarName(p.secretVar)) invalid(); args.push('--secret-var', p.secretVar); }
       if (p.auth !== undefined) { if (!AUTH.includes(p.auth)) invalid(); args.push('--auth', p.auth); }
       return run(args, { timeoutMs: 60000 });
     },
+    // 自定义 CLI：声明（对象）由表单组装，核心校验后写进 generics.<名> 与执行者配置。
+    async 'agents:add-generic'(p) {
+      if (!validName(p?.name)) invalid();
+      const args = ['agents', 'add', '--generic', declArg(p?.decl), '--name', p.name];
+      if (p.label !== undefined) { if (!validSingle(p.label) || !p.label) invalid(); args.push('--label', p.label); }
+      return run(args, { timeoutMs: 60000 });
+    },
+    // 以下三个只用声明，不读不写配置：校验（逐条错误交给界面）、检测程序、临时跑一次"只回复 OK"并返回映射结果。
+    async 'agents:validate-decl'(p) { return run(['agents', 'validate', '--decl', declArg(p?.decl)], { timeoutMs: 60000, soft: true }); },
+    async 'agents:detect-decl'(p) { return run(['agents', 'detect', '--decl', declArg(p?.decl)], { timeoutMs: 60000 }); },
+    async 'agents:test-decl'(p) {
+      const seconds = p?.timeout === undefined ? 60 : p.timeout;
+      if (!Number.isInteger(seconds) || seconds < 1 || seconds > 600) invalid();
+      return run(['agents', 'test', '--decl', declArg(p?.decl), '--timeout', String(seconds)], { timeoutMs: (seconds + 20) * 1000, soft: true });
+    },
+    async 'agents:models'(p) { return run(['agents', 'models', oneName(p)], { timeoutMs: 90000, soft: true }); },
+    // 文件对话框 + 导入 / 导出：选择文件在主进程里完成，渲染层拿不到任意路径读写能力。取消返回 { cancelled: true }。
+    async 'agents:choose-program'() {
+      const file = await chooseFile({ filters: [{ name: 'exe, cmd, bat, js', extensions: ['exe', 'cmd', 'bat', 'js', 'mjs'] }, { name: '*', extensions: ['*'] }] });
+      return file ? { file } : { cancelled: true };
+    },
+    async 'agents:import-file'(p) {
+      if (p?.name !== undefined && !validName(p.name)) invalid();
+      const file = await chooseFile({ filters: [{ name: 'JSON', extensions: ['json'] }] });
+      if (!file) return { cancelled: true };
+      if (!validAbsPath(file) || !file.toLowerCase().endsWith('.json')) invalid();
+      const args = ['agents', 'import', file];
+      if (p?.name !== undefined) args.push('--name', p.name);
+      if (p?.force === true) args.push('--force');
+      return { ...(await run(args, { timeoutMs: 60000, soft: true })), file };
+    },
+    async 'agents:export'(p) {
+      const name = oneName(p);
+      const file = await saveFile({ defaultPath: `${name}.json`, filters: [{ name: 'JSON', extensions: ['json'] }] });
+      if (!file) return { cancelled: true };
+      if (!validAbsPath(file)) invalid();
+      // 保存对话框已经让用户确认过覆盖，所以带 --force。
+      const result = await run(['agents', 'export', name, '--out', file, '--force'], { timeoutMs: 60000 });
+      return { ...result, file };
+    },
     async 'agents:update'(p) {
       if (!validName(p?.name)) invalid();
-      if (!['label', 'model', 'baseUrl', 'secretVar', 'maxTurns'].some(k => p[k] !== undefined)) invalid();
+      if (!['label', 'model', 'effort', 'escalate', 'baseUrl', 'secretVar', 'maxTurns'].some(k => p[k] !== undefined)) invalid();
       const args = ['agents', 'update', p.name];
       if (p.label !== undefined) { if (!validSingle(p.label)) invalid(); args.push('--label', p.label); }
       if (p.model !== undefined) { if (!validSingle(p.model)) invalid(); args.push('--model', p.model); }
+      // 推理强度：空串表示"默认"（核心删掉 effort）；升级目标：空串表示不升级。
+      if (p.effort !== undefined) { if (!validSingle(p.effort)) invalid(); args.push('--effort', p.effort); }
+      if (p.escalate !== undefined) { if (p.escalate !== '' && !validName(p.escalate)) invalid(); args.push('--escalate', p.escalate); }
       if (p.baseUrl !== undefined) { if (!validSingle(p.baseUrl)) invalid(); args.push('--base-url', p.baseUrl); }
       if (p.secretVar !== undefined) { if (!validVarName(p.secretVar)) invalid(); args.push('--secret-var', p.secretVar); }
       if (p.maxTurns !== undefined) {
@@ -141,6 +241,58 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
     async 'agents:disable'(p) { return run(['agents', 'disable', oneName(p)], { timeoutMs: 60000 }); },
     async 'agents:default'(p) { return run(['agents', 'default', oneName(p)], { timeoutMs: 60000 }); },
     async 'agents:test'(p) { return run(['agents', 'test', oneName(p), '--timeout', String(testTimeout)], { timeoutMs: (testTimeout + 20) * 1000 }); },
+    // 路由页（Stage07 T8）：读写路由配置都经核心命令 ar route …；规则 / 审查者的 JSON 作为参数数组里的一项传，不经 shell。
+    async 'route:config'() { return run(['route', 'config'], { timeoutMs: 60000 }); },
+    async 'route:rules'(p) {
+      const rules = p?.rules;
+      if (!Array.isArray(rules) || rules.length > 200) invalid();
+      for (const rule of rules) {
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) invalid();
+        if (!Array.isArray(rule.types) || !rule.types.length || rule.types.some(type => !ROUTE_TYPES.includes(type))) invalid();
+        if (!validName(rule.profile)) invalid();
+        if (rule.escalate !== undefined && rule.escalate !== null && !validName(rule.escalate)) invalid();
+        if (Object.keys(rule).some(key => !['types', 'profile', 'escalate'].includes(key))) invalid();
+      }
+      return run(['route', 'rules', 'set', JSON.stringify(rules)], { timeoutMs: 60000 });
+    },
+    // 兜底：name 为 null 表示清除（改回用默认执行者）。
+    async 'route:fallback'(p) {
+      if (p?.name === null) return run(['route', 'fallback', 'clear'], { timeoutMs: 60000 });
+      if (!validName(p?.name)) invalid();
+      return run(['route', 'fallback', 'set', p.name], { timeoutMs: 60000 });
+    },
+    async 'route:reviewer'(p) {
+      if (!Array.isArray(p?.profiles) || p.profiles.length > 50 || p.profiles.some(name => !validName(name))) invalid();
+      if (typeof p.mustDiffer !== 'boolean') invalid();
+      return run(['route', 'reviewer', 'set', JSON.stringify({ profiles: p.profiles, mustDiffer: p.mustDiffer })], { timeoutMs: 60000 });
+    },
+    // 每日上限：tasks / tokens 至少给一个；正整数是设置，null 是删除这一项（核心里用空串表示）。
+    async 'route:limit'(p) {
+      if (!validName(p?.name)) invalid();
+      const args = ['route', 'limit', 'set', p.name];
+      for (const [key, flag] of [['tasks', '--tasks'], ['tokens', '--tokens']]) {
+        if (p[key] === undefined) continue;
+        if (p[key] !== null && !(Number.isSafeInteger(p[key]) && p[key] > 0)) invalid();
+        args.push(flag, p[key] === null ? '' : String(p[key]));
+      }
+      if (args.length === 4) invalid();
+      return run(args, { timeoutMs: 60000 });
+    },
+    // 试算：只计算不派发。type 与 spec 至少给一个或都不给（直接写任务文字，看兜底）；project 不给时在系统临时目录里运行，不读任何项目自己的规则。
+    // 没有可用的执行者时返回 { failed: true, code, error, trace }，不当作通道错误。
+    async 'route:trial'(p) {
+      if (p?.type !== undefined && !ROUTE_TYPES.includes(p.type)) invalid();
+      if (p?.spec !== undefined && !validSpecRel(p.spec)) invalid();
+      if (p?.spec !== undefined && p?.type !== undefined) invalid();
+      if (p?.spec !== undefined && p?.project === undefined) invalid();
+      if (p?.project !== undefined) { if (!validAbsPath(p.project)) invalid(); await registeredProject(p.project); }
+      const args = ['route'];
+      if (p.type !== undefined) args.push('--type', p.type);
+      if (p.spec !== undefined) args.push('--spec', p.spec);
+      if (p.project !== undefined) args.push('--project', p.project);
+      args.push('--explain');
+      return run(args, { timeoutMs: 60000, cwd: p.project ?? os.tmpdir(), routeFailure: true });
+    },
     async 'secrets:status'(p) {
       const names = p?.names ?? [];
       if (!Array.isArray(names) || names.some(n => !validVarName(n))) invalid();
@@ -212,6 +364,16 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       await registeredProject(p.project);
       return run(args, { input: JSON.stringify(p.form), timeoutMs: 60000 });
     },
+    // 允许路径的匹配预览（只读）：路径数组作为 JSON 字符串传给核心，写法由核心校验；每项单行、最多 100 项。
+    async 'spec:check-paths'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!Array.isArray(p.paths) || p.paths.length > 100 || p.paths.some(item => typeof item !== 'string' || /[\r\n]/.test(item))) invalid();
+      if (p.limit !== undefined && !(Number.isSafeInteger(p.limit) && p.limit >= 0)) invalid();
+      await registeredProject(p.project);
+      const args = ['spec', 'check-paths', '--project', p.project, '--paths', JSON.stringify(p.paths)];
+      if (p.limit !== undefined) args.push('--limit', String(p.limit));
+      return run(args, { timeoutMs: 60000 });
+    },
     // 补好提交身份后，把上次已写好但没提交的任务说明补提交（新建任务页在派发前调用）。
     async 'specs:commit'(p) {
       if (!validAbsPath(p?.project) || !validSpecRel(p?.rel)) invalid();
@@ -224,7 +386,9 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       if (!validAbsPath(p?.path) || /"/.test(p.path)) invalid();
       await registeredProject(p.path);
       const command = claudeLaunch({ dir: p.path, name: path.basename(p.path), wt: await findWt() });
-      await launch(command.executable, command.args, { cwd: p.path });
+      // 网络代理（099）：有地址时终端带上代理变量；没有（不使用 / 读不到）时不传 env，终端照旧继承软件的环境。
+      const env = await proxyLaunchEnv();
+      await launch(command.executable, command.args, { cwd: p.path, ...(env ? { env } : {}) });
       return { ok: true, executable: path.basename(command.executable) };
     },
     async 'tasks:dispatch'(p) {
@@ -243,11 +407,11 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       return run(args, { timeoutMs: 60000, cwd: p.project });
     },
     // 再派一次：按记录目录里的 dispatch.json 用同样的参数重新派发（脱离软件进程）。
-    // 看板任务的仓库不在项目列表里时不做隐式登记，直接报 unknownProject，由用户先到项目页添加。
+    // 看板任务的仓库不在项目列表里时不做隐式登记，直接报 projectGoneBlocked，由用户先到项目页（或任务上的横幅）重新添加。
     async 'tasks:redispatch'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
-      await registeredProject(p.project);
+      await registeredProject(p.project, { blocked: true });
       // 软件发起的再派一次同样记为 AgentRouter（软件）。
       return run(['redispatch', p.name, '--host', 'agentrouter', '--detach'], { timeoutMs: 60000, cwd: p.project });
     },
@@ -262,18 +426,21 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
         if (typeof p.note !== 'string' || p.note.length > 20000) invalid();
         if (p.note.trim()) args.push('--note', p.note.trim());
       }
-      await registeredProject(p.project);
+      await registeredProject(p.project, { blocked: true });
       return run(args, { timeoutMs: 60000, cwd: p.project });
     },
     // 批准并合并（协议 15.6）：在项目根运行 ar accept，软件发起记为 human；合并方式由核心按项目配置的 mergeMode 决定。
-    // 成功返回 { merge, mode, cleanup }；冲突（退出码 4）返回 { conflict: true, files }；检查不通过时核心的中文原因作为错误抛出。合并大仓库可能较慢，超时 120 秒。
+    // 成功返回 { merge, mode, cleanup }（没有新提交的任务是确认：merge 为 null，mode 为 confirm）；冲突（退出码 4）返回 { conflict: true, files }；检查不通过时核心的中文原因作为错误抛出。合并大仓库可能较慢，超时 120 秒。
+    // confirm: true 是界面的"确认"流程（只读或没有新提交，主按钮本来就是"确认"）：项目被移除后仍可做；批准合并（会改项目）仍要求项目已登记。
     async 'tasks:accept'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
-      await registeredProject(p.project);
+      if (p.confirm !== undefined && typeof p.confirm !== 'boolean') invalid();
+      if (p.confirm === true) await closableTask(p.project, p.name);
+      else await registeredProject(p.project, { blocked: true });
       return run(['accept', p.name, '--by', 'human'], { timeoutMs: 120000, cwd: p.project, conflict: true });
     },
-    // 驳回（协议 15.7）：原因必填（空白不算）；keepBranch 为 true 时保留分支。
+    // 驳回（协议 15.7）：原因必填（空白不算）；keepBranch 为 true 时保留分支。项目被移除后仍可驳回（核心按任务记录里的仓库路径工作）。
     async 'tasks:reject'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
@@ -282,14 +449,15 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       const args = ['reject', p.name, '--reason', p.reason.trim()];
       if (p.keepBranch === true) args.push('--keep-branch');
       args.push('--by', 'human');
-      await registeredProject(p.project);
+      await closableTask(p.project, p.name);
       return run(args, { timeoutMs: 60000, cwd: p.project });
     },
     // 任务改动（协议 15.9）：只读，每个文件的 patch 最多 200 KB、整体最多 2 MB，超时 60 秒。
+    // 项目被移除后仍可读：验收页要靠它判断“确认”还是“批准”。
     async 'tasks:diff'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
-      await registeredProject(p.project);
+      await closableTask(p.project, p.name);
       return run(['diff', p.name], { timeoutMs: 60000, cwd: p.project });
     },
     // 链路报告（协议 16.1）：只读，分数全由核心算；任务还在进行或不是用任务说明派发的，核心拒绝，原因原样交给界面。
@@ -304,15 +472,24 @@ export function createConsole({ coreRun, chooseFolder, messages, testTimeout = 1
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
       if (!Number.isSafeInteger(p?.n) || p.n < 1 || p.n > 999) invalid();
-      if (p.who !== 'spec' && p.who !== 'worker') invalid();
+      if (p.who !== 'spec' && p.who !== 'worker' && p.who !== 'environment') invalid();
       await registeredProject(p.project);
       return run(['report', p.name, '--blame', `${p.n}=${p.who}`, '--json'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 任务的项目现在的样子（只读，不碰项目）：是否还在项目列表里、文件夹是否还在。界面据此显示“项目已移除”横幅并禁用要写项目的按钮。
+    // 任务必须是主进程已读到的任务，否则按参数无效处理。
+    async 'tasks:repo-state'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      if (!(await knownTask(p.project, p.name))) invalid();
+      const exists = await stat(p.project).then(info => info.isDirectory(), () => false);
+      return { registered: await isRegistered(p.project), exists };
     },
     // 冲突后继续（协议 15.8）：在原 worktree 里合并主分支，没有冲突就重新跑门禁，有冲突就让执行者解决；脱离派发，写法同 tasks:retry。
     async 'tasks:rebase'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
-      await registeredProject(p.project);
+      await registeredProject(p.project, { blocked: true });
       return run(['retry', p.name, '--rebase', '--host', 'agentrouter', '--detach'], { timeoutMs: 60000, cwd: p.project });
     },
     // 验收页概览用的任务说明摘要：派发参数里的允许改动与验收命令（dispatch.json 的 gate.merged），以及任务说明里"目标"的第一段。

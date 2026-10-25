@@ -9,7 +9,7 @@ import { pollUntil, type Harness } from './shots-input';
 import type { Registry } from './registry';
 import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
-import { c, gt, wt as w } from '../shared/copy';
+import { c, gt, pj, wt as w } from '../shared/copy';
 import { worktreeState, type Task, type WtState } from '../shared/types';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
@@ -253,6 +253,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             q2: { title: '排队任务二', file: '096-排队二', verify: 'git cat-file -e HEAD:src/q2.txt' },
         };
         const specText = (id: number, s: { title: string; verify: string }) => ['---', `id: 9${id}`, `title: ${s.title}`, 'type: code', 'allowed_paths:', '  - src/**', 'verify:', `  - ${s.verify}`, 'max_retries: 0', '---', '', '## 目标', '', `${s.title}：验收页检查用的任务。`, '', '## 范围 / 不做什么', '', '只改 src 下的文件。', ''].join('\n');
+        // 调研类任务（Stage07 T6）：type: research，只读运行，没有 allowed_paths 与 verify。
+        const researchSpec = (id: number, title: string) => ['---', `id: 9${id}`, `title: ${title}`, 'type: research', 'max_retries: 0', '---', '', '## 目标', '', `${title}：调研类任务的检查用说明。`, '', '## 范围 / 不做什么', '', '只读，不改任何文件。', ''].join('\n');
         await initRepo(repo, 'sample', []);
         let n = 0;
         for (const s of Object.values(specs)) { n++; await writeFile(path.join(repo, 'docs', 'specs', `${s.file}.md`), specText(n, s)); }
@@ -294,6 +296,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
                 y: { adapter: 'codex', label: '丁执行者', enabled: true, path: agentFile },
                 hold: profile('戊执行者', { releaseFile: holdFlag, releaseTimeoutMs: 120000, writes: [{ path: 'src/q1.txt', content: 'q1\n' }], commit: '戊：排队任务' }),
                 plain: profile('己执行者', {}),
+                research: profile('调研执行者', {}),
+                sneak: profile('偷改执行者', { writes: [{ path: 'src/a.txt', content: 'sneaky\n' }] }),
             },
         }, null, 2) + '\n');
         await writeConfig(2);
@@ -600,6 +604,9 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await writeFile(path.join(repo2, 'docs', 'specs', '097-准备失败.md'), specText(7, { title: '准备失败任务', verify: 'git cat-file -e HEAD:src/a.txt' }));
         git(repo2, ['add', '--', 'docs/specs']);
         git(repo2, ['commit', '-m', '任务说明', '--', 'docs/specs']);
+        // 项目要先登记：没登记的项目任务页会多一条“项目已移除”横幅（116），这里要检查的是准备失败的横幅，所以派发前就登记；检查结束时由 finally 移除。
+        await core(['projects', 'add', repo2]);
+        registered.push(repo2);
         await writeConfig(2);
         const F = await dispatchTask('097-准备失败', 'setup-fail', 'plain', repo2);
         const failEnd = await untilRow(async () => (await eventsOf(F.id)).find(r => r.event === 'end'), 'UI25 准备失败的 end', 90000);
@@ -623,9 +630,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await selectTask(F.id);
         await check('UI25 准备失败的横幅右侧有"驳回…"按钮（wt.setupFailReject）', `document.querySelector('.banner-holder .banner.fail [data-setup-reject]')?.textContent.trim() === ${jsonStr(w.setupFailReject)}`);
         const failedWt = await wtOf(F.id);
-        // 写操作只作用于已登记的项目（和验收页一样）：准备失败的测试项目先登记，检查结束时由 finally 移除。
-        await core(['projects', 'add', repo2]);
-        registered.push(repo2);
+        // 项目在派发前已登记（见上）；驳回本来也不要求项目已登记（116）。
         await press('[data-setup-reject]');
         await wait('!!document.querySelector(".sheet [data-reject-reason]")', 'UI25 准备失败的驳回弹窗');
         await check('UI25 准备失败的驳回弹窗与验收页同一个：原因必填，驳回按钮是危险样式且在原因为空时禁用', `(() => { const s = document.querySelector('.sheet'); const p = s.querySelector('[data-sheet-btn="1"]'); return s.getAttribute('aria-label') === ${jsonStr(w.rejectTitle(taskOf(F.id)!.title))} && s.querySelector('.fl em') !== null && p.classList.contains('danger') && p.disabled === true; })()`);
@@ -642,6 +647,188 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         });
         await selectTask(F.id);
         await check('UI25 准备失败的任务驳回后任务页显示已驳回（横幅是已驳回，不再有"驳回…"按钮）', `!!document.querySelector('.banner-holder .banner.stale') && !document.querySelector('[data-setup-reject]') && document.querySelector('[data-task="${F.id}"] .mk').classList.contains('stale')`);
+
+        // ================= UI24 扩展（Stage07 T6）：调研类任务只读运行，门禁通过后“确认”（不合并，只删 worktree 与分支）=================
+        console.log('验收检查进度：准备失败检查完成，开始调研类任务');
+        await writeFile(path.join(repo, 'docs', 'specs', '098-调研只读.md'), researchSpec(98, '调研只读任务'));
+        await writeFile(path.join(repo, 'docs', 'specs', '099-调研偷改.md'), researchSpec(99, '调研偷改任务'));
+        git(repo, ['add', '--', 'docs/specs/098-调研只读.md', 'docs/specs/099-调研偷改.md']);
+        git(repo, ['commit', '-m', '调研任务说明', '--', 'docs/specs/098-调研只读.md', 'docs/specs/099-调研偷改.md']);
+        const R = await dispatchTask('098-调研只读', 'research-r', 'research');
+        const S = await dispatchTask('099-调研偷改', 'research-s', 'sneak');
+        await untilState(R.id, 'awaiting', 150000);
+        const sEnd = await untilRow(async () => (await eventsOf(S.id)).find(r => r.event === 'end'), 'UI24 偷改文件的调研任务结束', 150000);
+        await verify('UI24 调研任务只读运行：start 与 dispatch.json 记 readOnly；偷改了文件的那个门禁不通过，summary 写"只读任务改动了文件"，退出码 3', async () => {
+            assert.equal(R.start.readOnly, true);
+            assert.equal(S.start.readOnly, true);
+            const dispatchJson = JSON.parse(await readFile(path.join(repo, '.agent-runs', 'research-r', 'dispatch.json'), 'utf8'));
+            assert.equal(dispatchJson.readOnly, true);
+            const gate = (await eventsOf(S.id)).findLast(r => r.event === 'gate');
+            assert.equal(gate.ok, false);
+            assert.match(gate.summary, /只读任务改动了文件：.*src\/a\.txt/);
+            assert.equal(sEnd.exit, 3);
+            assert.equal((await eventsOf(R.id)).findLast(r => r.event === 'gate').ok, true, '没有改动的调研任务门禁通过');
+        });
+        const tR = taskOf(R.id)!, wR = await wtOf(R.id);
+        await selectAccept(R.id);
+        await wait(`!!document.querySelector('.detail.acc .tab-body .banner.info')`, 'UI24 调研横幅', 20000);
+        await check('UI24 调研任务的验收页：信息横幅 wt.researchTitle / wt.researchHelp，"改动"标签数量是 0，底栏说明 wt.noteConfirm，按钮是驳回 · 重试 · 确认，没有"批准并合并"', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.info'); const acts = [...document.querySelectorAll('.detail.acc .actbar button')].map(x => x.textContent.trim()); return b.querySelector('.rt b').textContent === ${jsonStr(w.researchTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.researchHelp)} && document.querySelector('[data-atab=diff] .n').textContent === '0' && document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteConfirm)} && acts.join() === ${jsonStr([w.reject, w.retry, w.confirm].join())} && document.querySelector('.actbar .btn.primary').hasAttribute('data-acc-confirm') && !document.querySelector('[data-acc-approve]'); })()`);
+        await shots('accept-research');
+        const mainBeforeConfirm = git(repo, ['rev-parse', 'main']), commitsBeforeConfirm = git(repo, ['rev-list', '--count', 'main']);
+        await press('[data-acc-confirm]');
+        await wait(`!document.querySelector('[data-acc="${R.id}"]') && !!document.querySelector('.toast')`, 'UI24 确认成功：列表移除这一项并出现 toast', 90000);
+        await check('UI24 确认没有二次确认框；toast 是 wt.confirmedToast，没有"撤销说明"按钮', `!document.querySelector('.confirm-overlay') && document.querySelector('.toast span:not(.mk)').textContent === ${jsonStr(w.confirmedToast(tR.title))} && !document.querySelector('[data-acc-undo]')`);
+        const confirmEvent = await untilRow(async () => (await rows()).find(r => r.id === R.id && r.event === 'accepted'), 'UI24 确认的 accepted 事件', 15000);
+        await verify('UI24 确认：仓库 git log 没有新提交，git worktree list 里没有它，分支删掉，清单 accepted 为 merge: null、mode: confirm、by: human', async () => {
+            assert.equal(git(repo, ['rev-parse', 'main']), mainBeforeConfirm);
+            assert.equal(git(repo, ['rev-list', '--count', 'main']), commitsBeforeConfirm);
+            assert.ok(!git(repo, ['worktree', 'list', '--porcelain']).replaceAll('\\', '/').toLowerCase().includes(path.basename(wR.dir).toLowerCase()), 'git worktree list 里不应再有它');
+            assert.ok(!existsSync(wR.dir), 'worktree 目录应已删除');
+            assert.equal(git(repo, ['branch', '--list', wR.branch]), '', '分支应已删除');
+            assert.equal(confirmEvent.merge, null);
+            assert.equal(confirmEvent.mode, 'confirm');
+            assert.equal(confirmEvent.by, 'human');
+            assert.ok(!(await eventsOf(R.id)).some(r => r.event === 'cleanup'), '清理成功没有 cleanup 失败事件');
+        });
+        await untilState(R.id, 'accepted', 30000);
+        await selectTask(R.id);
+        await wait(`document.querySelector('.dh-state')?.textContent.startsWith(${jsonStr(w.subConfirmed)}) === true`, 'UI24 任务页收到已确认状态', 20000);
+        await check('UI24 确认后任务详情显示"已确认"：列表标记与第二行、状态行 wt.lineConfirmed、横幅 wt.confirmedTitle / wt.confirmedHelp、轨道合并节点 wt.nodeConfirmed，没有重试', `(() => { const n = [...document.querySelectorAll('.track .node')]; const b = document.querySelector('.banner-holder .banner.ok'); const mk = document.querySelector('[data-task="${R.id}"] .mk'); return mk.classList.contains('ok') && mk.title === ${jsonStr(w.subConfirmed)} && document.querySelector('[data-task="${R.id}"] .tm > span').textContent.endsWith(${jsonStr(' · ' + w.subConfirmed)}) && document.querySelector('.dh-state').textContent.trim() === ${jsonStr(w.lineConfirmed(clockOf(confirmEvent.at), w.by.human))} && b.querySelector('.rt b').textContent === ${jsonStr(w.confirmedTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.confirmedHelp(clockOf(confirmEvent.at), w.by.human))} && n.length === 5 && n[4].querySelector('.sub').textContent === ${jsonStr(w.subConfirmed)} && n[4].title === ${jsonStr(w.nodeConfirmed(w.by.human))} && !document.querySelector('[data-retry]') && !!document.querySelector('[data-redispatch]'); })()`);
+        await shots('wt-confirmed');
+        await selectTask(S.id);
+        await wait(`!!document.querySelector('.banner-holder .banner.fail')`, 'UI24 偷改文件的调研任务显示门禁失败横幅', 20000);
+        await check('UI24 偷改文件的调研任务：任务页门禁失败横幅写"只读任务改动了文件"', `document.querySelector('.banner-holder .banner.fail .rt span').textContent.includes('只读任务改动了文件')`);
+
+        // ================= T116（Stage07 116）：项目从列表移除后，它的待验收任务不卡死 =================
+        // 甲项目（gone-a）有三个待验收任务：G1（驳回）、G2（重新添加项目）、G4（调研类，确认）；丙项目（gone-missing）的 G3 用来查文件夹被删的情况。
+        console.log('验收检查进度：调研类任务完成，开始项目移除后的任务（116）');
+        const repoG = path.join(root, 'gone-a'), repoM = path.join(root, 'gone-missing');
+        const goneSpecs: Record<string, { title: string; file: string }> = {
+            g1: { title: '移除后驳回任务', file: '101-移除后驳回' }, g2: { title: '移除后重新添加任务', file: '102-移除后重新添加' },
+            g3: { title: '文件夹被删任务', file: '103-文件夹被删' },
+        };
+        const goneVerify = 'git cat-file -e HEAD:src/rej.txt';
+        for (const [dir, name, keys] of [[repoG, 'gone-a', ['g1', 'g2']], [repoM, 'gone-missing', ['g3']]] as const) {
+            await initRepo(dir, name, []);
+            for (const key of keys) await writeFile(path.join(dir, 'docs', 'specs', `${goneSpecs[key].file}.md`), specText(Number(key.slice(1)) + 10, { title: goneSpecs[key].title, verify: goneVerify }));
+            if (dir === repoG) await writeFile(path.join(dir, 'docs', 'specs', '104-移除后确认.md'), researchSpec(14, '移除后确认调研任务'));
+            git(dir, ['add', '--', 'docs/specs']);
+            git(dir, ['commit', '-m', '任务说明', '--', 'docs/specs']);
+            await core(['projects', 'add', dir]);
+            registered.push(dir);
+        }
+        await writeConfig(2);
+        const G1 = await dispatchTask(goneSpecs.g1.file, 'gone-1', 'b', repoG);
+        const G2 = await dispatchTask(goneSpecs.g2.file, 'gone-2', 'b', repoG);
+        const G4 = await dispatchTask('104-移除后确认', 'gone-4', 'research', repoG);
+        const G3 = await dispatchTask(goneSpecs.g3.file, 'gone-3', 'b', repoM);
+        for (const task of [G1, G2, G4, G3]) await untilState(task.id, 'awaiting', 150000);
+        const tG1 = taskOf(G1.id)!, tG2 = taskOf(G2.id)!, tG4 = taskOf(G4.id)!, tG3 = taskOf(G3.id)!;
+        const wG1 = await wtOf(G1.id), wG3 = await wtOf(G3.id);
+        const tip = jsonStr(c.projectGoneBlocked);
+        // ---- 项目页移除：确认框里列出还没处理完的任务 ----
+        await press('[data-page=projects]');
+        await wait(`[...document.querySelectorAll('[data-pj-row]')].some(b => b.dataset.pjRow === ${jsonStr(repoG)})`, 'T116 项目页列出甲项目', 20000);
+        await evaluate(`(() => { const row = [...document.querySelectorAll('[data-pj-row]')].find(b => b.dataset.pjRow === ${jsonStr(repoG)}); row.setAttribute('data-pj-pick', ''); return true; })()`);
+        await press('[data-pj-row][data-pj-pick]');
+        await wait('!!document.querySelector("[data-pj=more]")', 'T116 项目详情');
+        await press('[data-pj=more]');
+        await press('.ctx button:nth-child(2)');
+        await wait('!!document.querySelector(".confirm-overlay")', 'T116 移除确认框');
+        await check('T116 移除确认框：说明下面写还有 3 个任务没处理完，逐个列出任务名，再加 pj.removePendingHelp；仍然是移除（危险）按钮', `(() => { const t = document.querySelector('#confirm-body').textContent; return t.includes(${jsonStr(pj.removeBody)}) && t.includes(${jsonStr(pj.removePending(3))}) && [${jsonStr(tG1.title)}, ${jsonStr(tG2.title)}, ${jsonStr(tG4.title)}].every(x => t.includes(x)) && t.includes(${jsonStr(pj.removePendingHelp)}) && t.indexOf(${jsonStr(pj.removeBody)}) < t.indexOf(${jsonStr(pj.removePending(3))}) && !!document.querySelector('.confirm-actions .danger'); })()`);
+        await shots('project-remove-pending');
+        await press('.confirm-actions .danger');
+        await wait(`![...document.querySelectorAll('[data-pj-row]')].some(b => b.dataset.pjRow === ${jsonStr(repoG)})`, 'T116 移除后项目页没有甲项目', 20000);
+        await verify('T116 移除只从列表拿掉项目：登记表里没有它，文件夹和任务记录还在', async () => {
+            const list = await core(['projects', 'list', '--registry-only']);
+            assert.ok(!list.projects.some((p: { path: string }) => path.resolve(p.path).toLowerCase() === path.resolve(repoG).toLowerCase()));
+            assert.ok(existsSync(repoG) && existsSync(wG1.dir));
+        });
+        // ---- 任务页：横幅、再派一次与重试禁用 ----
+        await selectTask(G1.id);
+        await wait(`!!document.querySelector('.banner-holder [data-readd-project]')`, 'T116 任务页出现项目已移除横幅', 20000);
+        await check('T116 任务页横幅：标题 c.projectGoneTitle、说明 c.projectGoneHelp(仓库路径)、按钮"重新添加项目"；"再派一次"禁用且悬停提示是 c.projectGoneBlocked；"去验收"仍可用', `(() => { const b = document.querySelector('.banner-holder .banner.brand'); const r = document.querySelector('[data-redispatch]'); return b.querySelector('.rt b').textContent === ${jsonStr(c.projectGoneTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(c.projectGoneHelp(tG1.repo))} && b.querySelector('[data-readd-project]').textContent.trim() === ${jsonStr(c.projectGoneReAdd)} && r.disabled === true && r.dataset.tip === ${tip} && !!document.querySelector('[data-go-accept]') && document.querySelector('[data-go-accept]').disabled !== true; })()`);
+        await shots('wt-project-gone');
+        // ---- 验收页：批准并合并 / 重试禁用，驳回与确认可用 ----
+        await selectAccept(G1.id);
+        await wait(`!!document.querySelector('.detail.acc .tab-body [data-readd-project]')`, 'T116 验收页出现项目已移除横幅', 20000);
+        await check('T116 验收页：顶部横幅同任务页；"批准并合并"与"重试…"禁用并带同一句悬停提示，"驳回…"可用', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.brand'); const a = document.querySelector('[data-acc-approve]'), r = document.querySelector('[data-acc-retry]'), j = document.querySelector('[data-acc-reject]'); return b.querySelector('.rt b').textContent === ${jsonStr(c.projectGoneTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(c.projectGoneHelp(tG1.repo))} && a.disabled === true && a.dataset.tip === ${tip} && r.disabled === true && r.dataset.tip === ${tip} && j.disabled === false; })()`);
+        await shots('accept-project-gone');
+        // ---- 驳回：真实走完 ----
+        await press(`[data-acc-reject="${G1.id}"]`);
+        await wait('!!document.querySelector(".sheet [data-reject-reason]")', 'T116 项目已移除后的驳回弹窗');
+        const goneReason = 'project was removed, drop this task';
+        await type('[data-reject-reason]', goneReason);
+        await press('.sheet [data-sheet-btn="1"]');
+        await wait(`!document.querySelector('.sheet') && !document.querySelector('[data-acc="${G1.id}"]')`, 'T116 项目已移除后驳回成功', 60000);
+        const goneReject = await untilRow(async () => (await eventsOf(G1.id)).find(r => r.event === 'rejected'), 'T116 rejected 事件', 15000);
+        await untilState(G1.id, 'rejected', 30000);
+        await verify('T116 项目已移除后驳回：清单 rejected 的 reason 是输入原文、by 是 human，worktree 目录已删除，项目仍不在登记表里', async () => {
+            assert.equal(goneReject.reason, goneReason);
+            assert.equal(goneReject.by, 'human');
+            assert.ok(!existsSync(wG1.dir), 'worktree 目录应已删除');
+            const list = await core(['projects', 'list', '--registry-only']);
+            assert.ok(!list.projects.some((p: { path: string }) => path.resolve(p.path).toLowerCase() === path.resolve(repoG).toLowerCase()), '驳回不隐式登记项目');
+        });
+        // ---- 确认（调研类任务）：不要求项目登记 ----
+        await selectAccept(G4.id);
+        await wait(`!!document.querySelector('.detail.acc .tab-body [data-readd-project]') && !!document.querySelector('[data-acc-confirm]')`, 'T116 调研任务的验收页', 20000);
+        await check('T116 调研任务在项目已移除时："确认"可用，"重试…"禁用', `document.querySelector('[data-acc-confirm]').disabled === false && document.querySelector('[data-acc-retry]').disabled === true`);
+        await press('[data-acc-confirm]');
+        await wait(`!document.querySelector('[data-acc="${G4.id}"]') && !!document.querySelector('.toast')`, 'T116 项目已移除后确认成功', 90000);
+        const goneConfirm = await untilRow(async () => (await rows()).find(r => r.id === G4.id && r.event === 'accepted'), 'T116 确认的 accepted 事件', 15000);
+        await verify('T116 项目已移除后确认：accepted 为 merge: null、mode: confirm、by: human，主分支没有新提交', () => {
+            assert.equal(goneConfirm.merge, null);
+            assert.equal(goneConfirm.mode, 'confirm');
+            assert.equal(goneConfirm.by, 'human');
+            assert.equal(git(repoG, ['rev-list', '--count', 'main']), '2');
+        });
+        // ---- 重新添加项目：横幅消失，按钮恢复 ----
+        await selectAccept(G2.id);
+        await wait(`!!document.querySelector('.detail.acc .tab-body [data-readd-project]')`, 'T116 G2 的验收页横幅', 20000);
+        await press('[data-readd-project]');
+        await wait(`!document.querySelector('.detail.acc .tab-body [data-readd-project]') && document.querySelector('[data-acc-approve]')?.disabled === false`, 'T116 重新添加项目后横幅消失、"批准并合并"恢复', 30000);
+        await check('T116 重新添加项目后："批准并合并"与"重试…"可用且没有悬停提示，没有项目已移除横幅', `(() => { const a = document.querySelector('[data-acc-approve]'), r = document.querySelector('[data-acc-retry]'); return a.disabled === false && !a.dataset.tip && r.disabled === false && !r.dataset.tip && !document.querySelector('.detail.acc .tab-body .banner.brand'); })()`);
+        await verify('T116 重新添加项目走 projects:add：登记表里又有甲项目', async () => {
+            const list = await core(['projects', 'list', '--registry-only']);
+            assert.ok(list.projects.some((p: { path: string }) => path.resolve(p.path).toLowerCase() === path.resolve(repoG).toLowerCase()));
+        });
+        await selectTask(G2.id);
+        await check('T116 重新添加项目后任务页：没有项目已移除横幅，"再派一次"可用', `!document.querySelector('.banner-holder [data-readd-project]') && document.querySelector('[data-redispatch]').disabled === false`);
+        await shots('accept-project-readded');
+        // ---- 项目文件夹被删：只有“从列表删除”可用 ----
+        await core(['projects', 'remove', repoM]);
+        await rm(repoM, { recursive: true, force: true });
+        await verify('T116 丙项目的文件夹已删除（在临时目录里），任务记录还在', () => { assert.ok(!existsSync(repoM)); assert.ok(taskOf(G3.id)); });
+        await selectAccept(G3.id);
+        await wait(`[...document.querySelectorAll('.detail.acc .tab-body .banner.brand .rt b')].some(b => b.textContent === ${jsonStr(c.projectGoneTitle)})`, 'T116 文件夹已删除的横幅', 20000);
+        await check('T116 文件夹不在了：说明换成 c.projectGoneMissing，没有"重新添加项目"；驳回、重试、批准并合并都禁用并带悬停提示', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.brand'); const all = ['[data-acc-reject]', '[data-acc-retry]', '[data-acc-approve]'].map(s => document.querySelector(s)); return b.querySelector('.rt span').textContent === ${jsonStr(c.projectGoneMissing(tG3.repo))} && !document.querySelector('[data-readd-project]') && all.every(x => x.disabled === true && x.dataset.tip === ${tip}); })()`);
+        await shots('accept-project-missing');
+        await selectTask(G3.id);
+        await wait(`[...document.querySelectorAll('.banner-holder .banner.brand .rt b')].some(b => b.textContent === ${jsonStr(c.projectGoneTitle)})`, 'T116 任务页文件夹已删除的横幅', 20000);
+        await check('T116 任务页：文件夹不在时说明是 c.projectGoneMissing，没有"重新添加项目"，"再派一次"禁用', `document.querySelector('.banner-holder .banner.brand .rt span').textContent === ${jsonStr(c.projectGoneMissing(tG3.repo))} && !document.querySelector('[data-readd-project]') && document.querySelector('[data-redispatch]').disabled === true`);
+        // 从任务列表删除（多选模式，真实点击）：文件夹已删除的任务，不勾“同时删除记录文件”。
+        const deleteVia = async (id: string, withFiles: boolean) => {
+            await goTasks();
+            await press('[data-multi=select]');
+            await press(`[data-task="${id}"]`);
+            await wait(`document.querySelector('[data-multi=delete]')?.disabled === false`, 'T116 多选后“删除”可用');
+            await press('[data-multi=delete]');
+            await wait('!!document.querySelector(".sheet [data-delete-files]")', 'T116 删除确认框');
+            if (withFiles) await press('[data-delete-files]');
+            await press('.sheet [data-sheet-btn="1"]');
+            await wait(`!document.querySelector('.sheet') && !document.querySelector('[data-task="${id}"]')`, 'T116 删除成功：任务不在列表里', 30000);
+        };
+        await deleteVia(G3.id, false);
+        await verify('T116 文件夹被删的任务能从列表删除：任务已隐藏（runs.jsonl 不改）', async () => { assert.ok((await hiddenOf()).some(key => key.startsWith(G3.id + ':'))); });
+        // 项目已移除、文件夹还在的已驳回任务：“同时删除记录文件”照常删掉 .agent-runs 里的记录目录。
+        await verify('T116 删除前 G1 的记录目录还在', () => { assert.ok(existsSync(path.join(repoG, '.agent-runs', G1.name))); });
+        await core(['projects', 'remove', repoG]);
+        await deleteVia(G1.id, true);
+        await verify('T116 项目已移除的已驳回任务：删除并勾选“同时删除记录文件”成功，记录目录已删除，任务已隐藏', async () => {
+            assert.ok(!existsSync(path.join(repoG, '.agent-runs', G1.name)));
+            assert.ok((await hiddenOf()).some(key => key.startsWith(G1.id + ':')));
+        });
     }
     finally {
         // 清理：弹窗与菜单、假派发进程、临时项目、放行文件；恢复配置与演示任务的隐藏状态。

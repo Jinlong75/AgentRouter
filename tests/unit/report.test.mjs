@@ -83,7 +83,7 @@ test('scoreRole：按项扣分，超过上限只扣上限（越界 4 个 → −
   assert.equal(none.score, 100);
 });
 
-test('每个 key 的计数与扣分：执行者八项、主导六项，顺序同协议', t => {
+test('每个 key 的计数与扣分：执行者九项、主导七项（末尾各一项 envBlame），顺序同协议', t => {
   const f = scene(t, {
     attempts: [
       { n: 1, reason: 'first', gate: false, gateFile: { scope: { outside: ['a.js', 'b.js', '.agent-router/project.json'], protected: ['.agent-router/project.json'] }, outsideWrites: { checked: true, added: [{ root: 'home', name: 'x.txt', type: 'file' }] } } },
@@ -100,10 +100,10 @@ test('每个 key 的计数与扣分：执行者八项、主导六项，顺序同
     ],
   });
   const report = f.report();
-  assert.deepEqual(report.executor.items.map(entry => entry.key), ['attemptGate', 'attemptAgent', 'outsideFile', 'protectedFile', 'outsideWrites', 'escalated', 'toolError', 'needsScope']);
+  assert.deepEqual(report.executor.items.map(entry => entry.key), ['attemptGate', 'attemptAgent', 'outsideFile', 'protectedFile', 'outsideWrites', 'escalated', 'toolError', 'needsScope', 'envBlame']);
   assert.deepEqual(brief(report.executor), [
     ['attemptGate', 2, -30], ['attemptAgent', 1, -20], ['outsideFile', 2, -20], ['protectedFile', 1, -15],
-    ['outsideWrites', 1, -20], ['escalated', 1, -10], ['toolError', 3, -3], ['needsScope', 1, 0],
+    ['outsideWrites', 1, -20], ['escalated', 1, -10], ['toolError', 3, -3], ['needsScope', 1, 0], ['envBlame', 0, 0],
   ]);
   assert.equal(item(report.executor, 'outsideFile').detail, 'a.js、b.js', '受保护的路径不算超出范围的文件');
   assert.equal(item(report.executor, 'protectedFile').detail, '.agent-router/project.json');
@@ -112,8 +112,8 @@ test('每个 key 的计数与扣分：执行者八项、主导六项，顺序同
   assert.equal(item(report.executor, 'needsScope').detail, 'src/z.js');
   assert.equal(report.executor.score, 0, '扣分合计超过 100 最低 0');
   assert.equal(report.executor.cap, null);
-  assert.deepEqual(report.lead.items.map(entry => entry.key), ['specEdit', 'specBlame', 'manualRetry', 'needsScope', 'rejected', 'conflict']);
-  assert.deepEqual(brief(report.lead), [['specEdit', 0, 0], ['specBlame', 0, 0], ['manualRetry', 1, -10], ['needsScope', 1, -10], ['rejected', 0, 0], ['conflict', 0, 0]]);
+  assert.deepEqual(report.lead.items.map(entry => entry.key), ['specEdit', 'specBlame', 'manualRetry', 'needsScope', 'rejected', 'conflict', 'envBlame']);
+  assert.deepEqual(brief(report.lead), [['specEdit', 0, 0], ['specBlame', 0, 0], ['manualRetry', 1, -10], ['needsScope', 1, -10], ['rejected', 0, 0], ['conflict', 0, 0], ['envBlame', 0, 0]]);
   assert.equal(report.lead.score, 80);
   assert.deepEqual(report.executor.perf.profiles, ['deepseek', 'sonnet']);
   assert.equal(report.executor.perf.toolCalls, 4, 'cmd 开始 2 + tool 2');
@@ -199,7 +199,7 @@ test('setBlame：只对门禁未通过的尝试；写 marks.json（先临时文�
   const args = { home: f.home, root: f.root, name: f.name };
   assert.throws(() => setBlame({ ...args, n: 3, blame: 'spec' }), /第 3 次尝试的门禁没有失败/);
   assert.throws(() => setBlame({ ...args, n: 9, blame: 'spec' }), /第 9 次尝试的门禁没有失败/);
-  assert.throws(() => setBlame({ ...args, n: 1, blame: 'lead' }), /spec 或 worker/);
+  assert.throws(() => setBlame({ ...args, n: 1, blame: 'lead' }), /spec、worker 或 environment/);
   assert.throws(() => setBlame({ ...args, n: 0, blame: 'spec' }), /正整数/);
   assert.equal(existsSync(path.join(f.record, 'marks.json')), false, '被拒绝时什么都不写');
 
@@ -211,6 +211,83 @@ test('setBlame：只对门禁未通过的尝试；写 marks.json（先临时文�
   assert.deepEqual(marks(), { v: 1, blame: { 2: 'spec' } }, 'worker 是默认，写 worker 删掉这个键');
   assert.deepEqual(readdirSync(f.record).filter(entry => entry.includes('.tmp')), [], '没有残留的临时文件');
   assert.equal(f.report().attempts.find(a => a.n === 2).blame, 'spec');
+});
+
+test('归因到环境：两边都不扣分，两张卡片的 envBlame 各记次数（分数列恒为 0）', t => {
+  const attempts = [{ n: 1, reason: 'first', gate: false }, { n: 2, reason: 'gate', gate: true }];
+  const worker = scene(t, { name: '归执行者', attempts }).report();
+  const env = scene(t, { name: '归环境', attempts, marks: { v: 1, blame: { 1: 'environment' } } }).report();
+  const spec = scene(t, { name: '归说明', attempts, marks: { v: 1, blame: { 1: 'spec' } } }).report();
+
+  assert.deepEqual([worker.executor.score, worker.lead.score], [85, 100]);
+  assert.deepEqual([spec.executor.score, spec.lead.score], [100, 85]);
+  assert.deepEqual([env.executor.score, env.lead.score], [100, 100], '环境：执行者不扣多一次尝试，主导也不扣');
+  assert.deepEqual([item(env.executor, 'attemptGate').count, item(env.executor, 'attemptGate').points], [0, 0]);
+  assert.deepEqual([item(env.lead, 'specBlame').count, item(env.lead, 'specBlame').points], [0, 0]);
+  for (const role of [env.executor, env.lead]) assert.deepEqual(item(role, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
+  for (const role of [worker.executor, worker.lead, spec.executor, spec.lead]) assert.equal(item(role, 'envBlame').count, 0);
+  assert.equal(env.attempts[0].blame, 'environment');
+  assert.equal(spec.attempts[0].blame, 'spec');
+  assert.equal(worker.attempts[0].blame, 'worker');
+  assert.equal(env.executor.items.at(-1).key, 'envBlame', '执行者一节放在最后（"需要越界"之后）');
+  assert.equal(env.lead.items.at(-1).key, 'envBlame', '主导一节放在最后（验收结论之后）');
+
+  // 没有下一次尝试：只是不扣，失败封顶照旧。
+  const last = scene(t, { name: '没有下一次', attempts: [{ n: 1, reason: 'first', gate: false }], end: { exit: 3 }, marks: { v: 1, blame: { 1: 'environment' } } }).report();
+  assert.deepEqual([last.executor.score, last.lead.score, item(last.lead, 'envBlame').count], [40, 100, 1]);
+
+  // 文字输出：中文名"环境原因"，两节各一行。
+  const lines = reportLines(env);
+  assert.equal(lines.filter(entry => entry === '  环境原因：1 次（0）').length, 2, lines.join('\n'));
+  assert.ok(reportLines(worker).includes('  环境原因：0 次（0）'));
+});
+
+test('归因混合：第 1 次 environment、第 2 次 spec；执行者两次的"多一次尝试"都不扣，主导只扣 spec', t => {
+  const attempts = [{ n: 1, reason: 'first', gate: false }, { n: 2, reason: 'gate', gate: false }, { n: 3, reason: 'gate', gate: true }];
+  const mixed = scene(t, { name: '混合', attempts, marks: { v: 1, blame: { 1: 'environment', 2: 'spec' } } }).report();
+  assert.equal(item(mixed.executor, 'attemptGate').count, 0, '第 2、3 次的 reason 都是 gate，前一次都被归因了');
+  assert.equal(mixed.executor.score, 100);
+  assert.deepEqual([item(mixed.lead, 'specBlame').count, item(mixed.lead, 'specBlame').points], [1, -15]);
+  assert.deepEqual([item(mixed.lead, 'envBlame').count, item(mixed.lead, 'envBlame').points], [1, 0]);
+  assert.equal(mixed.lead.score, 85);
+  assert.deepEqual(mixed.attempts.map(a => a.blame), ['environment', 'spec', null]);
+
+  // 只归因第 1 次到环境：第 2 次门禁失败仍算执行者的，第 3 次（reason: gate）也算一次。
+  const half = scene(t, { name: '只一半', attempts, marks: { v: 1, blame: { 1: 'environment' } } }).report();
+  assert.equal(item(half.executor, 'attemptGate').count, 1);
+  assert.equal(half.executor.score, 85);
+  assert.equal(half.lead.score, 100);
+});
+
+test('marks.json 里的未知值当作没有；多余的编号不算；其他合法项照常读', t => {
+  const attempts = [{ n: 1, reason: 'first', gate: false }, { n: 2, reason: 'gate', gate: false }, { n: 3, reason: 'gate', gate: true }];
+  const f = scene(t, { name: '未知值', attempts, marks: { v: 1, blame: { 1: 'lead', 2: 'environment', 3: 'environment', 9: 'environment' } } }).report();
+  assert.deepEqual(f.attempts.map(a => a.blame), ['worker', 'environment', null], '未知值 lead 当作默认 worker；门禁通过与不存在的尝试不算');
+  assert.equal(item(f.lead, 'envBlame').count, 1);
+  assert.equal(item(f.executor, 'attemptGate').count, 1, '第 2 次被归因到环境，只免掉第 3 次');
+  const other = scene(t, { name: '大小写', attempts, marks: { v: 1, blame: { 1: 'Environment', 2: 'ENV', 3: 5 } } }).report();
+  assert.deepEqual(other.attempts.map(a => a.blame), ['worker', 'worker', null]);
+  assert.equal(item(other.lead, 'envBlame').count, 0);
+});
+
+test('setBlame：environment 写入；写一项时保留其他项原有的值；worker 只删自己这一项', t => {
+  const f = scene(t, { attempts: [{ n: 1, reason: 'first', gate: false }, { n: 2, reason: 'gate', gate: false }, { n: 3, reason: 'gate', gate: false }] });
+  const marks = () => JSON.parse(readFileSync(path.join(f.record, 'marks.json'), 'utf8'));
+  const args = { home: f.home, root: f.root, name: f.name };
+  setBlame({ ...args, n: 2, blame: 'spec' });
+  setBlame({ ...args, n: 1, blame: 'environment' });
+  assert.deepEqual(marks(), { v: 1, blame: { 1: 'environment', 2: 'spec' } }, '第 1 次改成 environment 不抹掉第 2 次的 spec');
+  assert.deepEqual(Object.keys(marks().blame), ['1', '2'], '按编号排序');
+  setBlame({ ...args, n: 3, blame: 'environment' });
+  setBlame({ ...args, n: 2, blame: 'environment' });
+  assert.deepEqual(marks(), { v: 1, blame: { 1: 'environment', 2: 'environment', 3: 'environment' } }, '同一项可以从 spec 改成 environment');
+  setBlame({ ...args, n: 1, blame: 'worker' });
+  assert.deepEqual(marks(), { v: 1, blame: { 2: 'environment', 3: 'environment' } });
+  setBlame({ ...args, n: 2, blame: 'spec' });
+  assert.deepEqual(marks(), { v: 1, blame: { 2: 'spec', 3: 'environment' } });
+  assert.deepEqual(readdirSync(f.record).filter(entry => entry.includes('.tmp')), [], '没有残留的临时文件');
+  assert.throws(() => setBlame({ ...args, n: 1, blame: 'Environment' }), /spec、worker 或 environment/);
+  assert.deepEqual(marks(), { v: 1, blame: { 2: 'spec', 3: 'environment' } }, '被拒绝时不改');
 });
 
 test('reportWeights：改一项后生效；形状不对或不是正数的值按默认并给出警告', t => {

@@ -5,7 +5,9 @@ import { captureGate } from './shots-gate';
 import { captureRetry } from './shots-retry';
 import { captureAccept } from './shots-accept';
 import { captureScore } from './shots-score';
+import { captureAgents } from './shots-agents';
 import { captureNewtask, waitNewtaskReady } from './shots-newtask';
+import { captureRouting } from './shots-routing';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
 import { app, BrowserWindow, nativeTheme } from 'electron';
 import { mkdir, writeFile, readFile, appendFile, open, rename, rm } from 'node:fs/promises';
@@ -56,6 +58,9 @@ const appEnv = appEnvironment(process.env);
  * UI24 验收页与 worktree 任务（Stage06）：任务页的排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回、验收页概览 / 改动 / 门禁、批准并合并、驳回、被拒的合并、待验收通知 ——「UI24 …」（shots-accept.ts：真实核心、临时 git 仓库）
  * UI25 合并冲突与"解决冲突并重试"、并发排队与停止、准备失败 ——「UI25 …」（shots-accept.ts）
  * UI26 任务详情"评分"标签（两张卡片、每项扣分、门禁失败归因、综合分怎么算）与设置页"统计主导的 token 与用时" ——「UI26 …」（shots-score.ts：真实核心 ar report 对照）
+ * UI27 路由页（Stage07 T8）：规则增删改与上移下移、兜底、试算（对照 ar route --explain）、每日上限、审查者候选，每一步读 config.json 断言 ——「UI27 …」（shots-routing.ts）
+ * UI28 导入向导扩展与模型、推理强度（Stage07）：自定义 CLI 表单 / 校验 / 测试并预览 / 保存并真实派发、Claude 类的推理强度与"升级到"、OpenAI 兼容接口、Qoder 默认模型、导出与从文件导入 ——「UI28 …」（shots-agents.ts：假 CLI 与假执行者，文件对话框用桩）
+ * UI29 新建任务页"执行者：自动"：按路由规则实时显示会派给谁、为什么、路由失败时派发照常可点 ——「UI29 …」（shots-newtask.ts）
  * 「通用 …」是每页通用检查、真实输入自测与环境检查。
  * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
  */
@@ -248,10 +253,22 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     console.log('验收开始时的 CPU（1 秒采样）：' + await cpuNow());
     await captureWizard(h);
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 单独复现 UI28（AR_SHOTS_FOCUS=agents）：引导之后只跑导入向导扩展的检查（自定义 CLI、模型与推理强度、OpenAI 兼容接口、导出与导入）。
+    if (process.env.AR_SHOTS_FOCUS === 'agents') {
+        await captureAgents(h, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'agents', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 单独复现 UI26（AR_SHOTS_FOCUS=score）：引导之后只跑评分标签与设置页开关的检查，演示数据是原样的。
     if (process.env.AR_SHOTS_FOCUS === 'score') {
         await captureScore(h, registry, win, save);
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'score', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
+    // 单独复现 UI27（AR_SHOTS_FOCUS=routing）：引导之后只跑路由页的检查。
+    if (process.env.AR_SHOTS_FOCUS === 'routing') {
+        await captureRouting(h, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'routing', checks, focusRestored: progress.focusRestored }, null, 2));
         return;
     }
     // UI15 / UI18：项目页在 UI01 之前准备好（UI01 的页面清单里加了"项目"），结束后回到任务页。
@@ -392,7 +409,7 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await check('通用 真实输入自测：Esc 关闭菜单', '!document.querySelector(".ctx")');
 
     // UI01 侧栏导航：鼠标与键盘都能切换，当前页高亮。
-    for (const [page, ready] of [['connect', '!!document.querySelector("[data-host-card]")'], ['projects', '!!document.querySelector("[data-pj-row]")'], ['newtask', '!!document.querySelector("[data-nt-project]")'], ['settings', '!!document.querySelector("[data-pref=notifications]")'], ['about', '!!document.querySelector(".about")'], ['tasks', '!!document.querySelector("[data-task=t1]")']]) {
+    for (const [page, ready] of [['connect', '!!document.querySelector("[data-host-card]")'], ['projects', '!!document.querySelector("[data-pj-row]")'], ['newtask', '!!document.querySelector("[data-nt-project]")'], ['routing', '!!document.querySelector("[data-ro-ready=\\"1\\"]")'], ['settings', '!!document.querySelector("[data-pref=notifications]")'], ['about', '!!document.querySelector(".about")'], ['tasks', '!!document.querySelector("[data-task=t1]")']]) {
         await press(`[data-page=${page}]`);
         await wait(ready);
         await check(`UI01 点击侧栏「${page}」切换页面并高亮当前页`, `document.querySelector("[data-page=${page}]").getAttribute("aria-current")==="page" && document.querySelectorAll("[data-page][aria-current=page]").length===1`);
@@ -421,6 +438,9 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
             if (scene === 'completed') await check('UI03 汇报排版：粗体、引用、分隔线、嵌套列表、任务列表、代码块与 h2（' + theme + '）', '(()=>{const md=document.querySelector(".tab-body .md");return !!md.querySelector(".md strong") && !!md.querySelector("blockquote") && !!md.querySelector("hr") && !!md.querySelector("ul ul") && !!md.querySelector("li.task") && !!md.querySelector("h2") && !!md.querySelector("pre.out") && !!md.querySelector("h3") && !!md.querySelector("h4") && !!md.querySelector("li.task .md-check.on");})()');
             if (scene === 'completed') await check('UI03 汇报排版：页面没有字面的 ** 与 |---（' + theme + '）', '(()=>{const text=document.querySelector(".dbody").innerText;return !text.includes("**") && !text.includes("|---");})()');
             if (scene === 'completed') await check('UI03 汇报宽表格只在 .md-table 里横向滚动，详情滚动区不横向溢出（' + theme + '）', '(()=>{const table=document.querySelectorAll(".tab-body .md .md-table")[1],box=document.querySelector(".dbody > .scroll");return table.scrollWidth>table.clientWidth && box.scrollWidth<=box.clientWidth;})()');
+            // 任务 114：中文列不被挤成一个字宽（走查发现的竖排）。
+            if (scene === 'completed') await check('UI03 汇报宽表格中文列不被挤成一个字宽（走查发现的竖排）（' + theme + '）', '(()=>{const table=document.querySelectorAll(".tab-body .md .md-table")[1];const cells=[...table.querySelectorAll("th,td")];if(!cells.length)return false;if(!cells.every(c=>c.getBoundingClientRect().width>=4*parseFloat(getComputedStyle(c).fontSize)))return false;const td=table.querySelector("tbody tr td:nth-child(3)"),rg=document.createRange();rg.selectNodeContents(td);return new Set([...rg.getClientRects()].map(r=>Math.round(r.top))).size<=2;})()');
+            if (scene === 'failed') await check('UI03 时间线说消息表格中文列不被挤成一个字宽（走查发现的竖排）（' + theme + '）', '(()=>{const say=[...document.querySelectorAll(".tl .say")].find(x=>x.textContent.includes("改动方案"));const cells=[...(say?say.querySelectorAll(".md-table th,.md-table td"):[])];if(!cells.length)return false;return cells.every(c=>c.getBoundingClientRect().width>=4*parseFloat(getComputedStyle(c).fontSize));})()');
             if (scene === 'running') await check('UI03 托管任务标题标签（' + theme + '）', 'document.querySelector(".dh .tag")?.textContent==="托管"');
             if (scene === 'interrupted') await check('UI03 中断横幅去设置（' + theme + '）', '!!document.querySelector(".banner [data-managed-settings]")');
             // O8：失败横幅用执行者显示名（t5 是 DeepSeek 任务），不再统称 Codex。
@@ -495,6 +515,9 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     }
     // 任务页标题栏在宽 < 1280 分两行后，默认窗口里的滚动区矮了一行的高度，上面滚 80 像素不一定到底；再滚一次到底，下面的断言不变。
     await wheel(scrollBox, 400);
+    // 滚轮输入分 4 步发出，渲染进程逐帧应用；evaluate 与输入走不同通道，检查可能抢在后几步应用之前读到中间位置（113：scrollTop 156.67，
+    // 与底部差一步的 33.33 像素，此时按设计还没到底、"跳到最新"当然显示）。所以先等滚动到底并且连续两次轮询位置不变，再做下面不变的断言。
+    await wait(`(()=>{const v=document.querySelector("${scrollBox}"),top=v.scrollTop,same=window.__top113===top;window.__top113=top;return same && v.scrollHeight-v.clientHeight-top<32;})()`, 'UI03 滚轮滚到底并停稳');
     await check('UI03 滚到底部时保持跟随，不显示"跳到最新"', `(()=>{const v=document.querySelector("${scrollBox}");return v.scrollHeight-v.clientHeight-v.scrollTop<32 && document.querySelector("[data-latest]").hidden;})()`, async () => evaluate(`(()=>{const v=document.querySelector("${scrollBox}");return JSON.stringify({scrollHeight:v.scrollHeight,clientHeight:v.clientHeight,scrollTop:v.scrollTop,latestHidden:document.querySelector("[data-latest]").hidden,window:[innerWidth,innerHeight]});})()`));
     await wheel(scrollBox, -3000);
     await check('UI03 滚轮向上离开底部后暂停跟随，出现"跳到最新"', '!document.querySelector("[data-latest]").hidden');
@@ -521,10 +544,13 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // DeepSeek 任务（演示数据 t8）：参数页显示执行者名称、profile、适配器与实际模型；Codex 才有的推理强度、档位、沙箱不显示。
     await press('[data-task=t8]'); await press('[data-tab=params]');
     await check('UI03 选中 DeepSeek 任务后参数页显示执行者与模型 deepseek-v4-pro', '[...document.querySelectorAll(".rows .r")].find(r=>r.querySelector(".k")?.textContent==="执行者")?.querySelector(".v")?.textContent==="DeepSeek V4 Pro（deepseek · claude-code）" && [...document.querySelectorAll(".rows .r")].find(r=>r.querySelector(".k")?.textContent==="模型")?.querySelector(".v")?.textContent==="deepseek-v4-pro" && [...document.querySelectorAll(".rows .r")].find(r=>r.querySelector(".k")?.textContent==="干活方")?.querySelector(".v")?.textContent==="2.1.302 (Claude Code)"');
-    await check('UI03 非 Codex 任务不显示推理强度、档位与沙箱', '![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent==="推理强度") && ![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent==="档位") && ![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent==="沙箱")');
+    // 改写（111）：原断言"非 Codex 任务不显示推理强度、档位与沙箱" → 新断言"非 Codex 任务显示推理强度一行（没有值时是 c.effortDefault），仍不显示档位与沙箱" → 原因：推理强度对 Claude 类、Qoder 等执行者也有意义，runs.jsonl 里本来就记了。
+    await check('UI03 非 Codex 任务参数页：有推理强度一行（没有值显示"默认（不传参数）"），不显示档位与沙箱', `[...document.querySelectorAll(".rows .r")].find(r=>r.querySelector(".k")?.textContent==="推理强度")?.querySelector(".v")?.textContent===${JSON.stringify(c.effortDefault)} && ![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent==="档位") && ![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent==="沙箱")`);
+    await check('UI03 没有 route 的任务（演示数据 t8）参数页没有"路由"一行', `![...document.querySelectorAll(".rows .r")].some(r=>r.querySelector(".k")?.textContent===${JSON.stringify(c.route)})`);
     await save('params-deepseek');
     await press('[data-task=t1]');
     await press('[data-tab=flow]');
+    await check('UI03 没有 route 的任务（演示数据 t1）进展里没有"路由："分隔行', '!document.body.textContent.includes("路由：")');
 
     // UI04 停止确认：默认焦点在取消，取消与 Esc 都不写入中断。焦点环只在键盘操作时出现，所以这里用键盘打开确认框。
     await tabTo('[data-stop]'); await key('Enter');
@@ -731,12 +757,16 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
     await captureProcessUnknown(h, registry, save, menuItem, runs);
     const fontLoaded = await capturePreferences(h);
+    // UI28（Stage07 导入向导扩展与模型、推理强度）：自己写专用的 config.json，结束后恢复；结束时停在设置页，和上面一致。
+    await captureAgents(h, win);
     // UI19：关闭询问、托盘与"窗口"设置。此时 t1 还在进行，正好检查重置在有任务时禁用确认。
     await captureCloseAndTray(h, win, save);
     // UI16 新建任务页放在设置验收之后：要临时改 config.json 的执行者配置（假执行者），避免影响设置页断言。
     await captureNewtask(h);
     // UI17 再派一次沿用新建任务页留下的临时仓库与假执行者配置。
     await captureRedispatch(h, saveNow, pressNow, registry, win);
+    // UI27 路由页：自己写执行者配置（假执行者）与项目，结束时恢复配置、清单与项目登记。
+    await captureRouting(h, win);
 
     // 每页通用检查与 UI11：深浅两主题 × 1160×720 / 960×600。
     await audit('任务页', async () => { await press('[data-page=tasks]'); await press('[data-task=t3]'); });
@@ -812,8 +842,9 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // UI19 = 关闭询问与托盘（012 A），UI20 = 设置页"数据"一节与清除缓存 / 重置确认框（012 B）。
     // 原 UI10 / UI11 已分别是"主题"与"最小窗口"，所以新增要求改用 UI19、UI20（见汇报）。
     // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
+    // UI27 = Stage07 路由页，UI28 = 导入向导扩展与模型、推理强度（107），UI29 = 新建任务页"执行者：自动"的路由结果。
     // UI23 = Stage05 多次尝试界面（061）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、一次真实重试。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26'], '界面功能基线 UI01～UI26 都要有检查');
+    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26', 'UI27', 'UI28', 'UI29'], '界面功能基线 UI01～UI29 都要有检查');
     console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。

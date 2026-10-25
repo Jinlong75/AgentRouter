@@ -66,13 +66,36 @@ export function mapLine(line, { root }) {
   }
 }
 
+// 值写成 TOML 基本字符串：JSON.stringify 的结果（引号、反斜杠、控制字符的转义）就是合法的 TOML 基本字符串。
+const toml = value => JSON.stringify(String(value));
+
+// 自定义接口（OpenAI 兼容，经 Codex 外壳）的 -c 覆盖参数；每项是一个独立参数，不经 shell。
+// 接口名用 ar-<执行者名>；密钥变量名（env_key）就是配置里 secrets 的唯一一个键。
+export function providerArgs({ name, label, provider, secrets }) {
+  const id = `ar-${name}`;
+  const [envKey] = Object.keys(secrets ?? {});
+  const args = [];
+  for (const entry of [
+    ['model_provider', toml(id)],
+    [`model_providers.${id}.name`, toml(label ?? name)],
+    [`model_providers.${id}.base_url`, toml(provider.baseUrl)],
+    [`model_providers.${id}.env_key`, toml(envKey)],
+    [`model_providers.${id}.wire_api`, toml(provider.wireApi ?? 'responses')],
+  ]) args.push('-c', entry.join('='));
+  return args;
+}
+
 export const codex = {
   id: 'codex',
   label: 'Codex',
   writesReport: true,
   // 执行者环境是白名单（../lib/env.mjs）；Codex 还要读自己的配置目录与自定义接口地址（都不是密钥）。
   // 064：执行者的用户目录是沙箱，Codex 的登录在用户真实的 ~/.codex：没设 CODEX_HOME 时指向它（与以前行为一致）。
-  isolate: () => ({ keep: ['CODEX_HOME', 'OPENAI_BASE_URL'], realHomeDefaults: { CODEX_HOME: '.codex' } }),
+  // 有 provider（OpenAI 兼容接口）的执行者同样用用户的 ~/.codex：Windows 上可写沙箱按 CODEX_HOME 做初始化，换目录会让沙箱失效；
+  // 接口、模型、密钥只通过 -c 覆盖（见 providerArgs），不写用户的配置文件。
+  isolate({ home, profileName, profile } = {}) {
+    return { keep: ['CODEX_HOME', 'OPENAI_BASE_URL'], realHomeDefaults: { CODEX_HOME: '.codex' } };
+  },
   detect({ env = process.env, settings = {}, tracePrefix } = {}) {
     try {
       const run = () => {
@@ -86,13 +109,20 @@ export const codex = {
       return { installed: !r.error && r.status === 0, version: r.status === 0 ? r.stdout.trim() || null : null, launcher };
     } catch (error) { return { installed: false, version: null, error: error.message }; }
   },
-  command({ root, report, prompt, settings, detection, env = process.env }) {
+  command({ root, report, prompt, settings, detection, env = process.env, profile, profileName, readOnly = false }) {
     const launcher = detection?.launcher ?? resolveLauncher(env, process.platform, settings.path);
     const args = [...launcher.args, 'exec', '--json', '-C', root];
-    if (settings.model != null) args.push('-m', settings.model);
+    const provider = profile?.provider;
+    if (provider != null) {
+      args.push(...providerArgs({ name: profileName ?? 'custom', label: profile.label, provider, secrets: profile.secrets }));
+    }
+    const model = settings.model ?? (provider != null ? profile.model : null);
+    if (model != null) args.push('-m', model);
     if (settings.effort != null) args.push('-c', `model_reasoning_effort=${JSON.stringify(settings.effort)}`);
     if (settings.tier != null) args.push('-c', `service_tier=${JSON.stringify(settings.tier)}`);
-    if (settings.sandbox != null) args.push('-s', settings.sandbox);
+    // 只读任务（调研 / 审查）一律只读沙箱，覆盖 settings.sandbox。
+    if (readOnly) args.push('-s', 'read-only');
+    else if (settings.sandbox != null) args.push('-s', settings.sandbox);
     args.push('-o', report, '-');
     return { executable: launcher.executable, args, stdin: prompt };
   },

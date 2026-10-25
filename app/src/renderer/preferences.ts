@@ -1,8 +1,9 @@
-import { ag, c, p, pj, s6, sc } from '../shared/copy';
+import { ag, c, gx, p, pj, px, s6, sc } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { Connections, GcItems, GcRun, Settings } from '../shared/types';
+import type { AgentPreset, Connections, GcItems, GcRun, Settings } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, trace, type Sheet } from './ui';
-import { AgentsView } from './agents';
+import { AgentsView, presetCards, variantField } from './agents';
+import { bindChoices, choiceHtml, type ChoiceSpec, type Opt } from './agent-custom';
 import brand from '../../design/icons/mark.svg';
 
 const hostName = (host: string) => host === 'claude-code' ? 'Claude Code' : host;
@@ -13,7 +14,7 @@ const kv = (label: string, value: string, state = 'ok', tag = '') => `<div class
 const row = (label: string, description: string, control: string) => `<div class="set-r"><div class="l">${esc(label)}<span>${description}</span></div><div class="ctl">${control}</div></div>`;
 const section = (title: string, description: string, body: string) => `<div class="sect"><h2>${esc(title)}</h2>${description ? `<p>${esc(description)}</p>` : ''}${body}</div>`;
 // 与 agents.ts 的导入向导同形：预设与测试结果都来自核心（agents:presets / agents:test）。
-interface Preset { name: string; title: string; description: string; recommended: boolean; adapter: string; label: string; auth: 'login' | 'token'; env?: Record<string, string>; secrets?: Record<string, string> }
+type Preset = AgentPreset;
 interface WizardTest { ok: boolean; seconds?: number; version?: string | null; reason?: string }
 
 export class PreferencesView {
@@ -46,14 +47,22 @@ export class PreferencesView {
     private gcItems: GcItems | null = null;
     private gcError = '';
     private gcDone = '';
+    // 网络代理一节（099）：点"手动填写"只是显示地址行（不写配置，保存通过校验才写）；地址输入框的草稿、错误码和"已保存"的短暂提示。
+    private proxyManual = false;
+    private proxyDraft: string | null = null;
+    private proxyError = '';
+    private proxySaved = false;
+    private proxyTimer?: ReturnType<typeof setTimeout>;
     // Agent 页"执行者"区（B）；Codex 的编辑回调到这里复用设置控件（C10）。
     private agentsView = new AgentsView({
-        openCodexEdit: trigger => { void this.openCodexEdit(trigger); },
+        openCodexEdit: (trigger, name, others) => { void this.openCodexEdit(trigger, name, others); },
         codexChange: () => this.connections?.codex.change,
         ack: () => { void this.ack(); },
         settingsLoaded: settings => { this.settings = settings; this.redrawStatus(); },
     });
     private codexSheet?: Sheet;
+    // Codex 编辑里的"升级到"：选了就经 agents:update 写入，这里记着当前值，重画正文时读它。
+    private codexEscalate?: { name: string; value: string; others: Opt[] };
     // 引导第 3 步：要导入的 Agent（预设、密钥状态、导入与测试结果都在这里，不跨次运行保留）。
     private wizardPresets: Preset[] = [];
     private wizardAgents: string[] = [];
@@ -73,11 +82,16 @@ export class PreferencesView {
     unmount() { this.container=undefined; this.active=''; }
     async init() { this.settings = await window.dock.preferences('settings'); this.wizard = !this.settings.own.wizardDone; void this.detect(); void this.gcCheck(); }
     mount(container: HTMLElement, page: string, version: string) {
+        // 进入页面时丢掉上次没保存的代理草稿（同一页面内重绘不丢）。
+        if (this.active !== page) { this.proxyManual = false; this.proxyDraft = null; this.proxyError = ''; this.proxySaved = false; }
         this.container = container; this.active = page; this.version = version;
         this.error='';
         container.replaceChildren();
         this.render();
         container.onclick = e => { void this.click(e).catch(error => { this.error = String(error.message || error); this.render(); }); };
+        // 代理地址输入框：输入时记下草稿（整块重建后还在）；回车等同点"保存"。
+        container.oninput = e => { const input = e.target as HTMLInputElement; if (input.matches?.('[data-pref=proxy-url]')) this.proxyDraft = input.value; };
+        container.onkeydown = e => { if (e.key === 'Enter' && (e.target as HTMLElement).matches?.('[data-pref=proxy-url]')) { e.preventDefault(); void this.saveProxyAddress(); } };
         if (page === 'connect') void this.detect();
         if (page === 'settings') void this.refreshSettings();
     }
@@ -102,6 +116,9 @@ export class PreferencesView {
         const focused = document.activeElement instanceof HTMLElement && this.container.contains(document.activeElement) ? document.activeElement : null;
         const identity = focused ? ['data-choice','data-pref','data-setting','data-segment','data-value','data-operation','data-host'].filter(a => focused.hasAttribute(a)).map(a => `[${a}="${CSS.escape(focused.getAttribute(a)!)}"]`).join('') : '';
         this.container.innerHTML = this.wizard ? this.wizardPage() : `<div class="doc scroll"><div class="page-h sticky"><h1>${({connect:c.connect,settings:c.settings,about:c.about} as Record<string,string>)[this.active]}</h1>${this.active === 'connect' ? `<span class="lead">${p.subtitle}</span><span class="sp"></span>${this.button(p.detect,'detect','',this.detecting?'disabled':'')}<button class="btn primary" data-import-agent ${this.busy?'disabled':''}>${icon('add-line')}${esc(ag.import)}</button>` : ''}</div><div class="doc-in">${banner(this.error)}${this.active === 'connect' ? this.connectPage() : this.active === 'settings' ? this.settingsPage() : this.aboutPage()}</div></div>`;
+        // 代理一节的两处样式（界面稿里的内联样式）：页面的内容安全策略不允许 style 属性，改用脚本设置样式。
+        this.container.querySelectorAll<HTMLElement>('[data-proxy-error]').forEach(node => { node.style.color = 'var(--fail)'; });
+        this.container.querySelectorAll<HTMLElement>('[data-pref=proxy-url]').forEach(node => { node.style.width = '280px'; });
         const scroll = this.container.querySelector('.scroll'); if(scroll) scroll.scrollTop = top;
         if (identity) (this.container.querySelector(identity) as HTMLElement | null)?.focus({ preventScroll: true });
         const agents = this.container.querySelector<HTMLElement>('[data-agents]');
@@ -139,6 +156,7 @@ export class PreferencesView {
     private settingsPage() {
         return `<div id="managed-section">${section(p.managed,p.managedHelp,this.managedToggle())}</div>`+
         this.parallelSection()+
+        this.proxySection()+
         section(sc.settingsSec,'',`<div class="set">${row(sc.leadUsage,esc(sc.leadUsageHelp),`<button class="toggle ${this.settings.leadUsage?'on':''}" data-pref="lead-usage" role="switch" aria-label="${sc.leadUsage}" aria-checked="${this.settings.leadUsage}" ${this.busy||this.settings.reason?'disabled':''}></button>`)}</div>`)+
         section(p.watch,'',`<div class="set">${row(p.watchTitle,this.description('watchWindow',p.watchHelp),this.segment('watchWindow',['auto','always','never'],p.watchOptions,this.settings.values.watchWindow!))}</div>`)+
         section(p.notifications,'',`<div class="set">${row(p.notify,esc(p.notifyHelp),`<button class="toggle ${this.settings.own.notifications?'on':''}" data-pref="notifications" role="switch" aria-label="${p.notify}" aria-checked="${this.settings.own.notifications}" ${this.busy?'disabled':''}></button>`)}</div>`)+
@@ -153,6 +171,52 @@ export class PreferencesView {
         const value = this.settings.concurrency, inRange = Number.isInteger(value) && value >= 1 && value <= 4;
         const current = inRange ? '' : `<span class="mono muted" data-concurrency-value>${value}</span>`;
         return section(s6.parallelSec, s6.parallelLead, `<div class="set">${row(s6.concurrency, esc(s6.concurrencyHelp), current + this.segment('concurrency', ['1','2','3','4'], ['1','2','3','4'], inRange ? String(value) : ''))}</div>`);
+    }
+    // 网络代理一节（099，界面稿"代理·跟随系统 / 代理·系统代理未开启 / 代理·手动填写"）：不使用 / 跟随系统代理 / 手动填写。
+    // 说明行：不使用与手动填写各一句固定的话；跟随系统代理写这一刻读到的结果。手动填写多一行地址，保存前由核心校验，不合法时在地址行显示原因。
+    private proxySection() {
+        const state = this.settings.proxy, mode = this.proxyManual ? 'manual' : state.mode;
+        const found = state.system?.url;
+        const system = found ? esc(px.systemFound(found)).replace(esc(found), `<span class="mono">${esc(found)}</span>`)
+            : esc(state.system?.reason === 'unreadable' || state.system?.reason === 'unsupported' ? px.systemUnreadable : px.systemNone);
+        const description = mode === 'off' ? esc(px.offHelp) : mode === 'system' ? system : esc(px.manualHelp);
+        const choices = ['off', 'system', 'manual'];
+        const lead = row(px.row, description, this.segment('proxy', choices, choices.map(value => px.modes[value]), mode));
+        const failure = ({ PROXY_CREDENTIALS: px.errCredentials, PROXY_FORMAT: px.errFormat, PROXY_EMPTY: px.errEmpty } as Record<string, string>)[this.proxyError];
+        const off = this.busy || this.settings.reason ? 'disabled' : '';
+        const address = mode !== 'manual' ? '' : row(px.url, failure ? `<span data-proxy-error>${esc(failure)}</span>` : '',
+            `<input class="inp mono" data-pref="proxy-url" aria-label="${px.url}" placeholder="${px.urlPlaceholder}" value="${esc(this.proxyDraft ?? state.url)}" ${this.settings.reason ? 'disabled' : ''}>`
+            + `<button class="btn sm" data-pref="proxy-save" ${off}>${esc(this.proxySaved ? px.saved : px.save)}</button>`);
+        return section(px.sec, px.lead, `<div class="set">${lead}${address}</div>`);
+    }
+    // 切换模式：不使用 / 跟随系统代理立即写入；手动填写只显示地址行，等保存通过校验才写。
+    private async chooseProxyMode(mode: string) {
+        this.proxyError = ''; this.proxySaved = false;
+        if (mode === 'manual') { this.proxyManual = true; this.render(); return; }
+        this.proxyManual = false; this.proxyDraft = null;
+        await this.saveProxy({ mode });
+    }
+    private async saveProxyAddress() {
+        if (this.busy) return;
+        this.proxyDraft ??= this.settings.proxy.url;
+        await this.saveProxy({ mode: 'manual', url: this.proxyDraft });
+    }
+    private async saveProxy(value: { mode: string; url?: string }) {
+        this.busy = true; this.error = ''; this.proxyError = ''; this.proxySaved = false; this.render();
+        try {
+            this.settings = await window.dock.preferences('save', { key: 'proxy', value });
+            if (value.mode === 'manual') {
+                // 保存成功：说明行恢复，按钮短暂显示"已保存"。
+                this.proxyManual = false; this.proxyDraft = null; this.proxySaved = true;
+                clearTimeout(this.proxyTimer);
+                this.proxyTimer = setTimeout(() => { this.proxySaved = false; if (!this.wizard && this.active === 'settings') this.render(); }, 2000);
+            }
+        }
+        catch (e) {
+            const message = String((e as Error).message || e), code = /PROXY_(?:CREDENTIALS|FORMAT|EMPTY)/.exec(message)?.[0];
+            if (code) this.proxyError = code; else this.error = message;
+        }
+        finally { this.busy = false; this.render(); this.redrawStatus(); }
     }
     // 列表一节（018）：清空任务列表与清空项目列表，放在"数据"一节之前。只清软件里的列表。
     private listsSection() {
@@ -348,12 +412,15 @@ export class PreferencesView {
         if (this.wizardLoading) return `${heading}<div class="hint" role="status">${mark('run')}<span>${p.detecting}</span></div>`;
         if (!this.wizardPresets.length) return `${heading}<div class="hint">${mark('info')}<span>${esc(p.wizardNoPresets)}</span></div>`;
         const x = this.wizardPresetObj();
-        const cards = this.wizardPresets.map(item => {
-            const on = item.name === this.wizardPreset;
-            return `<button class="preset ${on?'on':''}" role="radio" aria-checked="${on}" data-wizard-preset="${esc(item.name)}" tabindex="${on?0:-1}" ${this.busy||this.wizardAdded?'disabled':''}><span class="rd ${on?'on':''}"></span><span class="pk"><b>${esc(item.title)}${item.recommended?`<span class="tag brand">${esc(ag.recommended)}</span>`:''}</b><span>${esc(item.description)}</span></span></button>`;
+        const cardList = presetCards(this.wizardPresets);
+        const cards = cardList.map(item => {
+            const on = item.members.some(m => m.name === this.wizardPreset);
+            return `<button class="preset ${on?'on':''}" role="radio" aria-checked="${on}" data-wizard-preset="${esc(item.name)}" ${item.id?`data-card="${esc(item.id)}"`:''} tabindex="${on?0:-1}" ${this.busy||this.wizardAdded?'disabled':''}><span class="rd ${on?'on':''}"></span><span class="pk"><b>${esc(item.title)}${item.recommended?`<span class="tag brand">${esc(ag.recommended)}</span>`:''}</b><span>${esc(item.description)}</span></span></button>`;
         }).join('');
         const parts: string[] = [`<div class="presets" role="radiogroup" aria-label="${esc(p.wizardAgent)}">${cards}</div>`];
         if (x) {
+            const variant = variantField(cardList.find(item => item.members.some(m => m.name === this.wizardPreset)), this.wizardPreset, 'data-wizard-variant', this.busy || !!this.wizardAdded);
+            if (variant) parts.push(variant);
             parts.push(field(ag.auth, '', `<span>${esc(x.auth === 'token' ? ag.authToken : ag.authLogin)}</span>`));
             if (x.auth === 'token') {
                 const state = this.wizardSecretState === 'set'
@@ -401,7 +468,8 @@ export class PreferencesView {
             const [list, agents] = await Promise.all([window.dock.console('agents:presets'), window.dock.console('agents:list')]);
             this.wizardPresets = Array.isArray(list?.presets) ? list.presets : [];
             this.wizardAgents = Array.isArray(agents?.agents) ? agents.agents.map((a: { name: string }) => a.name) : [];
-            preset = this.wizardPresets.find(x => x.recommended) ?? this.wizardPresets[0];
+            const cardList = presetCards(this.wizardPresets);
+            preset = (cardList.find(x => x.recommended) ?? cardList[0])?.members[0];
             if (!this.wizardPreset && preset) this.useWizardPreset(preset.name);
         }
         catch (e) { this.error = String((e as Error)?.message || e); }
@@ -520,6 +588,8 @@ export class PreferencesView {
             const key=d.setting;
             menu(b,[{label:p.follow(this.settings.current[key]),run:()=>{void this.save(key,null);}},...(key==='model'?[{label:p.customModel,run:()=>this.modelInput(b)}]:(key==='effort'?['minimal','low','medium','high','xhigh']:['default','priority','flex']).map(value=>({label:value,run:()=>{void this.save(key,value);}})))],true); return;
         }
+        if(d.segment==='proxy') { await this.chooseProxyMode(d.value!); return; }
+        if(d.pref==='proxy-save') { await this.saveProxyAddress(); return; }
         if(d.segment) { await this.save(d.segment,d.segment==='concurrency'?Number(d.value):d.value!,d.segment==='theme'||d.segment==='closeAction'); return; }
         if(d.pref==='gc') { this.openGc(b); return; }
         if(d.pref==='gc-recheck') { await this.gcCheck(true); return; }
@@ -529,7 +599,9 @@ export class PreferencesView {
         if(d.pref==='reset-app') { await this.openReset(b); return; }
         if(d.pref==='ack-leftover') { this.settings=await window.dock.preferences('ackLeftover'); this.render(); return; }
         if(d.choice) { this.selected.has(d.choice)?this.selected.delete(d.choice):this.selected.add(d.choice); this.render(); return; }
-        if(d.wizardPreset) { await this.chooseWizardPreset(d.wizardPreset); return; }
+        // 点已选中的合并卡片：保留已选的预设，不重置回默认。
+        if(d.wizardPreset) { if(!(d.card&&presetCards(this.wizardPresets).find(item=>item.id===d.card)?.members.some(m=>m.name===this.wizardPreset))) await this.chooseWizardPreset(d.wizardPreset); return; }
+        if(d.wizardVariant) { await this.chooseWizardPreset(d.wizardVariant); return; }
         if(d.pref==='wizard-secret') { await this.saveWizardSecret(); return; }
         if(d.pref==='wizard-agent') { await this.importWizardAgent(); return; }
         if(d.pref==='wizard-choose-folder') { await this.chooseWizardProject(); return; }
@@ -584,20 +656,39 @@ export class PreferencesView {
     private codexBody() {
         const a=this.connections?.codex;
         const location=row(ag.location,esc(a?.path||p.auto),`${a?.path?this.button(p.reset,'reset','sm quiet'):''}${this.button(p.choose,'choose','sm')}`);
-        return `${banner(this.settings.reason?p.configError(this.settings.reason):'')}<div class="set">${this.defaultRows(true)}${location}</div>`;
+        const e=this.codexEscalate;
+        const escalate=e?row(gx.escalate,esc(gx.escalateHelp),choiceHtml(this.escalateSpec(e),{value:e.value,custom:false})):'';
+        return `${banner(this.settings.reason?p.configError(this.settings.reason):'')}<div class="set">${this.defaultRows(true)}${escalate}${location}</div>`;
     }
-    private async openCodexEdit(trigger: HTMLElement) {
+    private escalateSpec(e: { value: string; others: Opt[] }): ChoiceSpec {
+        const opts=[...e.others];
+        if(e.value&&!opts.some(x=>x.value===e.value)) opts.push({ value: e.value });
+        return { key: 'escalate', attr: 'data-e', fixed: true, mono: false, lead: [{ value: '', label: gx.escalateNone }], opts, label: gx.escalate };
+    }
+    private async openCodexEdit(trigger: HTMLElement, name: string, others: { name: string; label: string }[]) {
         await this.refreshSettings();
-        const close=()=>{ this.codexSheet=undefined; };
-        this.codexSheet=openSheet({ title: ag.editTitle('Codex'), trigger, body: this.codexBody(), note: ag.editNote('codex'), buttons: [ag.done], wide: true,
+        this.codexEscalate={ name, value: this.settings.profiles?.[name]?.escalate??'', others: others.map(x=>({ value: x.name, label: x.label })) };
+        const close=()=>{ this.codexSheet=undefined; this.codexEscalate=undefined; };
+        const sheet=this.codexSheet=openSheet({ title: ag.editTitle('Codex'), trigger, body: this.codexBody(), note: ag.editNote('codex'), buttons: [ag.done], wide: true,
             onButton: (_i, s) => { close(); s.close(); void this.agentsView.refresh(true); }, onClose: () => { close(); void this.agentsView.refresh(true); } });
-        this.codexSheet.root.onclick=e=>{ void this.click(e).catch(error=>{ this.codexSheet?.fail(String(error.message||error)); }); };
+        sheet.root.onclick=e=>{ void this.click(e).catch(error=>{ this.codexSheet?.fail(String(error.message||error)); }); };
+        // 选了"升级到"马上写入配置（和这个模态框里的其他设置一样即时生效）；写入失败时退回原值并显示原因。
+        bindChoices(sheet.root, {
+            spec: key=>key==='escalate'&&this.codexEscalate?this.escalateSpec(this.codexEscalate):undefined,
+            state: ()=>({ value: this.codexEscalate?.value??'', custom: false }),
+            set: (_key, st)=>{
+                const e=this.codexEscalate; if(!e) return;
+                const previous=e.value; e.value=st.value;
+                void window.dock.console('agents:update',{ name: e.name, escalate: st.value }).catch(error=>{ e.value=previous; this.codexSheet?.fail(String(error.message||error)); this.renderCodexSheet(); });
+            },
+            redraw: focus=>{ this.renderCodexSheet(focus); },
+        });
     }
     // 设置变化后重画模态框正文，焦点放回同一个控件。
-    private renderCodexSheet() {
+    private renderCodexSheet(focus?: string) {
         const sheet=this.codexSheet; if(!sheet?.root.isConnected) return;
         const focused=document.activeElement instanceof HTMLElement&&sheet.root.contains(document.activeElement)?document.activeElement:null;
-        const identity=focused?['data-pref','data-setting','data-segment','data-value'].filter(a=>focused.hasAttribute(a)).map(a=>`[${a}="${CSS.escape(focused.getAttribute(a)!)}"]`).join(''):'';
+        const identity=focus??(focused?['data-pref','data-setting','data-segment','data-value','data-sel'].filter(a=>focused.hasAttribute(a)).map(a=>`[${a}="${CSS.escape(focused.getAttribute(a)!)}"]`).join(''):'');
         sheet.setBody(this.codexBody());
         if(this.error) sheet.fail(this.error);
         if(identity) (sheet.root.querySelector(identity) as HTMLElement|null)?.focus({preventScroll:true});

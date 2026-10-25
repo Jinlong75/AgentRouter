@@ -11,5 +11,6 @@
   "title": "Claude Code 兼容后端",
   "description": "自定义接口地址和模型",
   "recommended": false,
+  "effortOptions": ["low", "medium", "high", "xhigh", "max"],
   "order": 6
 }

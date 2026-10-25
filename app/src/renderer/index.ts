@@ -1,4 +1,4 @@
-import { c, cx, gt, p, rt, s6, sc, wt as wtc } from '../shared/copy';
+import { c, cx, gt, p, ro, rt, s6, sc, wt as wtc } from '../shared/copy';
 import { dayGroup } from '../shared/types';
 import type { Task, Snapshot, Event as TaskEvent, GateResult, AttemptFiles, AgentRow, TaskSort } from '../shared/types';
 import { esc, markdown } from '../shared/markdown';
@@ -10,10 +10,11 @@ import { Timeline } from './timeline';
 import { PreferencesView } from './preferences';
 import { ProjectsView } from './projects';
 import { NewTaskView } from './newtask';
-import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack } from './gate';
+import { RoutingView } from './routing';
+import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack, trackNode } from './gate';
 import { AcceptView } from './accept';
 import { ScoreView, scoreVisible } from './score';
-import { needsAccept, wtBanner, wtHeadRow, wtMark, wtState, wtStateLine, wtSub, wtTailRow, wtTrack } from './wt';
+import { bannerHtml, loadRepoState, needsAccept, readdProject, repoBanner, routeHeadRow, writeBlocked, wtBanner as wtBannerBase, wtHeadRow, wtMark, wtState, wtStateLine as wtStateLineBase, wtSub as wtSubBase, wtTailRow, wtTrack as wtTrackBase } from './wt';
 import { attemptBadge, attemptBar, attemptList, attemptPick, attemptPickItems, historyTab, lastFailure, multiAttempts, openRetrySheet, separators, attemptLabel, type Labels } from './attempts';
 import brandSVG from '../../design/icons/mark.svg';
 const root = document.querySelector<HTMLElement>('#app')!;
@@ -21,7 +22,20 @@ const brand = brandSVG.replace('<svg ', '<svg aria-hidden="true" ');
 const marks = { run: ['run', 'loader-4-line'], done: ['ok', 'checkbox-circle-line'], fail: ['fail', 'close-circle-line'], stop: ['stale', 'stop-circle-line'] };
 const mark = (s: Task['status']) => `<span class="mk ${marks[s][0]}">${icon(marks[s][1])}</span>`;
 // worktree 任务的状态标记（排队、准备、待验收、冲突、已合并、已驳回各一个图标）；其余状态与非 worktree 任务沿用四态标记。
-const taskMark = (t: Task) => wtMark(wtState(t))?.html ?? mark(t.status);
+const taskMark = (t: Task) => confirmedTask(t) ? `<span class="mk ok" title="${esc(wtc.subConfirmed)}">${icon('check-line')}</span>` : wtMark(wtState(t))?.html ?? mark(t.status);
+// 已确认的任务（调研 / 审查类任务，accepted.mode === 'confirm'，没有合并提交）：列表第二行、状态行、横幅与轨道的合并节点改用“已确认”的文案，其余照“已合并”的写法（wt.ts）。
+const confirmedTask = (t: Task) => wtState(t) === 'accepted' && t.wt?.accepted?.mode === 'confirm';
+const confirmedBy = (t: Task) => wtc.by[t.wt?.accepted?.by ?? 'cli'] ?? t.wt?.accepted?.by ?? 'cli';
+const wtSub = (t: Task) => confirmedTask(t) ? esc(wtc.subConfirmed) : wtSubBase(t);
+const wtStateLine = (t: Task, now = Date.now()) => confirmedTask(t) ? { cls: 'ok', text: wtc.lineConfirmed(clock(t.wt?.accepted?.at ?? 0), confirmedBy(t)) } : wtStateLineBase(t, now);
+const wtBanner = (t: Task, limit: number) => confirmedTask(t)
+    ? { html: bannerHtml('ok', wtc.confirmedTitle, wtc.confirmedHelp(clock(t.wt?.accepted?.at ?? 0), confirmedBy(t)), '', t.wt?.cleanupFailed ? `<span>${esc(wtc.acceptedCleanup)}</span>` : ''), replacesFailure: false }
+    : wtBannerBase(t, limit);
+// 轨道最后一个节点（合并）换成“确认”：其余四个节点沿用 wt.ts 的。
+const wtTrack = (t: Task, file: ReturnType<typeof gateFile>) => {
+    const html = wtTrackBase(t, file), at = html.lastIndexOf('<button class="node');
+    return confirmedTask(t) && at >= 0 ? `${html.slice(0, at)}${trackNode(wtc.track.merge, 'done', icon('check-line'), wtc.subConfirmed, wtc.nodeConfirmed(confirmedBy(t)), 'flow')}</div>` : html;
+};
 // 执行者没写显示名时，侧栏按适配器（程序）名显示。
 const adapterNames: Record<string, string> = { codex: 'Codex', 'claude-code': 'Claude Code' };
 const project = (t: Task) => t.repo.split(/[\\/]/).filter(Boolean).at(-1)!;
@@ -86,6 +100,8 @@ function showTask(id: string) {
 const projectsHost = { tasks: () => state.tasks, openTask: showTask };
 let projectsView = new ProjectsView(projectsHost);
 const newTaskView = new NewTaskView({ tasks: () => state.tasks, openTask: showTask });
+// 路由页：每次进入都重新读取路由配置（Stage07 O4）。
+const routingView = new RoutingView();
 // 验收页：点轨道上的派发 / 执行 / 待验收 / 合并节点回到任务页对应的标签。
 const acceptView = new AcceptView({ tasks: () => state.tasks, openTask: (id, tabName) => { showTask(id); switchTab(tabName); } });
 const current = () => state.tasks.find(t => t.id === selected);
@@ -118,7 +134,7 @@ function nav() {
     // 侧栏“验收”：徽标是待验收与冲突的数量（品牌色底），悬停说明有几个任务等你处理。
     const waiting = state.tasks.filter(needsAccept).length;
     const item = (key: string, i: string, label: string) => `<button ${preferences.wizard ? 'disabled' : ''} data-page="${key}" ${page === key ? 'aria-current="page"' : ''}${key === 'accept' && waiting ? ` data-tip="${esc(wtc.navTip(waiting))}"` : ''}>${icon(i)}${label}${key === 'tasks' && running ? `<span class="count">${running}</span>` : key === 'accept' && waiting ? `<span class="count brand">${waiting}</span>` : ''}</button>`;
-    const html = item('tasks', 'stack-line', c.tasks) + item('newtask', 'add-circle-line', c.newTask) + item('accept', 'git-pull-request-line', wtc.nav) + `<div class="nav-group">${esc(c.configGroup)}</div>` + item('projects', 'folder-3-line', c.projectsNav) + item('connect', 'plug-line', c.connect) + '<span class="sp"></span>' + item('settings', 'settings-3-line', c.settings) + item('about', 'information-line', c.about) + `<div class="nav-foot">${load}<button class="mg" data-managed-settings ${preferences.wizard?'disabled':''}><span class="dot ${preferences.settings?.managed ? 'ok' : ''}"></span>${preferences.settings?.managed?c.managedOn:c.managedOff}</button></div>`;
+    const html = item('tasks', 'stack-line', c.tasks) + item('newtask', 'add-circle-line', c.newTask) + item('accept', 'git-pull-request-line', wtc.nav) + `<div class="nav-group">${esc(c.configGroup)}</div>` + item('projects', 'folder-3-line', c.projectsNav) + item('connect', 'plug-line', c.connect) + item('routing', 'route-line', ro.nav) + '<span class="sp"></span>' + item('settings', 'settings-3-line', c.settings) + item('about', 'information-line', c.about) + `<div class="nav-foot">${load}<button class="mg" data-managed-settings ${preferences.wizard?'disabled':''}><span class="dot ${preferences.settings?.managed ? 'ok' : ''}"></span>${preferences.settings?.managed?c.managedOn:c.managedOff}</button></div>`;
     if (box.innerHTML && html === navHtml) return;
     navHtml = html;
     const focused = document.activeElement instanceof HTMLElement && box.contains(document.activeElement) ? document.activeElement.getAttribute('data-page') ?? (document.activeElement.hasAttribute('data-managed-settings') ? 'managed' : null) : null;
@@ -136,8 +152,9 @@ function pageView() {
     preferences.unmount();
     projectsView.unmount();
     newTaskView.unmount();
+    routingView.unmount();
     acceptView.unmount();
-    if (preferences.wizard || (page !== 'tasks' && page !== 'projects' && page !== 'newtask' && page !== 'accept')) {
+    if (preferences.wizard || (page !== 'tasks' && page !== 'projects' && page !== 'newtask' && page !== 'accept' && page !== 'routing')) {
         preferences.mount(content as HTMLElement, page, state.version);
         return;
     }
@@ -154,6 +171,10 @@ function pageView() {
     }
     if (page === 'newtask') {
         newTaskView.mount(content as HTMLElement);
+        return;
+    }
+    if (page === 'routing') {
+        routingView.mount(content as HTMLElement);
         return;
     }
     content.innerHTML = '<div class="page-h tasks-h"></div><div class="banner-holder" data-process-banner></div><div class="split"><div class="edge"><div class="tlist scroll"></div></div><div class="detail"></div></div>';
@@ -403,9 +424,12 @@ function header() {
     const wst = wtState(t), pending = wst === 'awaiting' || wst === 'conflict', noRetry = pending || wst === 'accepted' || wst === 'rejected';
     const gate = gateState(t), gateFail = t.status === 'fail' && gate === 'fail';
     const goAccept = pending ? `<button class="btn sm primary" data-go-accept="${esc(t.id)}">${icon('git-pull-request-line')}${esc(wtc.goAccept)}</button>` : '';
-    const redispatch = finished ? `<button class="btn sm" data-redispatch data-tip="${esc(c.redispatchHelp)}" aria-label="${esc(c.redispatch)}" ${busy ? 'disabled' : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.redispatching)}` : `${icon('refresh-line')}${esc(c.redispatch)}`}</button>` : '';
+    // 项目已从列表移除（或文件夹没了）：要写项目的“再派一次”“重试”禁用，悬停提示同一句（驳回、确认、删除不受影响）。
+    loadRepoState(t, () => { if (current()?.id === t.id) header(); });
+    const blocked = writeBlocked(t);
+    const redispatch = finished ? `<button class="btn sm" data-redispatch data-tip="${esc(blocked ? c.projectGoneBlocked : c.redispatchHelp)}" aria-label="${esc(c.redispatch)}" ${busy || blocked ? 'disabled' : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.redispatching)}` : `${icon('refresh-line')}${esc(c.redispatch)}`}</button>` : '';
     // 重试（Stage05）：结束的任务（完成、失败、中断）在"再派一次"前多一个次按钮，在同一工作区新开一次尝试。
-    const retry = finished && !noRetry ? `<button class="btn sm" data-retry title="${esc(rt.buttonTip)}" aria-label="${esc(rt.button)}">${icon('arrow-go-forward-line')}${esc(rt.button)}</button>` : '';
+    const retry = finished && !noRetry ? `<button class="btn sm" data-retry title="${esc(blocked ? c.projectGoneBlocked : rt.buttonTip)}" aria-label="${esc(rt.button)}" ${blocked ? 'disabled' : ''}>${icon('arrow-go-forward-line')}${esc(rt.button)}</button>` : '';
     // 失败且门禁没过时，状态行第二段说明是门禁没过（不再是笼统的 exit=3）。
     const stateTail = t.status === 'run' ? ` · <span data-elapsed="${esc(t.id)}">${elapsed(t)}</span>` : t.status === 'done' ? ` · ${c.elapsed} ${t.minutes ?? '—'} ${c.minutes}` : t.status === 'fail' ? gateFail ? ` · ${esc(gt.badge.fail)}` : ` · exit=${t.exit}` : '';
     const stateLine = wtStateLine(t);
@@ -452,7 +476,7 @@ function banners(t: Task) {
         : '';
     // worktree 任务：排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回 / 准备失败的横幅放在详情顶部（门禁标签里已有自己的横幅，不显示）；冲突与准备失败的横幅取代通用的失败横幅。
     const wtb = tab !== 'gate' ? wtBanner(t, state.concurrency ?? 2) : null;
-    holder.innerHTML = failed + (wtb?.html ?? '') + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
+    holder.innerHTML = repoBanner(t) + failed + (wtb?.html ?? '') + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
 }
 function tabs() {
     const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!, t = current();
@@ -547,7 +571,7 @@ function renderTab() {
     }
     else {
         const row = (key: string, value: unknown, open?: string) => `<div class="r"><span class="k">${key}</span><span class="v mono">${esc(value)}</span>${open ? `<button class="btn sm quiet" data-open="${open}">${c.open}</button>` : ''}</div>`;
-        body.innerHTML = `<div class="rows">${[[c.record, t.name], [c.spec, t.spec ?? c.direct, t.spec ? 'spec' : undefined], [c.role, t.role ?? c.noRole], [c.dispatcher, host(t)], [c.executor, `${executorLabel(t)}（${[...new Set([t.profile, executorAdapter(t)].filter(Boolean))].join(' · ')}）`], [c.agent, t.agentVersion ?? (isCodexTask(t) ? 'Codex CLI' : '—')], [c.model, t.model ?? (isCodexTask(t) ? c.followCodex : '—')], ...(isCodexTask(t) ? [[c.effort, t.effort ?? c.followCodex], [c.tier, t.tier ?? c.followCodex]] : []), [c.managed, t.managed?c.yes:c.no], ...(isCodexTask(t) ? [[c.sandbox, t.sandbox ?? '—']] : []), [c.repo, t.repo, 'repo']].map(([k, v, o]) => row(k!, v, o)).join('')}</div><div class="sec-t">${c.records}</div><div class="rows">${[[c.progress, 'progress'], [c.events, 'events'], [c.raw, 'raw']].map(([label, key]) => row(label, t[key as 'progress'] ?? '—', t[key as 'progress'] ? key : undefined)).join('')}</div>`;
+        body.innerHTML = `<div class="rows">${[[c.record, t.name], [c.spec, t.spec ?? c.direct, t.spec ? 'spec' : undefined], [c.role, t.role ?? c.noRole], [c.dispatcher, host(t)], [c.executor, `${executorLabel(t)}（${[...new Set([t.profile, executorAdapter(t)].filter(Boolean))].join(' · ')}）`], ...(t.route ? [[c.route, t.route]] : []), [c.agent, t.agentVersion ?? (isCodexTask(t) ? 'Codex CLI' : '—')], [c.model, t.model ?? (isCodexTask(t) ? c.followCodex : '—')], [c.effort, t.effort ?? (isCodexTask(t) ? c.followCodex : c.effortDefault)], ...(isCodexTask(t) ? [[c.tier, t.tier ?? c.followCodex]] : []), [c.managed, t.managed?c.yes:c.no], ...(isCodexTask(t) ? [[c.sandbox, t.sandbox ?? '—']] : []), [c.repo, t.repo, 'repo']].map(([k, v, o]) => row(k!, v, o)).join('')}</div><div class="sec-t">${c.records}</div><div class="rows">${[[c.progress, 'progress'], [c.events, 'events'], [c.raw, 'raw']].map(([label, key]) => row(label, t[key as 'progress'] ?? '—', t[key as 'progress'] ? key : undefined)).join('')}</div>`;
     }
     if (tab !== 'flow') {
         const compact = root.querySelector<HTMLButtonElement>('[data-plan-top]')!;
@@ -599,7 +623,7 @@ function renderFlow() {
     timeline.footer = (showFooter && t?.gatingAt ?`<div class="tl k-turn gate-sep"><span class="t mono">${clock(t.gatingAt)}</span><div class="c">执行者结束（exit=${t.agentExit ?? 0}）· 门禁开始</div></div>` : '') + (t?.worktree ? wtTailRow(t) : '');
     // worktree 任务：进展开头一行“建好 worktree · 分支 · 基线”。
     const wtSlot = root.querySelector<HTMLElement>('.wt-slot');
-    if (wtSlot) { const head = t?.worktree ? wtHeadRow(t) : ''; if (wtSlot.innerHTML !== head) wtSlot.innerHTML = head; }
+    if (wtSlot) { const head = (t ? routeHeadRow(t) : '') + (t?.worktree ? wtHeadRow(t) : ''); if (wtSlot.innerHTML !== head) wtSlot.innerHTML = head; }
     timeline.render();
     const earlier = root.querySelector<HTMLButtonElement>('[data-earlier]')!;
     earlier.hidden = !timeline.cursor?.start;
@@ -881,6 +905,12 @@ root.addEventListener('click', async (e) => {
         if (out) out.hidden = !open;
         if (note) note.hidden = !open;
     }
+    // 项目已移除横幅的“重新添加项目”：走项目页同一条 projects:add，成功后横幅消失、按钮恢复。
+    else if (d.readdProject !== undefined) {
+        const t = state.tasks.find(x => x.id === d.readdProject);
+        if (t)
+            void readdProject(t, () => { if (current()?.id === t.id) header(); }).catch(notice);
+    }
     // 准备失败横幅的“驳回…”：和验收页同一个驳回弹窗。
     else if (d.setupReject) {
         const t = state.tasks.find(x => x.id === d.setupReject);
@@ -890,7 +920,7 @@ root.addEventListener('click', async (e) => {
     else if (d.blameN) {
         const t = current(), body = root.querySelector<HTMLElement>('.tab-body');
         if (t && body)
-            void scoreView.blame(t, Number(d.blameN), d.blameWho === 'spec' ? 'spec' : 'worker', body);
+            void scoreView.blame(t, Number(d.blameN), d.blameWho === 'spec' || d.blameWho === 'environment' ? d.blameWho : 'worker', body);
     }
     else if (d.open)
         void action(d.open);

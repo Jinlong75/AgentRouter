@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { createPreferences, loginState, skillState, hostActions, defaultChecked } from '../../app/src/main/preferences.mjs';
 import { preferenceFixture } from '../../tools/demo/preferences.mjs';
 import { copyFont, copyBrandFont, checkBrandFont, brandFontHash } from '../../tools/fonts.mjs';
@@ -191,10 +192,62 @@ test('统计主导的 token 与用时（leadUsage）：只认布尔值，写入 
   await writeFile(file,'invalid');await assert.rejects(service.run('save',{key:'leadUsage',value:true}));assert.equal(await readFile(file,'utf8'),'invalid');
 });
 
+test('网络代理（proxy）：模式只收 off / system / manual；manual 先用核心校验（带凭据、格式不对、为空都抛错误码，不写文件）；写入保留其余字段；配置读不了时拒绝',async t=>{
+  const {home,env,service}=await fixture(t),file=path.join(home,'config.json');
+  const disk=async()=>JSON.parse(await readFile(file,'utf8'));
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,future:'keep'}},managed:true,extension:{keep:true}}));
+  assert.deepEqual((await service.run('settings')).proxy,{mode:'off',url:'',system:null},'没写 proxy 按 off');
+  for(const value of [undefined,null,'off',{},{mode:'auto'},{mode:'manual'},{mode:'manual',url:5}]) await assert.rejects(service.run('save',{key:'proxy',value}),/Invalid value/,JSON.stringify(value));
+  for(const [url,code] of [['http://user:pass@127.0.0.1:7890','PROXY_CREDENTIALS'],['http://user@127.0.0.1:7890','PROXY_CREDENTIALS'],['127.0.0.1:7890','PROXY_FORMAT'],['http://127.0.0.1','PROXY_FORMAT'],['http://127.0.0.1:99999','PROXY_FORMAT'],['','PROXY_EMPTY'],['   ','PROXY_EMPTY']]) {
+    await assert.rejects(service.run('save',{key:'proxy',value:{mode:'manual',url}}),new RegExp(`^Error: ${code}$`),url);
+  }
+  assert.equal((await disk()).proxy,undefined,'被拒绝的值不写文件，也不出现 proxy 字段');
+  let result=await service.run('save',{key:'proxy',value:{mode:'manual',url:' http://127.0.0.1:7890/ '}});
+  assert.deepEqual(result.proxy,{mode:'manual',url:'http://127.0.0.1:7890',system:null});
+  let saved=await disk();
+  assert.deepEqual(saved.proxy,{mode:'manual',url:'http://127.0.0.1:7890'});assert.equal(saved.managed,true);assert.deepEqual(saved.extension,{keep:true});assert.equal(saved.profiles.codex.future,'keep');
+  // 校验不通过时已保存的值不变。
+  await assert.rejects(service.run('save',{key:'proxy',value:{mode:'manual',url:'http://u:p@h:1'}}),/PROXY_CREDENTIALS/);
+  assert.deepEqual((await disk()).proxy,{mode:'manual',url:'http://127.0.0.1:7890'});
+  // 切到不使用：mode 变 off，已保存的地址留着（再切回手动时还在）；其余字段不变。
+  result=await service.run('save',{key:'proxy',value:{mode:'off'}});
+  assert.deepEqual(result.proxy,{mode:'off',url:'http://127.0.0.1:7890',system:null});
+  saved=await disk();assert.deepEqual(saved.proxy,{mode:'off',url:'http://127.0.0.1:7890'});assert.equal(saved.managed,true);
+  // 跟随系统：保存时读一次系统代理（测试用 AR_TEST_PROXY_REG，不读注册表）。
+  const reg=(enable,server)=>['','HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings',`    ProxyEnable    REG_DWORD    ${enable}`,...(server?[`    ProxyServer    REG_SZ    ${server}`]:[]),''].join('\r\n');
+  env.AR_TEST_PROXY_REG=reg('0x1','10.0.0.9:3128');
+  result=await service.run('save',{key:'proxy',value:{mode:'system'}});
+  assert.equal((await disk()).proxy.mode,'system');
+  assert.deepEqual(result.proxy.system,process.platform==='win32'?{url:'http://10.0.0.9:3128',reason:'found'}:{url:null,reason:'unsupported'});
+  if(process.platform==='win32') {
+    env.AR_TEST_PROXY_REG=reg('0x0','10.0.0.9:3128');
+    assert.deepEqual((await service.run('settings')).proxy.system,{url:null,reason:'disabled'},'每次读设置都重新读系统代理');
+  }
+  // 手写的坏值：读设置不抛错，按 off 显示；配置读不了时保存被拒绝，文件原样。
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',enabled:true}},proxy:{mode:'auto'}}));
+  assert.equal((await service.run('settings')).proxy.mode,'off');
+  await writeFile(file,'invalid');await assert.rejects(service.run('save',{key:'proxy',value:{mode:'off'}}));assert.equal(await readFile(file,'utf8'),'invalid');
+});
+
 test('任务页排序记在软件偏好里：只收 time / state / project',async t=>{
   const {service}=await fixture(t);
   assert.equal((await service.run('settings')).own.taskSort,undefined);
   for(const value of ['state','project','time']) assert.equal((await service.run('own',{key:'taskSort',value})).own.taskSort,value);
   for(const value of ['name','',null,3]) await assert.rejects(service.run('own',{key:'taskSort',value}),/Invalid preference/);
   assert.equal((await service.run('settings')).own.taskSort,'time');
+});
+
+test('演示夹具里的假 Codex 认得 exec --json：ar agents test codex 通过，未知参数仍 exit 2',async t=>{
+  const {home,env}=await fixture(t);
+  const ar=path.join(root,'core','ar.mjs');
+  // 隔离的 AGENT_ROUTER_HOME / AR_TEST_AGENT 都来自夹具；假 Codex 只在隔离目录里，不会启动真实 Codex。
+  assert.equal(env.AGENT_ROUTER_HOME,home);assert.ok(env.AR_TEST_AGENT.startsWith(home));
+  const run=(file,args,opts={})=>new Promise(resolve=>{const child=spawn(process.execPath,[file,...args],{env,cwd:home,windowsHide:true,...opts});let out='';child.stdout.on('data',d=>out+=d);child.stderr.on('data',d=>out+=d);child.on('close',code=>resolve({code,out}));if(opts.input!==undefined)child.stdin.end(opts.input);});
+  const tested=await run(ar,['agents','test','codex','--json','--timeout','60']);
+  const result=JSON.parse(tested.out.slice(tested.out.indexOf('{')));
+  assert.equal(result.ok,true,tested.out);assert.equal(result.exit,0);assert.match(result.report,/\bOK\b/);
+  const direct=await run(env.AR_TEST_AGENT,['exec','--json','-C',home],{input:'ping'});
+  assert.equal(direct.code,0);assert.ok(direct.out.split('\n').filter(Boolean).every(l=>JSON.parse(l).type));
+  assert.equal((await run(env.AR_TEST_AGENT,['unknown-sub'])).code,2);
+  assert.equal((await run(env.AR_TEST_AGENT,['exec'])).code,2);
 });

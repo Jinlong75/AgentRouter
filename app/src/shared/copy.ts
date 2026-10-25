@@ -31,7 +31,11 @@ export const c = {
     deleteTitle: (n: number) => `删除 ${n} 个任务？`, deleteBody: '从任务列表里移除。项目里的代码和提交不受影响。',
     deleteFiles: '同时删除项目里的任务记录文件', deleteFilesHelp: '删除这些任务在各项目 .agent-runs 里的记录目录（进度、汇报、原始输出），删除后无法恢复。旧版本导入的任务没有这类目录，会跳过。',
     deleteConfirm: '删除', deleted: (n: number) => `已删除 ${n} 个任务`, deleteLeft: (n: number) => `${n} 个记录目录没能删除（可能正被占用），任务已从列表移除`,
-    record: '记录名', spec: '任务说明', direct: '直接给的任务文字', role: '角色', noRole: '不指定', dispatcher: '派活方', agent: '干活方', executor: '执行者', model: '模型', effort: '推理强度', tier: '档位', sandbox: '沙箱', repo: '仓库', records: '记录文件', progress: '进度', events: '统一事件', raw: '原始输出', followCodex: '跟随 Codex', turn: '一轮结束', input: '输入', output: '输出',
+    // Stage07 116：任务的项目已从项目列表移除（第二轮走查发现：待验收任务卡死）
+    projectGoneTitle: '这个任务的项目已从项目列表移除', projectGoneHelp: (path: string) => `项目 ${path} 不在项目列表里。驳回、确认和从列表删除照常可以做；要合并或重试，先把项目重新添加回来。`,
+    projectGoneReAdd: '重新添加项目', projectGoneMissing: (path: string) => `项目文件夹 ${path} 已经不存在：只能从列表删除这个任务。它的 worktree 还留在磁盘上，"清理"目前不处理这种情况；需要时在验收页用"⋯ → 打开 worktree 文件夹"找到它，确认不要了再手动删除。`,
+    projectGoneBlocked: '项目已从项目列表移除，先重新添加项目',
+    record: '记录名', route: '路由', effortDefault: '默认（不传参数）', spec: '任务说明', direct: '直接给的任务文字', role: '角色', noRole: '不指定', dispatcher: '派活方', agent: '干活方', executor: '执行者', model: '模型', effort: '推理强度', tier: '档位', sandbox: '沙箱', repo: '仓库', records: '记录文件', progress: '进度', events: '统一事件', raw: '原始输出', followCodex: '跟随 Codex', turn: '一轮结束', input: '输入', output: '输出',
     error: '操作没有完成，请重试', reportMissing: '汇报尚未生成或文件已不存在', fileMissing: '文件已不存在', earlier: '加载更早的进展', unknownHost: '其他派活方', appHost: 'AgentRouter（软件）',
     // 用户在本软件里停止的任务（signal 为 stopped-by-app）
     stopped: '你停止了这个任务', stoppedHelp: '工作区里没提交的改动还在。要继续，点"再派一次"，或在派活方的会话里重新派发。', stoppedShort: '手动停止',
@@ -160,6 +164,8 @@ export const pj = {
     notInit: '未初始化', notGit: '不是 git 仓库', select: '选择一个项目',
     openClaude: '在此项目打开 Claude Code', openFolder: '打开文件夹', dirty: (n: number) => `${n} 个文件未提交`, clean: '没有未提交的改动',
     menu: { edit: '编辑配置', remove: '移除' } as Record<string, string>,
+    // Stage07 116：移除还有未处理任务的项目时，在确认框里列出这些任务
+    removePending: (n: number) => `这个项目还有 ${n} 个任务没处理完（待验收、合并冲突或进行中）：`, removePendingMore: (n: number) => `…等 ${n} 个`, removePendingHelp: '移除后这些任务仍留在任务列表里，驳回、确认和删除照常可以做；要合并或重试，得先把项目重新添加回来。建议先处理完再移除。',
     removeTitle: (name: string) => `移除项目「${name}」？`, removeBody: '只从 AgentRouter 的列表里移除，不删除任何文件；以后可以再添加。', removeConfirm: '移除',
     config: '项目配置', configFile: '.agent-router/project.json', edit: '编辑配置', unset: '未设置', recent: '最近任务',
     fields: { baseBranch: '主分支', setup: '准备命令', verify: '验收命令', allowedPaths: '允许改动的路径', specsDir: '任务说明目录' } as Record<string, string>,
@@ -180,6 +186,9 @@ export const pj = {
     identityScope: '用于', identityScopes: { repo: '只用于这个项目', global: '本机所有项目（全局）' } as Record<string, string>,
     identityNote: (global: boolean) => global ? '写入你的全局 git 配置（~/.gitconfig）' : '写入这个项目的 .git/config', identitySave: '保存',
     identityNameRequired: '请填写用户名', identityEmailInvalid: '邮箱格式不对',
+    // Stage07 O14（D41）：git 低于 2.40 时项目详情顶部的提示（不用 worktree 的任务不受影响，所以不拦别的操作）
+    gitOldTitle: (version: string) => `git 版本太旧：${version}`,
+    gitOldHelp: '用 worktree 的任务需要 git 2.40 或更新，这个项目的任务现在派发不了；不用 worktree 的任务不受影响。到 git-scm.com 下载新版，装好后重新打开 AgentRouter。',
     commitNote: (n: number) => `git commit -m "[主导] 接入 AgentRouter" -- 这 ${n} 个文件`, commit: '提交这些文件', committed: (hash: string) => `已提交 ${hash}`,
 };
 
@@ -213,6 +222,9 @@ export const nt = {
     conseqNew: (spec: string, label: string, commit: boolean) => `写入 ${spec}${commit ? '，提交后' : '，'}派给 ${label}`,
     failed: '派发没有完成',
     identityWarn: '这个项目还没有设置 git 提交身份："先提交任务说明"和执行者提交改动都会失败。',
+    // Stage07 T8b：允许路径输入框下面的匹配预览（ar spec check-paths；界面稿新建任务页场景"允许路径·匹配预览"）
+    pathsMatched: (n: number) => `匹配到 ${n} 个现有文件：`, pathsMore: (n: number) => `，还有 ${n} 个`, pathsAll: (n: number) => `匹配项目里全部 ${n} 个文件`,
+    pathsNone: (pattern: string) => `${pattern} 没有匹配到现有文件（要新建的文件可以这样写）`, pathsChecking: '正在检查匹配的文件…', pathsFailed: (reason: string) => `没能检查匹配的文件：${reason}`,
 };
 
 // Stage04 门禁（协议第 12 节）：流水线轨道、门禁标签、列表徽标、横幅。summary 由核心生成，原样显示。
@@ -306,6 +318,8 @@ export const wt = {
     queuedTitle: '排队中', queuedHelp: (limit: number, ahead: number) => `同时最多运行 ${limit} 个任务。${ahead ? `前面还有 ${ahead} 个任务，` : ''}轮到时自动开始；现在停止不会留下任何东西。`,
     preparingTitle: '准备工作区', preparingNoWorktree: '正在建立独立的 worktree 与分支。', preparingHelp: (branch: string, base: string) => `已在独立的 worktree 里建好分支 ${branch}（基线 ${base}），正在运行准备命令。`,
     worktreeRow: (branch: string, base: string, sha: string) => `建好 worktree · 分支 ${branch} · 基线 ${base} ${sha}`,
+    // Stage07 111：进展里路由结果的分隔行（与 worktreeRow 同样式），文字是核心记下的路由说明原文
+    routeRow: (why: string) => `路由：${why}`,
     setupFailTitle: '准备命令失败，执行者没有启动', setupFailHelp: 'worktree 保留着供排查。修好项目配置里的准备命令后点"重试"会重跑准备命令；不要这个任务了就点"驳回…"，删除 worktree 与分支。', setupFailReject: '驳回…',
     awaitingTitle: '待验收', awaitingHelp: (base: string) => `门禁通过。改动在这个任务自己的分支里，还没有合并到 ${base}；批准后合并，驳回则丢弃。`, awaitingRow: '门禁通过 · 进入待验收',
     conflictTitle: '合并冲突，没有合并', conflictHelp: (base: string, files: number) => `批准时和 ${base} 上的新提交冲突（${files} 个文件），已撤回这次合并，${base} 没有变化。`,
@@ -332,6 +346,12 @@ export const wt = {
     noteApproveSquash: (base: string) => `批准：把改动压成一个提交放到 ${base} 上（--squash），然后删除 worktree 与分支；可以用 git revert 撤销这个提交`,
     noteConflict: '解决冲突在同一个 worktree 里进行，不占自动重试的次数',
     reject: '驳回…', retry: '重试…', approve: '批准并合并', resolve: '解决冲突并重试', resolving: '正在开始…',
+    // Stage07 T6：调研类任务（只读运行、没有提交）门禁通过后的"确认"：不合并，只删除 worktree 与分支（界面稿场景"调研·确认"）
+    researchTitle: '调研类任务：只读运行，没有改动', researchHelp: '看完汇报后点"确认"：删除 worktree 与分支，汇报和任务记录保留。不满意可以驳回，或者重试并写补充说明。',
+    noteConfirm: '确认：不合并任何东西，只删除 worktree 与分支', confirm: '确认', confirming: '正在确认…',
+    confirmedToast: (name: string) => `已确认「${name}」：worktree 已删除`,
+    confirmedTitle: '已确认', confirmedHelp: (time: string, by: string) => `${time}，${by}确认；没有改动，worktree 与分支已删除。`,
+    subConfirmed: '已确认', lineConfirmed: (time: string, by: string) => `已确认 · ${time} ${by}确认`, nodeConfirmed: (by: string) => `${by}确认（没有改动）`,
     // 批准确认
     approveTitle: (name: string, base: string) => `合并「${name}」到 ${base}？`,
     approveBody: (mode: string, branch: string) => `合并方式：${mode === 'squash' ? '--squash（压成一个提交）' : '--no-ff（一个任务一个合并提交）'}。合并后删除 worktree 与分支 ${branch}。`,
@@ -383,6 +403,92 @@ export const s6 = {
     gcDone: (n: number, size: string) => `已清理 ${n} 项，约 ${size}`, gcPartial: (failed: number) => `；${failed} 项没删掉（可能正被占用），下次再试`,
 };
 
+// Stage07 O4 / O5：路由页与新建任务页"执行者：自动"的路由结果（界面稿 app/design/preview.js 路由页场景"规则 / 添加规则 / 试算·为什么选它 / 已达每日上限 / 没有规则"，新建任务页场景"自动·路由结果"）
+export const ro = {
+    nav: '路由', title: '路由', lead: '按任务类型自动选执行者', addRule: '添加规则', addFirst: '添加第一条规则',
+    types: { code: '代码', test: '测试', fix: '修复', refactor: '重构', research: '调研', docs: '文档', review: '审查' } as Record<string, string>,
+    rulesSec: '规则', rulesLead: '按顺序匹配：任务说明指定了执行者时直接用它；否则找第一条类型相符、执行者可用的规则；都不符合时用兜底。停用、不支持只读、今天已达上限的执行者会被跳过。',
+    emptyTitle: '还没有规则', emptyHelp: (label: string) => `所有任务都派给默认执行者 ${label}。按任务类型分给不同的执行者，就添加一条规则。`,
+    escTo: (label: string) => `升级到 ${label}`, noEsc: '不升级',
+    moveUp: (n: number) => `上移第 ${n} 条`, moveDown: (n: number) => `下移第 ${n} 条`, edit: (n: number) => `编辑第 ${n} 条`, remove: (n: number) => `删除第 ${n} 条`,
+    stateDisabled: '已停用', stateNoReadOnly: '不支持只读', stateLimited: '今天已达上限', stateMissing: '执行者不存在',
+    projectRules: (project: string, n: number) => `项目 ${project} 另有 ${n} 条自己的规则（写在 .agent-router/project.json），派发这个项目的任务时排在上面这些之前。`,
+    ruleSheetAdd: '添加规则', ruleSheetEdit: (n: number) => `编辑第 ${n} 条规则`,
+    ruleTypes: '任务类型', ruleTypesHelp: '可以选多个；一个类型只认第一条符合的规则', ruleTypesRequired: '至少选一个任务类型',
+    ruleTo: '执行者', ruleToHelp: '调研、审查类任务只能选支持只读的执行者', ruleEsc: '升级到', ruleEscHelp: '可选：最后一次自动重试改用它',
+    ruleNote: '写进 config.json 的 routing.rules，加在最后', ruleAdd: '添加', ruleSave: '保存',
+    fallbackSec: '兜底', fallback: '兜底执行者', fallbackHelp: (label: string) => `没有规则符合时派给它；不设时用默认执行者（${label}）`, fallbackNone: '用默认执行者',
+    trialSec: '试算', trialLead: '不派发，只看会派给谁、为什么。', trialType: '任务类型', trialProject: '项目', trialAny: '不限项目',
+    trialResult: (label: string) => `将派给 ${label}`, trialWhy: '为什么选它', trialFail: '没有可用的执行者',
+    limitsSec: '每日上限', limitsLead: '到上限的执行者当天不再接任务，路由跳到下一条规则或兜底；第二天自动恢复。留空为不限。',
+    limitTasks: '任务数', limitTokens: 'token', limitNone: '不限', limitInvalid: '填正整数，或留空表示不限',
+    usedTasks: (n: number, max: number | null) => max ? `今天 ${n}/${max} 个任务` : `今天 ${n} 个任务`, usedTokens: (n: string, max: string | null) => max ? ` · ${n} / ${max} token` : ` · ${n} token`,
+    reviewSec: '审查者候选', reviewLead: '交叉审查（v0.8.0 起）按顺序取第一个可用的；必须支持只读。', reviewAdd: '添加', reviewRemove: (label: string) => `移除 ${label}`,
+    reviewDiffer: '必须与执行者不同', reviewDifferHelp: '同一个模型审查自己的改动，容易带着同样的盲点',
+    // 新建任务页"执行者：自动"
+    autoByRule: '自动（按路由规则）', hint: (label: string, why: string) => `将派给 ${label}（${why}）`, hintWhy: '为什么', hintFail: (reason: string) => `派发不了：${reason}`,
+    whyRule: (scope: string, n: number, types: string) => `${scope}规则 ${n}：${types}`, whyFallback: '兜底', whySpec: '任务说明指定', whyExplicit: '手动指定',
+    scopeProject: '项目', scopeGlobal: '全局',
+};
+
+// Stage07 O6 / O7：导入向导扩展——OpenAI 兼容接口、Qoder、自定义 CLI、从文件导入；模型与推理强度下拉；自定义 CLI 表单与"测试并预览"（界面稿 Agent 页场景"导入 1 新类型 / 导入 2 选模型与推理强度 / OpenAI 兼容接口 / 自定义 CLI / 测试并预览 / 编辑 Claude 类执行者"）
+export const gx = {
+    // 第 1 步两种不是预设的类型（预设卡片的名字与说明来自预设模板）
+    custom: '自定义 CLI', customDesc: '任意有非交互模式的命令行 Agent，填表接入，不用写代码',
+    fromFile: '从文件导入', fromFileDesc: '导入别人导出的声明文件（.json，不含密钥）', chooseFile: '选择声明文件…',
+    // 模型与推理强度下拉
+    model: '模型', modelHelpCli: (cli: string) => `列表来自 ${cli}；也可以选"自定义…"自己填`, modelHelpPreset: '常用值；也可以选"自定义…"自己填',
+    modelLoading: '正在读取模型列表…', modelCustom: '自定义…', modelCustomPh: '输入模型名',
+    effort: '推理强度', effortDefault: '默认', effortDefaultDesc: '不传参数', effortHelp: (cli: string) => `"默认"表示不传这个参数，由 ${cli} 自己决定`,
+    // OpenAI 兼容接口
+    baseUrl: '接口地址', baseUrlHelp: '可以从常用地址里选，也可以自己填', wireApi: '接口类型', wireApiValue: 'Responses',
+    wireApiHelp: 'Codex 只支持 Responses 接口；只提供 Chat Completions 的服务请改用"Claude Code 兼容后端"或自定义 CLI',
+    openaiNote: '经 Codex 外壳运行，不需要 ChatGPT 登录；沿用你的 Codex 配置目录',
+    // Qoder
+    qoderTokenHelp: (site: string, name: string) => `在 ${site} 的账户集成页生成个人访问令牌，保存到用户环境变量 ${name}`,
+    // 自定义 CLI 表单
+    customTitle: '导入 Agent · 自定义 CLI', program: '程序', programHelp: '程序名（在 PATH 里查找）或完整路径', browse: '浏览…',
+    programFound: (version: string) => `已找到 · ${version}`, programMissing: '找不到这个程序', programChecking: '正在检测…',
+    detectArgs: '检测参数', detectArgsHelp: '退出码 0 视为已安装，第一行输出当作版本',
+    argsTpl: '参数模板', argsTplHelp: '任务指令用 {prompt}（直接作参数）或 {promptFile}（写进临时文件再传路径；指令长、或程序是 .cmd 时用它）',
+    argAdd: '输入后回车', argRemove: (arg: string) => `删除参数 ${arg}`, insert: '插入：',
+    stdin: '标准输入', stdinHelp: '不需要时留空', stdinPh: '例如 {prompt}',
+    outFormat: '输出格式', formats: { text: '文本', jsonl: 'JSONL', 'stream-json': 'Claude Code 风格' } as Record<string, string>,
+    mapping: '事件映射', mappingHelp: 'JSONL 每一行按顺序找第一条符合的规则；都不符合的行丢弃（原样保存在 raw.log）', mapAdd: '添加一条', mapRemove: (n: number) => `删除第 ${n} 条映射`,
+    mapWhen: '条件', mapKind: '事件', mapFields: '字段',
+    kinds: { say: '说话', think: '思考', cmd: '命令', file: '文件', plan: '计划', tool: '工具', turn: '用量', error: '错误' } as Record<string, string>,
+    reportFrom: '汇报来源', reports: { stdout: '标准输出', lastSay: '最后一句话', file: '汇报文件 {report}' } as Record<string, string>,
+    readOnlyArgs: '只读参数', readOnlyArgsHelp: '不填时它不能做调研、审查类任务', readOnlyPh: '例如 --read-only',
+    secretVar: '密钥环境变量', secretVarHelp: '可选；只写变量名', secretVarPh: '例如 EXAMPLE_API_KEY',
+    testPreview: '测试并预览', customNote: (name: string) => `保存为 config.json 的 generics.${name}，可以在"⋯ → 导出声明"里导出`,
+    invalid: (n: number) => `声明有 ${n} 处问题，改好后才能保存`,
+    // 测试并预览
+    previewTitle: '导入 Agent · 测试并预览', rawOut: '原始输出', mapped: '映射结果', unmatched: (n: number) => `第 ${n} 行没有符合的规则，已丢弃`,
+    previewOk: '测试通过', previewOkHelp: (exit: number, seconds: string, report: string) => `退出码 ${exit}，用时 ${seconds} 秒；汇报：${report}`,
+    previewFail: '测试没有通过', retest: '重新测试', backEdit: '返回修改',
+    // 导出
+    exportDone: (file: string) => `已导出到 ${file}`, exportTitle: '导出声明',
+    // 执行者"编辑"里的升级目标（用户 2026-10-24 同意做进软件）
+    // 107 执行者用文案待定占位的几处（主导补）
+    nameInvalid: '名称只能用小写字母、数字和连字符（不能以连字符开头），最长 40 个字符', nameTaken: (name: string) => `已经有叫 ${name} 的执行者，换一个名称`,
+    whenFormat: (part: string) => `条件「${part}」要写成"键 = 值"，多个用逗号分隔`, fieldsFormat: (part: string) => `字段「${part}」要写成"字段 ← 路径"，多个用 · 分隔`,
+    genericEditNote: '这里只改显示名、模型、推理强度和升级目标。程序、参数、映射这些声明内容要改的话：⋯ → 导出声明，改好后再从文件导入。',
+    escalate: '升级到', escalateHelp: '可选：这个执行者的任务最后一次自动重试改用它；路由规则里写了"升级到"时以规则为准', escalateNone: '不升级',
+};
+
+// Stage07 O8（D33）：设置页"网络代理"（界面稿 app/design/preview.js 设置页场景"代理·跟随系统 / 代理·系统代理未开启 / 代理·手动填写"）
+export const px = {
+    sec: '网络代理', lead: '对"在此项目打开 Claude Code"和派发的执行者生效；已经打开的终端和运行中的任务不变。',
+    row: '代理', modes: { off: '不使用', system: '跟随系统代理', manual: '手动填写' } as Record<string, string>,
+    offHelp: '不设置也不清除代理变量，照旧继承',
+    systemFound: (url: string) => `当前读到：${url}（Windows 系统代理）`, systemNone: '当前：系统代理未开启，不使用代理', systemUnreadable: '当前：读不到系统代理设置，不使用代理',
+    manualHelp: '只支持 http://、https://、socks5:// 加主机和端口',
+    url: '代理地址', urlPlaceholder: 'http://127.0.0.1:7890', save: '保存', saved: '已保存',
+    errCredentials: '地址里不能带用户名和密码，这类代理请自己设环境变量',
+    errFormat: '地址格式不对：例如 http://127.0.0.1:7890',
+    errEmpty: '先填写代理地址',
+};
+
 // Stage06 链路报告第一版：任务详情"评分"标签与设置页"评分"一节（界面稿 app/design/preview.js 的"评分 / 评分·归因到任务说明"场景）
 export const sc = {
     tab: '评分', executor: '执行者', lead: '主导', outOf: '/ 100', scoreLabel: (n: number) => `综合分 ${n}`,
@@ -391,10 +497,12 @@ export const sc = {
         attemptGate: '多一次尝试：门禁未通过', attemptAgent: '多一次尝试：执行者异常退出', outsideFile: '越界文件', protectedFile: '动了受保护的路径',
         outsideWrites: '工作区外写入', escalated: '升级了执行者', toolError: '工具报错', needsScope: '写了"需要越界"',
         specEdit: '派发后改任务说明', specBlame: '门禁失败归因到任务说明', manualRetry: '手动重试', rejected: '驳回', conflict: '合并时冲突',
+        // Stage07 O12（D39）：归因到"环境"的门禁失败，两张卡片各列一行，不扣分
+        envBlame: '环境原因',
     } as Record<string, string>,
     // 主导一节里"需要越界"的名称与执行者不同（含义是范围划窄了）
     leadNeedsScope: '执行者写了"需要越界"',
-    count: (n: number) => `${n} 次`, files: (n: number) => `${n} 个`, none: '没有', yes: '有', needsScopeFree: '（写了也不扣）',
+    count: (n: number) => `${n} 次`, files: (n: number) => `${n} 个`, none: '没有', yes: '有', needsScopeFree: '（写了也不扣）', envFree: '（不扣分）',
     escalatedAt: (n: number) => `第 ${n} 次升级`, noAcceptance: '不用 worktree，没有验收', notYet: '还没验收',
     capFailed: '任务最终失败，执行者最多 40 分', capRejected: '被驳回，执行者最多 60 分',
     // 性能
@@ -402,9 +510,9 @@ export const sc = {
     tokens: (input: string, output: string) => `${input} / ${output}`, toolCalls: (n: number) => `${n} 次`, noPrice: '没有设置价格', noTokens: '没有统计',
     leadUsageOff: '没有统计（设置里打开后统计）', leadUsageUnavailable: '找不到派发会话的记录',
     // 门禁失败归因
-    blameSec: '门禁失败归因', blameHelp: '任务说明写错或漏写导致的失败改成"任务说明"，扣分从执行者移到主导',
+    blameSec: '门禁失败归因', blameHelp: '任务说明写错或漏写导致的改成"任务说明"，扣分从执行者移到主导；与双方都无关的偶发失败改成"环境"，两边都不扣',
     blameRow: (n: number) => `第 ${n} 次`, blameWhy: (summary: string) => `门禁未通过：${summary}`, blameLabel: (n: number) => `第 ${n} 次门禁失败归因`,
-    blameWorker: '执行者', blameSpec: '任务说明', blameFailed: '没有改成归因',
+    blameWorker: '执行者', blameSpec: '任务说明', blameEnv: '环境', blameFailed: '没有改成归因',
     // 怎么算
     how: '综合分怎么算',
     howText: '满分 100，按上面每一项扣分，最低 0；最终失败时执行者最多 40 分，被驳回时最多 60 分。用时、token、费用只列出来，不进分数（不同模型价格差太多）。每一项扣多少写在 config.json 的 reportWeights 里，可以改。主导的 token 要在设置里打开"统计主导的 token 与用时"才读。',
@@ -417,5 +525,7 @@ export const sc = {
 // Stage03 主进程调用核心（console 通道）的错误文案；核心自己的错误已经是中文，原样显示。
 export const cx = {
     invalid: '参数无效，操作没有执行', noResult: '核心没有返回结果', unknownProject: '这个项目没有登记，先在项目页添加',
+    // Stage07 116：任务的项目已从列表移除时，合并、重试、再派一次、合并主分支后重跑的提示（与 c.projectGoneBlocked 同一句）
+    projectGoneBlocked: '项目已从项目列表移除，先重新添加项目',
     failed: (reason: string) => `没有启动核心：${reason}`, timeout: (seconds: number) => `核心没有在 ${seconds} 秒内返回，操作已停止`,
 };

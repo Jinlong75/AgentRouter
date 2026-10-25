@@ -14,5 +14,7 @@
   "title": "DeepSeek",
   "description": "经 Claude Code 外壳运行，按量付费，用 API Key",
   "recommended": true,
+  "modelOptions": ["deepseek-v4-pro", "deepseek-v4-flash"],
+  "effortOptions": ["low", "medium", "high", "xhigh", "max"],
   "order": 1
 }

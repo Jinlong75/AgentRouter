@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { nativeTheme } from 'electron';
 import { clock, pollUntil, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, type Harness } from './shots-input';
 import { coreRun } from './core';
+import { nt, ro } from '../shared/copy';
 import { appEnvironment } from './app-env.mjs';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
@@ -396,6 +397,273 @@ export async function captureNewtask(h: Harness) {
             await verify('UI16 派发失败不写入新的任务行', async () => { assert.equal((await runs()).length, beforeFail); });
         }
         finally { await writeFile(configFile, fakeText); }
+
+        // ---- UI29（Stage07）：执行者选"自动"时按路由规则实时显示会派给谁、为什么 ----
+        // 用测试自己写的执行者配置：一条 research → 阅读执行者 的全局规则；其余类型走默认执行者（兜底）。
+        const researchRel = 'docs/specs/002-调研说明.md', researchFile = path.join(specs, '002-调研说明.md');
+        const routeCore = async (args: string[]) => (await coreRun(['route', ...args, '--explain'], { timeoutMs: 60000, cwd: repo })).json;
+        const reader = { ...fake.profiles.fake, label: '阅读执行者' };
+        const routedText = JSON.stringify({ ...fake, profiles: { fake: fake.profiles.fake, reader }, routing: { rules: [{ types: ['research'], profile: 'reader' }], fallback: null, reviewer: null } }, null, 2) + '\n';
+        const hintNow = async () => JSON.parse(await evaluate(`JSON.stringify((() => { const h = document.querySelector('[data-nt-route]'); return { text: h?.querySelector('span')?.textContent ?? null, profile: h?.dataset.ntRouteProfile ?? null, failed: h?.dataset.ntRouteFailed === '1', trace: [...document.querySelectorAll('[data-nt-route-trace] li')].map(li => li.textContent), expanded: h?.querySelector('[data-nt-route-why]')?.getAttribute('aria-expanded') ?? null }; })())`)) as { text: string | null; profile: string | null; failed: boolean; trace: string[]; expanded: string | null };
+        const waitHint = (profile: string, label: string) => wait(`document.querySelector('[data-nt-route]')?.dataset.ntRouteProfile === ${JSON.stringify(profile)}`, label);
+        const reenter = async (source: 'existing' | 'new' | 'text') => { await press('[data-page=tasks]'); await wait('!!document.querySelector("[data-task=t1]")'); await goto(source); };
+        await writeFile(researchFile, [
+            '---', 'id: 002', 'title: 调研说明：看看 README', 'type: research', 'worker: auto', 'allowed_paths: []', 'verify: []', '---', '',
+            '## 目标', '', '读一遍 README，写出你觉得缺的说明。', '',
+        ].join('\n'));
+        await writeFile(configFile, routedText);
+        try {
+            await reenter('new');
+            await wait('!!document.querySelector("[data-nt-route]")', 'UI29 "自动"下面出现路由提示');
+            await check('UI29 执行者下拉显示 ro.autoByRule，下面一行 route-hint（图标、文字、"为什么"按钮）', `document.querySelector('[data-nt-worker] span').textContent === ${JSON.stringify(ro.autoByRule)} && !!document.querySelector('.route-hint > i.ri-route-line') && document.querySelector('[data-nt-route-why]').textContent.trim() === ${JSON.stringify(ro.hintWhy)} && document.querySelector('[data-nt-route-why]').getAttribute('aria-expanded') === 'false'`);
+            await press('[data-nt-worker]');
+            await wait('!!document.querySelector(".ctx")', 'UI29 执行者下拉');
+            await check('UI29 执行者下拉第一项是 ro.autoByRule，其余是各个执行者', `[...document.querySelectorAll('.ctx button')].map(b => b.textContent.trim()).join() === ${JSON.stringify([ro.autoByRule, '假执行者', '阅读执行者'].join())}`);
+            await key('Escape');
+            // 类型是 code：没有规则符合，走默认执行者（兜底）。
+            await waitHint('fake', 'UI29 类型 code 的提示是兜底 → 假执行者');
+            await verify('UI29 类型 code：提示是 ro.hint(假执行者, 兜底)，底部说明里"派给"的是 假执行者', async () => {
+                const hint = await hintNow();
+                assert.equal(hint.text, ro.hint('假执行者', ro.whyFallback));
+                assert.equal(await evaluate(`document.querySelector('[data-nt-note]').textContent.includes('假执行者')`), true);
+            });
+            // 点类型：code → research，提示里的执行者随之变成阅读执行者。
+            await press('[data-nt-type=research]');
+            await waitHint('reader', 'UI29 类型点到 research：提示变成 阅读执行者');
+            await verify('UI29 类型点到 research：提示是 ro.hint(阅读执行者, 全局规则 1：调研)，底部说明里"派给"的是 阅读执行者，并与核心 ar route 一致', async () => {
+                const hint = await hintNow(), expected = await routeCore(['--type', 'research', '--project', repo]);
+                assert.equal(expected.profile, 'reader');
+                assert.equal(hint.text, ro.hint('阅读执行者', ro.whyRule(ro.scopeGlobal, 1, ro.types.research)));
+                assert.equal(await evaluate(`document.querySelector('[data-nt-note]').textContent.includes('阅读执行者')`), true, '底部说明用路由结果的显示名');
+            });
+            await check('UI29 展开前 trace 不显示', '!document.querySelector("[data-nt-route-trace]")');
+            await press('[data-nt-route-why]');
+            await wait('!!document.querySelector("[data-nt-route-trace] li")', 'UI29 展开"为什么"');
+            await verify('UI29 展开"为什么"：逐行显示 trace（等宽字体），与核心 ar route --explain 一致；按钮 aria-expanded 为 true', async () => {
+                const hint = await hintNow(), expected = await routeCore(['--type', 'research', '--project', repo]);
+                assert.deepEqual(hint.trace, expected.trace);
+                assert.equal(hint.expanded, 'true');
+                assert.equal(await evaluate(`document.querySelector('[data-nt-route-trace]').classList.contains('mono')`), true);
+            });
+            await evaluate('document.querySelector("[data-nt-route-box]").scrollIntoView({ block: "center" })');
+            await pause(300);
+            await shot('newtask-route');
+            // 键盘：在类型分段上用方向键连续切换，最后停在 research；旧请求返回晚了不能盖掉新的。
+            await tabTo('[data-nt-type=research]');
+            await key('Right');
+            await key('Left');
+            await key('Right');
+            await key('Left');
+            await wait(`document.querySelector('[data-nt-type=research]').classList.contains('on')`, 'UI29 方向键回到 research');
+            await pause(1200);
+            await verify('UI29 连续切换类型后，提示是最后一次输入（research）的结果，没有被旧请求盖掉', async () => {
+                const hint = await hintNow();
+                assert.equal(hint.profile, 'reader');
+                assert.equal(hint.text, ro.hint('阅读执行者', ro.whyRule(ro.scopeGlobal, 1, ro.types.research)));
+            });
+            await key('Right');
+            await waitHint('fake', 'UI29 方向键到 docs：提示回到兜底');
+            await verify('UI29 方向键切到 docs：提示回到 假执行者（兜底）', async () => { assert.equal((await hintNow()).text, ro.hint('假执行者', ro.whyFallback)); });
+
+            // 选择已有任务说明：选中的说明改变时用 --spec；新写的 002 类型是 research。
+            await reenter('existing');
+            await wait('!!document.querySelector("[data-nt-spec]")');
+            await press(`[data-nt-spec="${researchRel}"]`);
+            await waitHint('reader', 'UI29 已有说明（选中 002，type: research）→ 阅读执行者');
+            await verify('UI29 已有说明：提示按选中的说明算（--spec），与核心 ar route --spec 一致', async () => {
+                const hint = await hintNow(), expected = await routeCore(['--spec', researchRel, '--project', repo]);
+                assert.equal(expected.profile, 'reader');
+                assert.equal(await evaluate('document.querySelector("[data-nt-spec].on")?.dataset.ntSpec'), researchRel);
+                assert.equal(hint.text, ro.hint('阅读执行者', ro.whyRule(ro.scopeGlobal, 1, ro.types.research)));
+            });
+            await press(`[data-nt-spec="${specRel}"]`);
+            await waitHint('fake', 'UI29 选中 001（type: docs）：提示变成 假执行者（兜底）');
+            await verify('UI29 换选 001：提示随之改变，与核心 ar route --spec 一致', async () => {
+                const hint = await hintNow(), expected = await routeCore(['--spec', specRel, '--project', repo]);
+                assert.equal(expected.profile, 'fake');
+                assert.equal(hint.text, ro.hint('假执行者', ro.whyFallback));
+                assert.equal(await evaluate(`document.querySelector('[data-nt-note]').textContent.includes(${JSON.stringify(specRel)}) && document.querySelector('[data-nt-note]').textContent.includes('假执行者')`), true);
+            });
+
+            // 直接写任务文字：没有类型，显示兜底的结果。
+            await goto('text');
+            await waitHint('fake', 'UI29 直接写文字：提示是兜底');
+            await verify('UI29 直接写文字：没有类型，提示是兜底（假执行者），与核心 ar route（不带类型）一致', async () => {
+                const hint = await hintNow(), expected = await routeCore(['--project', repo]);
+                assert.deepEqual(expected.trace, ['兜底：fake']);
+                assert.equal(hint.text, ro.hint('假执行者', ro.whyFallback));
+            });
+
+            // 选了具体执行者：不显示路由提示，底部说明用它；再选回"自动"提示又出现。
+            await press('[data-nt-worker]');
+            await wait('!!document.querySelector(".ctx")', 'UI29 执行者下拉');
+            await press(await menuItem('阅读执行者'));
+            await wait('!document.querySelector("[data-nt-route]")', 'UI29 选了具体执行者：路由提示消失');
+            await check('UI29 选了具体执行者：执行者下拉显示它，不显示路由提示，底部说明写 阅读执行者', `document.querySelector('[data-nt-worker] span').textContent === '阅读执行者' && !document.querySelector('[data-nt-route]') && document.querySelector('[data-nt-note]').textContent === ${JSON.stringify(nt.conseqText('阅读执行者'))}`);
+            await press('[data-nt-worker]');
+            await wait('!!document.querySelector(".ctx")', 'UI29 执行者下拉（选回自动）');
+            await press(await menuItem(ro.autoByRule));
+            await waitHint('fake', 'UI29 选回自动：路由提示回来');
+
+            // 没有可用的执行者：显示原因，派发按钮照常可点，真点下去由核心给出同样的原因。
+            const failText = JSON.stringify({ ...fake, profiles: { fake: { ...fake.profiles.fake, limits: { maxTasksPerDay: 1 } } }, routing: { rules: [{ types: ['research'], profile: 'fake' }], fallback: null, reviewer: null } }, null, 2) + '\n';
+            await writeFile(configFile, failText);
+            const todays = (await runs()).filter(r => r.event === 'start' && r.profile === 'fake' && new Date(r.started).toDateString() === new Date().toDateString()).length;
+            let fixture = '';
+            if (todays < 1) { fixture = JSON.stringify({ v: 1, event: 'start', id: 'ui29-limit', profile: 'fake', started: Date.now() }) + '\n'; await writeFile(runsFile, (await readFile(runsFile, 'utf8').catch(() => '')) + fixture); }
+            try {
+                await reenter('existing');
+                await wait('!!document.querySelector("[data-nt-route][data-nt-route-failed]")', 'UI29 路由失败的提示');
+                await verify('UI29 没有可用的执行者：提示是 ro.hintFail(核心原因)，"为什么"可展开 trace（含"已达每日上限"），与核心 ar route 一致', async () => {
+                    const expected = await routeCore(['--spec', await evaluate('document.querySelector("[data-nt-spec].on").dataset.ntSpec'), '--project', repo]);
+                    assert.equal(expected.ok, false);
+                    assert.equal(expected.code, 'NO_PROFILE');
+                    assert.equal((await hintNow()).text, ro.hintFail(expected.error));
+                    // 展开状态是页面记住的（前面已经展开过一次）：没展开才点。
+                    if ((await hintNow()).expanded !== 'true') await press('[data-nt-route-why]');
+                    await wait('!!document.querySelector("[data-nt-route-trace] li")', 'UI29 展开失败原因');
+                    const hint = await hintNow();
+                    assert.deepEqual(hint.trace, expected.trace);
+                    assert.ok(hint.trace.some(line => line.includes('已达每日上限')));
+                });
+                await check('UI29 路由失败时派发按钮照常可点（不额外拦截）', `!document.querySelector('[data-nt-dispatch]').disabled`);
+                await evaluate('document.querySelector("[data-nt-route-box]").scrollIntoView({ block: "center" })');
+                await pause(300);
+                await shot('newtask-route-fail');
+                const startsBefore = (await runs()).length;
+                await press('[data-nt-dispatch]');
+                await wait('!!document.querySelector(".banner.fail .rt b")', 'UI29 派发失败横幅', 20000);
+                await check('UI29 真点派发：核心用同样的原因拒绝（没有可用的执行者、已达每日上限），横幅是"派发没有完成"', `document.querySelector('.banner.fail .rt b')?.textContent === '派发没有完成' && document.querySelector('.banner.fail .rt span')?.textContent.includes('没有可用的执行者') && document.querySelector('.banner.fail .rt span')?.textContent.includes('已达每日上限')`);
+                await verify('UI29 被拒绝的派发不写任何任务行', async () => { assert.equal((await runs()).length, startsBefore); });
+            }
+            finally {
+                if (fixture) await writeFile(runsFile, (await readFile(runsFile, 'utf8')).split('\n').filter(line => !line.includes('ui29-limit')).join('\n')).catch(() => { });
+            }
+        }
+        finally {
+            await writeFile(configFile, fakeText);
+            await rm(researchFile, { force: true });
+            // 回到没有规则的状态：重新进入页面，后面的通用检查与以前一样。
+            await reenter('existing').catch(() => { });
+        }
+
+        // ---- UI16（Stage07 T8b）：新建说明里"允许改动的文件"下面实时显示会匹配到的现有文件 ----
+        // 用测试自己的临时仓库（src/a.ts、src/b.ts、README.md），检查结束后取消登记。
+        const pathsRepo = path.join(home, 'shots-newtask', 'paths');
+        await mkdir(path.join(pathsRepo, 'src'), { recursive: true });
+        await writeFile(path.join(pathsRepo, 'src', 'a.ts'), 'export const a = 1;\n');
+        await writeFile(path.join(pathsRepo, 'src', 'b.ts'), 'export const b = 2;\n');
+        await writeFile(path.join(pathsRepo, 'README.md'), '# paths\n');
+        git(pathsRepo, ['init', '-b', 'main']);
+        git(pathsRepo, ['config', 'user.name', 'AgentRouter Shots']);
+        git(pathsRepo, ['config', 'user.email', 'shots@example.invalid']);
+        git(pathsRepo, ['add', '--', 'README.md', 'src/a.ts', 'src/b.ts']);
+        git(pathsRepo, ['commit', '-m', '初始提交', '--', 'README.md', 'src/a.ts', 'src/b.ts']);
+        await core(['projects', 'add', pathsRepo]);
+        const pathsBox = async () => JSON.parse(await evaluate(`JSON.stringify((() => {
+            const box = document.querySelector('[data-nt-paths-box]'), q = s => box?.querySelector(s);
+            return { kind: q('[data-nt-paths]')?.dataset.ntPaths ?? null, text: q('[data-nt-paths]')?.textContent ?? null,
+                files: [...(box?.querySelectorAll('[data-nt-paths=matched] .mono') ?? [])].map(e => e.textContent),
+                none: [...(box?.querySelectorAll('[data-nt-paths-none]') ?? [])].map(e => ({ pattern: e.dataset.ntPathsNone, text: e.textContent, icon: !!e.querySelector('.mk.brand > i') })),
+                allowed: document.querySelector('[data-nt-f=allowed]')?.value ?? null, below: !!box && box.previousElementSibling?.matches('[data-nt-f=allowed]') };
+        })())`)) as { kind: string | null; text: string | null; files: string[]; none: { pattern: string; text: string; icon: boolean }[]; allowed: string | null; below: boolean };
+        const clearAllowed = async () => { await focusField('[data-nt-f=allowed]'); await key('a', ['control']); await key('Backspace'); };
+        try {
+            await reenter('new');
+            await press('[data-nt-project]');
+            await wait('!!document.querySelector(".ctx")', 'UI16 项目下拉');
+            await press(await menuItem('paths'));
+            await wait(`document.querySelector('[data-nt-path]')?.textContent.includes('paths') && document.querySelector('[data-nt-path]')?.textContent.includes('· main')`, 'UI16 选到 paths 项目', 20000);
+            await check('UI16 允许路径预览：输入框为空时不显示预览', `document.querySelector('[data-nt-f=allowed]').value === '' && !document.querySelector('[data-nt-paths]') && !document.querySelector('[data-nt-paths-none]')`);
+
+            // 1. 输入 src/**：匹配到 2 个现有文件，列出文件名。
+            await type('[data-nt-f=allowed]', 'src/**');
+            await wait(`document.querySelector('[data-nt-paths=matched]') !== null`, 'UI16 输入 src/** 后出现匹配预览', 15000);
+            await verify('UI16 允许路径预览：src/** → nt.pathsMatched(2) 和两个文件名（等宽、用"、"连接），在输入框正下方', async () => {
+                const box = await pathsBox();
+                assert.equal(box.below, true, '预览应紧跟在输入框下面');
+                assert.deepEqual(box.files, ['src/a.ts', 'src/b.ts']);
+                assert.equal(box.text, `${nt.pathsMatched(2)}src/a.ts、src/b.ts`);
+                assert.deepEqual(box.none, []);
+            });
+            await verify('UI16 允许路径预览：显示的数字与核心 ar spec check-paths 一致', async () => {
+                const expected = await core(['spec', 'check-paths', '--project', pathsRepo, '--paths', JSON.stringify(['src/**'])]);
+                assert.equal(expected.total, 2);
+                assert.deepEqual(expected.files, (await pathsBox()).files);
+            });
+
+            // 2. 再加一行 docs/new.md：多一行"没有匹配到现有文件"的提示，上面的匹配结果不变。
+            await focusField('[data-nt-f=allowed]');
+            await key('End', ['control']);
+            await key('Enter');
+            for (const ch of 'docs/new.md') await key(ch);
+            await wait(`document.querySelector('[data-nt-paths-none]') !== null`, 'UI16 加一行 docs/new.md 后出现"没有匹配到"的提示', 15000);
+            await verify('UI16 允许路径预览：docs/new.md → 一行 nt.pathsNone("docs/new.md")（品牌色提示图标），匹配到的 2 个文件不变', async () => {
+                const box = await pathsBox();
+                assert.equal(box.allowed, 'src/**\ndocs/new.md');
+                assert.deepEqual(box.files, ['src/a.ts', 'src/b.ts']);
+                assert.deepEqual(box.none, [{ pattern: 'docs/new.md', text: nt.pathsNone('docs/new.md'), icon: true }]);
+            });
+            await check('UI16 允许路径预览：没有匹配时只是提示，不拦派发（派发按钮可点）', `document.querySelector('[data-nt-dispatch]') !== null && !document.querySelector('[data-nt-dispatch]').disabled`);
+            await evaluate('document.querySelector("[data-nt-paths-box]").scrollIntoView({ block: "center" })');
+            await pause(300);
+            await shot('newtask-paths');
+
+            // 3. 改成 **：显示匹配项目里全部 3 个文件。
+            await clearAllowed();
+            await check('UI16 允许路径预览：清空输入框后预览消失', `document.querySelector('[data-nt-f=allowed]').value === '' && !document.querySelector('[data-nt-paths]')`);
+            await typeIn('[data-nt-f=allowed]', '**');
+            await wait(`document.querySelector('[data-nt-paths=all]') !== null`, 'UI16 输入 ** 后显示全部文件', 15000);
+            await verify('UI16 允许路径预览：** → 只写 nt.pathsAll(3)，不列文件名', async () => {
+                const box = await pathsBox();
+                assert.equal(box.text, nt.pathsAll(3));
+                assert.deepEqual(box.files, []);
+                assert.deepEqual(box.none, []);
+                const expected = await core(['spec', 'check-paths', '--project', pathsRepo, '--paths', JSON.stringify(['**'])]);
+                assert.deepEqual([expected.all, expected.fileCount], [true, 3]);
+            });
+            await evaluate('document.querySelector("[data-nt-paths-box]").scrollIntoView({ block: "center" })');
+            await pause(300);
+            await shot('newtask-paths-all');
+
+            // 写法不合法：显示 nt.pathsFailed(核心的原因)，派发按钮不被拦。
+            await clearAllowed();
+            await typeIn('[data-nt-f=allowed]', '../x');
+            await wait(`document.querySelector('[data-nt-paths=failed]') !== null`, 'UI16 写法不合法时显示失败原因', 15000);
+            await verify('UI16 允许路径预览：../x → nt.pathsFailed(原因) 并写明是哪一项', async () => {
+                const box = await pathsBox();
+                assert.ok(box.text?.startsWith(nt.pathsFailed('')), box.text ?? '');
+                assert.ok(box.text?.includes('第 1 项') && box.text.includes('../x'), box.text ?? '');
+            });
+
+            // 只在"新建任务说明"来源下显示；切回来重新检查。
+            await clearAllowed();
+            await typeIn('[data-nt-f=allowed]', 'src/*.ts');
+            await wait(`document.querySelector('[data-nt-paths=matched]') !== null`, 'UI16 输入 src/*.ts');
+            await press('[data-nt-source=existing]');
+            // paths 项目里没有任务说明：已有说明来源显示"还没有任务说明"。
+            await wait(`document.querySelector('[data-nt-specs-empty]') !== null`, 'UI16 切到已有说明');
+            await check('UI16 允许路径预览：已有说明来源下不显示', `!document.querySelector('[data-nt-paths-box]') && !document.querySelector('[data-nt-paths]')`);
+            await press('[data-nt-source=new]');
+            await wait(`document.querySelector('[data-nt-paths=matched]') !== null`, 'UI16 切回新建说明后重新检查', 15000);
+            await verify('UI16 允许路径预览：切回新建说明后仍是 src/*.ts 的结果（2 个文件）', async () => {
+                const box = await pathsBox();
+                assert.equal(box.allowed, 'src/*.ts');
+                assert.deepEqual(box.files, ['src/a.ts', 'src/b.ts']);
+            });
+        }
+        finally {
+            // 回到 sample 项目、取消 paths 项目的登记，后面的检查与以前一样。
+            try {
+                await reenter('new');
+                await press('[data-nt-project]');
+                await wait('!!document.querySelector(".ctx")', 'UI16 项目下拉（回到 sample）');
+                await press(await menuItem('sample'));
+                await wait(`document.querySelector('[data-nt-path]')?.textContent.includes('· main') && document.querySelector('[data-nt-project]')?.textContent.includes('sample')`, 'UI16 回到 sample', 20000);
+            }
+            catch (error) { console.log(`UI16 允许路径预览：没能回到 sample 项目：${(error as Error).message}`); }
+            await coreRun(['projects', 'remove', pathsRepo], { timeoutMs: 60000 }).catch(() => { });
+        }
 
         // 每页通用检查：三种来源各走一遍（沿用缓存，不重新加载，避免打断 Tab 检查）。
         await goto('existing');

@@ -8,6 +8,7 @@ import { app, nativeTheme } from 'electron';
 import type { Harness } from './shots-input';
 import { effects } from './effects';
 import { appEnvironment } from './app-env.mjs';
+import { px, s6, sc } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读（演示与截图把隔离覆盖放在 AR_ISOLATED_ENV 里，主进程 process.env 是用户原样）。
 const appEnv = appEnvironment(process.env);
@@ -80,6 +81,36 @@ export async function captureWizard(h: Harness) {
 
     // 第 3 步：导入第一个 Agent（推荐预设 + API Key + 自动测试连接）。
     await check('UI09 第 3 步默认选中推荐预设，API Key 用密码框', 'document.querySelector(".preset.on").getAttribute("aria-checked")==="true" && document.querySelector(".preset.on .tag.brand")?.textContent==="推荐" && document.querySelector("[data-wizard-secret]").type==="password"');
+    // 112：同一服务只放一张卡片；选 Xiaomi MiMo 后表单第一行是"套餐"分段按钮，切换等于改选另一个预设。
+    const wizardPresets: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
+    const byName = (name: string) => wizardPresets.find(x => x.name === name);
+    await check('UI09 第 3 步的预设卡片按服务合并：7 张（DeepSeek、Xiaomi MiMo、Claude Code、兼容后端、Codex、Qoder、OpenAI 兼容接口），合并卡片的标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
+        const cards = [...document.querySelectorAll(".presets .preset")], names = cards.map(c => c.dataset.wizardPreset);
+        const merged = (name, c) => { const el = cards.find(x => x.dataset.wizardPreset === name); return el.dataset.card === c.id && el.querySelector("b").textContent === c.title && el.querySelector(".pk > span").textContent === c.description; };
+        return names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,openai-compat"
+            && merged("mimo", ${JSON.stringify(byName('mimo').card)}) && merged("claude-native", ${JSON.stringify(byName('claude-native').card)}) && merged("qoder-cn", ${JSON.stringify(byName('qoder-cn').card)})
+            && document.querySelectorAll(".presets .preset .tag.brand").length === 1 && !!cards[0].querySelector(".tag.brand");
+    })()`);
+    await press('[data-wizard-preset=mimo]');
+    await wait('document.querySelector(".preset.on")?.dataset.wizardPreset==="mimo" && !!document.querySelector("[data-wizard-variant]")');
+    await check('UI09 选 Xiaomi MiMo 后第一行是"套餐"分段按钮：Token Plan 选中，说明是该预设的 variant.help', `(() => {
+        const first = document.querySelector(".presets").nextElementSibling, buttons = [...first.querySelectorAll(".segm button")];
+        return first.querySelector(".fl b").textContent === ${JSON.stringify(byName('mimo').variant.label)} && buttons.map(b => b.textContent).join() === ${JSON.stringify(byName('mimo').variant.option + ',' + byName('mimo-payg').variant.option)}
+            && buttons[0].classList.contains("on") && buttons[0].getAttribute("aria-pressed") === "true" && buttons[0].dataset.wizardVariant === "mimo" && buttons[1].dataset.wizardVariant === "mimo-payg"
+            && first.querySelector(".fl span").textContent === ${JSON.stringify(byName('mimo').variant.help)};
+    })()`);
+    await press('[data-wizard-variant=mimo-payg]');
+    await wait('document.querySelector("[data-wizard-variant=mimo-payg]")?.classList.contains("on")');
+    // 引导页不显示接口地址；切换真的改选了另一个预设（按钮对应的预设有不同的接口地址），说明与按钮状态一起变。
+    await check('UI09 点"按量付费"：按钮状态互换、说明换成该预设的 variant.help；这个按钮对应的预设接口地址与 Token Plan 的不同', `(() => {
+        const buttons = [...document.querySelectorAll("[data-wizard-variant]")], first = document.querySelector(".presets").nextElementSibling;
+        return buttons[1].getAttribute("aria-pressed") === "true" && buttons[0].getAttribute("aria-pressed") === "false" && !buttons[0].classList.contains("on")
+            && first.querySelector(".fl span").textContent === ${JSON.stringify(byName('mimo-payg').variant.help)}
+            && ${JSON.stringify(byName('mimo-payg').env.ANTHROPIC_BASE_URL)} !== ${JSON.stringify(byName('mimo').env.ANTHROPIC_BASE_URL)} && document.querySelector(".preset.on").dataset.wizardPreset === "mimo";
+    })()`);
+    // 回到推荐的 DeepSeek，后面按原流程导入。
+    await press('[data-wizard-preset=deepseek]');
+    await wait('document.querySelector(".preset.on")?.dataset.wizardPreset==="deepseek" && !document.querySelector("[data-wizard-variant]")');
     const secretValue = 'sk-shots-wizard-7291';
     await type('[data-wizard-secret]', secretValue);
     await press('[data-pref=wizard-secret]');
@@ -266,6 +297,7 @@ export async function capturePreferences(h: Harness) {
     await press('[data-segment=watchWindow][data-value=never]');
     await verify('UI07 进度窗口分段写入 config.json', async () => { assert.equal((await readConfig()).watchWindow, 'never'); });
     await press('[data-segment=watchWindow][data-value=auto]');
+    await captureProxy(h, { config });
     await save('settings-configured-dark'); nativeTheme.themeSource = 'light'; await save('settings-configured-light'); nativeTheme.themeSource = 'dark';
     await press('[data-managed-settings]');
     await check('UI07 侧栏托管入口滚动到托管设置', 'document.querySelector("#managed-section").getBoundingClientRect().top>=document.querySelector(".page-h").getBoundingClientRect().bottom-1');
@@ -364,6 +396,78 @@ export async function capturePreferences(h: Harness) {
     return fontExists;
 }
 
+// 网络代理一节（099，UI07 扩展）：真实键盘 / 鼠标输入，读 config.json 断言功能真的生效。
+// 不检查"跟随系统代理"：切到它会读真实的 Windows 注册表，验收不碰（读注册表的各种情形由单元测试用注入的 reg 输出覆盖）。
+// 开始前设置页已经打开，config.json 存在；结束后删掉这一节写进去的 proxy 字段，不影响后面的检查。
+async function captureProxy(h: Harness, { config }: { config: string }) {
+    const { evaluate, wait, check, verify, press, key, type, tabTo, save } = h;
+    const readConfig = async () => JSON.parse(await readFile(config, 'utf8'));
+    const field = '[data-pref=proxy-url]', manual = '[data-segment=proxy][data-value=manual]', offMode = '[data-segment=proxy][data-value=off]';
+    const center = (selector: string) => evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: 'center' })`);
+    const description = `document.querySelector('[data-segment=proxy]').closest('.set-r').querySelector('.l span').textContent`;
+    const sections = `[...document.querySelectorAll('.sect h2')].map(h => h.textContent)`;
+    const jsonStr = JSON.stringify;
+    await center(manual);
+    await check('UI07 网络代理一节在“并行”和“评分”之间；默认选中“不使用”，说明行是 px.offHelp，没有地址行',
+        `(() => { const t = ${sections}, at = t.indexOf(${jsonStr(px.sec)}); return at > 0 && t[at - 1] === ${jsonStr(s6.parallelSec)} && t[at + 1] === ${jsonStr(sc.settingsSec)}; })() && document.querySelector('[data-segment=proxy].on')?.dataset.value === 'off' && ${description} === ${jsonStr(px.offHelp)} && !document.querySelector(${jsonStr(field)})`);
+    await check('UI07 网络代理：三个选项文案来自 px.modes', `[...document.querySelectorAll('[data-segment=proxy]')].map(b => b.textContent).join() === ${jsonStr(['off', 'system', 'manual'].map(m => px.modes[m]).join())}`);
+    // 1. 键盘切到“手动填写”：只显示地址行，不写配置。
+    await tabTo(manual); await key('Enter');
+    await wait(`!!document.querySelector(${jsonStr(field)})`, '手动填写后出现地址行');
+    await check('UI07 切到“手动填写”：选中它，说明行是 px.manualHelp，出现地址输入框与保存按钮', `document.querySelector('[data-segment=proxy].on')?.dataset.value === 'manual' && ${description} === ${jsonStr(px.manualHelp)} && document.querySelector(${jsonStr(field)}).placeholder === ${jsonStr(px.urlPlaceholder)} && document.querySelector('[data-pref=proxy-save]').textContent === ${jsonStr(px.save)}`);
+    await verify('UI07 只是切到“手动填写”不写 config.json', async () => { assert.equal((await readConfig()).proxy, undefined); });
+    // 2. 带用户名密码的地址：拒绝保存，说明行显示 px.errCredentials，config.json 没有 proxy 字段。
+    await center(field);
+    await type(field, 'http://user:pass@127.0.0.1:7890');
+    await press('[data-pref=proxy-save]');
+    await wait(`document.querySelector('[data-proxy-error]')?.textContent === ${jsonStr(px.errCredentials)}`, '带凭据的地址显示 px.errCredentials');
+    await check('UI07 带用户名密码的地址：地址行显示 px.errCredentials，输入框里仍是填写的内容', `document.querySelector('[data-proxy-error]').textContent === ${jsonStr(px.errCredentials)} && document.querySelector(${jsonStr(field)}).value === 'http://user:pass@127.0.0.1:7890'`);
+    await verify('UI07 带用户名密码的地址没有写进 config.json（没有 proxy 字段，凭据不出现在文件里）', async () => {
+        const text = await readFile(config, 'utf8');
+        assert.equal(JSON.parse(text).proxy, undefined);
+        assert.ok(!text.includes('user:pass'));
+    });
+    // 3. 格式不对 / 为空：对应的说明，同样不写。
+    // 点击输入框会把光标放在点击处：先按 End 把光标移到末尾，再逐个退格清空。
+    const clear = async () => { const length = Number(await evaluate(`document.querySelector(${jsonStr(field)}).value.length`)); await press(field); await key('End'); for (let i = 0; i < length; i++) await key('Backspace'); };
+    await clear();
+    await check('UI07 清空输入框', `document.querySelector(${jsonStr(field)}).value === ''`);
+    await press('[data-pref=proxy-save]');
+    await wait(`document.querySelector('[data-proxy-error]')?.textContent === ${jsonStr(px.errEmpty)}`, '空地址显示 px.errEmpty');
+    await type(field, 'http://127.0.0.1');
+    await press('[data-pref=proxy-save]');
+    await wait(`document.querySelector('[data-proxy-error]')?.textContent === ${jsonStr(px.errFormat)}`, '缺端口显示 px.errFormat');
+    await verify('UI07 地址为空 / 格式不对都没有写进 config.json', async () => { assert.equal((await readConfig()).proxy, undefined); });
+    // 4. 合法地址（回车保存）：config.json 的 proxy 变成 { mode: 'manual', url }，说明行恢复，按钮短暂显示 px.saved。
+    await clear();
+    await type(field, 'http://127.0.0.1:7890');
+    await key('Enter');
+    await wait(`document.querySelector('[data-pref=proxy-save]')?.textContent === ${jsonStr(px.saved)}`, '保存成功后按钮显示 px.saved');
+    await verify('UI07 合法地址保存后 config.json 的 proxy 是 { mode: manual, url }，其余字段保留', async () => {
+        const saved = await readConfig();
+        assert.deepEqual(saved.proxy, { mode: 'manual', url: 'http://127.0.0.1:7890' });
+        assert.ok(saved.profiles?.codex, '其余字段原样保留');
+    });
+    await check('UI07 保存成功：说明行恢复为 px.manualHelp，错误提示消失，输入框是保存的地址', `${description} === ${jsonStr(px.manualHelp)} && !document.querySelector('[data-proxy-error]') && document.querySelector(${jsonStr(field)}).value === 'http://127.0.0.1:7890' && document.querySelector('[data-segment=proxy].on')?.dataset.value === 'manual'`);
+    // 先等“已保存”恢复成 px.save 再截图：恢复时设置页会重新渲染，发生在截图中间会让路径遮盖与截图错开。
+    await wait(`document.querySelector('[data-pref=proxy-save]')?.textContent === ${jsonStr(px.save)}`, '“已保存”短暂显示后恢复为 px.save');
+    await center(manual);
+    await save('settings-proxy-manual-dark');
+    nativeTheme.themeSource = 'light'; await save('settings-proxy-manual-light'); nativeTheme.themeSource = 'dark';
+    // 5. 切到“不使用”：config.json 的 proxy.mode 变成 off，地址行消失。
+    await press(offMode);
+    await wait(`!document.querySelector(${jsonStr(field)})`, '切到不使用后地址行消失');
+    await verify('UI07 切到“不使用”后 config.json 的 proxy.mode 是 off', async () => { assert.equal((await readConfig()).proxy.mode, 'off'); });
+    await check('UI07 切到“不使用”：选中它，说明行是 px.offHelp', `document.querySelector('[data-segment=proxy].on')?.dataset.value === 'off' && ${description} === ${jsonStr(px.offHelp)}`);
+    await save('settings-proxy-off-dark');
+    nativeTheme.themeSource = 'light'; await save('settings-proxy-off-light'); nativeTheme.themeSource = 'dark';
+    // 恢复：config.json 回到没有 proxy 字段。
+    const restored = await readConfig(); delete restored.proxy;
+    await writeFile(config, JSON.stringify(restored));
+    await press('[data-page=tasks]'); await press('[data-page=settings]'); await wait('!!document.querySelector("[data-pref=notifications]")');
+    await check('UI07 恢复后设置页回到默认“不使用”', `document.querySelector('[data-segment=proxy].on')?.dataset.value === 'off'`);
+}
+
 // 执行者区（任务 004）：标签与认证状态、测试连接成功 / 失败、设为默认、停用 / 启用、删除、编辑 claude-code、模态框焦点。
 // 开始前写入专用的 config.json 与隔离密钥，结束后恢复成"没有 config.json"、密钥文件原样。
 async function captureExecutors(h: Harness, { config, home, settings }: { config: string; home: string; settings: () => Promise<void> }) {
@@ -414,11 +518,11 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
         await verify('UI06 停用写入 config.json', async () => { assert.equal((await readConfig()).profiles.bad.enabled, false); });
         await press('[data-more-agent=bad]'); await press('.ctx button:nth-child(3)'); await wait('!document.querySelector("[data-agent=bad] .x1").textContent.includes("已停用")');
         await verify('UI06 启用写入 config.json', async () => { assert.equal((await readConfig()).profiles.bad.enabled, true); });
-        await press('[data-more-agent=bad]'); await press('.ctx button:nth-child(4)');
+        await press('[data-more-agent=bad]'); await press('.ctx button:nth-child(5)');
         await check('UI06 删除确认默认焦点在取消且使用危险按钮', 'document.activeElement.textContent==="取消" && !!document.querySelector(".confirm-actions .danger")');
         await press('.confirm-actions .btn');
         await verify('UI06 取消删除不改 config.json', async () => { assert.ok((await readConfig()).profiles.bad); });
-        await press('[data-more-agent=bad]'); await press('.ctx button:nth-child(4)'); await press('.confirm-actions .danger'); await wait('!document.querySelector("[data-agent=bad]")');
+        await press('[data-more-agent=bad]'); await press('.ctx button:nth-child(5)'); await press('.confirm-actions .danger'); await wait('!document.querySelector("[data-agent=bad]")');
         await verify('UI06 确认删除后 config.json 里没有这个执行者', async () => { assert.equal((await readConfig()).profiles.bad, undefined); });
         // 编辑 claude-code 执行者：模态框焦点、保存、失败横幅、放弃确认。
         await press('[data-more-agent=example]'); await press('.ctx button:nth-child(1)'); await wait('!!document.querySelector(".sheet [data-e=model]")');
@@ -481,26 +585,52 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
         await check('UI13 取消放弃后仍在第 2 步', '!!document.querySelector(".sheet [data-w=label]")');
         await key('Escape'); await wait('!!document.querySelector(".confirm-actions")'); await press('.confirm-actions .danger'); await wait('!document.querySelector(".sheet")');
         await check('UI13 放弃后向导关闭、DOM 里没有密码框', '!document.querySelector("[data-w=secret]")');
-        // 走查第 3 轮：新增 MiMo 两张预设卡（Token Plan / 按量付费）；推荐标记仍只在 DeepSeek 上。
+        // 走查第 3 轮：MiMo 两种套餐；112 改写：同一服务只放一张卡片（Claude Code、Xiaomi MiMo、Qoder 各一张），第 2 步用分段按钮选套餐。推荐标记仍只在 DeepSeek 上。
+        // 改写（112）：原断言"12 张卡片，mimo / mimo-payg / claude-native / claude-subscription / qoder-cn / qoder 各一张，MiMo 两张的标题说明各自来自预设"
+        //   → 新断言"9 张卡片，data-preset 是组里默认预设，合并卡片带 data-card，标题与说明逐字等于 presets --json 的 card"；原因：卡片按服务合并。
         await press('.page-h [data-import-agent]'); await wait('!!document.querySelector(".sheet .preset.on")');
-        await check('UI13 第 1 步按新清单显示 7 张卡片，两张 MiMo 紧跟 DeepSeek，标题与说明来自预设，推荐标记只在 DeepSeek 上', `(() => {
+        const presetList: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
+        const cardOf = (name: string) => presetList.find(x => x.name === name).card;
+        await check('UI13 第 1 步显示 9 张卡片（7 张预设加自定义 CLI、从文件导入），MiMo、Claude Code、Qoder 各合并成一张，标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
             const cards = [...document.querySelectorAll(".sheet .preset")];
             const names = cards.map(c => c.dataset.preset);
             const card = name => cards.find(c => c.dataset.preset === name);
             const brand = [...document.querySelectorAll(".sheet .preset .tag.brand")];
-            return names.length === 7 && names[0] === "deepseek" && names[1] === "mimo" && names[2] === "mimo-payg" && names[3] === "claude-native" && names[4] === "claude-subscription" && names[5] === "compat" && names[6] === "codex"
-                && card("mimo").querySelector("b").textContent === "Xiaomi MiMo（Token Plan）" && card("mimo").querySelector(".pk > span").textContent === "经 Claude Code 外壳运行，用 Token Plan 的 API Key（tp- 开头）"
-                && card("mimo-payg").querySelector("b").textContent === "Xiaomi MiMo（按量付费）" && card("mimo-payg").querySelector(".pk > span").textContent === "经 Claude Code 外壳运行，按量付费，用 sk- 开头的 API Key"
+            const merged = (name, id, c) => card(name).dataset.card === id && card(name).querySelector("b").textContent === c.title && card(name).querySelector(".pk > span").textContent === c.description;
+            return names.length === 9 && names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,openai-compat,@custom,@file"
+                && cards.filter(c => c.dataset.card).map(c => c.dataset.card).join() === "mimo,claude-code,qoder"
+                && merged("mimo", "mimo", ${JSON.stringify(cardOf('mimo'))}) && merged("claude-native", "claude-code", ${JSON.stringify(cardOf('claude-native'))}) && merged("qoder-cn", "qoder", ${JSON.stringify(cardOf('qoder-cn'))})
+                && !card("mimo-payg") && !card("claude-subscription") && !card("qoder")
                 && brand.length === 1 && brand[0].closest(".preset").dataset.preset === "deepseek";
         })()`);
-        await save('connect-import-1-mimo-dark');
+        await save('connect-import-1-merged-dark');
         await press('[data-preset=mimo]');
         await wait('document.querySelector(".sheet .preset.on")?.dataset.preset==="mimo"');
         await press('[data-w-act=next]');
         await wait('!!document.querySelector(".sheet [data-w=secretVar]")');
-        await check('UI13 选 MiMo（Token Plan）进入第 2 步：密钥变量名为 MIMO_API_KEY，隔离密钥文件里未设置', 'document.querySelector("[data-w=secretVar]").value==="MIMO_API_KEY" && document.querySelector("[data-w-status]").textContent==="未设置"');
+        const mimoVariant = (name: string) => presetList.find(x => x.name === name);
+        await check('UI13 选 MiMo 进入第 2 步：第一行是"套餐"分段按钮（Token Plan 选中），说明是该预设的 variant.help；密钥变量名为 MIMO_API_KEY，隔离密钥文件里未设置', `(() => {
+            const first = document.querySelector(".sheet .form > .fld"), buttons = [...first.querySelectorAll(".segm button")];
+            return first.querySelector(".fl b").textContent === ${JSON.stringify(mimoVariant('mimo').variant.label)} && buttons.map(b => b.textContent).join() === ${JSON.stringify(mimoVariant('mimo').variant.option + ',' + mimoVariant('mimo-payg').variant.option)}
+                && buttons[0].classList.contains("on") && buttons[0].getAttribute("aria-pressed") === "true" && buttons[1].getAttribute("aria-pressed") === "false" && !buttons[1].classList.contains("on")
+                && first.querySelector(".fl span").textContent === ${JSON.stringify(mimoVariant('mimo').variant.help)}
+                && document.querySelector("[data-w=secretVar]").value==="MIMO_API_KEY" && document.querySelector("[data-w-status]").textContent==="未设置" && document.querySelector("[data-w=baseUrl]").value === ${JSON.stringify(mimoVariant('mimo').env.ANTHROPIC_BASE_URL)};
+        })()`);
         await save('connect-import-2-mimo-dark');
-        await key('Escape'); await wait('!document.querySelector(".sheet")');
+        // 键盘：Tab 到"按量付费"，空格切换；整张表单按那个预设重填，焦点留在这个按钮上。
+        await tabTo('[data-w-variant=mimo-payg]'); await key('Space');
+        await wait(`document.querySelector("[data-w=baseUrl]")?.value === ${JSON.stringify(mimoVariant('mimo-payg').env.ANTHROPIC_BASE_URL)}`);
+        await check('UI13 空格切到"按量付费"：接口地址换成该预设的、名称换成 mimo-payg 系、说明换成该预设的 variant.help、按钮状态互换，焦点留在刚按的按钮上', `(() => {
+            const buttons = [...document.querySelectorAll(".sheet .segm button")], first = document.querySelector(".sheet .form > .fld");
+            return buttons[1].classList.contains("on") && buttons[1].getAttribute("aria-pressed") === "true" && !buttons[0].classList.contains("on") && buttons[0].getAttribute("aria-pressed") === "false"
+                && document.activeElement === buttons[1] && first.querySelector(".fl span").textContent === ${JSON.stringify(mimoVariant('mimo-payg').variant.help)}
+                && document.querySelector("[data-w=name]").value.startsWith("mimo-payg") && document.querySelector("[data-w=secretVar]").value === "MIMO_API_KEY" && document.querySelector("[data-w-status]").textContent === "未设置";
+        })()`);
+        await save('connect-import-2-mimo-payg-dark');
+        await press('[data-w-variant=mimo]');
+        await wait(`document.querySelector("[data-w=baseUrl]")?.value === ${JSON.stringify(mimoVariant('mimo').env.ANTHROPIC_BASE_URL)}`);
+        await check('UI13 点回"Token Plan"：接口地址、名称回到默认预设的', 'document.querySelector("[data-w=name]").value.startsWith("mimo") && !document.querySelector("[data-w=name]").value.startsWith("mimo-payg") && document.querySelector(".sheet .segm button.on").textContent === "Token Plan"');
+        await key('Escape'); await wait('!!document.querySelector(".confirm-actions .danger")'); await press('.confirm-actions .danger'); await wait('!document.querySelector(".sheet")');
         // 063：config.json 无效时 Agent 页显示核心的原因（不再回退到内置默认），也不显示"还没有导入执行者"的空状态；
         // 对照：真的没有执行者（可读的空配置）时照旧显示空状态。
         await writeFile(config, JSON.stringify({ v: 2, defaultProfile: null, managed: false, watchWindow: 'never', profiles: {} }));

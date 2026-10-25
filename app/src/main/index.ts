@@ -413,8 +413,9 @@ app.whenReady().then(async () => {
     const consoleService = createConsole({
       coreRun, messages: cx,
       knownRunDir: dir => registry.knownRunDir(dir),
+      knownTask: (repo, name) => registry.knownTask(repo, name),
       openFolder: async dir => { const error = await effects.open(dir); if (error) throw Error(error); },
-      launch: (executable, args, { cwd }) => effects.launch(executable, args, cwd),
+      launch: (executable, args, { cwd, env }) => effects.launch(executable, args, cwd, env),
       // Windows Terminal：用户目录下的应用执行别名（不存在时退回 cmd.exe）。
       findWt: async () => { const wt = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe'); try { await stat(wt); return wt; } catch { return null; } },
       testTimeout: (() => { if (!shotMode) return 180; const v = Number(process.env.AR_SHOTS_AGENT_TIMEOUT); return Number.isInteger(v) && v > 0 ? v : 180; })(),

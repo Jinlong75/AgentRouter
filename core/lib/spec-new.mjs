@@ -5,15 +5,19 @@ import { readFileSync, writeFileSync, readdirSync, mkdirSync, statSync } from 'n
 import { basename, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { requireGitIdentity } from './project.mjs';
-import { parseSpec, validateSpec, SPEC_TYPES, SpecError } from './spec.mjs';
+import { parseSpec, validateSpec, checkAllowedPath, SPEC_TYPES, SpecError } from './spec.mjs';
 import { traced } from './trace.mjs';
 import { readJson } from './json.mjs';
+import { matchesAny } from './glob.mjs';
+import { git as runGit } from './git.mjs';
 
 const MAX_BYTES = 256 * 1024;
+const DEFAULT_CHECK_LIMIT = 20;
 // 错误提示沿用原有五种类型的顺序，后加的类型排在后面（已有测试断言了前半段）。
 const LEGACY_TYPES = ['code', 'test', 'fix', 'research', 'docs'];
 const TYPE_TEXT = [...LEGACY_TYPES.filter(t => SPEC_TYPES.includes(t)), ...SPEC_TYPES.filter(t => !LEGACY_TYPES.includes(t))].join('、');
-const usageSpec = '用法：ar spec list <项目路径> | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径>';
+const usageSpec = '用法：ar spec list <项目路径> | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径> | check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]';
+const usageCheck = '用法：ar spec check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>] [--json]';
 
 // 从标准输入读完整内容（spec new 的表单 JSON），与 cli.mjs 里读密钥的 readSecretValue 互不影响。
 export async function readSpecForm({ input = process.stdin } = {}) {
@@ -66,8 +70,45 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
         : `任务说明没有提交：${committed.error}`;
       return { result: committed, text, code: committed.ok ? 0 : 1 };
     }
+    case 'check-paths': {
+      const options = {};
+      for (let i = 0; i < args.length; i += 2) {
+        const flag = args[i], value = args[i + 1];
+        if (!['--project', '--paths', '--limit'].includes(flag) || value === undefined || Object.hasOwn(options, flag)) throw new Error(usageCheck);
+        options[flag] = value;
+      }
+      if (!options['--project'] || options['--paths'] === undefined) throw new Error(usageCheck);
+      const checked = checkPaths(resolve(cwd, options['--project']), options['--paths'], options['--limit']);
+      const text = checked.all ? `匹配项目里全部 ${checked.fileCount} 个文件`
+        : [`匹配到 ${checked.total} 个现有文件（项目共 ${checked.fileCount} 个）${checked.files.length ? '：' : ''}`, ...checked.files.map(f => `  ${f}`), ...(checked.truncated ? [`  …还有 ${checked.total - checked.files.length} 个`] : []),
+          ...checked.patterns.map(p => `  ${p.pattern}：${p.count} 个`)].join('\n');
+      return { result: { ok: true, ...checked }, text };
+    }
     default: throw new Error(usageSpec);
   }
+}
+
+// 允许路径的匹配预览（只读）：项目里现有的文件（已跟踪 + 没被忽略的未跟踪，去掉 .agent-runs/）一次 ls-files 取回，
+// 匹配在内存里完成，规则就是门禁用的 glob.mjs matchesAny（写法校验同任务说明解析器的 checkAllowedPath）。
+export function checkPaths(root, pathsJson, limitText) {
+  let patterns;
+  try { patterns = JSON.parse(pathsJson); } catch { throw new Error('--paths 不是有效的 JSON'); }
+  if (!Array.isArray(patterns) || patterns.some(p => typeof p !== 'string')) throw new Error('--paths 必须是字符串数组');
+  patterns.forEach((item, index) => checkAllowedPath(item, index, (_key, reason) => { throw new Error(`允许改动的文件${reason}：${item}`); }));
+  let limit = DEFAULT_CHECK_LIMIT;
+  if (limitText !== undefined) {
+    if (!/^[0-9]+$/.test(limitText) || !Number.isSafeInteger(Number(limitText))) throw new Error(`--limit 必须是非负整数：${limitText}`);
+    limit = Number(limitText);
+  }
+  const listed = runGit(root, ['ls-files', '--cached', '--others', '--exclude-standard', '-z']);
+  if (listed.status !== 0) throw new Error(`不是 git 仓库或读不到文件列表：${tail(listed.stderr) || root}`);
+  const all = [...new Set(listed.stdout.split('\0').filter(f => f && !f.startsWith('.agent-runs/')))];
+  const matched = all.filter(file => matchesAny(file, patterns));
+  const counts = patterns.map(pattern => ({ pattern, count: all.reduce((n, file) => n + (matchesAny(file, [pattern]) ? 1 : 0), 0) }));
+  return {
+    total: matched.length, files: matched.slice(0, limit), truncated: matched.length > limit,
+    patterns: counts, all: all.length > 0 && matched.length === all.length, fileCount: all.length,
+  };
 }
 
 // project.json 的 specsDir（没有时默认 docs/specs）；解析成项目根内的绝对路径。

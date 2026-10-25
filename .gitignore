@@ -13,3 +13,5 @@ logs/
 build/fonts/
 build/icons/
 .tmp/
+# PowerShell 在执行者沙箱里偶尔把模块分析缓存写进当前目录（Stage07 097 实测），不是项目文件
+/Microsoft/

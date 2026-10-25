@@ -32,6 +32,19 @@ test('确认后身份变化时不 kill、不写 interrupted',async()=>{const {ho
 test('导入旧任务只在本地存储；viewer 退出只删除自己的 pid',async()=>{const {home}=await fixture();const dir=path.join(home,'.codex-runs');await mkdir(dir);await writeFile(path.join(dir,'old.progress.log'),'=== Codex 开始：旧任务（角色：工程负责人）  2026/10/8 10:05:00 ===\n[10:06:00] 说：完成\n=== Codex 结束：exit=0，用时 1.0 分钟，汇报在 demo.md ===\n');const imported=await importTasks(home);assert.equal(imported[0].title,'旧任务');assert.equal(imported[0].status,'done');assert.equal(imported[0].imported,true);const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});await registry.start();const original=await readFile(registry.file,'utf8');await registry.import(home);assert.equal(await readFile(registry.file,'utf8'),original);const viewer=JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8'));assert.equal(viewer.suppressWatchWindow,true);assert.equal(viewer.acceptsManaged,true);await writeFile(path.join(home,'viewer.json'),JSON.stringify({pid:99999}));await registry.close();assert.equal(JSON.parse(await readFile(path.join(home,'viewer.json'),'utf8')).pid,99999);});
 test('无效日期与数值不进入渲染 DTO，持久化导入记录重新验证',async()=>{assert.equal(parseRegistry(lines(row({started:1e100}))).length,0);const parsed=parseRegistry(lines(row(),{v:1,event:'end',id:'sample',exit:0,minutes:'<img src=x>',at:'bad'}))[0];assert.equal(parsed.minutes,undefined);assert.equal(parsed.ended,undefined);assert.equal(parseEvent(JSON.stringify({v:1,seq:1,at:1e100,kind:'say',text:'bad'}),0),null);const {home,task}=await fixture();await writeFile(path.join(home,'monitor','tasks.json'),JSON.stringify({imports:[{...task,id:'import-safe',imported:true,status:'done',minutes:'<img src=x>'},{id:'invalid',imported:true,status:'done'}],hidden:[{},1]}));const registry=new Registry(home,path.join(home,'monitor'),{processes:async()=>[],killTree:async()=>assert.fail(),open:async()=>{}},()=>{},()=>{},()=>{});try{await registry.start();assert.ok(!registry.tasks.some(t=>t.id==='invalid'));assert.equal(registry.tasks.find(t=>t.id==='import-safe')?.minutes,undefined);}finally{await registry.close();}});
 
+// ---- 096 任务名：title 与 spec 相同（任务说明路径）时显示文件名，记录里的 title / spec 不改 ----
+test('任务名：title 等于 spec 时取文件名并去掉 .md，其余原样',()=>{
+  const title=(extra:object)=>parseRegistry(lines(row(extra)))[0].title;
+  assert.equal(title({title:'docs/specs/002-001-改第二行.md',spec:'docs/specs/002-001-改第二行.md'}),'002-001-改第二行');
+  assert.equal(title({title:'docs\\specs\\003-反斜杠.MD',spec:'docs\\specs\\003-反斜杠.MD'}),'003-反斜杠');
+  assert.equal(title({title:'004-无目录.md',spec:'004-无目录.md'}),'004-无目录');
+  assert.equal(title({title:'修一下登录页',spec:null}),'修一下登录页');
+  assert.equal(title({title:'修一下登录页',spec:'docs/specs/005-登录.md'}),'修一下登录页');
+  assert.equal(title({title:'docs/specs/006-空说明.md',spec:null}),'docs/specs/006-空说明.md');
+  assert.equal(title({title:'docs/specs/007-空串.md',spec:''}),'docs/specs/007-空串.md');
+  assert.equal(parseRegistry(lines(row({title:'docs/specs/008-记录.md',spec:'docs/specs/008-记录.md'})))[0].spec,'docs/specs/008-记录.md','spec 字段不改');
+});
+
 // ---- 060 跨尝试读取（协议 14.4）：attempt / attempt-end / resume 的清单解析 ----
 test('自动重试三次：尝试列表 3 项、total 正确，状态与最后一个 end 一致',()=>{
   const attempt=(n:number,at:number)=>({v:1,event:'attempt',id:'sample',n,total:3,profile:'fake',reason:n===1?'first':'gate',at});

@@ -152,3 +152,13 @@ test('这一节只出现在代码块里：当作没有，照常重试', async t 
   assert.equal(list.filter(row => row.event === 'attempt').length, 3);
   assert.ok(!('needsScope' in list.at(-1)));
 });
+
+// 101：汇报模板给各节编了号，执行者写成 "### 10. 需要越界"（094 的实测）：同样只跑 1 次。
+test('标题带层级与编号（### 10. 需要越界）：同样识别，只跑 1 次', async t => {
+  const numbered = SCOPE_REPORT.replace('## 需要越界', '### 10. 需要越界').replace('## 已知问题', '### 11. 已知问题');
+  const f = fixture(t, { report: numbered });
+  const result = await f.ar(['dispatch', 'docs/specs/001-越界.md', '--name', '越界五', '--json']);
+  assert.equal(result.code, 3, result.stderr + result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout).needsScope, SCOPE_LIST);
+  assert.equal(f.list('越界五').filter(row => row.event === 'attempt').length, 1);
+});

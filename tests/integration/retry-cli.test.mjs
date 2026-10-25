@@ -246,7 +246,7 @@ test('中断的任务重试：没有失败段落，只带补充说明', async t 
       2: { events: [{ kind: 'say', text: '重试完成' }], report: '重试汇报\n', exit: 0 },
     },
   });
-  const spec = f.spec('docs/specs/003-中断后手动重试.md', { type: 'research', allowed: null, verify: [], expectCommit: false, maxRetries: 0 });
+  const spec = f.spec('docs/specs/003-中断后手动重试.md', { type: 'docs', allowed: null, verify: [], expectCommit: false, maxRetries: 0 });
   const dispatching = f.spawnAr(['dispatch', spec, '--name', '中断后重试']);
   const start = await until(() => startOf(f.home, '中断后重试'), '中断后重试的 start 记录');
   await until(() => rows(f.home).some(row => row.id === start.id && row.event === 'spawned'), '第一次 spawned 记录');

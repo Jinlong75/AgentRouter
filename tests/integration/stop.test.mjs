@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, appendFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { stopTask } from '../../core/lib/stop.mjs';
 import { registryWriter } from '../../core/lib/records.mjs';
@@ -31,12 +31,20 @@ test('找不到、已经结束和身份不符不结束进程', async t => {
   assert.equal(await stopTask(f.home,f.home,'中文 空格',options),2);
   assert.equal(output.pop(),'停止：在当前仓库找不到记录 中文 空格');
   f.record(f.start);
-  // 本测试进程命令行不包含派发入口；实际查询应拒绝它。
-  assert.equal(await stopTask(f.home,f.home,'中文 空格',options),1);
-  assert.equal(output.pop(),'停止：中文 空格 的进程已经不在了');
-  for (const info of [null, { created:Date.now()+10000,command:'node codex-task.mjs' }, {created:null,command:'codex-task.mjs'}]) {
+  // 102 改写：下面两种"查不出来 / 说不准"的情形仍然不结束进程、不写记录，退出码 1（原断言不变）。
+  for (const info of [null, {created:null,command:'codex-task.mjs'}]) {
     assert.equal(await stopTask(f.home,f.home,'中文 空格',{...options,info:async()=>info}),1);
   }
+  assert.equal(readFileSync(f.file,'utf8').trim().split('\n').length,1,'没有追加任何记录');
+  // 102 改写：本测试进程命令行不包含派发入口，实际查询认定它不是原派发进程（PID 已被复用）。
+  // 原断言 退出码 1、输出 '停止：中文 空格 的进程已经不在了' → 新断言 退出码 0、输出 '…，已记为中断（派发进程意外退出）'，清单多一条 process-gone；
+  // 原因：任务说明 102——确认原派发进程已经不在时补写 interrupted。创建时间晚于 started 的那一条同理，单独用一个新任务测。
+  assert.equal(await stopTask(f.home,f.home,'中文 空格',options),0);
+  assert.equal(output.pop(),'停止：中文 空格 的进程已经不在了，已记为中断（派发进程意外退出）');
+  assert.equal(JSON.parse(readFileSync(f.file,'utf8').trim().split('\n').at(-1)).signal,'process-gone');
+  const later = fixture(t); later.record(later.start);
+  assert.equal(await stopTask(later.home,later.home,'中文 空格',{...options,info:async()=>({created:Date.now()+10000,command:'node codex-task.mjs'})}),0);
+  assert.equal(output.pop(),'停止：中文 空格 的进程已经不在了，已记为中断（派发进程意外退出）');
   f.record({event:'end',id:'sample',exit:0});
   assert.equal(await stopTask(f.home,f.home,'中文 空格',options),0);
   assert.equal(output.pop(),'停止：中文 空格（已经结束）');
@@ -51,10 +59,13 @@ test('停止成功隔开尾部半行，失败不追加记录', async t => {
   assert.match(readFileSync(f.file,'utf8'),/broken half\n\{"v":1,"event":"interrupted"/);
 });
 test('新入口 ar.mjs 派发的任务同样能停止，其他脚本不行', async t => {
-  for (const [command, expected] of [['node "C:\\示例\\core\\ar.mjs" 只回复 OK',0],['node other.mjs',1]]) {
+  // 102 改写：其他脚本（PID 已被复用）原断言 退出码 1 → 新断言 退出码 0 且补写 process-gone；仍然不结束进程（killed 为 false）。
+  // 原因：任务说明 102——确认原派发进程已经不在时补写 interrupted；真正的 ar.mjs 派发进程仍被结束，signal 为 stopped-by-command。
+  for (const [command, killedExpected, signal] of [['node "C:\\示例\\core\\ar.mjs" 只回复 OK',true,'stopped-by-command'],['node other.mjs',false,'process-gone']]) {
     const f=fixture(t); f.record(f.start); let killed=false;
     const code=await stopTask(f.home,f.home,'中文 空格',{info:async()=>({created:0,command}),alive:async()=>true,killTree:async()=>{killed=true;},log:()=>{}});
-    assert.equal(code,expected); assert.equal(killed,expected===0);
+    assert.equal(code,0); assert.equal(killed,killedExpected);
+    assert.equal(JSON.parse(readFileSync(f.file,'utf8').trim().split('\n').at(-1)).signal,signal);
   }
 });
 
@@ -91,6 +102,36 @@ test('resume 之后已经有新的 end：按"已经结束"处理，不结束进�
   f.record({ event: 'end', id: 'sample', exit: 0, at: Date.now() });
   assert.equal(await stopTask(f.home, f.home, '中文 空格', options), 0);
   assert.equal(output.pop(), '停止：中文 空格（已经结束）');
+});
+// 102：真实启动一个假派发进程，结束它但不写任何结束记录（模拟意外退出），再运行真实的 ar stop。
+test('派发进程意外退出、没写结束记录：ar stop 补写 interrupted（process-gone）并如实报告，再停一次是"已经结束"', async t => {
+  const f = fixture(t);
+  const env = { ...process.env, AGENT_ROUTER_HOME: f.home, AR_NO_WATCH: '1' };
+  for (const key of ['CODEX_DISPATCH_HOME', 'AR_DRY_RUN', 'CODEX_DRY_RUN', 'NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE']) delete env[key];
+  const fake = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore', windowsHide: true, shell: false });
+  t.after(() => { try { fake.kill(); } catch { /* 已经退出。 */ } });
+  const closed = new Promise(resolve => fake.on('close', resolve));
+  assert.ok(Number.isSafeInteger(fake.pid));
+  f.record({ ...f.start, pid: fake.pid, started: Date.now() });
+  fake.kill(); // 只结束自己启动的这一个进程；没有信号处理的机会，也就没有结束记录
+  await closed;
+  const before = readFileSync(f.file, 'utf8');
+  const run = () => spawnSync(process.execPath, [fileURLToPath(script), 'stop', '中文 空格'], { cwd: f.home, env, encoding: 'utf8', windowsHide: true, timeout: 120000 });
+  const first = run();
+  assert.equal(first.status, 0, first.stdout + first.stderr);
+  assert.equal(first.stdout.trim(), '停止：中文 空格 的进程已经不在了，已记为中断（派发进程意外退出）');
+  const after = readFileSync(f.file, 'utf8');
+  assert.ok(after.startsWith(before), '原有记录原样保留');
+  const added = after.slice(before.length).split('\n').filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(added.length, 1, '只多一条');
+  assert.equal(added[0].event, 'interrupted');
+  assert.equal(added[0].id, 'sample');
+  assert.equal(added[0].signal, 'process-gone');
+  assert.ok(Number.isFinite(added[0].at));
+  const second = run();
+  assert.equal(second.status, 0, second.stdout + second.stderr);
+  assert.equal(second.stdout.trim(), '停止：中文 空格（已经结束）');
+  assert.equal(readFileSync(f.file, 'utf8'), after, '第二次不重复写');
 });
 test('平台树结束必须等待子孙退出，超时失败', async () => {
   const calls=[];

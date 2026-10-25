@@ -4,6 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { waitInterval } from './wait.mjs';
 import { taskPaths } from './records.mjs';
 import { readJson } from './json.mjs';
+import { validateGeneric } from './generic-schema.mjs';
 
 function appName(value) {
   return typeof value === 'string' && value.trim() ? Array.from(value.trim()).slice(0, 40).join('') : 'AgentRouter';
@@ -73,7 +74,11 @@ function validProfileConfig(p) {
     && (p.maxTurns === null || (Number.isInteger(p.maxTurns) && p.maxTurns > 0))
     && (p.label === null || typeof p.label === 'string')
     && (p.adapter === undefined || p.adapter === null || typeof p.adapter === 'string')
-    && (p.path === undefined || p.path === null || (typeof p.path === 'string' && isAbsolute(p.path)));
+    && (p.path === undefined || p.path === null || (typeof p.path === 'string' && isAbsolute(p.path)))
+    // 通用适配器（Stage07）：派发进程解析好的声明（按 schema 校验）、声明名、或解析失败的原因。
+    && (p.generic === undefined || typeof p.generic === 'string')
+    && (p.genericDecl === undefined || (object(p.genericDecl) && validateGeneric(p.genericDecl).ok))
+    && (p.genericError === undefined || typeof p.genericError === 'string');
 }
 export const existingPaths = taskPaths;
 // 只处理完整行，保留尾部半行；轮询时不重复读取整个清单。

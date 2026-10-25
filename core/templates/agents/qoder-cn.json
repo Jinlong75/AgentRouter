@@ -1,0 +1,30 @@
+{
+  "name": "qoder-cn",
+  "adapter": "generic",
+  "label": "Qoder（国内版）",
+  "enabled": true,
+  "auth": "token",
+  "secrets": { "QODERCN_PERSONAL_ACCESS_TOKEN": "QODERCN_PERSONAL_ACCESS_TOKEN" },
+  "model": "DeepSeek-Flash",
+  "effort": "ultracode",
+  "generic": {
+    "label": "Qoder（国内版）",
+    "executable": "qoderclicn",
+    "detect": ["--version"],
+    "args": ["-p", "--output-format", "stream-json", "--permission-mode", "bypass_permissions", "--no-session-persistence", "-m", "{model}", "--reasoning-effort", "{effort}"],
+    "readOnlyArgs": ["-p", "--output-format", "stream-json", "--permission-mode", "dont_ask", "--tools", "Read", "Grep", "Glob", "--no-session-persistence", "-m", "{model}", "--reasoning-effort", "{effort}"],
+    "stdin": "{prompt}",
+    "output": { "format": "stream-json" },
+    "failureHints": [ { "match": "not logged in|authentication_failed|token .*rejected", "text": "Qoder 国内版没有登录或令牌无效：在 qoder.cn 的账户集成页生成个人访问令牌，设为用户环境变量 QODERCN_PERSONAL_ACCESS_TOKEN" } ]
+  },
+  "modelOptions": ["Auto", "Fast", "Qwen3.8-Max", "Qwen3.8-Flash", "DeepSeek-V4-Pro", "DeepSeek-Flash", "GLM-5.3", "GLM-5.3-Flash", "Kimi-K3.1-Pro", "Kimi-K2.8-Preview", "MiniMax-M3.1-Flash"],
+  "listModels": ["--list-models"],
+  "effortOptions": ["auto", "none", "low", "medium", "high", "xhigh", "max", "ultracode"],
+  "types": ["research", "docs", "review"],
+  "title": "Qoder（国内版）",
+  "description": "用 qoder.cn 的个人访问令牌；适合调研、阅读类任务，也能写代码",
+  "recommended": false,
+  "card": { "id": "qoder", "title": "Qoder", "description": "国内版或国际版，用个人访问令牌；适合调研、阅读类任务，也能写代码" },
+  "variant": { "label": "版本", "option": "国内版", "help": "程序 qoderclicn，在 qoder.cn 的账户集成页生成个人访问令牌" },
+  "order": 8
+}

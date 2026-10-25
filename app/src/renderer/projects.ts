@@ -4,8 +4,9 @@
 // 数据都经 window.dock.console 交给核心；会写文件的操作期间按钮忙碌，失败在详情顶部显示核心给的原因。
 import { ag, c, pj, s6 } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { ProjectChange, ProjectRow, ProjectShow, ProjectSort, Task } from '../shared/types';
+import type { GitVersionInfo, ProjectChange, ProjectRow, ProjectShow, ProjectSort, Task } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, type Sheet } from './ui';
+import { forgetRepoStates, wtState } from './wt';
 import { SearchField, closeSortMenu, foundRow, hit, matches, openSortMenu, paintHeader, sortButton } from './search';
 
 export interface ProjectsHost {
@@ -104,6 +105,8 @@ export class ProjectsView {
     private rows: ProjectRow[] = [];
     private selected = '';
     private show: ProjectShow | null = null;
+    // 核心报告的 git 版本（全局一份）；ok 为 false 时在已初始化项目的详情顶部显示"版本太旧"横幅。
+    private git: GitVersionInfo | null = null;
     private loaded = false;
     private mode: 'view' | 'plan' | 'written' = 'view';
     private plan: ProjectChange[] = [];
@@ -240,7 +243,9 @@ export class ProjectsView {
         const recentRows = recent.length
             ? recent.map(t => `<button class="r pj-task" data-pj-task="${esc(t.id)}">${mark(t.status)}<span class="v">${esc(t.title)}</span><span class="sp"></span><span class="mono muted">${esc(clock(t.started))}</span></button>`).join('')
             : `<div class="r"><span class="muted">${esc(pj.noRecent)}</span></div>`;
-        return `<div class="sec-t">${esc(pj.config)} <span class="mono muted">${esc(pj.configFile)}</span><span class="sp"></span><button class="btn sm" data-pj="edit" ${this.busy ? 'disabled' : ''}>${icon('edit-line')}${esc(pj.edit)}</button></div><div class="rows">${rows}</div><div class="sec-t">${esc(pj.recent)}</div><div class="rows">${recentRows}</div>`;
+        // git 低于 2.40：只是提示，不禁用任何按钮（不用 worktree 的任务不受影响）。
+        const oldGit = this.git?.ok === false ? banner('brand', pj.gitOldTitle(this.git.version ?? ''), pj.gitOldHelp) : '';
+        return `${oldGit}<div class="sec-t">${esc(pj.config)} <span class="mono muted">${esc(pj.configFile)}</span><span class="sp"></span><button class="btn sm" data-pj="edit" ${this.busy ? 'disabled' : ''}>${icon('edit-line')}${esc(pj.edit)}</button></div><div class="rows">${rows}</div><div class="sec-t">${esc(pj.recent)}</div><div class="rows">${recentRows}</div>`;
     }
     private planBody(): string {
         if (!this.plan.length) return `<div class="sec-t">${esc(pj.planNone)}</div><div class="inline-f"><button class="btn" data-pj="plan-cancel">${esc(pj.cancel)}</button></div>`;
@@ -287,7 +292,7 @@ export class ProjectsView {
     private async loadShow(path: string, seq: number) {
         try {
             const r = await window.dock.console('projects:show', { path });
-            if (seq === this.seq && this.selected === path) { this.show = r.project; this.error = ''; }
+            if (seq === this.seq && this.selected === path) { this.show = r.project; this.git = r.git ?? null; this.error = ''; }
         }
         catch (e) { if (seq === this.seq && this.selected === path) this.error = failure(e); }
         finally { if (seq === this.seq) this.render(); }
@@ -311,7 +316,9 @@ export class ProjectsView {
                 const r = await window.dock.console('projects:show', { path: this.selected });
                 if (seq !== this.seq) return;
                 this.show = r.project;
+                this.git = r.git ?? null;
             }
+            else this.git = list.git ?? null;
             this.error = '';
         }
         catch (e) { if (seq === this.seq) this.error = failure(e); }
@@ -366,6 +373,7 @@ export class ProjectsView {
             const path = await window.dock.console('projects:choose');
             if (typeof path === 'string' && path) {
                 await window.dock.console('projects:add', { path });
+                forgetRepoStates();
                 this.selected = path;
             }
             this.busy = false;
@@ -390,10 +398,16 @@ export class ProjectsView {
     private async remove(trigger: HTMLElement) {
         const s = this.show;
         if (!s) return;
-        if (!await confirmAction(pj.removeTitle(s.name), pj.removeBody, pj.removeConfirm, trigger, true)) return;
+        // 还有没处理完的任务（待验收、合并冲突、进行中）时在说明下面列出名字（最多 5 个）：只提醒，仍然允许移除。
+        const pending = this.host.tasks().filter(t => samePath(t.repo, s.path) && (t.status === 'run' || wtState(t) === 'awaiting' || wtState(t) === 'conflict'));
+        const names = pending.slice(0, 5).map(t => `· ${t.title}`);
+        const more = pending.length > 5 ? [pj.removePendingMore(pending.length)] : [];
+        const body = pending.length ? [pj.removeBody, '', pj.removePending(pending.length), ...names, ...more, '', pj.removePendingHelp].join('\n') : pj.removeBody;
+        if (!await confirmAction(pj.removeTitle(s.name), body, pj.removeConfirm, trigger, true)) return;
         this.busy = true; this.error = ''; this.render();
         try {
             await window.dock.console('projects:remove', { path: s.path });
+            forgetRepoStates();
             this.selected = ''; this.show = null; this.mode = 'view';
             this.busy = false;
             await this.refresh();

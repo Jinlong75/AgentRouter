@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { explicitlyAllowed, explicitlyAllowedRootSpec, isRootSpecFile, literalPrefixOf, normalizeSpecsDir, summarizeGate } from '../../core/lib/gate.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { explicitlyAllowed, explicitlyAllowedRootSpec, isRootSpecFile, literalPrefixOf, normalizeSpecsDir, runGate, summarizeGate } from '../../core/lib/gate.mjs';
 import { parseNameStatusZ, parseStatusPorcelainZ } from '../../core/lib/git.mjs';
 
 // 构造 summarizeGate 的输入；没给的字段按"这一项没问题"处理。
@@ -218,4 +222,101 @@ test('explicitlyAllowedRootSpec：放行的模式要明确写到编号（字面�
   assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: false }), false);
   assert.equal(explicitlyAllowedRootSpec('065-x.MD', ['065-*.md'], { caseInsensitive: false }), false);
   assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: true }), true);
+});
+
+// 093：runGate 的 extraEnv 在 removeEnv 之后合并；不传时验收命令的环境与原来相同。
+function gateRepo() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ar-093-gate-'));
+  const run = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  run(['init', '-q', '-b', 'main']);
+  run(['config', 'user.name', 'gate 测试']);
+  run(['config', 'user.email', 'gate@example.test']);
+  run(['config', 'commit.gpgsign', 'false']);
+  writeFileSync(path.join(dir, 'a.txt'), '初始\n');
+  run(['add', 'a.txt']);
+  run(['commit', '-q', '-m', '初始']);
+  return { dir, base: run(['rev-parse', 'HEAD']) };
+}
+const dumpGateEnv = `node -e "console.log(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k]) => /^(AR_|FOO_093)/i.test(k)))))"`;
+
+test('runGate：extraEnv 在去掉 AR_ 变量之后合并，同名的父进程变量被它覆盖，其余 AR_ 变量照旧被去掉', async () => {
+  const { dir, base } = gateRepo();
+  try {
+    const env = { ...process.env, AR_BASE_REPO: '父进程的值', AR_OTHER: '别的', FOO_093: '保留' };
+    const gate = await runGate({ root: dir, base, spec: { verify: [dumpGateEnv] }, env, dir: path.join(dir, '.agent-runs'), extraEnv: { AR_BASE_REPO: '/主工作区', AR_WORKTREE: '/worktree' } });
+    assert.equal(gate.ok, true, gate.summary);
+    assert.deepEqual(JSON.parse(gate.commands[0].output.trim()), { FOO_093: '保留', AR_BASE_REPO: '/主工作区', AR_WORKTREE: '/worktree' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runGate：不传 extraEnv 时去掉全部 AR_ 变量，与原来相同', async () => {
+  const { dir, base } = gateRepo();
+  try {
+    const env = { ...process.env, AR_BASE_REPO: '父进程的值', AR_WORKTREE: '父进程的值', FOO_093: '保留' };
+    const gate = await runGate({ root: dir, base, spec: { verify: [dumpGateEnv] }, env, dir: path.join(dir, '.agent-runs') });
+    assert.equal(gate.ok, true, gate.summary);
+    assert.deepEqual(JSON.parse(gate.commands[0].output.trim()), { FOO_093: '保留' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+// 105：只读任务（调研 / 审查）的门禁——允许路径视为空、不要求提交，base..HEAD 与工作区里任何改动的文件都算越界。
+test('summarizeGate：只读任务把越界与未提交合成"只读任务改动了文件"，不单列"有未提交的文件"；不只读时写法不变', () => {
+  const only = { ...parts({ commit: { required: false, ok: true }, outside: ['a.js', 'b.js'], uncommitted: ['b.js'] }), readOnly: true };
+  assert.equal(summarizeGate(only), '只读任务改动了文件：a.js、b.js');
+  assert.equal(summarizeGate({ ...only, readOnly: undefined }), '有未提交的文件；改动超出范围：a.js、b.js', '没有 readOnly 时与原来一致');
+  const many = { ...only, scope: { ...only.scope, outside: ['a', 'b', 'c', 'd', 'e', 'f'] }, uncommitted: [] };
+  assert.equal(summarizeGate(many), '只读任务改动了文件：a、b、c、d、e 等');
+  // 验收命令失败照常追加在后面。
+  assert.equal(summarizeGate({ ...only, commands: [command({ exit: 2 })] }), '只读任务改动了文件：a.js、b.js；验收命令失败：npm test（exit 2）');
+});
+
+test('runGate readOnly：没有任何改动时通过，允许路径记空数组、不要求提交（即使说明写了 expect_commit 和 allowed_paths）', async () => {
+  const { dir, base } = gateRepo();
+  try {
+    const gate = await runGate({ root: dir, base, readOnly: true, spec: { allowed_paths: ['src/**'], expect_commit: true, verify: [] }, dir: path.join(dir, '.agent-runs') });
+    assert.equal(gate.ok, true, gate.summary);
+    assert.equal(gate.summary, '门禁通过');
+    assert.deepEqual(gate.scope.allowed, []);
+    assert.deepEqual(gate.commit, { required: false, ok: true });
+    assert.deepEqual(gate.scope.outside, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runGate readOnly：已提交的改动、没提交的改动、未跟踪的新文件都算越界；就算在 allowed_paths 里也一样', async () => {
+  const { dir, base } = gateRepo();
+  const run = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  try {
+    writeFileSync(path.join(dir, 'a.txt'), '改过\n');
+    run(['commit', '-q', '-am', '偷偷提交']);
+    writeFileSync(path.join(dir, 'new.txt'), '新文件\n');
+    const gate = await runGate({ root: dir, base, readOnly: true, spec: { allowed_paths: ['**'] }, dir: path.join(dir, '.agent-runs') });
+    assert.equal(gate.ok, false);
+    assert.deepEqual(gate.scope.changed, ['a.txt']);
+    assert.deepEqual(gate.uncommitted, ['new.txt']);
+    assert.deepEqual(gate.scope.outside, ['a.txt', 'new.txt']);
+    assert.equal(gate.summary, '只读任务改动了文件：a.txt、new.txt');
+    // 同样的改动、不只读、允许 **：通过（对照）。
+    const writable = await runGate({ root: dir, base, spec: { allowed_paths: ['**'] }, dir: path.join(dir, '.agent-runs') });
+    assert.deepEqual(writable.scope.outside, []);
+    assert.equal(writable.summary, '有未提交的文件');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runGate readOnly：.agent-runs 里的文件不算改动；受保护目录的改动记入 protected；验收命令照常运行', async () => {
+  const { dir, base } = gateRepo();
+  const run = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  try {
+    mkdirSync(path.join(dir, '.agent-runs/x'), { recursive: true });
+    writeFileSync(path.join(dir, '.agent-runs/x/progress.log'), '进度\n');
+    const clean = await runGate({ root: dir, base, readOnly: true, spec: { verify: ['node -e "process.exit(0)"'] }, dir: path.join(dir, '.agent-runs', 'g1') });
+    assert.equal(clean.ok, true, clean.summary);
+    assert.equal(clean.commands.length, 1, '验收命令照常运行');
+    mkdirSync(path.join(dir, 'docs/specs'), { recursive: true });
+    writeFileSync(path.join(dir, 'docs/specs/001-x.md'), '改了任务说明\n');
+    run(['add', 'docs/specs/001-x.md']);
+    run(['commit', '-q', '-m', '改任务说明']);
+    const protectedChange = await runGate({ root: dir, base, readOnly: true, spec: { verify: ['node -e "process.exit(3)"'] }, dir: path.join(dir, '.agent-runs', 'g2') });
+    assert.equal(protectedChange.ok, false);
+    assert.deepEqual(protectedChange.scope.protected, ['docs/specs/001-x.md']);
+    assert.match(protectedChange.summary, /^只读任务改动了文件：docs\/specs\/001-x\.md；验收命令失败：/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
