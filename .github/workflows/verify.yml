@@ -125,7 +125,8 @@ jobs:
     # 手动触发且开了 Linux 复现（linux 非空）时只跑 linux 作业，也不跑界面验收。
     if: github.event_name != 'workflow_dispatch' || (github.event.inputs.h1 != 'quiet' && github.event.inputs.nodetest == '' && github.event.inputs.linux == '')
     runs-on: windows-latest
-    timeout-minutes: 30
+    # 界面检查 v0.7.5 是 1572 项，CI 上 30 分钟跑不完（v0.7.0 的 1424 项已用 28 分 44 秒），放宽到 50 分钟；只改超时，不改检查。
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
