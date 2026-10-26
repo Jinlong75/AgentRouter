@@ -4,6 +4,7 @@ import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, uncommittedFiles } from './git.mjs';
 import { readJson } from './json.mjs';
+import { pushBranch } from './push.mjs';
 import { registryWriter } from './records.mjs';
 import { parseSpec, validateSpec } from './spec.mjs';
 import { findTerminal, latestEvent, locateStart, reverseRows, worktreeOutcome } from './wait.mjs';
@@ -63,8 +64,9 @@ function cleanUp({ root, registry, id, worktree, force, deleteBranch, forceBranc
 }
 
 // ar accept：检查 → 合并 → accepted 事件 → 清理。任务分支没有新提交时不合并，改为确认（merge 为 null，mode 为 confirm）。
-// 返回 { ok: true, merge, mode, cleanup } 或冲突时 { ok: false, conflict: true, files }；检查不通过时抛出中文原因（退出码 2）。
-export function accept({ homes, root, name, squash = false, by = null, env = process.env } = {}) {
+// 返回 { ok: true, merge, mode, cleanup[, push] } 或冲突时 { ok: false, conflict: true, files }；检查不通过时抛出中文原因（退出码 2）。
+// push：true 合并后推送，false 不推送，null 按项目配置 push.afterAccept；只读任务的"确认"没有合并，不推送。
+export function accept({ homes, root, name, squash = false, push = null, by = null, env = process.env } = {}) {
   const { file, home, start, worktree } = locateWorktreeTask(homes, root, name, '验收');
   const id = start.id;
   const registry = registryWriter(home);
@@ -84,7 +86,7 @@ export function accept({ homes, root, name, squash = false, by = null, env = pro
   let dirtyMain;
   try { dirtyMain = uncommittedFiles(root); }
   catch (error) { throw new Error(`无法检查主工作区是否干净：${error.message}`); }
-  if (dirtyMain.length) throw new Error(`主工作区有未提交的改动，先提交或暂存：${firstFive(dirtyMain)}`);
+  if (dirtyMain.length) throw Object.assign(new Error(`主工作区有未提交的改动，先提交或暂存：${firstFive(dirtyMain)}`), { arCode: 'DIRTY_MAIN', files: dirtyMain.slice(0, 5) });
   // 检查 4：worktree 里没有门禁之后的未提交改动。
   if (!worktree || typeof worktree.dir !== 'string' || !existsSync(worktree.dir)) {
     throw new Error(`worktree 已经不在了：${worktree?.dir ?? '（清单里没有记录）'}`);
@@ -120,7 +122,20 @@ export function accept({ homes, root, name, squash = false, by = null, env = pro
   const merge = head.stdout.trim();
   registry({ event: 'accepted', id, merge, mode, by: actor({ by, env }), at: Date.now() });
   const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: mode === 'squash' });
-  return { ok: true, merge, mode, cleanup };
+  // 合并后推送（Stage07b 128）：--push，或没写 --push / --no-push 且项目配置 push.afterAccept 为 true。没有推送时结果里不出现 push 键。
+  const pushed = push === true || (push === null && config.push?.afterAccept === true)
+    ? pushAfterMerge({ root, home: homes[0], registry, id, by: actor({ by, env }), env })
+    : null;
+  return { ok: true, merge, mode, cleanup, ...(pushed ? { push: pushed } : {}) };
+}
+
+// 合并成功后接着推送 baseBranch。推送失败不影响合并结果：返回 { ok, pushed?, code?, error? }，并在任务记录追加一条 push 事件。
+function pushAfterMerge({ root, home, registry, id, by, env }) {
+  let result;
+  try { result = pushBranch({ root, home, by, env }); }
+  catch (error) { result = { ok: false, error: error.message }; }
+  registry({ event: 'push', id, ok: result.ok === true, ...(result.code ? { code: result.code } : {}), by, at: Date.now() });
+  return { ok: result.ok === true, ...(result.pushed !== undefined ? { pushed: result.pushed } : {}), ...(result.code ? { code: result.code } : {}), ...(result.ok ? {} : { error: result.error }) };
 }
 
 // 门禁用的基线：重新基线之后（协议 15.8）新基线写在 attempt 事件上，取最近一条带 base 的，没有就是 start.base。

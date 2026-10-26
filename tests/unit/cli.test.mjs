@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { normalizeArgs, main, commands } from '../../core/lib/cli.mjs';
 import { parseArgs } from '../../core/lib/options.mjs';
 
@@ -20,6 +21,50 @@ test('旧写法与新写法解析结果相同', () => {
   assert.deepEqual(normalizeArgs(['--json', '--wait', '记录']), { command: 'wait', rest: ['记录'], json: true });
   assert.deepEqual(normalizeArgs(['--run-request', 'a.claimed.json']), { command: '--run-request', rest: ['a.claimed.json'], json: false });
   assert.ok(commands.includes('init') && commands.includes('projects'));
+});
+
+test('help / --help / -h 识别成帮助命令，任务文字里含 help 仍是派发', () => {
+  for (const argv of [['help'], ['--help'], ['-h'], ['--help', '--json'], ['-h', 'retry']]) {
+    assert.equal(normalizeArgs(argv).command, 'help', argv.join(' '));
+  }
+  assert.equal(normalizeArgs(['--help', '--json']).json, true);
+  assert.deepEqual(normalizeArgs(['帮我写个 help 页面']), { command: 'dispatch', rest: ['帮我写个 help 页面'], json: false });
+  assert.equal(normalizeArgs(['写个 --help 说明', '--name', 'x']).command, 'dispatch');
+  assert.ok(commands.includes('help'));
+});
+
+test('push / pull 是子命令，不会被当作任务文字派发；用法里有这两条', async () => {
+  assert.ok(commands.includes('push') && commands.includes('pull'));
+  assert.deepEqual(normalizeArgs(['push', 'proj', '--dry-run', '--json']), { command: 'push', rest: ['proj', '--dry-run'], json: true });
+  assert.deepEqual(normalizeArgs(['pull', 'proj']), { command: 'pull', rest: ['proj'], json: false });
+  const { usage } = await import('../../core/lib/cli.mjs');
+  assert.match(usage, /ar push <项目路径>/);
+  assert.match(usage, /ar pull <项目路径>/);
+  assert.match(usage, /ar accept <记录名> \[--squash\] \[--push\|--no-push\]/);
+});
+
+test('ar help：退出码 0、打印用法，不派发、不建任何文件', () => {
+  const root = fs.mkdtempSync(path.join(tmpdir(), 'ar help '));
+  try {
+    const home = path.join(root, 'home'), cwd = path.join(root, 'cwd');
+    fs.mkdirSync(home); fs.mkdirSync(cwd);
+    const env = { ...process.env, AGENT_ROUTER_HOME: home, CLAUDE_CONFIG_DIR: path.join(root, 'claude'), AR_WORKTREE_ROOT: path.join(root, 'wt') };
+    const script = path.resolve('core/ar.mjs');
+    for (const word of ['help', '--help', '-h']) {
+      const r = spawnSync(process.execPath, [script, word], { cwd, env, encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /用法：/);
+      assert.match(r.stdout, /ar retry .*--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：在原 worktree 合并主分支后重跑门禁，协议 15\.8/);
+      assert.deepEqual(fs.readdirSync(home), [], '公共目录里没有 runs.jsonl 等文件');
+      assert.deepEqual(fs.readdirSync(cwd), [], '当前目录没有 .agent-runs');
+    }
+    const j = spawnSync(process.execPath, [script, '--help', '--json'], { cwd, env, encoding: 'utf8' });
+    assert.equal(j.status, 0, j.stderr);
+    const parsed = JSON.parse(j.stdout);
+    assert.equal(parsed.ok, true);
+    assert.match(parsed.usage, /^用法：/);
+    assert.deepEqual(fs.readdirSync(home), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test('--detach 是布尔参数，不吃掉后面的参数', () => {

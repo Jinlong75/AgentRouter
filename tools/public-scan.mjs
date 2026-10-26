@@ -125,7 +125,7 @@ const USER_DIR_RES = [
 // entries 的每一项带 path 字段。
 export const collectSpecStems = entries => entries
   .map(e => e.path.match(/^docs\/specs\/(.+)\.[^.]+$/))
-  .filter(m => m && /^\d{3}-/.test(m[1]) && !m[1].includes('/'))
+  .filter(m => m && /^\d{3,}-/.test(m[1]) && !m[1].includes('/'))
   .map(m => m[1]);
 
 // 扫描一个文本文件，返回 { file, line, category, masked } 列表。

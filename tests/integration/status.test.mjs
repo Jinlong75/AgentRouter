@@ -250,6 +250,30 @@ test('3 ar status 的文字输出与错误：找不到记录、参数不对都�
   assert.equal(two.code, 2);
 });
 
+test('3b 已撤销的合并（129）：状态仍是 accepted，JSON 多 reverted、文字多一行；没撤销的任务 JSON 没有 reverted 键；撤销写在合并之前的不算', async t => {
+  const f = fixture(t);
+  const commit = 'd'.repeat(40), at = Date.UTC(2026, 9, 25, 6, 5);
+  const merged = { event: 'accepted', merge: 'c'.repeat(40), mode: 'no-ff', by: 'human' };
+  f.fabricate('合并后撤销', [{ event: 'end', exit: 0 }, merged, { event: 'reverted', commit, by: 'human', at }]);
+  f.fabricate('合并没撤销', [{ event: 'end', exit: 0 }, merged]);
+  f.fabricate('撤销在合并前', [{ event: 'end', exit: 0 }, { event: 'reverted', commit, by: 'human', at }, merged]);
+
+  const value = await f.status('合并后撤销');
+  assert.equal(value.state, 'accepted');
+  assert.deepEqual(Object.keys(value), [...keys, 'reverted']);
+  assert.equal(value.merge, 'c'.repeat(40));
+  assert.deepEqual(value.reverted, { commit, at, by: 'human' });
+  const text = await f.ar(['status', '合并后撤销']);
+  assert.match(text.stdout, new RegExp(`^已撤销：提交 ${commit.slice(0, 7)}（\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}）$`, 'm'));
+
+  for (const name of ['合并没撤销', '撤销在合并前']) {
+    const other = await f.status(name);
+    assert.equal(other.state, 'accepted', name);
+    assert.deepEqual(Object.keys(other), keys, `${name}：没有 reverted 键`);
+    assert.ok(!(await f.ar(['status', name])).stdout.includes('已撤销'), name);
+  }
+});
+
 test('4 ar wait 遇到待验收：退出码 0、多一行原文、--json 多 state；已合并、失败、已停止也带 state；非 worktree 任务不变', async t => {
   const f = fixture(t);
   await f.task('待验收任务', change);

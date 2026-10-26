@@ -58,6 +58,7 @@ export function taskStatus({ homes, root, name }) {
   const outside = readOutsideWrites(recent.find(row => row.event === 'attempt-end')?.outsideWrites);
   const worktree = start.worktree === true ? rows.find(row => row.event === 'worktree') : null;
   const conflict = state === 'conflict' ? rows.find(row => row.event === 'conflict') : null;
+  const reverted = state === 'accepted' ? revertedOf(rows) : null;
   return {
     ok: true, id: start.id, name: start.name, state, attempts,
     gate: gate ? { ok: gate.ok === true, summary: gate.summary ?? null } : null,
@@ -66,8 +67,25 @@ export function taskStatus({ homes, root, name }) {
     worktree: worktree ? { dir: worktree.dir, branch: worktree.branch, base: worktree.base } : null,
     merge: state === 'accepted' ? rows.find(row => row.event === 'accepted')?.merge ?? null : null,
     conflict: conflict ? { files: Array.isArray(conflict.files) ? conflict.files : [] } : null,
+    // 撤销合并（129）：只在已撤销时才有这个字段，其余任务的 JSON 保持原样。
+    ...(reverted ? { reverted } : {}),
   };
 }
+
+// 已合并任务的撤销记录（rows 最新的在前）：accepted 之后的 reverted 事件，没有返回 null。
+export function revertedOf(rows) {
+  for (const row of rows) {
+    if (row.event === 'accepted') return null;
+    if (row.event === 'reverted' && typeof row.commit === 'string') return { commit: row.commit, at: Number.isFinite(row.at) ? row.at : null, by: row.by ?? 'cli' };
+  }
+  return null;
+}
+
+// 本地时间，年-月-日 时:分（不随系统语言变）。
+const localStamp = ms => {
+  const date = new Date(ms), two = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}`;
+};
 
 // 不加 --json 时给人看的几行。
 export function statusLines(status) {
@@ -75,6 +93,7 @@ export function statusLines(status) {
   if (status.gate) lines.push(status.gate.ok ? '门禁：通过' : `门禁：未通过（${status.gate.summary ?? '无说明'}）`);
   if (status.worktree) lines.push(`worktree：${status.worktree.dir}（分支 ${status.worktree.branch}）`);
   if (status.merge) lines.push(`合并提交：${status.merge}`);
+  if (status.reverted) lines.push(`已撤销：提交 ${status.reverted.commit.slice(0, 7)}${status.reverted.at === null ? '' : `（${localStamp(status.reverted.at)}）`}`);
   if (status.conflict) lines.push(`冲突文件：${status.conflict.files.join('、')}`);
   if (status.needsScope) lines.push(`需要越界：${status.needsScope.map(item => item.path).join('、')}`);
   if (status.outsideWrites) lines.push(`工作区外新文件：${status.outsideWrites.added.map(item => item.name).join('、')}`);

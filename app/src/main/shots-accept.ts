@@ -29,7 +29,7 @@ const clockOf = (n: number) => new Date(n).toLocaleTimeString('zh-CN', { hour: '
 // 演示任务 t30～t35 默认隐藏，这里临时显示、检查完恢复；真实合并用测试自己的临时 git 仓库（隔离的公共目录与 AR_WORKTREE_ROOT）、
 // fake 执行者与一个会解决合并冲突的测试执行者脚本，用真实核心派发、批准、驳回、重新基线。全程不碰用户的目录与进程。
 export async function captureAccept(h: Harness, registry: Registry, out: string, save: (name: string) => Promise<void>, win: BrowserWindow) {
-    const { evaluate, wait, check, verify, press, key, type, tabTo, focusRing, pause, audit } = h;
+    const { evaluate, wait, check, verify, press, key, type, tabTo, focusRing, pause, audit, hits } = h;
     const home = appEnv.AGENT_ROUTER_HOME!, worktreeRoot = appEnv.AR_WORKTREE_ROOT!;
     assert.ok(home && path.isAbsolute(home), '截图验收必须在隔离公共目录里运行');
     assert.ok(worktreeRoot && path.resolve(worktreeRoot).toLowerCase().startsWith(path.resolve(home).toLowerCase()), 'worktree 根目录必须在隔离公共目录里');
@@ -169,7 +169,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await check('UI24 合并冲突：状态行、轨道（待验收节点已批准、合并节点冲突）、横幅列出冲突文件数、"去验收"与"再派一次"，没有重试', `(() => { const n = [...document.querySelectorAll('.track .node')]; const banner = document.querySelector('.banner-holder .banner.fail'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.goAccept !== undefined ? 'go' : b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); return document.querySelector('.dh-state').textContent === ${jsonStr(w.lineConflict(2))} && n[3].classList.contains('done') && n[3].querySelector('.sub').textContent === ${jsonStr(w.trackApproved)} && n[4].classList.contains('attn') && n[4].querySelector('.sub').textContent === ${jsonStr(w.trackConflict)} && n[4].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.merge, w.nodeConflict(['src/save/schema.ts', 'tests/save-migration.test.ts'])))} && banner.querySelector('.rt b').textContent === ${jsonStr(w.conflictTitle)} && banner.querySelector('.rt span').textContent === ${jsonStr(w.conflictHelp('main', 2))} && !!banner.querySelector('[data-go-accept]') && acts.join() === 'go,again,more' && document.querySelectorAll('.banner-holder .banner').length === 1; })()`);
         await press('[data-task=t34]');
         await wait(`document.querySelector('.dh h2')?.textContent === '013-音量滑块'`);
-        await check('UI24 已合并：状态行、轨道（已批准 · 合并提交）、横幅写合并提交与撤销命令，只有"再派一次"（没有重试与去验收）', `(() => { const n = [...document.querySelectorAll('.track .node')]; const banner = document.querySelector('.banner-holder .banner.ok'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); return /^已合并 · .+ 主导批准$/.test(document.querySelector('.dh-state').textContent) && document.querySelector('.dh-state').classList.contains('ok') && n[3].querySelector('.sub').textContent === ${jsonStr(w.by.lead)} && n[4].classList.contains('done') && n[4].querySelector('.sub').textContent === '9b3f0a2' && n[4].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.merge, w.nodeMerged('main', '9b3f0a2')))} && banner.querySelector('.rt b').textContent === ${jsonStr(w.acceptedTitle('main'))} && banner.querySelector('.rt span').textContent.startsWith('合并提交 9b3f0a2（') && banner.querySelector('.rt span').textContent.endsWith(${jsonStr('主导批准）；worktree 与分支已删除。撤销整个任务：git revert -m 1 9b3f0a2')}) && acts.join() === 'again,more'; })()`);
+        await check('UI24 已合并：状态行、轨道（已批准 · 合并提交）、横幅写合并提交与撤销按钮，只有"再派一次"（没有重试与去验收）', `(() => { const n = [...document.querySelectorAll('.track .node')]; const banner = document.querySelector('.banner-holder .banner.ok'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); return /^已合并 · .+ 主导批准$/.test(document.querySelector('.dh-state').textContent) && document.querySelector('.dh-state').classList.contains('ok') && n[3].querySelector('.sub').textContent === ${jsonStr(w.by.lead)} && n[4].classList.contains('done') && n[4].querySelector('.sub').textContent === '9b3f0a2' && n[4].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.merge, w.nodeMerged('main', '9b3f0a2')))} && banner.querySelector('.rt b').textContent === ${jsonStr(w.acceptedTitle('main'))} && banner.querySelector('.rt span').textContent.startsWith('合并提交 9b3f0a2（') && banner.querySelector('.rt span').textContent.endsWith(${jsonStr('主导批准）；worktree 与分支已删除。')}) && banner.querySelector('[data-revert-open]')?.textContent.trim() === ${jsonStr(w.revertOpen)} && acts.join() === 'again,more'; })()`);
         await press('[data-task=t35]');
         await wait(`document.querySelector('.dh h2')?.textContent === '017-换肤主题'`);
         await check('UI24 已驳回：状态行、轨道（待验收节点已驳回、合并节点不合并）、横幅写驳回原因，只有"再派一次"', `(() => { const n = [...document.querySelectorAll('.track .node')]; const banner = document.querySelector('.banner-holder .banner.stale'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); return /^已驳回 · .+ 你驳回$/.test(document.querySelector('.dh-state').textContent) && n[3].classList.contains('stopped') && n[3].querySelector('.sub').textContent === ${jsonStr(w.trackRejected)} && n[4].classList.contains('skip') && n[4].querySelector('.sub').textContent === ${jsonStr(w.trackNoMerge)} && banner.querySelector('.rt b').textContent === ${jsonStr(w.rejectedTitle)} && banner.querySelector('.rt span').textContent.startsWith('方向不对：主题跟随系统即可，不要加手动开关（') && banner.querySelector('.rt span').textContent.endsWith('你驳回）。worktree 已删除，分支已删除。') && acts.join() === 'again,more'; })()`);
@@ -298,6 +298,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
                 plain: profile('己执行者', {}),
                 research: profile('调研执行者', {}),
                 sneak: profile('偷改执行者', { writes: [{ path: 'src/a.txt', content: 'sneaky\n' }] }),
+                pu1: profile('推送甲执行者', { writes: [{ path: 'src/pu1.txt', content: 'pu1\n' }], commit: '推送甲：新增 pu1' }),
+                pu2: profile('推送乙执行者', { writes: [{ path: 'src/pu2.txt', content: 'pu2\n' }], commit: '推送乙：新增 pu2' }),
             },
         }, null, 2) + '\n');
         await writeConfig(2);
@@ -391,6 +393,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await press('[data-acc-approve]');
         await wait('!!document.querySelector(".confirm-card")', 'UI24 批准确认框');
         await check('UI24 批准确认框：标题、说明（合并方式与删除 worktree 的提示）、默认焦点在取消，主按钮"批准并合并"', `(() => { const card = document.querySelector('.confirm-card'); const b = [...card.querySelectorAll('button')]; return card.querySelector('h2').textContent === ${jsonStr(w.approveTitle(tA.title, 'main'))} && card.querySelector('p').textContent === ${jsonStr(w.approveBody('no-ff', wA.branch))} && b.map(x => x.textContent).join() === ${jsonStr([c.cancel, w.approve].join())} && document.activeElement === b[0] && b[1].classList.contains('primary'); })()`);
+        // 132 新增：这个项目没有远程，确认框里不出现“合并后推送”勾选项（上面那条检查不变）。
+        await check('UI24 132 新增：项目没有远程时批准确认框没有勾选项，只有取消与批准两个按钮', `!document.querySelector('.confirm-card [data-confirm-opt]') && !document.querySelector('.confirm-card [role=checkbox]') && document.querySelectorAll('.confirm-card button').length === 2`);
         await shots('accept-approve-confirm');
         await press('.confirm-actions .btn.primary');
         await wait(`!!document.querySelector('.detail.acc .tab-body .banner.fail')`, 'UI24 被拒的合并显示失败横幅', 60000);
@@ -410,6 +414,39 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await h.happened('UI24 复制命令写入剪贴板', () => effects.copyLog.length > copiesBlocked, 3000);
         await verify('UI24 复制命令：剪贴板桩收到 git switch main', () => assert.equal(effects.copyLog.at(-1)!.text, 'git switch main'));
         git(repo, ['switch', 'main']);
+        await check('UI24 不在主分支的拒绝没有"去提交"，只有"复制命令"', `!document.querySelector('.detail.acc .tab-body [data-acc-commit]')`);
+
+        // ---- 125 主工作区有未提交的改动：批准被拒，横幅给"去提交"，提交后再批准 ----
+        await writeFile(path.join(repo, 'draft-1.txt'), 'draft 1\n');
+        await writeFile(path.join(repo, 'draft-2.txt'), 'draft 2\n');
+        const mainBeforeDirty = git(repo, ['rev-parse', 'main']);
+        await press('[data-acc-approve]');
+        await wait('!!document.querySelector(".confirm-card")');
+        await press('.confirm-actions .btn.primary');
+        await wait(`!!document.querySelector('.detail.acc .tab-body [data-acc-commit]')`, 'UI24 主工作区不干净：横幅出现"去提交"', 60000);
+        await check('UI24 主工作区不干净：失败横幅是核心原文 + "什么都没有改动"，右边是"去提交"，没有"复制命令"', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.fail'); return b.querySelector('.rt b').textContent === ${jsonStr(w.blockedTitle)} && b.querySelector('.rt span').textContent.startsWith('主工作区有未提交的改动，先提交或暂存：') && b.querySelector('.rt span').textContent.includes('draft-1.txt') && b.querySelector('[data-acc-commit]').textContent.trim() === ${jsonStr(w.goCommit)} && !b.querySelector('[data-acc-copy]'); })()`);
+        await verify('UI24 主工作区不干净被拒之后：main 没变，两个文件仍未提交，任务仍是待验收', async () => {
+            assert.equal(git(repo, ['rev-parse', 'main']), mainBeforeDirty);
+            assert.equal(git(repo, ['status', '--porcelain']).split('\n').sort().join('|'), '?? draft-1.txt|?? draft-2.txt');
+            assert.equal(worktreeState(taskOf(A.id)!), 'awaiting');
+        });
+        await shots('accept-dirty-main');
+        await press('[data-acc-commit]');
+        await wait(`document.querySelectorAll('.sheet [data-cm-file]').length === 2`, 'UI24 去提交：打开同一个提交弹窗，列出两个未提交文件');
+        await check('UI24 去提交打开的提交弹窗：标题"提交 2 个文件"，两个文件默认全选', `document.querySelector('.sheet').getAttribute('aria-label') === ${jsonStr(pj.commitTitle(2))} && [...document.querySelectorAll('.sheet [data-cm-file]')].every(r => r.getAttribute('aria-checked') === 'true') && [...document.querySelectorAll('.sheet [data-cm-file] .mono')].map(x => x.textContent).join() === 'draft-1.txt,draft-2.txt'`);
+        await type('[data-cm-message]', 'add drafts');
+        await press('.sheet [data-sheet-btn="1"]');
+        await wait(`!document.querySelector('.sheet') && !document.querySelector('.detail.acc .tab-body .banner.fail')`, 'UI24 提交成功：弹窗关闭，横幅消失', 30000);
+        await verify('UI24 提交成功：main 多一个提交（含两个文件），主工作区干净，任务仍是待验收', async () => {
+            assert.notEqual(git(repo, ['rev-parse', 'main']), mainBeforeDirty);
+            assert.deepEqual(git(repo, ['show', '--name-only', '--pretty=format:', 'HEAD']).split('\n').filter(Boolean).sort(), ['draft-1.txt', 'draft-2.txt']);
+            assert.equal(git(repo, ['log', '-1', '--format=%s']), 'add drafts');
+            assert.equal(git(repo, ['status', '--porcelain']), '');
+            assert.equal(worktreeState(taskOf(A.id)!), 'awaiting');
+        });
+        await check('UI24 提交成功后右下角提示"已提交 <哈希>（2 个文件）"', `document.querySelector('.notice')?.textContent === ${jsonStr(pj.commitDone(git(repo, ['rev-parse', '--short', 'HEAD']), 2))}`);
+        // 提示在右下角停留 5 秒，会盖住底栏的主按钮；等它自己消失后再批准（真实输入的命中测试不会点穿它）。
+        await wait(`!document.querySelector('.notice')`, 'UI24 提交提示消失', 15000);
 
         // ---- 批准并合并 ----
         console.log('验收检查进度：被拒的合并检查完成，开始批准并合并');
@@ -482,6 +519,76 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await wait(`document.querySelector('[data-task="${B.id}"] .mk')?.classList.contains('stale') === true && !!document.querySelector('.banner-holder .banner.stale')`, 'UI24 任务页收到已驳回状态', 20000);
         await check('UI24 驳回后任务页：已驳回标记、状态行"已驳回 · 时刻 你驳回"、横幅写原因并说明分支保留、没有重试', `(() => { const b = document.querySelector('.banner-holder .banner.stale'); return document.querySelector('[data-task="${B.id}"] .mk').classList.contains('stale') && document.querySelector('[data-task="${B.id}"] .tm > span').textContent.endsWith(${jsonStr(' · ' + w.subRejected)}) && document.querySelector('.dh-state').textContent.endsWith('你驳回') && b.querySelector('.rt b').textContent === ${jsonStr(w.rejectedTitle)} && b.querySelector('.rt span').textContent.startsWith(${jsonStr(reason + '（')}) && b.querySelector('.rt span').textContent.endsWith(${jsonStr(`你驳回）。worktree 已删除，分支 ${wB.branch} 保留。`)}) && !document.querySelector('[data-retry]') && !!document.querySelector('[data-redispatch]'); })()`);
         await shots('wt-rejected');
+
+        // ---- 撤销合并（Stage07b 129）：已合并的 A。先造“合并之后同一处又被改过”的冲突，再撤销成功 ----
+        console.log('验收检查进度：驳回检查完成，开始撤销合并');
+        await selectTask(A.id);
+        await wait(`!!document.querySelector('.banner-holder .banner.ok [data-revert-open]')`, 'UI24 已合并横幅出现"撤销这次合并…"', 20000);
+        await check('UI24 已合并任务详情的横幅有"撤销这次合并…"（次按钮，不在标题行按钮区）', `(() => { const b = document.querySelector('.banner-holder .banner.ok [data-revert-open]'); return b.textContent.trim() === ${jsonStr(w.revertOpen)} && b.classList.contains('sm') && !b.classList.contains('primary') && !b.disabled && !document.querySelector('.dh-1 .acts [data-revert-open]'); })()`);
+        await shots('wt-revert-open');
+        // 冲突：合并之后在 main 上又改了 a.txt 并提交；撤销要被放弃，main 字节级不变。
+        await writeFile(path.join(repo, 'src', 'a.txt'), 'alpha\nbeta changed later\ngamma\n');
+        git(repo, ['add', '--', 'src/a.txt']);
+        git(repo, ['commit', '-m', '合并之后又改 a.txt', '--', 'src/a.txt']);
+        const afterLater = { head: git(repo, ['rev-parse', 'HEAD']), index: git(repo, ['ls-files', '-s']), status: git(repo, ['status', '--porcelain']), file: await readFile(path.join(repo, 'src', 'a.txt'), 'utf8') };
+        const eventCountBeforeRevert = (await eventsOf(A.id)).length;
+        await press(`[data-revert-open="${A.id}"]`);
+        await wait('!!document.querySelector(".confirm-card")', 'UI24 撤销确认框');
+        await check('UI24 撤销确认框：标题 wt.revertTitle(任务名)、说明 wt.revertBody(main)、默认焦点在"取消"、确认按钮是危险样式 wt.revertConfirm', `(() => { const card = document.querySelector('.confirm-card'); const b = [...card.querySelectorAll('button')]; return card.querySelector('h2').textContent === ${jsonStr(w.revertTitle(tA.title))} && card.querySelector('p').textContent === ${jsonStr(w.revertBody('main'))} && b.map(x => x.textContent).join() === ${jsonStr([c.cancel, w.revertConfirm].join())} && document.activeElement === b[0] && b[1].classList.contains('danger'); })()`);
+        await shots('wt-revert-confirm');
+        await key('Escape');
+        await wait('!document.querySelector(".confirm-card")', 'UI24 撤销确认框 Esc 关闭');
+        await verify('UI24 取消撤销（Esc）：main、索引、工作区都没变，没有写任何事件', async () => {
+            assert.equal(git(repo, ['rev-parse', 'HEAD']), afterLater.head);
+            assert.equal((await eventsOf(A.id)).length, eventCountBeforeRevert);
+        });
+        await press(`[data-revert-open="${A.id}"]`);
+        await wait('!!document.querySelector(".confirm-card")', 'UI24 撤销确认框（再次）');
+        await press('.confirm-actions .btn.danger');
+        await wait(`!!document.querySelector('.banner-holder .banner.fail')`, 'UI24 撤销冲突横幅', 90000);
+        await check('UI24 撤销冲突：横幅是失败色，标题 wt.revertConflictTitle、正文 wt.revertConflictHelp(main, 冲突文件)，带"复制命令"，"撤销这次合并…"换成了复制命令', `(() => { const b = document.querySelector('.banner-holder .banner.fail'); return b.getAttribute('role') === 'alert' && b.querySelector('.rt b').textContent === ${jsonStr(w.revertConflictTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.revertConflictHelp('main', ['src/a.txt']))} && b.querySelector('[data-revert-copy]').textContent === ${jsonStr(w.copyCommand)} && !document.querySelector('[data-revert-open]'); })()`);
+        await verify('UI24 撤销冲突之后主分支字节级不变：HEAD、暂存区、git status、a.txt 内容都和撤销前一样，没有 REVERT_HEAD，没有写 reverted 事件', async () => {
+            assert.equal(git(repo, ['rev-parse', 'HEAD']), afterLater.head);
+            assert.equal(git(repo, ['ls-files', '-s']), afterLater.index);
+            assert.equal(git(repo, ['status', '--porcelain']), afterLater.status);
+            assert.equal(await readFile(path.join(repo, 'src', 'a.txt'), 'utf8'), afterLater.file);
+            assert.ok(!existsSync(path.join(repo, '.git', 'REVERT_HEAD')));
+            assert.equal(git(repo, ['rev-list', '--count', `${mergeSha}..HEAD`]), '1', '合并之后只有那一个"又改"的提交，没有 Revert 提交');
+            assert.ok(!(await eventsOf(A.id)).some(r => r.event === 'reverted'));
+        });
+        await shots('wt-revert-conflict');
+        const copiesRevert = effects.copyLog.length;
+        await press('[data-revert-copy]');
+        await h.happened('UI24 撤销冲突的"复制命令"写入剪贴板', () => effects.copyLog.length > copiesRevert, 3000);
+        await verify('UI24 撤销冲突的复制命令：剪贴板桩收到 git revert -m 1 <合并提交>', () => assert.equal(effects.copyLog.at(-1)!.text, w.undoText(mergeSha, 'no-ff')));
+        // 去掉那个“又改”的提交（测试自己的临时仓库），换到别的任务再回来，冲突提示作废，"撤销这次合并…"回来。
+        git(repo, ['reset', '--hard', mergeSha]);
+        await selectTask(B.id);
+        await selectTask(A.id);
+        await wait(`!!document.querySelector('.banner-holder .banner.ok [data-revert-open]')`, 'UI24 换任务再回来后冲突提示作废', 20000);
+        const mainBeforeRevert = git(repo, ['rev-parse', 'main']);
+        await press(`[data-revert-open="${A.id}"]`);
+        await wait('!!document.querySelector(".confirm-card")', 'UI24 撤销确认框（成功路径）');
+        await press('.confirm-actions .btn.danger');
+        // 提示约 5 秒后消失：先在它还在的时候取下文字，反向提交的 SHA 等事件到了再对。
+        await wait(`document.querySelector('.notice')?.getAttribute('role') === 'status' && document.querySelector('.notice').textContent.startsWith(${jsonStr(w.revertedToast(tA.title, ''))})`, 'UI24 撤销成功的提示', 90000);
+        const revertToast = String(await evaluate(`document.querySelector('.notice').textContent`));
+        const revertEvent = await untilRow(async () => (await rows()).find(r => r.id === A.id && r.event === 'reverted'), 'reverted 事件', 90000);
+        await verify('UI24 撤销成功：main 上恰好多一个普通提交（Revert "合并提交信息"），文件回到合并前，worktree 与分支早已删除；清单 reverted 的 commit 是它的完整 SHA、by 是 human；任务仍是 accepted', async () => {
+            assert.equal(git(repo, ['rev-list', '--count', `${mainBeforeRevert}..main`]), '1');
+            assert.equal(git(repo, ['rev-parse', 'main']), revertEvent.commit);
+            assert.equal(git(repo, ['log', '-1', '--format=%s', 'main']), `Revert "[执行] 合并 ${A.name}：${specs.a.title}"`);
+            assert.equal(git(repo, ['rev-list', '--parents', '-1', 'main']).split(' ').length, 2, '反向提交是普通提交');
+            assert.equal(await readFile(path.join(repo, 'src', 'a.txt'), 'utf8'), 'alpha\nbeta\n');
+            assert.ok(!existsSync(path.join(repo, 'src', 'ok.txt')));
+            assert.equal(git(repo, ['status', '--porcelain']), '');
+            assert.equal(revertEvent.by, 'human');
+            await untilState(A.id, 'accepted', 30000);
+        });
+        await wait(`document.querySelector('.dh-state')?.textContent === ${jsonStr(w.revertedState(sha7(String(revertEvent.commit)), clockOf(Number(revertEvent.at))))}`, 'UI24 状态行变成"已合并 · 已撤销"', 30000);
+        await check('UI24 撤销成功后：横幅是 stale 色 wt.revertedTitle / wt.revertedHelp，没有"撤销这次合并…"，状态行是 wt.revertedState，轨道合并节点仍是合并提交', `(() => { const b = document.querySelector('.banner-holder .banner.stale'); const n = [...document.querySelectorAll('.track .node')]; return b.querySelector('.rt b').textContent === ${jsonStr(w.revertedTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.revertedHelp(sha7(mergeSha), sha7(String(revertEvent.commit)), clockOf(Number(revertEvent.at)), w.by.human))} && !document.querySelector('[data-revert-open]') && !document.querySelector('.banner-holder .banner.ok') && document.querySelector('.dh-state').classList.contains('ok') && n[4].querySelector('.sub').textContent === ${jsonStr(sha7(mergeSha))}; })()`);
+        await verify('UI24 撤销成功的提示：wt.revertedToast(任务名, 反向提交短 SHA)', () => assert.equal(revertToast, w.revertedToast(tA.title, sha7(String(revertEvent.commit)))));
+        await shots('wt-reverted');
 
         // ================= UI25 =================
         console.log('验收检查进度：UI24 完成，开始 UI25');
@@ -621,6 +728,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await untilState(F.id, 'failed', 30000);
         await selectTask(F.id);
         await check('UI25 准备失败：横幅文案 wt.setupFailTitle / wt.setupFailHelp，标题行有"重试"，没有"去验收"，也没有通用的失败横幅', `(() => { const b = document.querySelector('.banner-holder .banner.fail'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(x => x.dataset.retry !== undefined ? 'retry' : x.dataset.redispatch !== undefined ? 'again' : x.dataset.more !== undefined ? 'more' : x.textContent.trim()); return b.querySelector('.rt b').textContent === ${jsonStr(w.setupFailTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.setupFailHelp)} && document.querySelectorAll('.banner-holder .banner').length === 1 && !!document.querySelector('[data-retry]') && !document.querySelector('[data-go-accept]') && acts.join() === 'retry,again,more' && !document.querySelector('[data-task="${F.id}"] .tm em.attn'); })()`);
+        await check('UI25 准备失败的任务没有“合并主分支后重跑”（127）', `!document.querySelector('[data-rebase-run]')`);
         await shots('wt-setup-failed');
         await goAccept();
         await check('UI25 准备失败的任务不在验收页列表里（没有"去验收"）', `!document.querySelector('[data-acc="${F.id}"]')`);
@@ -648,6 +756,69 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await selectTask(F.id);
         await check('UI25 准备失败的任务驳回后任务页显示已驳回（横幅是已驳回，不再有"驳回…"按钮）', `!!document.querySelector('.banner-holder .banner.stale') && !document.querySelector('[data-setup-reject]') && document.querySelector('[data-task="${F.id}"] .mk').classList.contains('stale')`);
 
+        // ================= UI25 扩展（Stage07b T4d④，127）：失败任务的“合并主分支后重跑” =================
+        // 夹具：repo 里新派一个门禁必然失败的 worktree 任务（验收命令检查一个不存在的文件，max_retries: 0，执行者是不写文件的 fake）→ 门禁失败（worktree 状态 failed，不是准备失败）。
+        // 点击走 tasks:rebase（ar retry --rebase --detach）：在原 worktree 里合并主分支，没有冲突就只重跑门禁，清单出现 reason 为 rebase 的新尝试。
+        console.log('验收检查进度：准备失败检查完成，开始合并主分支后重跑');
+        await writeFile(path.join(repo, 'docs', 'specs', '100-门禁失败.md'), specText(0, { title: '门禁失败任务', verify: 'git cat-file -e HEAD:src/never.txt' }));
+        git(repo, ['add', '--', 'docs/specs/100-门禁失败.md']);
+        git(repo, ['commit', '-m', '门禁失败任务说明', '--', 'docs/specs/100-门禁失败.md']);
+        const RB = await dispatchTask('100-门禁失败', 'gate-fail', 'plain');
+        await untilState(RB.id, 'failed', 150000);
+        await selectTask(RB.id);
+        await check('UI25 门禁失败的 worktree 任务：标题行在“重试”后面有次按钮 c.rebaseRun，悬停提示 c.rebaseRunTip(主分支名)，可用', `(() => { const b = document.querySelector('[data-rebase-run]'), r = document.querySelector('[data-retry]'); return !!b && !!r && r.nextElementSibling === b && b.classList.contains('btn') && !b.classList.contains('primary') && b.textContent.trim() === ${jsonStr(c.rebaseRun)} && b.dataset.tip === ${jsonStr(c.rebaseRunTip('main'))} && b.disabled === false; })()`);
+        await verify('UI25 合并主分支后重跑：夹具任务是门禁失败（不是准备失败）', () => { const t = taskOf(RB.id)!; assert.equal(worktreeState(t), 'failed'); assert.ok(!t.wt?.setupFailed); });
+        // 已合并 / 已驳回 / 待验收的任务没有这个按钮（准备失败的任务在上面的准备失败一段里断言过）。
+        for (const [id, state] of [[A.id, 'accepted'], [B.id, 'rejected'], [Q1.id, 'awaiting']] as const) {
+            assert.equal(worktreeState(taskOf(id)!), state, `UI25 合并主分支后重跑：${id} 应是 ${state}`);
+            await selectTask(id);
+            await check(`UI25 ${state === 'accepted' ? '已合并' : state === 'rejected' ? '已驳回' : '待验收'}的任务没有“合并主分支后重跑”`, `!document.querySelector('[data-rebase-run]') && !!document.querySelector('.dh-1 .acts')`);
+        }
+        await selectTask(RB.id);
+        // 项目已从列表移除：按钮禁用，悬停提示 c.projectGoneBlocked（与“重试”一致）；重新添加项目后恢复。
+        await core(['projects', 'remove', repo]);
+        // 项目状态按仓库缓存、同一仓库 3 秒内不重读（wt.ts loadRepoState）：这里绕过项目页直接用核心移除，等缓存过期再重新选中任务。
+        await pause(3200);
+        await selectTask(RB.id);
+        await wait(`!!document.querySelector('.banner-holder [data-readd-project]')`, 'UI25 合并主分支后重跑：项目已移除横幅', 20000);
+        await check('UI25 项目已移除：“合并主分支后重跑”与“重试”都禁用，悬停提示同一句 c.projectGoneBlocked', `(() => { const b = document.querySelector('[data-rebase-run]'), r = document.querySelector('[data-retry]'); return b.disabled === true && b.dataset.tip === ${jsonStr(c.projectGoneBlocked)} && r.disabled === true && r.title === ${jsonStr(c.projectGoneBlocked)}; })()`);
+        await press('[data-readd-project]');
+        await wait(`!document.querySelector('.banner-holder [data-readd-project]') && document.querySelector('[data-rebase-run]')?.disabled === false`, 'UI25 重新添加项目后“合并主分支后重跑”恢复', 30000);
+        // 点击：按钮在调用期间显示 c.rebaseRunning 并禁用。
+        // 状态只在调用期间短暂出现（核心 --detach 约 300 毫秒返回），点击后再读一次取决于时机；
+        // 所以点击之前先在页面里装记录器（134）：MutationObserver 观察整个 body 的子树与属性变化，每次变化都查 [data-rebase-run]，看到"禁用 + c.rebaseRunning"就记下。
+        // 记录器只认 .detail 里的那一个按钮（页面里有别的 [data-rebase-run] 也不会被误认），装好后先断言点击前的状态。
+        const rebaseFrom = effects.ipcLog.length, attemptsBefore = (await eventsOf(RB.id)).filter(r => r.event === 'attempt').length;
+        await check('UI25 点击前：“合并主分支后重跑”可用、文字是 c.rebaseRun，页面里只有详情里这一个', `(() => { const all = [...document.querySelectorAll('[data-rebase-run]')]; const b = document.querySelector('.detail [data-rebase-run]'); return all.length === 1 && all[0] === b && b.disabled === false && b.textContent.trim() === ${jsonStr(c.rebaseRun)}; })()`);
+        await evaluate(`(() => {
+            const w = window;
+            w.__arRebaseSeen = false;
+            const probe = () => {
+                const b = document.querySelector('.detail [data-rebase-run]');
+                if (b && b.disabled === true && b.textContent.trim() === ${jsonStr(c.rebaseRunning)}) w.__arRebaseSeen = true;
+            };
+            w.__arRebaseObserver?.disconnect();
+            w.__arRebaseObserver = new MutationObserver(probe);
+            w.__arRebaseObserver.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+            return true;
+        })()`);
+        const fastBox = await hits('[data-rebase-run]');
+        assert.ok(!('error' in fastBox), `[data-rebase-run]：${'error' in fastBox ? fastBox.error : ''}`);
+        const { x: fastX, y: fastY } = fastBox as { x: number; y: number };
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: fastX, y: fastY });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: fastX, y: fastY, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: fastX, y: fastY, button: 'left', clickCount: 1 });
+        const rebaseCall = await untilRow(async () => effects.ipcLog.find(e => e.seq > rebaseFrom && e.channel === 'console' && e.name === 'tasks:rebase' && e.end !== undefined) ?? null, 'UI25 主进程收到 tasks:rebase 并返回', 60000);
+        assert.equal(rebaseCall.ok, true, `tasks:rebase 失败：${rebaseCall.error}`);
+        await check('UI25 点“合并主分支后重跑”：调用期间按钮显示 c.rebaseRunning 并禁用', `(() => { window.__arRebaseObserver?.disconnect(); return window.__arRebaseSeen === true; })()`);
+        const rebaseAttempt = await untilRow(async () => { const list = (await eventsOf(RB.id)).filter(r => r.event === 'attempt'); return list.length > attemptsBefore ? list.at(-1) : null; }, 'UI25 清单出现合并主分支后重跑的新尝试', 60000);
+        await verify('UI25 合并主分支后重跑：主进程收到 tasks:rebase，清单出现 reason 为 rebase 的新尝试（只重跑门禁，不启动执行者）', () => {
+            assert.equal(rebaseAttempt.reason, 'rebase');
+        });
+        await untilState(RB.id, 'failed', 120000);
+        await wait(`document.querySelector('[data-rebase-run]')?.disabled === false && document.querySelector('[data-rebase-run]').textContent.trim() === ${jsonStr(c.rebaseRun)}`, 'UI25 重跑结束（门禁仍失败）后按钮恢复', 30000);
+        await shots('wt-rebase-run');
+
         // ================= UI24 扩展（Stage07 T6）：调研类任务只读运行，门禁通过后“确认”（不合并，只删 worktree 与分支）=================
         console.log('验收检查进度：准备失败检查完成，开始调研类任务');
         await writeFile(path.join(repo, 'docs', 'specs', '098-调研只读.md'), researchSpec(98, '调研只读任务'));
@@ -673,6 +844,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await selectAccept(R.id);
         await wait(`!!document.querySelector('.detail.acc .tab-body .banner.info')`, 'UI24 调研横幅', 20000);
         await check('UI24 调研任务的验收页：信息横幅 wt.researchTitle / wt.researchHelp，"改动"标签数量是 0，底栏说明 wt.noteConfirm，按钮是驳回 · 重试 · 确认，没有"批准并合并"', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.info'); const acts = [...document.querySelectorAll('.detail.acc .actbar button')].map(x => x.textContent.trim()); return b.querySelector('.rt b').textContent === ${jsonStr(w.researchTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.researchHelp)} && document.querySelector('[data-atab=diff] .n').textContent === '0' && document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteConfirm)} && acts.join() === ${jsonStr([w.reject, w.retry, w.confirm].join())} && document.querySelector('.actbar .btn.primary').hasAttribute('data-acc-confirm') && !document.querySelector('[data-acc-approve]'); })()`);
+        await check('UI24 调研任务的概览（122）：任务说明卡片“允许改动”一行是 w.specReadOnly，不再显示 **', `(() => { const k = [...document.querySelectorAll('.specbox .sb-k')].find(x => x.children[0].textContent === ${jsonStr(w.specAllowed)}); return !!k && k.children[1].textContent === ${jsonStr(w.specReadOnly)}; })()`);
         await shots('accept-research');
         const mainBeforeConfirm = git(repo, ['rev-parse', 'main']), commitsBeforeConfirm = git(repo, ['rev-list', '--count', 'main']);
         await press('[data-acc-confirm]');
@@ -698,6 +870,117 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await selectTask(S.id);
         await wait(`!!document.querySelector('.banner-holder .banner.fail')`, 'UI24 偷改文件的调研任务显示门禁失败横幅', 20000);
         await check('UI24 偷改文件的调研任务：任务页门禁失败横幅写"只读任务改动了文件"', `document.querySelector('.banner-holder .banner.fail .rt span').textContent.includes('只读任务改动了文件')`);
+
+        // ================= UI24 扩展（Stage07b 132）：批准确认框“合并后推送”与推送失败提示 =================
+        // 远程是测试自己建的本机临时裸仓库（origin.git）；项目配置 push.afterAccept 为 true。绝不连真实远程。
+        console.log('验收检查进度：调研类任务完成，开始合并后推送（132）');
+        const originBare = path.join(root, 'origin.git');
+        git(root, ['init', '-q', '--bare', '-b', 'main', originBare]);
+        git(repo, ['remote', 'add', 'origin', originBare]);
+        await core(['projects', 'config', repo, 'push.afterAccept=true']);
+        git(repo, ['add', '--', '.agent-router/project.json']);
+        git(repo, ['commit', '-q', '-m', '项目配置：批准合并后推送', '--', '.agent-router/project.json']);
+        git(repo, ['push', '-q', 'origin', 'main']);
+        const pushSpecs = { pu1: { title: '推送甲任务', file: '105-推送甲', verify: 'git cat-file -e HEAD:src/pu1.txt' }, pu2: { title: '推送乙任务', file: '106-推送乙', verify: 'git cat-file -e HEAD:src/pu2.txt' } };
+        await writeFile(path.join(repo, 'docs', 'specs', `${pushSpecs.pu1.file}.md`), specText(15, pushSpecs.pu1));
+        await writeFile(path.join(repo, 'docs', 'specs', `${pushSpecs.pu2.file}.md`), specText(16, pushSpecs.pu2));
+        git(repo, ['add', '--', `docs/specs/${pushSpecs.pu1.file}.md`, `docs/specs/${pushSpecs.pu2.file}.md`]);
+        git(repo, ['commit', '-q', '-m', '推送任务说明', '--', `docs/specs/${pushSpecs.pu1.file}.md`, `docs/specs/${pushSpecs.pu2.file}.md`]);
+        git(repo, ['push', '-q', 'origin', 'main']);
+        const PU1 = await dispatchTask(pushSpecs.pu1.file, 'push-1', 'pu1');
+        const PU2 = await dispatchTask(pushSpecs.pu2.file, 'push-2', 'pu2');
+        await untilState(PU1.id, 'awaiting', 150000);
+        await untilState(PU2.id, 'awaiting', 150000);
+        const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+        const originMain = () => git(originBare, ['rev-parse', 'refs/heads/main']);
+        const mainOf = () => git(repo, ['rev-parse', 'refs/heads/main']);
+        const pushEvents = async (id: string) => (await eventsOf(id)).filter(r => r.event === 'push');
+        const toastText = `document.querySelector('.toast span:not(.mk)')?.textContent`;
+
+        // ---- Q1：确认框默认勾上（afterAccept 为 true），批准后裸仓库里出现合并提交 ----
+        const tQ1 = taskOf(Q1.id)!;
+        await selectAccept(Q1.id);
+        await press(`[data-acc-approve="${Q1.id}"]`);
+        await wait('!!document.querySelector(".confirm-card [data-confirm-opt]")', 'UI24 132 批准确认框出现“合并后推送”勾选项', 20000);
+        await check('UI24 132 项目有远程：确认框多一项勾选 wt.approvePush(origin) + 说明 wt.approvePushHelp，默认值取项目配置 afterAccept（勾上）；默认焦点仍在“取消”，主按钮仍是“批准并合并”', `(() => { const card = document.querySelector('.confirm-card'); const box = card.querySelector('[data-confirm-opt]'); const b = [...card.querySelectorAll('.confirm-actions button')]; return box.getAttribute('role') === 'checkbox' && box.getAttribute('aria-checked') === 'true' && !!box.querySelector('.cb.on') && box.querySelector('.ct').firstChild.textContent === ${jsonStr(w.approvePush('origin'))} && box.querySelector('.ct span').textContent === ${jsonStr(w.approvePushHelp)} && document.activeElement === b[0] && b.map(x => x.textContent).join() === ${jsonStr([c.cancel, w.approve].join())} && b[1].classList.contains('primary') && card.querySelector('h2').textContent === ${jsonStr(w.approveTitle(tQ1.title, 'main'))}; })()`);
+        await shots('accept-approve-push');
+        // 键盘：Tab 在“勾选项 → 取消 → 批准”之间循环，焦点不出框。
+        await key('Tab');
+        await check('UI24 132 确认框 Tab 顺序：取消 → 批准 → 勾选项 → 取消（循环）', `document.activeElement.textContent === ${jsonStr(w.approve)}`);
+        await key('Tab');
+        await check('UI24 132 确认框 Tab 到勾选项', `document.activeElement === document.querySelector('[data-confirm-opt]')`);
+        await key('Tab');
+        await check('UI24 132 确认框 Tab 回到取消', `document.activeElement.textContent === ${jsonStr(c.cancel)}`);
+        const originBeforeQ1 = originMain(), mainBeforeQ1 = mainOf();
+        await press('.confirm-actions .btn.primary');
+        await wait(`!document.querySelector('[data-acc="${Q1.id}"]') && !!document.querySelector('.toast')`, 'UI24 132 批准并推送成功：列表移除这一项并出现 toast', 90000);
+        const q1Merge = await untilRow(async () => (await rows()).find(r => r.id === Q1.id && r.event === 'accepted'), 'Q1 的 accepted 事件', 15000);
+        const q1Push = await untilRow(async () => (await pushEvents(Q1.id))[0], 'Q1 的 push 事件', 15000);
+        await verify('UI24 132 勾选推送并批准：main 多一个合并提交，裸仓库里的 main 就是它；任务记录有 push 事件 ok: true、by human', async () => {
+            assert.notEqual(mainOf(), mainBeforeQ1);
+            assert.notEqual(originMain(), originBeforeQ1);
+            assert.equal(originMain(), mainOf());
+            assert.equal(q1Merge.merge, mainOf());
+            assert.equal(q1Push.ok, true);
+            assert.equal(q1Push.by, 'human');
+            assert.ok(!q1Push.code);
+        });
+        await check('UI24 132 批准并推送成功的 toast：wt.mergedPushed(任务名, main, origin)，仍带“撤销说明”', `(() => { const t = document.querySelector('.toast'); return t.getAttribute('role') === 'status' && ${toastText} === ${jsonStr(w.mergedPushed(tQ1.title, 'main', 'origin'))} && t.querySelector('[data-acc-undo]')?.textContent === ${jsonStr(w.undoHelp)}; })()`);
+        await shots('accept-merged-pushed');
+
+        // ---- PU1：取消勾选再批准 → 只合并不推送（传 --no-push），裸仓库不变 ----
+        const tPU1 = taskOf(PU1.id)!;
+        await selectAccept(PU1.id);
+        await press(`[data-acc-approve="${PU1.id}"]`);
+        await wait('!!document.querySelector(".confirm-card [data-confirm-opt]")', 'UI24 132 PU1 的确认框', 20000);
+        await press('[data-confirm-opt]');
+        await check('UI24 132 点勾选项：取消勾选，复选框熄灭', `document.querySelector('[data-confirm-opt]').getAttribute('aria-checked') === 'false' && !document.querySelector('[data-confirm-opt] .cb.on')`);
+        const originBeforePU1 = originMain();
+        await press('.confirm-actions .btn.primary');
+        await wait(`!document.querySelector('[data-acc="${PU1.id}"]') && !!document.querySelector('.toast')`, 'UI24 132 取消勾选后批准成功', 90000);
+        const pu1Merge = await untilRow(async () => (await rows()).find(r => r.id === PU1.id && r.event === 'accepted'), 'PU1 的 accepted 事件', 15000);
+        await verify('UI24 132 取消勾选后批准：合并成功，裸仓库没变，任务记录没有 push 事件（即使项目配置 afterAccept 是 true）', async () => {
+            assert.equal(pu1Merge.merge, mainOf());
+            assert.equal(originMain(), originBeforePU1);
+            assert.notEqual(originMain(), mainOf());
+            assert.equal((await pushEvents(PU1.id)).length, 0);
+        });
+        await check('UI24 132 取消勾选后的 toast 是普通的已合并提示（w.mergedToast 的样子，不提“并推送”与“推送失败”，任务名里的“推送”二字不算）', `${toastText}.startsWith(${jsonStr(`已合并「${tPU1.title}」到 main：`)}) && ${toastText}.endsWith(${jsonStr(sha7(String(pu1Merge.merge)))}) && !${toastText}.includes('并推送') && !${toastText}.includes('推送失败')`);
+
+        // ---- PU2：远程不可达 → 合并成功、推送失败；提示带“去项目页”，任务照常离开验收列表 ----
+        const tPU2 = taskOf(PU2.id)!;
+        git(repo, ['remote', 'set-url', 'origin', path.join(root, 'no-such-remote', 'origin.git')]);
+        const originBeforePU2 = originMain(), mainBeforePU2 = mainOf();
+        await selectAccept(PU2.id);
+        await press(`[data-acc-approve="${PU2.id}"]`);
+        await wait('!!document.querySelector(".confirm-card [data-confirm-opt]")', 'UI24 132 PU2 的确认框', 20000);
+        await check('UI24 132 远程不可达时确认框照样有勾选项（默认勾上）', `document.querySelector('[data-confirm-opt]').getAttribute('aria-checked') === 'true'`);
+        await press('.confirm-actions .btn.primary');
+        await wait(`!document.querySelector('[data-acc="${PU2.id}"]') && !!document.querySelector('.toast [data-acc-go-project]')`, 'UI24 132 合并成功、推送失败的提示', 90000);
+        const pu2Merge = await untilRow(async () => (await rows()).find(r => r.id === PU2.id && r.event === 'accepted'), 'PU2 的 accepted 事件', 15000);
+        const pu2Push = await untilRow(async () => (await pushEvents(PU2.id))[0], 'PU2 的 push 事件', 15000);
+        await verify('UI24 132 推送失败不影响合并：main 多了合并提交、任务已 accepted，push 事件 ok: false 带 code；裸仓库没变', async () => {
+            assert.notEqual(mainOf(), mainBeforePU2);
+            assert.equal(pu2Merge.merge, mainOf());
+            assert.equal(git(repo, ['rev-list', '--count', '--merges', `${mainBeforePU2}..${mainOf()}`]), '1');
+            assert.equal(pu2Push.ok, false);
+            assert.equal(typeof pu2Push.code, 'string');
+            assert.equal(originMain(), originBeforePU2);
+        });
+        const [failPrefix, failSuffix] = w.mergedPushFailed(tPU2.title, 'main', sha7(String(pu2Merge.merge)), '\u0000').split('\u0000');
+        await check('UI24 132 推送失败的提示：wt.mergedPushFailed(任务名, main, 合并提交短哈希, 核心原因)，带“去项目页”按钮；任务已离开验收列表', `(() => { const t = document.querySelector('.toast'); const text = ${toastText}; return t.getAttribute('role') === 'status' && text.startsWith(${jsonStr(failPrefix)}) && text.endsWith(${jsonStr(failSuffix)}) && text.includes('取远程状态失败') && t.querySelector('[data-acc-go-project]').textContent === ${jsonStr(w.goProject)} && !document.querySelector('[data-acc="${PU2.id}"]'); })()`);
+        await shots('accept-merged-push-failed');
+        // 点“去项目页”：切到项目页并选中这个项目；那里能看到本机领先远程，改好地址后重试推送。
+        await press('[data-acc-go-project]');
+        await wait(`document.querySelector('[data-page=projects]')?.getAttribute('aria-current') === 'page' && !!document.querySelector('[data-pj-row].on') && !!document.querySelector('[data-pj-remote=ahead]')`, 'UI24 132 去项目页后选中这个项目、显示领先', 30000);
+        await verify('UI24 132 “去项目页”：项目页选中的就是这个项目', async () => {
+            assert.equal(norm(await evaluate(`document.querySelector('[data-pj-row].on').dataset.pjRow`)), norm(repo));
+            assert.equal(await evaluate(`document.querySelector('[data-pj-detail] .dh h2').textContent`), 'sample');
+        });
+        git(repo, ['remote', 'set-url', 'origin', originBare]);
+        await press('[data-pj=remote-push]');
+        await wait(`!!document.querySelector('[data-pj-remote=same]') && document.querySelector('[data-pj=remote-refresh]')?.disabled === false`, 'UI24 132 在项目页重试推送后同步', 60000);
+        await verify('UI24 132 在项目页重试推送：之前没推上去的两个合并提交都到了裸仓库', () => { assert.equal(originMain(), mainOf()); });
 
         // ================= T116（Stage07 116）：项目从列表移除后，它的待验收任务不卡死 =================
         // 甲项目（gone-a）有三个待验收任务：G1（驳回）、G2（重新添加项目）、G4（调研类，确认）；丙项目（gone-missing）的 G3 用来查文件夹被删的情况。

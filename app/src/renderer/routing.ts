@@ -2,7 +2,7 @@ import { c, ro } from '../shared/copy';
 import { esc } from '../shared/markdown';
 import { executorTag } from '../shared/executor';
 import type { ProjectRow, RouteConfig, RouteProfile, RouteResult, RouteRule, RouteTrial } from '../shared/types';
-import { field, icon, menu, openSheet } from './ui';
+import { field, icon, menu, openSheet, trace } from './ui';
 
 // 路由页（Stage07 O4）：规则 → 兜底 → 试算 → 每日上限 → 审查者候选。
 // 所有读写都经 console 通道 route:*（核心的 ar route …），界面不直接碰 config.json。
@@ -116,12 +116,15 @@ export class RoutingView {
     // 把一条写入排进队列；返回的 Promise 在这条写完后成功，核心拒绝时带着原因失败。
     private write(action: string, payload: Record<string, unknown>): Promise<void> {
         this.pending++;
-        const run = this.queue.then(() => call(action, payload) as Promise<RouteConfig>);
+        // 追踪（只在验收打开 data-ar-trace 时记录）：入队、开始调用核心、完成 / 失败，带队列里还没做完的条数。
+        trace('route-write', { phase: 'queued', action, pending: this.pending });
+        const run = this.queue.then(() => { trace('route-write', { phase: 'call', action, pending: this.pending }); return call(action, payload) as Promise<RouteConfig>; });
         this.queue = run.catch(() => undefined);
         return run.then(result => {
             this.pending--;
+            trace('route-write', { phase: 'done', action, pending: this.pending });
             if (this.pending === 0 && this.container) this.settle(result);
-        }, error => { this.pending--; throw error; });
+        }, error => { this.pending--; trace('route-write', { phase: 'error', action, pending: this.pending, error: failure(error) }); throw error; });
     }
 
     // 即时写入的失败处理：显示核心给的原因，再读回真实状态。

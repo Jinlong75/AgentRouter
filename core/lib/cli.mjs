@@ -1,4 +1,4 @@
-// ar 子命令：dispatch · redispatch · retry · wait · stop · accept · reject · diff · status · report · gc · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs，accept/reject 见 accept.mjs，diff 见 diff.mjs，status 见 status.mjs，report 见 report.mjs，gc 见 gc.mjs）。
+// ar 子命令：dispatch · redispatch · retry · wait · stop · accept · reject · push · pull · revert · diff · status · report · gc · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs，accept/reject 见 accept.mjs，diff 见 diff.mjs，status 见 status.mjs，report 见 report.mjs，gc 见 gc.mjs）。
 // 所有面向软件的命令支持 --json：标准输出只有一个 JSON 对象；出错时 { ok:false, error } 且退出码非 0。
 import { trace, tracing } from './trace.mjs';
 import { readFileSync } from 'node:fs';
@@ -14,6 +14,8 @@ import { readNeedsScope } from './needs-scope.mjs';
 import { readOutsideWrites } from './outside-writes.mjs';
 import { stopTask } from './stop.mjs';
 import { accept, reject } from './accept.mjs';
+import { revertMerge } from './revert.mjs';
+import { BYS, pullBranch, pullLines, pushBranch, pushLines } from './push.mjs';
 import { diffTask } from './diff.mjs';
 import { buildReport, reportLines, setBlame } from './report.mjs';
 import { gc, gcLines } from './gc.mjs';
@@ -27,24 +29,27 @@ import { readJson } from './json.mjs';
 import { withProxy } from './env.mjs';
 import { proxyText, readSystemProxy, resolveProxy } from './proxy.mjs';
 
-export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'diff', 'status', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'route', 'proxy', 'version', '--run-request'];
+export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'push', 'pull', 'revert', 'diff', 'status', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'route', 'proxy', 'version', 'help', '--run-request'];
+const helpWords = ['help', '--help', '-h'];
 export { listAgents };
 const legacy = { '--wait': 'wait', '--stop': 'stop', '--config': 'config' };
 export const usage = [
   '用法：',
   '  ar dispatch <任务说明 | "任务文字"> [补充说明] [--profile <名>] [--role <角色>] [--name <记录名>] [--host claude-code|agentrouter] [--sandbox …] [--watch-window …] [--detach] [--no-worktree]',
   '  ar redispatch <记录名> [--detach] [--host claude-code|agentrouter]（按记录里保存的参数再派发一次，记录名自动去重）',
-  '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]（同一工作区手动重试下一次尝试，协议 14.3；--rebase 用于合并冲突的 worktree 任务，协议 15.8）',
-  '  ar accept <记录名> [--squash] [--by human]　　ar reject <记录名> --reason "<原因>" [--keep-branch] [--by human]　　ar diff <记录名>（worktree 任务的验收合并、驳回与改动，协议 15.6～15.9）',
+  '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]（同一工作区手动重试下一次尝试，协议 14.3；--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：在原 worktree 合并主分支后重跑门禁，协议 15.8）',
+  '  ar accept <记录名> [--squash] [--push|--no-push] [--by human]　　ar reject <记录名> --reason "<原因>" [--keep-branch] [--by human]　　ar diff <记录名>（worktree 任务的验收合并、驳回与改动，协议 15.6～15.9；--push 合并后接着推送主分支）',
+  '  ar revert <记录名> [--by human]（撤销已合并任务的合并：git revert，只追加一个反向提交，不改历史、不推送）',
+  '  ar push <项目路径> [--by human|lead|cli] [--dry-run] [--no-fetch]（把主分支普通推送到项目配置的远程，不强制、不推标签；--dry-run 只报告领先落后）　　ar pull <项目路径> [--by human|lead|cli]（只快进，分叉时不拉取）',
   '  ar status <记录名>（任务当前状态，不等待，协议 15.11）　　ar gc [--dry-run]（清理孤立的 worktree、并发名额与过期的执行者会话记录，协议 15.10）',
   '  ar report <记录名> [--blame <n>=spec|worker|environment]（任务结束后的链路报告与评分：执行者、主导各一组指标；--blame 把第 n 次门禁失败归因到任务说明、执行者或环境，协议第 16 节）',
   '  ar wait [记录名]　　ar stop <记录名>　　ar config [键=值 … | init]',
-  '  ar init [项目路径] [--dry-run]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径>|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
+  '  ar init [项目路径] [--dry-run]　　ar init --upgrade [项目路径] [--dry-run] [--replace-role <角色,…>] [--add-field <键,…>]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|purge <路径> [--dry-run] [--worktrees]|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径> [--with-existing]|changes <路径>|commit <路径> [--message <说明> --files <路径…>]（表单也可从标准输入读 JSON）|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
   '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--effort …] [--base-url …] [--secret-var …] [--auth login|token]|add --generic <声明JSON> --name <名> [--label …]|update <名> […|--effort <级别>|""|--max-turns <正整数>|-|--escalate <名>|""]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
-  '  ar agents models <名>（可选的模型）|validate <文件>（校验声明或导出文件，只读）|export <名> [--out <文件>] [--force]|import <文件> [--name <名>] [--force]',
+  '  ar agents models <名>（可选的模型）|validate <文件>（校验声明或导出文件，只读）|export <名> [--out <文件>] [--force]|import <文件> [--name <名>] [--force]（单独的声明必须加 --name）',
   '  ar agents validate --decl <声明JSON>|detect --decl <声明JSON>|test --decl <声明JSON> [--timeout <秒>]（只用声明，不读不写配置；软件的自定义 CLI 表单用）',
   '  ar secrets status [变量名 …]|set <变量名>（值从标准输入读入，不回显）|unset <变量名>（删除 Windows 用户环境变量）',
-  '  ar spec list <项目路径>|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>|check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]（允许路径会匹配到哪些现有文件，只读）',
+  '  ar spec list <项目路径> [--include-archived]|archive <项目路径> <相对路径…> [--commit]（把顶层任务说明 git mv 到 archive/，不删除）|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>|check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]（允许路径会匹配到哪些现有文件，只读）',
   '  ar route [--spec <任务说明>] [--type <类型>] [--project <路径>] [--profile <名>] [--explain]（只计算会派给谁和为什么，不派发、不写文件）',
   '  ar route config　　ar route rules set \'<JSON 数组>\'　　ar route fallback set <名>|clear　　ar route reviewer set \'<JSON>\'　　ar route limit set <名> [--tasks <n>|""] [--tokens <n>|""]（路由配置的读取与写入）',
   '  ar proxy resolve（这一刻的网络代理：config.json 的 proxy 模式、读到的地址与要给执行者设置的变量，只读）',
@@ -55,7 +60,9 @@ export const usage = [
 export function normalizeArgs(argv) {
   const json = argv.includes('--json');
   let args = argv.filter(a => a !== '--json');
-  if (legacy[args[0]]) args = [legacy[args[0]], ...args.slice(1)];
+  // 第一个参数正好是 help / --help / -h 才算帮助（后面的参数不管）；任务文字里含 help 不受影响。
+  if (helpWords.includes(args[0])) args = ['help'];
+  else if (legacy[args[0]]) args = [legacy[args[0]], ...args.slice(1)];
   else if (!args.length || !commands.includes(args[0])) args = ['dispatch', ...args];
   return { command: args[0], rest: args.slice(1), json };
 }
@@ -144,8 +151,12 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
   };
   try {
     // ar version 与用法帮助不碰公共目录，可以不检查（任务 047）。
-    if (command !== 'version') assertSafeHome(env);
+    if (command !== 'version' && command !== 'help') assertSafeHome(env);
     switch (command) {
+      case 'help': {
+        if (json) emit({ ok: true, usage }); else out(usage);
+        return 0;
+      }
       case 'dispatch': case 'redispatch': case '--run-request': {
         let detach = null, gate = null, inheritRoute = null;
         let runArgs;
@@ -181,8 +192,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
       }
       case 'retry': {
         // 手动重试（协议 14.3，任务 059）：记录名允许中文、空格等（同 redispatch），只校验个数与开关取值。
-        // 参数错误的用法文字保持原样（已有测试逐字核对）；--rebase 写在上面的总用法里。
-        const usageText = '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--detach] [--host claude-code|agentrouter]';
+        const usageText = '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]';
         let profile = null, note = null, host = null;
         const names = [];
         for (let i = 0; i < rest.length; i++) {
@@ -213,8 +223,10 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
       }
       // worktree 任务的验收合并、驳回与改动（协议 15.6～15.9）。记录名允许中文、空格等。
       case 'accept': {
-        const { name, options } = taskArgs(rest, { booleans: ['--squash'], values: ['--by'] }, '用法：ar accept <记录名> [--squash] [--by human] [--json]');
-        const result = accept({ homes, root: cwd, name, squash: options['--squash'] === true, by: options['--by'] ?? null, env });
+        const acceptUsage = '用法：ar accept <记录名> [--squash] [--push|--no-push] [--by human] [--json]';
+        const { name, options } = taskArgs(rest, { booleans: ['--squash', '--push', '--no-push'], values: ['--by'] }, acceptUsage);
+        if (options['--push'] && options['--no-push']) throw new Error(acceptUsage);
+        const result = accept({ homes, root: cwd, name, squash: options['--squash'] === true, push: options['--push'] ? true : options['--no-push'] ? false : null, by: options['--by'] ?? null, env });
         if (result.conflict) {
           if (json) emit({ ok: false, conflict: true, files: result.files });
           else {
@@ -223,12 +235,41 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           }
           return 4;
         }
-        if (json) emit({ ok: true, merge: result.merge, mode: result.mode, cleanup: result.cleanup });
+        if (json) emit({ ok: true, merge: result.merge, mode: result.mode, cleanup: result.cleanup, ...(result.push ? { push: result.push } : {}) });
         else {
           if (result.mode === 'confirm') out(`已确认：${name}（没有改动，worktree 已删除）`);
           else out(`已合并：${name}（${result.mode === 'squash' ? '压成一个提交' : '合并提交'} ${result.merge.slice(0, 7)}）`);
           if (!result.cleanup) out('worktree 或分支没能清理干净，合并结果不受影响；稍后用 ar gc 清理');
+          if (result.push) out(result.push.ok ? (result.push.pushed === false ? '没有需要推送的提交' : '已推送到远程') : `已合并，推送失败：${result.push.error}（合并结果不受影响，可以稍后用 ar push 重试）`);
         }
+        return 0;
+      }
+      // 推送与快进拉取（Stage07b 128）：项目路径一个，其余是开关。预期内的失败（落后、没有凭据等）带 code，退出码 2。
+      case 'push': case 'pull': {
+        const isPush = command === 'push';
+        const usageText = isPush ? '用法：ar push <项目路径> [--by human|lead|cli] [--dry-run] [--no-fetch] [--json]' : '用法：ar pull <项目路径> [--by human|lead|cli] [--json]';
+        let by = null;
+        const paths = [];
+        const flags = new Set();
+        for (let i = 0; i < rest.length; i++) {
+          const a = rest[i];
+          if (a === '--by') {
+            by = rest[++i];
+            if (by === undefined || !BYS.includes(by)) throw new Error(usageText);
+          } else if (isPush && (a === '--dry-run' || a === '--no-fetch')) flags.add(a);
+          else if (a.startsWith('--')) throw new Error(usageText);
+          else paths.push(a);
+        }
+        if (paths.length !== 1 || !paths[0]) throw new Error(usageText);
+        const root = resolvePath(cwd, paths[0]);
+        const result = isPush
+          ? pushBranch({ root, home: homes[0], by, dryRun: flags.has('--dry-run'), noFetch: flags.has('--no-fetch'), env })
+          : pullBranch({ root, home: homes[0], by, env });
+        if (!result.ok) {
+          if (json) { emit(result); return 2; }
+          throw new Error(result.error);
+        }
+        if (json) emit(result); else for (const line of isPush ? pushLines(result) : pullLines(result)) out(line);
         return 0;
       }
       case 'reject': {
@@ -239,6 +280,22 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           out(`已驳回：${name}${result.keptBranch ? '（保留分支）' : ''}`);
           if (!result.cleanup) out('worktree 或分支没能清理干净；稍后用 ar gc 清理');
         }
+        return 0;
+      }
+      // 撤销合并（Stage07b 129）：冲突时退出码 4，主分支恢复原样。
+      case 'revert': {
+        const { name, options } = taskArgs(rest, { values: ['--by'] }, '用法：ar revert <记录名> [--by human] [--json]');
+        const result = revertMerge({ homes, root: cwd, name, by: options['--by'] ?? null, env });
+        if (result.conflict) {
+          if (json) emit({ ok: false, conflict: true, files: result.files });
+          else {
+            out(`撤销冲突：${result.files.join('、')}`);
+            out('已放弃这次撤销，主分支没有变化。需要在终端里手动处理（git revert，解决冲突后提交）');
+          }
+          return 4;
+        }
+        if (json) emit({ ok: true, commit: result.commit.slice(0, 7) });
+        else out(`已撤销：${name}（反向提交 ${result.commit.slice(0, 7)}）`);
         return 0;
       }
       case 'diff': {
@@ -375,7 +432,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         return 0;
       }
       case 'init': case 'projects': {
-        const result = await (command === 'init' ? initCommand : projectsCommand)(rest, { home: homes[0], cwd, json });
+        const result = await (command === 'init' ? initCommand : projectsCommand)(rest, { home: homes[0], homes, env, cwd, json, readForm });
         if (json) emit(result); else out(result);
         return 0;
       }
@@ -387,7 +444,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
       default: throw new Error(usage);
     }
   } catch (error) {
-    if (json) { out(JSON.stringify({ ok: false, error: error.message, ...(error.arCode ? { code: error.arCode } : {}) })); return 2; }
+    if (json) { out(JSON.stringify({ ok: false, error: error.message, ...(error.arCode ? { code: error.arCode } : {}), ...(Array.isArray(error.files) ? { files: error.files } : {}) })); return 2; }
     throw error;
   }
 }

@@ -18,7 +18,7 @@ const DEFAULT_SPECS_DIR = 'docs/specs';
 // specsDir 为项目根本身（协议 12.1 第 4 步，065）：规范化结果记作 '.'，受保护的不是整个仓库。
 export const ROOT_SPECS_DIR = '.';
 // 项目根目录下符合任务说明命名的文件（三位编号加连字符开头、.md 结尾，如 065-修复.md；编号后的部分可为空）。
-const ROOT_SPEC_FILE = /^\d{3}-.*\.md$/;
+const ROOT_SPEC_FILE = /^\d{3,}-.*\.md$/;
 
 // 规范化基线项目配置里的 specsDir：\ 换 /、去掉开头 ./ 与末尾 /；
 // '.' 与 './'（含尾部 /）规范化后为项目根（'.'）；其余不是字符串、空、绝对路径、含 .. 段时回退 docs/specs。
@@ -76,7 +76,7 @@ export function explicitlyAllowed(file, allowed, protectedDirs, options) {
 export function explicitlyAllowedRootSpec(file, allowed, options) {
   const caseInsensitive = options?.caseInsensitive ?? process.platform === 'win32';
   const lower = value => (caseInsensitive ? value.toLowerCase() : value);
-  const nnn = file.slice(0, 4); // 'NNN-'
+  const nnn = /^\d+-/.exec(file)?.[0] ?? file.slice(0, 4); // 开头的数字加连字符（三位及以上）
   for (const pattern of allowed) {
     if (!lower(literalPrefixOf(pattern)).startsWith(lower(nnn))) continue;
     if (globToRegExp(pattern, { caseInsensitive }).test(file)) return true;

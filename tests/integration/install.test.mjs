@@ -600,7 +600,7 @@ test('清单 spec 和进度文件路径统一为 /，无效配置提示文案及
   const s = setup(t), fake = join(s.base, '假 agent.mjs');
   fs.copyFileSync(join(project, 'tests/fixtures/fake-agent.txt'), fake);
   const samples = join(s.base, '事件.jsonl');
-  write(samples, JSON.stringify({ type: 'item.completed', item: { type: 'error', message: '示例条目错误' } }) + '\n' + JSON.stringify({ type: 'item.completed', item: { type: 'file_change', changes: [{ kind: 'add', path: join(s.base, 'src/new.ts') }] } }) + '\n');
+  write(samples, JSON.stringify({ type: 'item.completed', item: { type: 'error', message: '示例条目错误' } }) + '\n' + JSON.stringify({ type: 'item.completed', item: { type: 'file_change', changes: [{ kind: 'add', path: join(fs.realpathSync.native(s.base), 'src/new.ts') }] } }) + '\n');
   write(join(s.base, 'docs/任务.md'), '任务');
   Object.assign(s.env, { CODEX_NO_WATCH: '1', FAKE_FIXTURES: JSON.stringify([samples]), FAKE_ECHO: join(s.base, '参数.json') });
   const entry = join(project, 'core/ar.mjs');

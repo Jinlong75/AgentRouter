@@ -18,6 +18,8 @@ const jsonStr = JSON.stringify;
 // 试算与核心的 ar route --explain 对照；用测试自己写的执行者配置（假执行者），结束时恢复配置、清单与项目登记。
 export async function captureRouting(h: Harness, win: BrowserWindow) {
     const { evaluate, wait, check, verify, press, key, type, tabTo, focusRing, pause, save } = h;
+    // 119：打开渲染层追踪（routing.ts 的 route-write 事件）；不清空已有事件。
+    await evaluate('document.documentElement.dataset.arTrace = "1"; window.__arTrace ??= []; true');
     const home = appEnv.AGENT_ROUTER_HOME!;
     const temp = path.resolve(os.tmpdir()).toLowerCase();
     assert.ok(home && path.isAbsolute(home) && path.resolve(home).toLowerCase().startsWith(temp), '截图验收必须在隔离公共目录里运行');
@@ -51,9 +53,26 @@ export async function captureRouting(h: Harness, win: BrowserWindow) {
         const end = Date.now() + 8000;
         for (;;) {
             try { await fn(); return; }
-            catch (error) { if (Date.now() > end) throw error; await pause(150); }
+            catch (error) { if (Date.now() > end) throw await withDiagnosis(error); await pause(150); }
         }
     });
+    // 119：最后一次断言失败时才采的现场（不改判断、不重试、不改 8 秒上限）：路由页写入队列的追踪、错误横幅、界面上此刻的规则顺序，
+    // 再加最近 30 秒的核心调用（含 route:rules 的收到 / 返回 / 用时 / 结果）与核心进程。
+    const withDiagnosis = async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const page = await evaluate(`JSON.stringify((() => {
+            const events = (window.__arTrace ?? []).filter(e => e.event === 'route-write');
+            const count = phase => events.filter(e => e.phase === phase).length;
+            return {
+                queue: { queued: count('queued'), call: count('call'), done: count('done'), error: count('error'), pendingNow: events.length ? events[events.length - 1].pending : null },
+                writes: events.slice(-12).map(e => e.phase + ' ' + e.action + ' pending=' + e.pending + (e.error ? ' error=' + String(e.error).slice(0, 200) : '') + ' @-' + (Date.now() - e.at) + 'ms'),
+                errorBanner: [...document.querySelectorAll('.banner.fail')].map(b => (b.textContent || '').trim().slice(0, 200)),
+                rulesOnScreen: [...document.querySelectorAll('[data-ro-rule]')].map(r => r.querySelector('.ro-types')?.textContent ?? '?'),
+            };
+        })())`).catch((e: Error) => `读取路由页状态失败：${e.message}`);
+        const scene = await h.scene().catch((e: Error) => `现场采集失败：${e.message}`);
+        return Error(`${message}\n路由页状态：${page}\n${scene}`, { cause: error });
+    };
     const menuItem = async (label: string) => {
         const index = await evaluate(`(() => { const items = [...document.querySelectorAll('.ctx button')]; items.forEach((b, i) => b.setAttribute('data-menu-index', String(i))); return items.findIndex(b => b.textContent.trim() === ${jsonStr(label)}); })()`);
         assert.ok(index >= 0, `菜单里没有「${label}」`);

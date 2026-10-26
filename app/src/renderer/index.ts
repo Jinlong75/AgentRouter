@@ -14,7 +14,7 @@ import { RoutingView } from './routing';
 import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack, trackNode } from './gate';
 import { AcceptView } from './accept';
 import { ScoreView, scoreVisible } from './score';
-import { bannerHtml, loadRepoState, needsAccept, readdProject, repoBanner, routeHeadRow, writeBlocked, wtBanner as wtBannerBase, wtHeadRow, wtMark, wtState, wtStateLine as wtStateLineBase, wtSub as wtSubBase, wtTailRow, wtTrack as wtTrackBase } from './wt';
+import { baseBranchOf, bannerHtml, loadRepoState, needsAccept, readdProject, repoBanner, revertCommand, revertTask, routeHeadRow, writeBlocked, wtBanner as wtBannerBase, wtHeadRow, wtMark, wtState, wtStateLine as wtStateLineBase, wtSub as wtSubBase, wtTailRow, wtTrack as wtTrackBase } from './wt';
 import { attemptBadge, attemptBar, attemptList, attemptPick, attemptPickItems, historyTab, lastFailure, multiAttempts, openRetrySheet, separators, attemptLabel, type Labels } from './attempts';
 import brandSVG from '../../design/icons/mark.svg';
 const root = document.querySelector<HTMLElement>('#app')!;
@@ -66,6 +66,8 @@ let histGates = new Map<number, GateResult>();
 const attCache = new Map<string, AttemptFiles>();
 // 再派一次：正在派发的任务、失败原因（只显示在触发它的那个任务详情上）。
 let redispatchFor = '', redispatchBusy = false, redispatchError = '', redispatchErrorFor = '';
+// Stage07b T4d④：失败任务的"合并主分支后重跑"——正在调用的任务、失败原文（只显示在触发它的任务详情上）。
+let rebaseFor = '', rebaseError = '', rebaseErrorFor = '';
 // 017：批量选择与删除。checked 只存 id；筛选后不可见的勾选保留，计数照实。
 let selecting = false;
 const checked = new Set<string>();
@@ -242,11 +244,16 @@ function exitSelect(focus = true) {
     if (focus) root.querySelector<HTMLElement>('[data-multi=select]')?.focus({ preventScroll: true });
 }
 // 017：删除确认框。渲染层只把 id 与"是否删记录文件"交给主进程，路径全由主进程导出。
-function openDelete(trigger: HTMLElement) {
-    const ids = [...checked].filter(id => state.tasks.some(t => t.id === id));
+// Stage07b T4o：详情 ⋯ 菜单的"删除任务…"传入 one，复用同一个确认框（标题换成单个任务名），删除后选中列表里的下一个任务。
+function openDelete(trigger: HTMLElement, one?: Task) {
+    const ids = one ? [one.id] : [...checked].filter(id => state.tasks.some(t => t.id === id));
     if (!ids.length) return;
+    // 删除前按列表当前顺序找相邻任务：优先下一个，没有下一个就是上一个。
+    const order = taskGroups(visibleTasks(), taskSort(), () => '').flatMap(g => g.rows).map(t => t.id);
+    const at = one ? order.indexOf(one.id) : -1;
+    const neighbour = at < 0 ? '' : order[at + 1] ?? order[at - 1] ?? '';
     const choice = `<button class="choice" role="checkbox" aria-checked="false" data-delete-files><span class="cb"></span><span class="ct">${esc(c.deleteFiles)}<span>${esc(c.deleteFilesHelp)}</span></span></button>`;
-    const sheet = openSheet({ title: c.deleteTitle(ids.length), trigger, body: `<p class="sheet-lead">${esc(c.deleteBody)}</p>${choice}`, buttons: [c.cancel, c.deleteConfirm],
+    const sheet = openSheet({ title: one ? c.deleteOneTitle(one.title) : c.deleteTitle(ids.length), trigger, body: `<p class="sheet-lead">${esc(c.deleteBody)}</p>${choice}`, buttons: [c.cancel, c.deleteConfirm],
         onButton: (index, s) => {
             if (index === 0) { s.close(); return; }
             const files = sheet.root.querySelector<HTMLElement>('[data-delete-files]')?.getAttribute('aria-checked') === 'true';
@@ -256,6 +263,17 @@ function openDelete(trigger: HTMLElement) {
                 s.busy(false);
                 s.close();
                 if (!result.deleted) { notice(new Error(c.changed)); return; }
+                if (one) {
+                    // 任务快照可能比这里先到：列表已把选中清空了（任务不在了），所以空也算“还停在这个任务上”。
+                    if (selected === one.id || !selected) {
+                        selected = neighbour;
+                        tab = current()?.status === 'done' ? 'report' : 'flow';
+                    }
+                    list();
+                    detail();
+                    toast(result.filesLeft ? `${c.deletedOne(one.title)}；${c.deleteLeft(result.filesLeft)}` : c.deletedOne(one.title));
+                    return;
+                }
                 selecting = false;
                 checked.clear();
                 list();
@@ -276,6 +294,46 @@ function openDelete(trigger: HTMLElement) {
         cb.classList.toggle('on', on);
         cb.innerHTML = on ? icon('check-line') : '';
     });
+}
+// Stage07b T4m：归档任务说明。勾选的任务里取"已结束、用任务说明派发、说明不在 archive/ 里"的，按项目分组确认后各调一次 specs:archive。
+// 只移动说明文件并提交，不删除任务、不改任务记录。
+function openArchive(trigger: HTMLElement) {
+    const picked = state.tasks.filter(t => checked.has(t.id));
+    const groups = new Map<string, string[]>();
+    let eligible = 0;
+    for (const t of picked) {
+        if (t.status === 'run' || !t.spec || /(^|\/)archive\/[^/]+$/.test(t.spec.replace(/\\/g, '/'))) continue;
+        eligible++;
+        const specs = groups.get(t.repo) ?? [];
+        if (!specs.includes(t.spec)) specs.push(t.spec);
+        groups.set(t.repo, specs);
+    }
+    const skipped = picked.length - eligible;
+    if (!groups.size) { toast(c.archiveNone); return; }
+    const total = [...groups.values()].reduce((n, specs) => n + specs.length, 0);
+    const dir = (groups.values().next().value as string[])[0].replace(/\\/g, '/').split('/').slice(0, -1).join('/') || '.';
+    const rows = [...groups.entries()].map(([repo, specs]) => `${groups.size > 1 ? `<p class="sheet-lead mono">${esc(repo)}</p>` : ''}<div class="card"><div class="card-b">${specs.map(s => `<div class="mono" data-archive-file>${esc(s)}</div>`).join('')}</div></div>`).join('');
+    const sheet = openSheet({ title: c.archiveTitle(total), trigger, body: `<p class="sheet-lead">${esc(c.archiveBody(dir))}</p>${rows}`, note: c.archiveNote(total), buttons: [c.cancel, c.archiveConfirm],
+        onButton: (index, s) => {
+            if (index === 0) { s.close(); return; }
+            s.busy(true);
+            s.fail('');
+            void (async () => {
+                const hashes: string[] = [];
+                for (const [repo, specs] of groups) {
+                    const result = await window.dock.console('specs:archive', { project: repo, rels: specs });
+                    if (result?.commit && !hashes.includes(result.commit)) hashes.push(result.commit);
+                }
+                s.busy(false);
+                s.close();
+                selecting = false;
+                checked.clear();
+                list();
+                root.querySelector<HTMLElement>('[data-multi=select]')?.focus({ preventScroll: true });
+                toast(c.archived(total, hashes.join('、')) + (skipped ? `；${c.archiveSkipped(skipped)}` : ''));
+            })().catch(error => { s.busy(false); s.fail(String((error as Error)?.message || error)); });
+        } });
+    sheet.root.querySelectorAll<HTMLButtonElement>('.sheet-btns button')[0]?.focus({ preventScroll: true });
 }
 function list() {
     if (page !== 'tasks' || preferences.wizard)
@@ -300,7 +358,7 @@ function list() {
     const header = root.querySelector<HTMLElement>('.page-h')!;
     header.classList.toggle('selecting', selecting);
     paintHeader(header, taskSearch, `<h1>${selecting ? c.multiCount(checked.size) : c.tasks}</h1>${filters}`, selecting
-        ? `<span class="sp"></span><button class="btn" data-multi="all">${allChecked ? c.multiNone : c.multiAll}</button><button class="btn danger" data-multi="delete" ${checked.size && processOk() ? '' : 'disabled'}>${esc(c.multiDelete)}</button><button class="btn" data-multi="done">${esc(c.multiDone)}</button>`
+        ? `<span class="sp"></span><button class="btn" data-multi="all">${allChecked ? c.multiNone : c.multiAll}</button><button class="btn" data-multi="archive" ${checked.size && processOk() ? '' : 'disabled'}>${esc(c.multiArchive)}</button><button class="btn danger" data-multi="delete" ${checked.size && processOk() ? '' : 'disabled'}>${esc(c.multiDelete)}</button><button class="btn" data-multi="done">${esc(c.multiDone)}</button>`
         : `<span class="sp"></span><button class="btn" data-multi="select">${esc(c.multiSelect)}</button><button class="btn icon quiet" data-import data-tip="${c.import}" aria-label="${c.import}">${icon('folder-add-line')}</button><button class="btn primary" data-page="newtask">${icon('add-line')}${esc(c.newTask)}</button>`,
         projectSel + sortButton('data-sort', s6.taskSorts[sort][0]));
     if (selected && !tasks.some(t => t.id === selected)) {
@@ -362,6 +420,21 @@ function detail() {
         timeline.follow = true; timeline.render(); followButton(); }, { passive: true });
     renderTab();
     void refreshDetail();
+}
+// 合并主分支后重跑：走验收页冲突重试同一条 tasks:rebase（ar retry --rebase --detach）；失败把核心原文显示在详情页横幅上。
+async function rebaseRun(t: Task) {
+    if (rebaseFor) return;
+    rebaseFor = t.id;
+    rebaseError = '';
+    rebaseErrorFor = '';
+    header();
+    try { await window.dock.console('tasks:rebase', { project: t.repo, name: t.name }); }
+    catch (error) {
+        rebaseError = String((error as Error)?.message || error);
+        rebaseErrorFor = t.id;
+    }
+    rebaseFor = '';
+    if (page === 'tasks' && !preferences.wizard && current()) header();
 }
 // 再派一次：核心按记录目录里的 dispatch.json 用同样参数脱离软件派发。成功后照任务 007 的做法
 // 最多等 5 秒，等新任务的 start 行进了看板再选中它；失败把原因显示在详情页横幅上。
@@ -430,10 +503,14 @@ function header() {
     const redispatch = finished ? `<button class="btn sm" data-redispatch data-tip="${esc(blocked ? c.projectGoneBlocked : c.redispatchHelp)}" aria-label="${esc(c.redispatch)}" ${busy || blocked ? 'disabled' : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.redispatching)}` : `${icon('refresh-line')}${esc(c.redispatch)}`}</button>` : '';
     // 重试（Stage05）：结束的任务（完成、失败、中断）在"再派一次"前多一个次按钮，在同一工作区新开一次尝试。
     const retry = finished && !noRetry ? `<button class="btn sm" data-retry title="${esc(blocked ? c.projectGoneBlocked : rt.buttonTip)}" aria-label="${esc(rt.button)}" ${blocked ? 'disabled' : ''}>${icon('arrow-go-forward-line')}${esc(rt.button)}</button>` : '';
+    // 合并主分支后重跑（Stage07b）：worktree 任务门禁失败（不含准备失败）或已中断时，在"重试"后面多一个次按钮。
+    const canRebase = t.worktree && !!t.wt && ((wst === 'failed' && !t.wt.setupFailed) || wst === 'stopped');
+    const rebasing = rebaseFor === t.id;
+    const rebase = canRebase ? `<button class="btn sm" data-rebase-run data-tip="${esc(blocked ? c.projectGoneBlocked : c.rebaseRunTip(baseBranchOf(t)))}" aria-label="${esc(c.rebaseRun)}" ${rebasing || blocked ? 'disabled' : ''}>${rebasing ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(c.rebaseRunning)}` : `${icon('git-merge-line')}${esc(c.rebaseRun)}`}</button>` : '';
     // 失败且门禁没过时，状态行第二段说明是门禁没过（不再是笼统的 exit=3）。
     const stateTail = t.status === 'run' ? ` · <span data-elapsed="${esc(t.id)}">${elapsed(t)}</span>` : t.status === 'done' ? ` · ${c.elapsed} ${t.minutes ?? '—'} ${c.minutes}` : t.status === 'fail' ? gateFail ? ` · ${esc(gt.badge.fail)}` : ` · exit=${t.exit}` : '';
     const stateLine = wtStateLine(t);
-    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${goAccept}${retry}${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2">${stateLine ? `<span class="dh-state ${stateLine.cls}">${taskMark(t)}${esc(stateLine.text)}</span>` : `<span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span>`}<span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
+    root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${goAccept}${retry}${rebase}${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2">${stateLine ? `<span class="dh-state ${stateLine.cls}">${taskMark(t)}${esc(stateLine.text)}</span>` : `<span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span>`}<span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
     // 流水线轨道（B3）：只给带 gate 字段的任务画；放在标题区下面、标签栏上面。
     const track = root.querySelector<HTMLElement>('.track-holder');
     if (track) track.innerHTML = t.worktree ? wtTrack(t, gateFile(gateResult)) : gateTrack(t, gateFile(gateResult));
@@ -457,6 +534,7 @@ function banners(t: Task) {
     const gate = gateState(t), gateFail = t.status === 'fail' && gate === 'fail';
     // 再派一次失败用页面横幅显示原因。
     const failed = redispatchError && redispatchErrorFor === t.id ? `<div class="banner fail" role="alert">${mark('fail')}<div class="rt"><b>${esc(c.redispatchFailed)}</b><span>${esc(redispatchError)}</span></div></div>` : '';
+    const rebaseFailed = rebaseError && rebaseErrorFor === t.id ? `<div class="banner fail" role="alert" data-rebase-error>${mark('fail')}<div class="rt"><b>${esc(rt.failed)}</b><span>${esc(rebaseError)}</span></div></div>` : '';
     // 门禁未过：横幅用核心写的 summary，主按钮是"查看门禁"；门禁进行中：提示横幅。
     const gateBanner = tab === 'gate' ? ''
         : gateFail
@@ -476,7 +554,7 @@ function banners(t: Task) {
         : '';
     // worktree 任务：排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回 / 准备失败的横幅放在详情顶部（门禁标签里已有自己的横幅，不显示）；冲突与准备失败的横幅取代通用的失败横幅。
     const wtb = tab !== 'gate' ? wtBanner(t, state.concurrency ?? 2) : null;
-    holder.innerHTML = repoBanner(t) + failed + (wtb?.html ?? '') + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
+    holder.innerHTML = repoBanner(t) + failed + rebaseFailed + (wtb?.html ?? '') + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
 }
 function tabs() {
     const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!, t = current();
@@ -792,6 +870,8 @@ root.addEventListener('click', async (e) => {
     }
     else if (d.multi === 'delete')
         openDelete(b);
+    else if (d.multi === 'archive')
+        openArchive(b);
     else if (d.filter) {
         filter = d.filter;
         list();
@@ -860,6 +940,11 @@ root.addEventListener('click', async (e) => {
         if (t)
             openRetrySheet({ t, trigger: b, failure: lastFailure(t, t.gateSummary ?? gateFile(gateResult)?.summary ?? ''), gate: gateEnabled(t) });
     }
+    else if (b.hasAttribute('data-rebase-run')) {
+        const t = current();
+        if (t)
+            void rebaseRun(t);
+    }
     else if (b.hasAttribute('data-think')) {
         think = !think;
         timeline?.invalidate();
@@ -895,7 +980,9 @@ root.addEventListener('click', async (e) => {
     }
     else if (b.hasAttribute('data-more')) {
         const t = current()!;
-        menu(b, [{ label: c.openRepo, run: () => void action('repo') }, ...(t.spec ? [{ label: c.openSpec, run: () => void action('spec') }] : []), { label: t.hasReport ? c.openReport : c.reportPending, disabled: !t.hasReport, run: () => void action('report') }, { label: c.openProgress, run: () => void action('progress') }, { label: c.copyName, run: () => void action('copy') }, { label: c.hide, separator: true, disabled: t.status === 'run' || !processOk(), run: () => void action('hide') }]);
+        menu(b, [{ label: c.openRepo, run: () => void action('repo') }, ...(t.spec ? [{ label: c.openSpec, run: () => void action('spec') }] : []), { label: t.hasReport ? c.openReport : c.reportPending, disabled: !t.hasReport, run: () => void action('report') }, { label: c.openProgress, run: () => void action('progress') }, { label: c.copyName, run: () => void action('copy') }, { label: c.hide, separator: true, disabled: t.status === 'run' || !processOk(), run: () => void action('hide') }, ...(t.status === 'run' ? [] : [{ label: c.deleteOne, disabled: !processOk(), run: () => openDelete(b, t) }])]);
+        // 菜单部件没有“危险项”选项（ui.ts 不在这次的清单里）：打开后给“删除任务…”补上危险样式类。
+        [...document.querySelectorAll<HTMLButtonElement>('.ctx button')].find(x => x.textContent === c.deleteOne)?.classList.add('danger');
     }
     // 门禁标签里的验收命令：只切换展开状态，不重建 DOM，焦点和滚动都不动。
     else if (d.gcmd !== undefined) {
@@ -916,6 +1003,17 @@ root.addEventListener('click', async (e) => {
         const t = state.tasks.find(x => x.id === d.setupReject);
         if (t)
             acceptView.rejectSheet(t, b);
+    }
+    // 已合并横幅的“撤销这次合并…”（确认框 → ar revert）与撤销冲突横幅的“复制命令”（在终端里手动处理）。
+    else if (d.revertOpen) {
+        const t = state.tasks.find(x => x.id === d.revertOpen);
+        if (t)
+            void revertTask(t, b, () => { if (current()?.id === t.id) header(); });
+    }
+    else if (d.revertCopy) {
+        const t = state.tasks.find(x => x.id === d.revertCopy);
+        if (t)
+            void window.dock.action(t.id, 'copy-text', revertCommand(t)).catch(notice);
     }
     else if (d.blameN) {
         const t = current(), body = root.querySelector<HTMLElement>('.tab-body');

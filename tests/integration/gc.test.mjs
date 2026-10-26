@@ -337,3 +337,60 @@ test('4 清理失败不中断其他项：被占用的 worktree 记进 errors，�
   assert.ok(!existsSync(locked.wt.dir));
   assert.ok(!f.branches().includes(locked.wt.branch), '合并过的分支也删掉');
 });
+
+test('5 项目文件夹已不存在：待验收、失败的任务留下的 worktree 列出并只删目录；仓库还在的、仓库已删但仍在进行中的不动；清单不变', async t => {
+  const f = fixture(t);
+  // 手写任务：仓库路径各自独立（删掉就没了），worktree 目录直接建在根下，不依赖 git。
+  const goneRepos = [];
+  const make = ({ name, entry, repoPath, events = [] }) => {
+    const id = `fab-${name}`;
+    const dir = path.join(f.wtRoot, entry);
+    write(path.join(dir, 'work.txt'), `${name}\n`);
+    const lines = [
+      { v: 2, event: 'start', id, repo: repoPath, name, spec: null, title: name, role: null, pid: process.pid, started: Date.now() - 60000, profile: 'fake', adapter: 'fake', worktree: true, base: 'b'.repeat(40), at: Date.now() },
+      { v: 1, event: 'worktree', id, dir, branch: `ar/${name}`, base: 'b'.repeat(40), at: Date.now() },
+      ...events.map(event => ({ v: 1, id, at: Date.now(), ...event })),
+    ];
+    appendFileSync(path.join(f.home, 'runs.jsonl'), lines.map(line => `${JSON.stringify(line)}\n`).join(''));
+    return dir;
+  };
+  const tempRepo = name => {
+    const dir = path.join(f.base, `仓库 ${name}`);
+    mkdirSync(dir);
+    goneRepos.push(dir);
+    return dir;
+  };
+  const awaiting = make({ name: 'pending', entry: 'aaaaa1-pending', repoPath: tempRepo('a'), events: [{ event: 'end', exit: 0, attempts: 1 }] });
+  const failed = make({ name: 'failed', entry: 'aaaaa2-failed', repoPath: tempRepo('b'), events: [{ event: 'end', exit: 1, attempts: 1 }] });
+  const stopped = make({ name: 'stopped', entry: 'aaaaa3-stopped', repoPath: tempRepo('c'), events: [{ event: 'interrupted' }] });
+  const runningGone = make({ name: 'running', entry: 'aaaaa4-running', repoPath: tempRepo('d') });
+  const repoAlive = make({ name: 'alive', entry: 'aaaaa5-alive', repoPath: f.repo, events: [{ event: 'end', exit: 0, attempts: 1 }] });
+  const foreign = path.join(f.wtRoot, 'not-ours');
+  write(path.join(foreign, 'keep.txt'), '别人的\n');
+  write(path.join(f.wtRoot, 'stray.txt'), '散落的文件\n');
+  // 删掉仓库目录（running 的那个也删）。
+  for (const repo of goneRepos) rmSync(repo, { recursive: true, force: true });
+
+  const manifest = readFileSync(path.join(f.home, 'runs.jsonl'), 'utf8');
+  const expected = sortBy([
+    { dir: awaiting, reason: 'repo-missing' },
+    { dir: failed, reason: 'repo-missing' },
+    { dir: stopped, reason: 'repo-missing' },
+  ], 'dir');
+
+  const dry = await f.gc(['--dry-run']);
+  assert.deepEqual(sortBy(dry.worktrees, 'dir'), expected);
+  assert.deepEqual(dry.errors, []);
+  for (const dir of [awaiting, failed, stopped, runningGone, repoAlive, foreign]) assert.ok(existsSync(dir), `dry-run 之后还在：${dir}`);
+
+  const text = await f.ar(['gc', '--dry-run']);
+  assert.equal(text.code, 0, text.stderr + text.stdout);
+  assert.ok(text.stdout.includes('项目文件夹已不存在'), text.stdout);
+
+  const done = await f.gc([]);
+  assert.deepEqual(sortBy(done.worktrees, 'dir'), expected);
+  assert.deepEqual(done.errors, []);
+  for (const dir of [awaiting, failed, stopped]) assert.ok(!existsSync(dir), `已删除：${dir}`);
+  for (const dir of [runningGone, repoAlive, foreign, path.join(f.wtRoot, 'stray.txt')]) assert.ok(existsSync(dir), `不动：${dir}`);
+  assert.equal(readFileSync(path.join(f.home, 'runs.jsonl'), 'utf8'), manifest, 'gc 不写清单');
+});

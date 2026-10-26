@@ -78,6 +78,8 @@ test('JSONL 型：say / think / cmd / turn / plan / file / tool 事件，汇报�
   assert.equal(raw.length, 11, 'raw.log 原样保存每一行（含被丢弃的）');
   assert.ok(raw.some(line => line.includes('mystery')) && raw.includes('this line is not json'));
   const progress = fs.readFileSync(path.join(s.dir('json 任务'), 'progress.log'), 'utf8');
+  assert.ok(events[7].name, '工具事件有 name');
+  assert.ok(progress.includes(`工具：${events[7].name} {"q":"x"}`), '进度里的工具行带工具名');
   for (const line of ['说：开始处理', '运行：git status --short', '新增文件：src/a.txt', '一轮结束（输入 120，输出 30 tokens）', '说：完成', '=== JSONL CLI 结束：exit=0'])
     assert.ok(progress.includes(line), `进度缺少：${line}`);
   const start = s.runs().find(r => r.event === 'start');

@@ -257,6 +257,39 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await type('[data-m=fields][data-i="1"]', 'command ← cmd · exit ← code');
         await wait('!document.querySelector("[data-c-act=save]").disabled', 'UI28 声明校验通过后保存可用');
         await check('UI28 校验通过：保存与测试并预览可用，底部说明是 gx.customNote(名称)', `!document.querySelector('[data-c-act=preview]').disabled && document.querySelector('.sheet-f .note').textContent === ${jsonStr(gx.customNote('custom'))} && [...document.querySelectorAll('[data-err]')].every(e => !e.classList.contains('on'))`);
+        // 示例填入（Stage07b T4d⑪）：标准输入、只读参数、密钥环境变量三个字段，空着时按 → 填入示例；Tab 仍只切换焦点。检查完把三个字段清回空，后面的检查沿用。
+        const exampleField = (selector: string) => `document.querySelector(${jsonStr(selector)}).closest('.fld')`;
+        const kbdShown = (selector: string) => `(() => { const i = document.querySelector(${jsonStr(selector)}), box = i.closest('.exw'), k = box.querySelector('.kbd'), host = box.querySelector('.inp, .argbox'), kr = k.getBoundingClientRect(), hr = host.getBoundingClientRect(); return getComputedStyle(k).display !== 'none' && k.textContent === ${jsonStr(gx.exampleKey)} && kr.left >= hr.left && kr.right <= hr.right && hr.right - kr.left <= parseFloat(getComputedStyle(host).paddingRight) + 1; })()`;
+        const kbdHidden = (selector: string) => `getComputedStyle(document.querySelector(${jsonStr(selector)}).closest('.exw').querySelector('.kbd')).display === 'none'`;
+        await check('UI28 示例：三个字段的说明末尾都是「 · 」加 gx.exampleHint', [['stdin', gx.stdinHelp, '[data-c=stdin]'], ['readOnly', gx.readOnlyArgsHelp, '[data-tag-in=readOnly]'], ['secretVar', gx.secretVarHelp, '[data-c=secretVar]']].map(([, help, sel]) => `${exampleField(sel)}.querySelector('.fl span').textContent === ${jsonStr(`${help} · ${gx.exampleHint}`)}`).join(' && '));
+        await check('UI28 示例：没聚焦时三个字段都不显示按键提示', ['[data-c=stdin]', '[data-tag-in=readOnly]', '[data-c=secretVar]'].map(kbdHidden).join(' && '));
+        await press('[data-c=stdin]');
+        await check('UI28 示例：标准输入聚焦且为空时，右侧显示按键提示 gx.exampleKey，且在输入框右侧内边距里（不挡文字）', `document.querySelector('[data-c=stdin]').value === '' && ${kbdShown('[data-c=stdin]')}`);
+        await key('Right');
+        await check('UI28 示例：空的标准输入按 → 填入 {prompt}，光标在末尾，按键提示消失，并触发和手动输入一样的更新（保存暂时禁用等重新校验）', `(() => { const i = document.querySelector('[data-c=stdin]'); return i.value === ${jsonStr(gx.examples.stdin)} && i.value === '{prompt}' && i.selectionStart === i.value.length && i.selectionEnd === i.value.length && document.activeElement === i && ${kbdHidden('[data-c=stdin]')} && document.querySelector('[data-c-act=save]').disabled; })()`);
+        await wait('!document.querySelector("[data-c-act=save]").disabled', 'UI28 示例填入后重新校验通过');
+        await key('Right');
+        await check('UI28 示例：标准输入不为空时再按 → 不再改变（保持默认的移动光标）', `document.querySelector('[data-c=stdin]').value === '{prompt}'`);
+        await key('Tab');
+        await check('UI28 示例：Tab 仍只切换焦点，到下一个控件，标准输入的值不变', `document.activeElement.matches('[data-seg=format]') && document.querySelector('[data-c=stdin]').value === '{prompt}'`);
+        await press('[data-c=stdin]');
+        for (let i = 0; i < '{prompt}'.length; i++) await key('Backspace');
+        await check('UI28 示例：退格清空标准输入后又为空，按键提示重新出现', `document.querySelector('[data-c=stdin]').value === '' && ${kbdShown('[data-c=stdin]')}`);
+        await press('[data-c=secretVar]');
+        await check('UI28 示例：密钥环境变量聚焦且为空时显示按键提示', `document.querySelector('[data-c=secretVar]').value === '' && ${kbdShown('[data-c=secretVar]')}`);
+        await key('Right');
+        await check('UI28 示例：空的密钥环境变量按 → 填入 EXAMPLE_API_KEY，光标在末尾', `(() => { const i = document.querySelector('[data-c=secretVar]'); return i.value === ${jsonStr(gx.examples.secretVar)} && i.value === 'EXAMPLE_API_KEY' && i.selectionStart === i.value.length && ${kbdHidden('[data-c=secretVar]')}; })()`);
+        for (let i = 0; i < 'EXAMPLE_API_KEY'.length; i++) await key('Backspace');
+        await check('UI28 示例：清空密钥环境变量', `document.querySelector('[data-c=secretVar]').value === ''`);
+        await press('[data-tag-in=readOnly]');
+        await check('UI28 示例：只读参数输入框聚焦且为空时显示按键提示', `document.querySelector('[data-tag-in=readOnly]').value === '' && ${kbdShown('[data-tag-in=readOnly]')}`);
+        await key('Right');
+        await check('UI28 示例：空的只读参数输入框按 → 只把 --read-only 填进输入框文字，还没有小方块', `document.querySelector('[data-tag-in=readOnly]').value === ${jsonStr(gx.examples.readOnly)} && document.querySelector('[data-tag-in=readOnly]').value === '--read-only' && document.querySelectorAll('.sheet .argbox')[1].querySelectorAll('.argchip').length === 0`);
+        await key('Enter');
+        await check('UI28 示例：回车后 --read-only 才成为小方块', `document.querySelectorAll('.sheet .argbox')[1].querySelectorAll('.argchip').length === 1 && document.querySelectorAll('.sheet .argbox')[1].querySelector('.argchip .mono').textContent === '--read-only'`);
+        await key('Backspace');
+        await check('UI28 示例：退格删掉只读参数的小方块，回到空状态', `document.querySelectorAll('.sheet .argbox')[1].querySelectorAll('.argchip').length === 0 && document.querySelector('[data-tag-in=readOnly]').value === ''`);
+        await wait('!document.querySelector("[data-c-act=save]").disabled', 'UI28 示例检查完成后重新校验通过');
         await shots('custom-form');
         // 2. 校验：参数模板里的 {bogus}。
         await type('[data-tag-in=args]', '{bogus}'); await key('Enter');
@@ -284,6 +317,7 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await press('[data-c-act=preview]');
         await wait('!!document.querySelector("[data-pv]")', 'UI28 失败预览结果', 60000);
         await check('UI28 测试并预览（115）：失败时右栏和失败横幅完整显示在模态框内，原始输出在左栏内折行', `(() => { const s = document.querySelector('.sheet').getBoundingClientRect(), last = document.querySelector('.pv2 > :last-child').getBoundingClientRect(), f = document.querySelector('[data-pv=fail]'), fr = f?.getBoundingClientRect(), raw = document.querySelector('[data-pv-raw]'); return !!f && last.right <= s.right && fr.right <= s.right && fr.left >= s.left && raw.scrollWidth <= raw.clientWidth + 1 && raw.textContent.includes('no-such-cli.mjs') && raw.textContent.length > 150; })()`);
+        await check('UI28 测试并预览（122）：失败原因是真正的报错行（Error: Cannot find module），不是 Node 版本那一行', `(() => { const t = document.querySelector('[data-pv=fail] div span').textContent.trim(); return t.startsWith('Error: Cannot find module') && !t.startsWith('Node.js v'); })()`);
         await shots('custom-preview-fail');
         await press('[data-c-act=edit]'); await wait('!!document.querySelector("[data-c=program]")');
         await press('[data-tag-in=args]'); await key('Backspace'); await key('Backspace');

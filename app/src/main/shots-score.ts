@@ -224,10 +224,10 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
         // 点击也能切换（鼠标）：第 2 次归因到任务说明再切回，验证两种输入都走同一条路径。
         await press('[data-sc-fail="2"] [data-blame-who=spec]');
         await wait(`document.querySelector('[data-sc-fail="2"] [role=radio][aria-checked=true]')?.dataset.blameWho === 'spec'`, 'UI26 点击把第 2 次归因切到任务说明');
-        await verify('UI26 点击第 2 次的"任务说明"：marks.json 写入第 2 次；第 3 次（reason gate）不算执行者的，核心重算后界面一致', async () => {
+        await verify('UI26 点击第 2 次的"任务说明"：marks.json 写入第 2 次；第 3 次（reason gate）和第 2 次的受保护路径都不算执行者的，核心重算后界面一致', async () => {
             assert.deepEqual(JSON.parse(await readFile(marks, 'utf8')), { v: 1, blame: { 2: 'spec' } });
             const second = await reportNow();
-            assert.equal(second.executor.score, base.executor.score + 15);
+            assert.equal(second.executor.score, base.executor.score + 30);
             compare(await dom(), second);
         });
         await press('[data-sc-fail="2"] [data-blame-who=worker]');

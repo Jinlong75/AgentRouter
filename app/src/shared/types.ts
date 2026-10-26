@@ -89,6 +89,8 @@ export interface WtInfo {
     setupFailed?: boolean;
     // mode 为 confirm 时是没有改动的确认（调研 / 审查类任务）：merge 为 null，没有合并提交。
     accepted?: { merge: string | null; mode: 'no-ff' | 'squash' | 'confirm'; by: string; at: number };
+    // 撤销合并（Stage07b 129）：accepted 之后的 reverted 事件；commit 是反向提交的完整 SHA。
+    reverted?: { commit: string; at: number; by: string };
     rejected?: { reason: string; keptBranch: boolean; by: string; at: number };
     // 最近一条 conflict 事件的冲突文件。
     conflictFiles?: string[];
@@ -323,6 +325,9 @@ export interface ProjectRow {
     git: boolean;
     initialized: boolean;
 }
+// 彻底清理已删除的项目：projects:purge-plan（ar projects purge --dry-run，另带 worktree 总大小 bytes）与 projects:purge 的结果。
+export interface ProjectPurgePlan { ok: true; listed: boolean; tasks: string[]; worktrees: { dir: string; reason: string }[]; slots: string[]; bytes: number }
+export interface ProjectPurgeResult { ok: true; removed: boolean; worktrees: number; slots: number; bytes: number; errors?: { kind: string; path: string; error: string }[] }
 // 核心报告的 git 版本（projects list / show 的顶层 git 字段）：ok 为 false 表示低于 2.40，null 表示未知。
 export interface GitVersionInfo { version: string | null; ok: boolean | null }
 export interface ProjectsList { ok: true; projects: ProjectRow[]; git?: GitVersionInfo }export interface ProjectShow {
@@ -335,9 +340,31 @@ export interface ProjectsList { ok: true; projects: ProjectRow[]; git?: GitVersi
     initialized: boolean;
     // 生效的 git 提交身份（仓库、全局、系统合起来）；非 git 仓库或读不到为 null。
     identity: { name: string | null; email: string | null } | null;
+    // 本机是否已有全局 user.name 和 user.email（git config --global）；决定提交身份弹窗默认写全局还是只写这个项目。
+    globalIdentity?: boolean;
     config: Record<string, unknown> | null;
     configError: string | null;
     lastTask: { name: string; started: number } | null;
+    // 远程状态（核心只读本地已有的远程跟踪分支，不联网）；非 git 仓库为 null。
+    remote?: ProjectRemote | null;
+}
+// 主分支与远程的关系（Stage07b 128）：projects show 的 remote 与 ar push --dry-run 的结果同形（后者多 branch、lastPush）。
+export type RemoteState = 'same' | 'ahead' | 'behind' | 'diverged' | 'noUpstream';
+export interface ProjectRemote {
+    name: string;
+    // ar push --dry-run 的结果里远程名叫 remote（projects show 里叫 name）。
+    remote?: string;
+    exists: boolean;
+    // 已去掉用户名与密码的地址。
+    url?: string;
+    ahead?: number | null;
+    behind?: number | null;
+    state?: RemoteState | null;
+    branch?: string;
+    // 最近一次成功推送的时间（毫秒时间戳）；只有 ar push --dry-run 才带。
+    lastPush?: number | null;
+    // 地址里带了用户名 / 令牌，核心拒绝推送与拉取。
+    credentialInUrl?: boolean;
 }
 // ar init 的改动项：只有 --dry-run 才带 content（完整内容）与 preview（要追加的部分）。
 export interface ProjectChange {
@@ -345,6 +372,17 @@ export interface ProjectChange {
     action: 'create' | 'update';
     content?: string;
     preview?: string;
+}
+// ar init --upgrade --dry-run 额外的两类计划项：角色文档与最新模板的差异（按行，只含有变化的段落和上下文）、项目配置缺少的顶层键。
+export interface RoleDiffLine { op: '+' | '-' | ' '; text: string }
+export interface UpgradeRoleDiff { path: string; action: 'roleDiff'; added: number; removed: number; diff: RoleDiffLine[]; truncated: boolean }
+export interface UpgradeConfigField { path: string; action: 'configField'; key: string; value: unknown }
+export type UpgradeItem = (ProjectChange & { action: 'create' | 'update' }) | UpgradeRoleDiff | UpgradeConfigField;
+// ar projects changes 的一项：主工作区里未提交的文件（重命名带旧路径 from）。
+export interface ProjectFileChange {
+    path: string;
+    kind: 'add' | 'update' | 'delete' | 'rename';
+    from?: string;
 }
 export interface SpecRow {
     file: string;

@@ -72,7 +72,16 @@ export async function processList(pid, platform = process.platform, timeout = PR
     const value = JSON.parse(stdout.trim() || '[]');
     return (Array.isArray(value) ? value : [value]).map(p => ({ ...p, command: p.command ?? '' }));
   }
-  const { stdout } = await run('ps', [...(pid === undefined ? ['-A'] : ['-p', String(pid)]), '-o', 'pid=,ppid=,stat=,lstart=,args='], { env: { ...process.env, LC_ALL: 'C' } });
+  let stdout;
+  try {
+    ({ stdout } = await executeFile('ps', [...(pid === undefined ? ['-A'] : ['-p', String(pid)]), '-o', 'pid=,ppid=,stat=,lstart=,args='], { ...options, env: { ...process.env, LC_ALL: 'C' } }));
+  } catch (error) {
+    // 按 pid 查询时，进程不存在 → ps 无输出、退出码 1：这是"没有这个进程"，不是查询失败（119）。
+    // 超时、ENOENT、其他退出码、有标准错误的情况照旧报错。
+    const empty = value => String(value ?? '').trim() === '';
+    if (pid !== undefined && !isTimeout(error) && error?.code === 1 && empty(error.stdout) && empty(error.stderr)) return [];
+    throw queryFailure(error, timeout);
+  }
   return stdout.split('\n').flatMap(line => {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/);
     if (!m || m[3].startsWith('Z')) return [];

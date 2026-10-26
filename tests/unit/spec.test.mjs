@@ -322,6 +322,7 @@ test('core/templates/spec.md 能被解析与校验', () => {
   assert.equal(spec.worker, 'auto');
   assert.ok(spec.allowed_paths.length > 0);
   assert.ok(spec.verify.length > 0);
+  assert.match(text, /\n## 受影响的已有测试\n/);
 });
 
 test('SPEC_TYPES 是协议里的七种类型', () => {

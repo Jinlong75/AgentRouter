@@ -8,7 +8,7 @@ import { git } from './git.mjs';
 import { readJson } from './json.mjs';
 import { readNeedsScope } from './needs-scope.mjs';
 import { readOutsideWrites } from './outside-writes.mjs';
-import { taskState } from './status.mjs';
+import { revertedOf, taskState } from './status.mjs';
 import { locateStart, reverseRows } from './wait.mjs';
 
 export const notSpecTask = '这个任务不是用任务说明派发的，没有评分';
@@ -147,11 +147,14 @@ function executorItems({ attempts, counts, blamed }) {
   const outside = new Set(), protectedPaths = new Set(), added = [];
   const listed = [];
   for (const item of attempts) {
-    const scope = item.gateFile?.scope;
-    for (const file of Array.isArray(scope?.outside) ? scope.outside : []) if (typeof file === 'string') outside.add(file);
-    for (const file of Array.isArray(scope?.protected) ? scope.protected : []) if (typeof file === 'string') protectedPaths.add(file);
-    for (const source of [readOutsideWrites(item.gateFile?.outsideWrites), readOutsideWrites(item.end?.outsideWrites)]) {
-      for (const entry of source?.added ?? []) if (!added.some(other => other.root === entry.root && other.name === entry.name)) added.push(entry);
+    // 被归因到任务说明或环境的那次尝试，越界、受保护路径、工作区外写入都不算执行者的。
+    if (!blamed.has(item.n)) {
+      const scope = item.gateFile?.scope;
+      for (const file of Array.isArray(scope?.outside) ? scope.outside : []) if (typeof file === 'string') outside.add(file);
+      for (const file of Array.isArray(scope?.protected) ? scope.protected : []) if (typeof file === 'string') protectedPaths.add(file);
+      for (const source of [readOutsideWrites(item.gateFile?.outsideWrites), readOutsideWrites(item.end?.outsideWrites)]) {
+        for (const entry of source?.added ?? []) if (!added.some(other => other.root === entry.root && other.name === entry.name)) added.push(entry);
+      }
     }
     const scopeList = readNeedsScope(item.end?.needsScope);
     if (scopeList) listed.push({ n: item.n, list: scopeList });
@@ -201,12 +204,14 @@ function leadItems({ start, rows, attempts, blamed, state, root, endAt }) {
   const edits = specEdits({ root, start, rows, endAt });
   const plain = start.worktree !== true;
   const pending = state === 'awaiting' || state === 'conflict';
+  const reverted = state === 'accepted' ? revertedOf([...rows].reverse()) : null;
   return [
     { key: 'specEdit', count: edits.count, detail: edits.detail },
     { key: 'specBlame', count: [...blamed.values()].filter(who => who === 'spec').length, detail: null },
     { key: 'manualRetry', count: attempts.filter(item => item.reason === 'manual').length, detail: null },
     { key: 'needsScope', count: attempts.some(item => readNeedsScope(item.end?.needsScope)) ? 1 : 0, detail: null },
-    { key: 'rejected', count: plain ? 0 : rows.some(row => row.event === 'rejected') ? 1 : 0, detail: plain ? noWorktreeNote : pending ? notYetAccepted : null },
+    // 撤销合并不改分，只在这一项的说明里注明（129）。
+    { key: 'rejected', count: plain ? 0 : rows.some(row => row.event === 'rejected') ? 1 : 0, detail: plain ? noWorktreeNote : pending ? notYetAccepted : reverted ? `已撤销（提交 ${reverted.commit.slice(0, 7)}）` : null },
     { key: 'conflict', count: plain ? 0 : rows.some(row => row.event === 'conflict') ? 1 : 0, detail: plain ? noWorktreeNote : null },
     { key: 'envBlame', count: envCount(blamed), detail: null },
   ];

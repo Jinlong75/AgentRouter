@@ -394,7 +394,27 @@ export async function captureSearch(h: Harness, registry: Registry, win: Browser
             assert.equal(again.worktrees.length + again.slots.length + again.sessions.length, 0);
             assert.ok(existsSync(awaitingDir));
         });
+
+        // 项目文件夹已不存在：一个待验收任务，仓库目录删掉后，它的 worktree 目录出现在清理确认框里，点清理后被删。
+        const goneRepo = path.join(fixtureRoot, 'gc-gone-repo'), goneDir = path.join(worktreeRoot, '0a1b2c-gc-repo-missing');
+        await mkdir(goneRepo, { recursive: true });
+        await mkdir(goneDir, { recursive: true });
+        await writeFile(path.join(goneDir, 'work.txt'), 'z'.repeat(20000));
+        await appendFile(manifest, rowsText('shots-gc-gone', goneDir, 'ar/gc-gone', [{ event: 'end', exit: 0, attempts: 1 }]).replace(JSON.stringify(repo), JSON.stringify(goneRepo)));
+        await rm(goneRepo, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        await press('[data-pref=gc-recheck]');
+        await wait(`!!document.querySelector('[data-gc-found]')`, 'UI07 重新检查发现“项目文件夹已不存在”的 worktree', 30000);
+        await press('[data-pref=gc]');
+        await wait('!!document.querySelector(".sheet [data-gc-item]")', 'UI07 清理确认框再次出现（项目文件夹已不存在）');
+        await check('UI07 清理确认框里有“项目文件夹已不存在”一项，名字是 worktree 目录名', `(() => { const items = [...document.querySelectorAll('.sheet [data-gc-item]')]; return items.length === 1 && items[0].querySelector('.lb').textContent === ${jsonStr(s6.gcReason['repo-missing'])} && items[0].querySelector('.val').textContent === ${jsonStr(base(goneDir))}; })()`);
+        await press('.sheet-btns button:last-of-type');
+        await wait('!!document.querySelector("[data-gc-done]")', 'UI07 清理“项目文件夹已不存在”的 worktree 后显示完成说明', 90000);
+        await verify('UI07 点“清理”后：项目文件夹已不存在的 worktree 目录已删除，待验收任务的 worktree 没动', () => {
+            assert.equal(existsSync(goneDir), false, '该 worktree 目录应已删除');
+            assert.ok(existsSync(awaitingDir));
+        });
     } finally {
+        await rm(path.join(worktreeRoot, '0a1b2c-gc-repo-missing'), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => null);
         // 收尾：撤掉清单里补的行（只去掉自己加的），删临时仓库与 worktree。
         const current = await readFile(manifest, 'utf8').catch(() => '');
         if (manifestBefore || current.includes('shots-gc-')) await writeFile(manifest, current.split('\n').filter(line => !line.includes('"shots-gc-')).join('\n'));

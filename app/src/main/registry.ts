@@ -136,6 +136,10 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                     w.accepted = { merge: typeof e.merge === 'string' ? e.merge : null, mode: e.mode === 'squash' || e.mode === 'confirm' ? e.mode : 'no-ff', by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
                     w.phase = 'accepted';
                 }
+                // 撤销合并（Stage07b 129）：只在 accepted 之后出现才算；状态仍是 accepted。
+                else if (e.event === 'reverted' && w.phase === 'accepted' && typeof e.commit === 'string') {
+                    w.reverted = { commit: e.commit, at: Number.isFinite(e.at) ? e.at : 0, by: typeof e.by === 'string' ? e.by : 'cli' };
+                }
                 else if (e.event === 'rejected' && ['awaiting', 'conflict', 'failed'].includes(w.phase)) {
                     w.rejected = { reason: typeof e.reason === 'string' ? e.reason : '', keptBranch: e.keptBranch === true, by: typeof e.by === 'string' ? e.by : 'cli', at: Number.isFinite(e.at) ? e.at : 0 };
                     w.phase = 'rejected';

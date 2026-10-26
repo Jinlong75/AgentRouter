@@ -1,7 +1,7 @@
 // ar spec：列出、读取、新建任务说明（新建任务页背后的核心命令）。
 // 全部结果走 cli.mjs 的约定：--json 时输出 { ok:true, … }；失败抛中文错误（由 cli.mjs 转成 { ok:false, error }），
 // 或直接返回 { ok:false, error, … }（spec new --commit 提交失败时文件保留）。
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, statSync, existsSync } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { requireGitIdentity } from './project.mjs';
@@ -16,7 +16,8 @@ const DEFAULT_CHECK_LIMIT = 20;
 // 错误提示沿用原有五种类型的顺序，后加的类型排在后面（已有测试断言了前半段）。
 const LEGACY_TYPES = ['code', 'test', 'fix', 'research', 'docs'];
 const TYPE_TEXT = [...LEGACY_TYPES.filter(t => SPEC_TYPES.includes(t)), ...SPEC_TYPES.filter(t => !LEGACY_TYPES.includes(t))].join('、');
-const usageSpec = '用法：ar spec list <项目路径> | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径> | check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]';
+const ARCHIVE_DIR = 'archive';
+const usageSpec = '用法：ar spec list <项目路径> [--include-archived] | archive <项目路径> <相对路径…> [--commit] | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径> | check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]';
 const usageCheck = '用法：ar spec check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>] [--json]';
 
 // 从标准输入读完整内容（spec new 的表单 JSON），与 cli.mjs 里读密钥的 readSecretValue 互不影响。
@@ -31,14 +32,27 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
   const [sub, ...args] = rest;
   switch (sub) {
     case 'list': {
-      if (args.length !== 1 || !args[0] || args[0].startsWith('--')) throw new Error(usageSpec);
-      const root = resolve(cwd, args[0]);
+      const includeArchived = args.includes('--include-archived');
+      const positional = args.filter(a => a !== '--include-archived');
+      if (positional.length !== 1 || !positional[0] || positional[0].startsWith('--')) throw new Error(usageSpec);
+      const root = resolve(cwd, positional[0]);
       const dir = specsDirPath(root);
-      const specs = listSpecs(root, dir, home);
+      const specs = listSpecs(root, dir, home, includeArchived);
+      const archivedCount = countArchived(dir);
       const text = specs.length
-        ? [`任务说明（${dir}）：`, ...specs.map(s => `  ${s.rel}  ${s.title}${s.dispatched ? `（已派发 ${s.dispatched} 次）` : ''}${s.error ? `（解析失败：${s.error}）` : ''}`)].join('\n')
+        ? [`任务说明（${dir}）：`, ...specs.map(s => `  ${s.rel}  ${s.title}${s.archived ? '（已归档）' : ''}${s.dispatched ? `（已派发 ${s.dispatched} 次）` : ''}${s.error ? `（解析失败：${s.error}）` : ''}`)].join('\n')
         : `还没有任务说明：${dir}`;
-      return { result: { ok: true, dir, specs }, text };
+      return { result: { ok: true, dir, specs, archivedCount }, text };
+    }
+    case 'archive': {
+      const commit = args.includes('--commit');
+      const positional = args.filter(a => a !== '--commit');
+      if (positional.length < 2 || positional.some(a => !a || a.startsWith('--'))) throw new Error(usageSpec);
+      const archived = archiveSpecs(resolve(cwd, positional[0]), positional.slice(1), { commit });
+      const text = archived.ok
+        ? `已归档 ${archived.moved.length} 份任务说明${archived.commit ? `（已提交 ${archived.commit}）` : ''}`
+        : `任务说明没有归档：${archived.error}`;
+      return { result: archived, text, code: archived.ok ? 0 : 1 };
     }
     case 'read': {
       if (args.length !== 2 || args.some(a => !a || a.startsWith('--'))) throw new Error(usageSpec);
@@ -130,7 +144,16 @@ function isInside(root, target) {
   return t === r || t.startsWith(r.endsWith(sep) ? r : r + sep);
 }
 
-function listSpecs(root, dir, home) {
+// 默认只列顶层；archive/ 是目录，本来就不在里面。includeArchived 时归档的排在后面，每项带 archived: true。
+function listSpecs(root, dir, home, includeArchived = false) {
+  const rows = listSpecsIn(root, dir, home);
+  return includeArchived ? [...rows, ...listSpecsIn(root, join(dir, ARCHIVE_DIR), home).map(row => ({ ...row, archived: true }))] : rows;
+}
+function countArchived(dir) {
+  try { return readdirSync(join(dir, ARCHIVE_DIR)).filter(f => f.endsWith('.md') && f !== 'README.md').length; } catch { return 0; }
+}
+
+function listSpecsIn(root, dir, home) {
   let names = [];
   try { names = readdirSync(dir); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const rows = [];
@@ -141,7 +164,7 @@ function listSpecs(root, dir, home) {
     try { mtime = statSync(full).mtimeMs; } catch { continue; }
     const rel = relative(root, full).split(sep).join('/');
     const info = readSpecMeta(full, file);
-    rows.push({ file, rel, id: /^(\d{3})-/.exec(file)?.[1] ?? null, title: info.title, mtime, dispatched: dispatchedCount(home, root, rel), error: info.error, warnings: info.warnings });
+    rows.push({ file, rel, id: /^(\d{3,})-/.exec(file)?.[1] ?? null, title: info.title, mtime, dispatched: dispatchedCount(home, root, rel), error: info.error, warnings: info.warnings });
   }
   rows.sort((a, b) => b.mtime - a.mtime);
   return rows;
@@ -214,6 +237,7 @@ function newSpec(root, form, { dryRun, commit, home }) {
     nonGoals: textField(form.nonGoals),
     refs: textField(form.refs),
     acceptance: textField(form.acceptance),
+    affectedTests: textField(form.affectedTests),
     questions: textField(form.questions),
     worker: typeof form.worker === 'string' && form.worker.trim() ? form.worker.trim() : 'auto',
   };
@@ -234,11 +258,15 @@ function stringArray(value) {
 }
 function textField(value) { return typeof value === 'string' ? value : ''; }
 
-// 编号取已有最大三位编号 + 1；独占创建（wx），同名已存在就换下一个编号重试，两个同时运行的 spec new 也不会撞号。
+// 编号取已有最大编号（开头三位及以上的数字加连字符）+ 1，不足三位补零、超过照写；
+// 独占创建（wx），同名已存在就换下一个编号重试，两个同时运行的 spec new 也不会撞号。
 function renderSpecFile(dir, fields, dryRun) {
-  let used = [];
-  try { used = readdirSync(dir).filter(f => /^(\d{3})-/.test(f)).map(f => Number(f.slice(0, 3))); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  // 归档里的说明（<specsDir>/archive/）编号也算，已归档的编号不重用。
+  const used = [];
+  for (const where of [dir, join(dir, ARCHIVE_DIR)]) {
+    try { used.push(...readdirSync(where).map(f => /^(\d{3,})-/.exec(f)?.[1]).filter(Boolean).map(Number)); }
+    catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+  }
   const max = used.length ? Math.max(...used) : 0;
   const slug = slugOf(fields.title);
   for (let attempt = 0; attempt < 20; attempt++) {
@@ -273,7 +301,7 @@ function renderSpec(id, f) {
     '---',
   ].join('\n');
   const parts = [
-    ['目标', f.goal], ['不做什么', f.nonGoals], ['参照', f.refs], ['验收标准', f.acceptance], ['汇报要回答的问题', f.questions],
+    ['目标', f.goal], ['不做什么', f.nonGoals], ['参照', f.refs], ['验收标准', f.acceptance], ['受影响的已有测试', f.affectedTests], ['汇报要回答的问题', f.questions],
   ].map(([name, text]) => section(name, text)).filter(Boolean);
   const body = parts.join('\n\n');
   return `${fm}\n\n${body ? `${body}\n` : ''}`;
@@ -335,10 +363,61 @@ function commitExistingSpec(root, rel) {
   return commitSpec(root, rel, id, title);
 }
 
+// ar spec archive：把任务说明目录顶层、已跟踪的 .md 用 git mv 移到 <specsDir>/archive/（只移动，不删除任何文件）。
+// 先校验全部路径再动手，任何一项不满足就整体拒绝、什么都不改；--commit 只提交这些路径的删除与新增。
+function archiveSpecs(root, rels, { commit }) {
+  root = resolve(root);
+  const dir = specsDirPath(root);
+  const archiveDir = join(dir, ARCHIVE_DIR);
+  const git = gitIn(root);
+  const plan = [];
+  for (const rel of rels) {
+    const abs = resolve(root, rel);
+    if (!isInside(root, abs)) throw new Error(`只能归档项目内的任务说明：${rel}`);
+    if (!abs.toLowerCase().endsWith('.md')) throw new Error(`只能归档 .md 文件：${rel}`);
+    const file = basename(abs);
+    const shown = relative(root, dir).split(sep).join('/') || '.';
+    if (norm(join(dir, file)) !== norm(abs)) {
+      throw new Error(isInside(archiveDir, abs) ? `已经在归档里：${rel}` : `只能归档任务说明目录（${shown}）顶层的文件：${rel}`);
+    }
+    if (file.toLowerCase() === 'readme.md') throw new Error(`不能归档 README.md：${rel}`);
+    const from = relative(root, abs).split(sep).join('/');
+    if (plan.some(item => norm(item.abs) === norm(abs))) throw new Error(`路径重复：${rel}`);
+    if (git(['ls-files', '--error-unmatch', '--', from]).status !== 0) throw new Error(`任务说明还没有被 git 跟踪，不能归档：${rel}`);
+    const target = join(archiveDir, file);
+    if (existsSync(target)) throw new Error(`归档里已经有同名文件：${relative(root, target).split(sep).join('/')}`);
+    plan.push({ abs, from, to: relative(root, target).split(sep).join('/'), target, file });
+  }
+  // 先查提交身份，再 git mv：缺身份时什么都没移动。
+  if (commit) {
+    try { requireGitIdentity(root); }
+    catch (error) { return { ok: false, error: error.message, ...(error.arCode ? { code: error.arCode } : {}) }; }
+  }
+  mkdirSync(archiveDir, { recursive: true });
+  const done = [];
+  for (const item of plan) {
+    const moved = git(['mv', '--', item.from, item.to]);
+    if (moved.status !== 0) {
+      // 中途失败：把已经移动的移回去，保持"什么都不改"。
+      for (const back of done.reverse()) git(['mv', '--', back.to, back.from]);
+      return { ok: false, error: `git mv 失败：${tail(moved.stderr)}` };
+    }
+    done.push(item);
+  }
+  const movedList = plan.map(({ from, to }) => ({ from, to }));
+  if (!commit) return { ok: true, moved: movedList };
+  const ids = plan.map(item => /^(\d{3,})-/.exec(item.file)?.[1]).filter(Boolean).sort();
+  const label = ids.length === plan.length ? (ids[0] === ids.at(-1) ? ids[0] : `${ids[0]}～${ids.at(-1)}`) : `${plan.length} 份`;
+  const paths = plan.flatMap(item => [item.from, item.to]);
+  const made = git(['commit', '-m', `[主导] 归档任务说明 ${label}`, '--', ...paths]);
+  if (made.status !== 0) return { ok: false, error: `git commit 失败：${tail(made.stderr)}`, moved: movedList };
+  return { ok: true, moved: movedList, commit: git(['rev-parse', '--short', 'HEAD']).stdout.trim() };
+}
+
 // 提交信息里的 id 与标题：用 v1 解析器从文件读，读不到时按文件名回退（与 spec list 的回退规则一致）。
 function specIdentity(full, file) {
   const stem = file.replace(/\.md$/i, '');
-  const fallbackId = /^(\d{3})-/.exec(file)?.[1] ?? stem;
+  const fallbackId = /^(\d{3,})-/.exec(file)?.[1] ?? stem;
   let text;
   try { text = readFileSync(full, 'utf8'); } catch { return { id: fallbackId, title: stem }; }
   try {

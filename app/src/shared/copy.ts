@@ -28,12 +28,21 @@ export const c = {
     // 批量删除任务（017）：列表进入选择模式，勾选已结束的任务后删除
     multiSelect: '选择', multiDone: '完成', multiCount: (n: number) => `已选 ${n} 个`, multiAll: '全选已结束的', multiNone: '取消全选',
     multiRunning: '进行中的任务不能删除', multiDelete: '删除…',
+    // Stage07b T4m：选择模式下把已结束任务的任务说明 git mv 到 docs/specs/archive/ 并提交（不删除任何文件；取新编号时归档里的也算）
+    multiArchive: '归档任务说明…', archiveTitle: (n: number) => `归档 ${n} 份任务说明？`,
+    archiveBody: (dir: string) => `移到 ${dir}/archive/ 并提交。新建任务说明时归档里的编号也算在内，编号继续递增；新建任务页的列表默认不显示归档，可以展开。`,
+    archiveNote: (n: number) => `git mv 这 ${n} 个文件，并提交`, archiveConfirm: '归档并提交', archived: (n: number, hash: string) => `已归档 ${n} 份任务说明（提交 ${hash}）`,
+    archiveNone: '选中的任务没有可以归档的任务说明（直接文字派发的任务、或说明已经归档）', archiveSkipped: (n: number) => `${n} 个任务没有可归档的说明，已跳过`,
     deleteTitle: (n: number) => `删除 ${n} 个任务？`, deleteBody: '从任务列表里移除。项目里的代码和提交不受影响。',
     deleteFiles: '同时删除项目里的任务记录文件', deleteFilesHelp: '删除这些任务在各项目 .agent-runs 里的记录目录（进度、汇报、原始输出），删除后无法恢复。旧版本导入的任务没有这类目录，会跳过。',
     deleteConfirm: '删除', deleted: (n: number) => `已删除 ${n} 个任务`, deleteLeft: (n: number) => `${n} 个记录目录没能删除（可能正被占用），任务已从列表移除`,
+    // Stage07b T4o：任务详情 ⋯ 菜单里删除这一个任务（确认框与批量删除同一个，说明与勾选项相同）
+    deleteOne: '删除任务…', deleteOneTitle: (name: string) => `删除任务「${name}」？`, deletedOne: (name: string) => `已删除「${name}」`,
+    // Stage07b T4d④：门禁失败或已中断的 worktree 任务，在原 worktree 合并主分支后用新基线重跑门禁（ar retry --rebase，不启动执行者）
+    rebaseRun: '合并主分支后重跑', rebaseRunTip: (base: string) => `在原 worktree 里合并 ${base} 的新提交，再用新基线重跑门禁；不启动执行者`, rebaseRunning: '正在开始…',
     // Stage07 116：任务的项目已从项目列表移除（第二轮走查发现：待验收任务卡死）
     projectGoneTitle: '这个任务的项目已从项目列表移除', projectGoneHelp: (path: string) => `项目 ${path} 不在项目列表里。驳回、确认和从列表删除照常可以做；要合并或重试，先把项目重新添加回来。`,
-    projectGoneReAdd: '重新添加项目', projectGoneMissing: (path: string) => `项目文件夹 ${path} 已经不存在：只能从列表删除这个任务。它的 worktree 还留在磁盘上，"清理"目前不处理这种情况；需要时在验收页用"⋯ → 打开 worktree 文件夹"找到它，确认不要了再手动删除。`,
+    projectGoneReAdd: '重新添加项目', projectGoneMissing: (path: string) => `项目文件夹 ${path} 已经不存在：只能从列表删除这个任务。它留下的 worktree 可以在设置 → 数据 → 清理里清掉。`,
     projectGoneBlocked: '项目已从项目列表移除，先重新添加项目',
     record: '记录名', route: '路由', effortDefault: '默认（不传参数）', spec: '任务说明', direct: '直接给的任务文字', role: '角色', noRole: '不指定', dispatcher: '派活方', agent: '干活方', executor: '执行者', model: '模型', effort: '推理强度', tier: '档位', sandbox: '沙箱', repo: '仓库', records: '记录文件', progress: '进度', events: '统一事件', raw: '原始输出', followCodex: '跟随 Codex', turn: '一轮结束', input: '输入', output: '输出',
     error: '操作没有完成，请重试', reportMissing: '汇报尚未生成或文件已不存在', fileMissing: '文件已不存在', earlier: '加载更早的进展', unknownHost: '其他派活方', appHost: 'AgentRouter（软件）',
@@ -171,6 +180,29 @@ export const pj = {
     fields: { baseBranch: '主分支', setup: '准备命令', verify: '验收命令', allowedPaths: '允许改动的路径', specsDir: '任务说明目录' } as Record<string, string>,
     fieldHelp: { baseBranch: '执行者从这里开始，验收后合并回这里', setup: '每行一条；建工作区后先运行', verify: '每行一条；任务说明没写验收命令时，门禁用这里的', allowedPaths: '每行一个通配符；任务说明没写时，门禁用这里的', specsDir: '' } as Record<string, string>,
     editTitle: '编辑项目配置', editNote: '写入 .agent-router/project.json（核心校验后原子写入）', save: '保存',
+    // Stage07b O4："编辑配置"底部默认折叠的"高级"区；留空表示删掉这个键、用默认值
+    advanced: '高级',
+    advFields: { maxRetries: '自动重试次数', mergeMode: '合并方式', verifyTimeoutMin: '验收命令超时', worktree: '用 worktree' } as Record<string, string>,
+    advHelp: { maxRetries: '0～5，留空等于 2（共 3 次）', mergeMode: '批准时怎样合并到主分支', verifyTimeoutMin: '每条验收命令最多运行多少分钟，1～240，留空等于 10', worktree: '关掉后新任务在主工作区里运行、门禁通过就算完成；进行中的任务不受影响' } as Record<string, string>,
+    mergeModes: { 'no-ff': '一个任务一个合并提交（--no-ff）', squash: '压成一个提交（--squash）' } as Record<string, string>,
+    advDefault: (value: string) => `默认 ${value}`,
+    // Stage07b O2（D34）：远程与推送。只推主分支、普通推送；落后时只快进拉取；分叉时不给按钮；凭据只用本机 git 已有的登录，软件不保存
+    remoteSec: '远程', remoteRefresh: '刷新', remoteRefreshing: '正在读取远程…',
+    remoteNone: '这个项目还没有远程仓库。要推送到 GitHub 等，先在终端里 git remote add origin <地址>，再回来刷新。',
+    remoteSame: (branch: string, remote: string) => `${branch} 与 ${remote} 同步`, remoteAhead: (branch: string, remote: string, n: number) => `${branch} 领先 ${remote} ${n} 个提交`,
+    remoteBehind: (branch: string, remote: string, n: number) => `${branch} 落后 ${remote} ${n} 个提交（只快进，不合并）`,
+    remoteDiverged: (ahead: number, behind: number) => `本机和远程各有新提交（领先 ${ahead} · 落后 ${behind}），需要在终端里合并或 rebase。软件不做合并。`,
+    remoteNoUpstream: (branch: string, remote: string) => `${remote} 上还没有 ${branch}，推送后会新建`,
+    remoteLastPush: (time: string) => `最后推送 ${time}`, remoteNotFetched: '还没有读取远程的最新状态，点"刷新"',
+    pushTo: (remote: string) => `推送到 ${remote}`, pushing: '正在推送…', pushed: (remote: string, range: string) => `已推送到 ${remote}：${range}`, pushNothing: (remote: string) => `已经和 ${remote} 一样，不用推送`,
+    pull: '拉取', pulling: '正在拉取…', pulled: (n: number) => `已拉取 ${n} 个提交`, pullNothing: '已经是最新的',
+    pushFailedTitle: '没有推送', pullFailedTitle: '没有拉取', pushFailedHelp: (reason: string) => `${reason}。什么都没有改动。`,
+    pushNoCredential: 'git 没有拿到可用的登录，软件不会弹登录窗口。在终端里手动 git push 一次完成登录（Git Credential Manager 会记住），之后软件就能推送',
+    pushCopyCommand: '复制命令', pushRetry: '重试',
+    // 编辑配置：推送三项（批准合并后自动推送、允许主导推送默认都关）
+    pushSec: '推送', pushRemote: '远程', pushRemoteHelp: '推送与拉取用哪个远程',
+    pushAfterAccept: '批准合并后自动推送', pushAfterAcceptHelp: '验收页的确认框里默认勾上；推送失败不影响合并',
+    pushAllowLead: '允许主导（AI）推送', pushAllowLeadHelp: '关闭时核心拒绝主导的推送与拉取；你在软件里点的不受影响',
     // 非 git 文件夹
     gitTitle: '这个文件夹不是 git 仓库', gitHelp: '任务要靠 git 记录改动、方便撤销。"初始化为 git 仓库"会运行 git init -b main，不改动已有文件。', gitInit: '初始化为 git 仓库',
     // 初始化：预览 → 确认写入 → 可选提交
@@ -178,7 +210,23 @@ export const pj = {
     planHelp: (added: number, updated: number) => `初始化会改动这些文件（新建 ${added} · 更新 ${updated}）。已有文件只追加带标记的段落，不覆盖。`,
     planNone: '项目已经是最新的约定，没有要改动的文件。', kindAdd: '新建', kindUpdate: '更新', notWritten: '还没有写入任何文件', confirmWrite: '确认写入', cancel: '取消',
     written: (n: number) => `已写入 ${n} 个文件`, writtenHelp: '项目已登记到 AgentRouter。要让执行者从干净的基线开始，建议把这些文件提交。',
+    // Stage07b O5：已初始化项目的"更新协作约定…"。缺失 / 更新的文件照旧；和最新模板不同的角色文档逐个"备份后替换 / 保留"（默认保留）；配置缺少的新字段默认不写
+    upgradeOpen: '更新协作约定…', upgradeTitle: (version: string) => `更新协作约定 · 对照 AgentRouter ${version} 的模板`,
+    upgradeFilesSec: '要补上或更新的文件', upgradeRolesSec: '角色文档（你改过的内容会被替换；替换前备份到 .agent-router/backup/）',
+    roleDiffTag: '和最新模板不同', roleLines: (added: number, removed: number) => `+${added} −${removed} 行`, roleReplace: '备份后替换', roleKeep: '保留',
+    upgradeFieldsSec: '项目配置缺少的新字段（默认不写）',
+    upgradeFieldHelp: { worktree: '打开后新任务在独立的 worktree 里运行、门禁通过后要验收；进行中的任务不受影响', setup: '准备命令：新建 worktree 后先运行，例如 npm ci', verify: '验收命令：任务说明没写验收命令时门禁用这里的', allowedPaths: '允许改动的路径：任务说明没写时门禁用这里的', specsDir: '任务说明目录', routing: '这个项目自己的路由规则' } as Record<string, string>,
+    upgradeNote: (files: number, backups: number) => backups ? `会写入 ${files} 个文件（备份 ${backups} 个），还没有写入任何文件` : `会写入 ${files} 个文件，还没有写入任何文件`,
+    upgradeDone: (files: number, backups: number) => backups ? `已写入 ${files} 个文件，备份了 ${backups} 个` : `已写入 ${files} 个文件`,
     missing: '文件夹不存在', missingTitle: '项目文件夹不存在', missingHelp: '文件夹可能已被移动或删除。可以从更多菜单里移除这个项目，再重新添加。', noRecent: '这个项目还没有任务',
+    // Stage07b T4m（D44）：项目文件夹已被用户删掉时"彻底清理这个项目"——只清 AgentRouter 自己的记录，不删用户的任何文件
+    goneTag: '文件夹已不存在', goneTitle: '项目文件夹已不存在',
+    goneHelp: (path: string, tasks: number) => `${path} 找不到了（被删除或移走）。它的 ${tasks} 个任务还在任务列表里，残留的 worktree 可能还在磁盘上。如果是移走了，重新添加新位置即可；不要了就彻底清理。`,
+    purgeOpen: '彻底清理这个项目…', purgeTitle: (name: string) => `彻底清理「${name}」？`,
+    purgeLead: '只清理 AgentRouter 自己的记录。项目文件夹已经不存在，AgentRouter 不会删除你的任何文件。',
+    purgeList: '从项目列表移除', purgeTasks: (n: number) => `从任务列表删除它的 ${n} 个任务`, purgeTasksHelp: '任务记录文件随项目文件夹一起已经不在了',
+    purgeWorktrees: (n: number, size: string) => `清理残留的 worktree 与并发名额（${n} 个，约 ${size}）`, purgeWorktreesHelp: 'worktree 根目录下 AgentRouter 自己建的目录',
+    purgeNote: '清理后在同一位置新建的项目从 001 开始编号', purgeConfirm: '彻底清理', purged: (name: string) => `已彻底清理「${name}」`,
     // git 提交身份（user.name / user.email）：本机设置，不需要登录 GitHub
     identityLabel: '提交身份', identityMissing: '未设置',
     identityTitle: '还没有设置 git 提交身份', identityHelp: '提交初始化文件、任务说明，以及执行者提交改动，都需要 git 的用户名和邮箱。只在本机设置，不需要登录 GitHub。',
@@ -190,6 +238,18 @@ export const pj = {
     gitOldTitle: (version: string) => `git 版本太旧：${version}`,
     gitOldHelp: '用 worktree 的任务需要 git 2.40 或更新，这个项目的任务现在派发不了；不用 worktree 的任务不受影响。到 git-scm.com 下载新版，装好后重新打开 AgentRouter。',
     commitNote: (n: number) => `git commit -m "[主导] 接入 AgentRouter" -- 这 ${n} 个文件`, commit: '提交这些文件', committed: (hash: string) => `已提交 ${hash}`,
+    // Stage07b O1（D35）：不用命令行的提交。项目页状态行"N 个文件未提交"旁的按钮与提交弹窗；只 git add 勾选的文件
+    commitOpen: '提交…', commitTitle: (n: number) => `提交 ${n} 个文件`, commitPicked: (k: number, n: number) => `${k} / ${n} 个文件`,
+    commitAll: '全选', commitKinds: { add: '新增', update: '修改', delete: '删除', rename: '重命名' } as Record<string, string>,
+    commitMessage: '提交说明', commitMessageHelp: '一句话说清这次改了什么', commitMessagePh: '例如：补充 README 的安装步骤', commitMessageRequired: '请填写提交说明',
+    commitDo: (n: number) => `提交 ${n} 个文件`, commitNonePicked: '至少勾选一个文件',
+    commitIdentity: (name: string, email: string, global: boolean) => `提交身份：${name} <${email}>（${global ? '全局' : '只用于这个项目'}）`,
+    commitDone: (hash: string, n: number) => `已提交 ${hash}（${n} 个文件）`, commitNothing: '没有未提交的文件', commitFailed: '没有提交',
+    // 本机还没有全局身份时，提交身份弹窗默认"本机所有项目（全局）"，并在上面说明一句
+    identityGlobalLead: '本机还没有全局身份。设一次以后，所有项目都用它，不再问。',
+    // 初始化：项目还没有任何提交时，把已有的文件一起放进第一个提交（默认勾上）
+    initWithExisting: (n: number, files: string) => `把已有的文件一起放进第一个提交（${n} 个：${files}）`,
+    initWithExistingHelp: '遵守 .gitignore；不勾时只提交约定文件，已有文件留在"未提交"，第一次批准合并会被拒绝',
 };
 
 // Stage03 新建任务页
@@ -198,6 +258,7 @@ export const nt = {
     noProject: '先添加一个项目', noProjectHelp: '任务要在某个 git 项目里运行。添加项目后，这里可以选任务说明和执行者派发。', addProject: '添加项目',
     project: '项目', source: '来源', sources: { existing: '选择已有任务说明', new: '新建任务说明', text: '直接写任务文字' } as Record<string, string>,
     specs: '任务说明', specsHelp: (dir: string) => `列出 ${dir} 下的说明，最新的在上面`, specsEmpty: '还没有任务说明。改用"新建任务说明"写一份。',
+    specsArchived: (n: number) => `显示已归档的 ${n} 份`, specsArchivedHide: '收起已归档的', specsArchivedTag: '已归档',
     dispatched: (n: number) => n ? `已派发 ${n} 次` : '未派发',
     text: '任务文字', textHelp: '直接交给执行者，不生成任务说明文件；适合一次性的小事',
     titleField: '标题', titleHelp: '会成为文件名：NNN-标题.md', goal: '目标', goalHelp: '做完后是什么样子', type: '类型', types: ['code', 'test', 'fix', 'research', 'docs'],
@@ -323,7 +384,15 @@ export const wt = {
     setupFailTitle: '准备命令失败，执行者没有启动', setupFailHelp: 'worktree 保留着供排查。修好项目配置里的准备命令后点"重试"会重跑准备命令；不要这个任务了就点"驳回…"，删除 worktree 与分支。', setupFailReject: '驳回…',
     awaitingTitle: '待验收', awaitingHelp: (base: string) => `门禁通过。改动在这个任务自己的分支里，还没有合并到 ${base}；批准后合并，驳回则丢弃。`, awaitingRow: '门禁通过 · 进入待验收',
     conflictTitle: '合并冲突，没有合并', conflictHelp: (base: string, files: number) => `批准时和 ${base} 上的新提交冲突（${files} 个文件），已撤回这次合并，${base} 没有变化。`,
-    acceptedTitle: (base: string) => `已合并到 ${base}`, acceptedHelp: (sha: string, time: string, by: string, mode: string) => `合并提交 ${sha}（${time}，${by}批准）；worktree 与分支已删除。撤销整个任务：${mode === 'squash' ? 'git revert' : 'git revert -m 1'} ${sha}`,
+    acceptedTitle: (base: string) => `已合并到 ${base}`, acceptedHelp: (sha: string, time: string, by: string, _mode: string) => `合并提交 ${sha}（${time}，${by}批准）；worktree 与分支已删除。`,
+    // Stage07b O3（D36）：已合并任务的"撤销这次合并…"（git revert，只追加反向提交、不改历史）
+    revertOpen: '撤销这次合并…', revertTitle: (name: string) => `撤销「${name}」？`,
+    revertBody: (base: string) => `会在 ${base} 上新建一个提交，把这次合并的改动反向撤回；历史不会被改写，以后还可以再撤销这个撤销。开启了"合并后推送"也不会自动推送。`,
+    revertConfirm: '撤销', reverting: '正在撤销…', revertedToast: (name: string, sha: string) => `已撤销「${name}」：反向提交 ${sha}`,
+    revertedTitle: '已合并 · 已撤销', revertedHelp: (merge: string, sha: string, time: string, by: string) => `合并提交 ${merge} 的改动已被反向提交 ${sha}（${time}，${by}撤销）撤回。历史没有改写；要恢复，可以在终端里撤销这个撤销。`,
+    revertedState: (sha: string, time: string) => `已合并 · 已撤销（提交 ${sha}，${time}）`,
+    revertConflictTitle: '没有撤销：和之后的改动冲突', revertConflictHelp: (base: string, files: string[]) => `合并之后 ${files.join('、')} 又被改过，反向提交会冲突，已放弃（git revert --abort），${base} 没有变化。需要在终端里手动处理。`,
+    revertFailedTitle: '没有撤销', revertFailedHelp: (reason: string) => `${reason}。什么都没有改动。`,
     acceptedCleanup: 'worktree 或分支没能删除，留给"清理"处理；合并结果不受影响。',
     rejectedTitle: '已驳回', rejectedHelp: (reason: string, time: string, by: string, kept: string | null) => `${reason}（${time}，${by}驳回）。worktree 已删除${kept ? `，分支 ${kept} 保留` : '，分支已删除'}。`,
     goAccept: '去验收',
@@ -336,14 +405,16 @@ export const wt = {
     moreTip: '更多：打开 worktree、复制分支名', openWorktree: '打开 worktree 文件夹', copyBranch: '复制分支名',
     baseToHead: (base: string, from: string, to: string) => `${base} ${from} → ${to}`,
     specBox: '任务说明', specAllowed: '允许改动', specVerify: '验收命令', specAll: '全部文件', specNone: '没有',
+    // Stage07b T4d⑦：只读任务（调研 / 审查，或 read_only: true）的“允许改动”：门禁按不允许任何改动处理
+    specReadOnly: '只读：不允许改动',
     // 改动标签（ar diff --json）
     diffHead: (files: number, add: number, del: number) => `${files} 个文件 · +${add} −${del}`, diffOpen: '在 worktree 打开',
     diffStatus: { A: '新增', M: '修改', D: '删除', R: '重命名' } as Record<string, string>, diffRenamed: (from: string) => `从 ${from} 重命名`,
     diffBinary: '二进制文件，不显示内容', diffTruncated: '这个文件的改动太长，只显示前 200 KB', diffAllTruncated: '改动总量超过 2 MB，后面的文件只列出名字',
     diffLoading: '正在读取改动…', diffNone: '没有改动', diffGone: '改动已不可查：worktree 与分支都已删除',
     // 底部操作栏
-    noteApprove: (base: string) => `批准：在 ${base} 上新建一个合并提交（--no-ff），然后删除 worktree 与分支；可以用 git revert -m 1 撤销整个任务`,
-    noteApproveSquash: (base: string) => `批准：把改动压成一个提交放到 ${base} 上（--squash），然后删除 worktree 与分支；可以用 git revert 撤销这个提交`,
+    noteApprove: (base: string) => `批准：在 ${base} 上新建一个合并提交（--no-ff），然后删除 worktree 与分支；以后可以在任务详情里撤销这次合并`,
+    noteApproveSquash: (base: string) => `批准：把改动压成一个提交放到 ${base} 上（--squash），然后删除 worktree 与分支；以后可以在任务详情里撤销这次合并`,
     noteConflict: '解决冲突在同一个 worktree 里进行，不占自动重试的次数',
     reject: '驳回…', retry: '重试…', approve: '批准并合并', resolve: '解决冲突并重试', resolving: '正在开始…',
     // Stage07 T6：调研类任务（只读运行、没有提交）门禁通过后的"确认"：不合并，只删除 worktree 与分支（界面稿场景"调研·确认"）
@@ -358,7 +429,11 @@ export const wt = {
     approving: '正在合并…',
     mergedToast: (name: string, base: string, from: string, to: string) => `已合并「${name}」到 ${base}：${from} → ${to}`, undoHelp: '撤销说明', undoText: (sha: string, mode: string) => `${mode === 'squash' ? 'git revert' : 'git revert -m 1'} ${sha}`,
     // 不能合并（核心拒绝，什么都没改）：标题 + 核心返回的原文
-    blockedTitle: '没有合并', blockedHelp: (reason: string) => `${reason}。什么都没有改动。`, copyCommand: '复制命令',
+    blockedTitle: '没有合并', blockedHelp: (reason: string) => `${reason}。什么都没有改动。`, goCommit: '去提交', copyCommand: '复制命令',
+    // Stage07b O2：批准确认框里的"合并后推送"（只在项目有远程时出现），推送失败不影响合并
+    approvePush: (remote: string) => `合并后推送到 ${remote}`, approvePushHelp: '默认值来自项目配置"批准合并后自动推送"；这里改只影响这一次',
+    mergedPushFailed: (name: string, base: string, sha: string, reason: string) => `已合并「${name}」到 ${base}（${sha}），推送失败：${reason}。可以在项目页重试推送`,
+    mergedPushed: (name: string, base: string, remote: string) => `已合并「${name}」到 ${base}，并推送到 ${remote}`, goProject: '去项目页',
     // 合并冲突（ar accept 退出码 4）：验收页横幅
     conflictPageHelp: (base: string, files: string[]) => `和 ${base} 上的新提交冲突，已撤回这次合并，${base} 没有变化。冲突的文件：${files.join('、')}。"解决冲突并重试"会在 worktree 里合并 ${base}：没有冲突就重新跑门禁；有冲突就让执行者解决，再跑门禁，之后回到这里。`,
     // 驳回弹窗
@@ -390,13 +465,13 @@ export const s6 = {
     parallelSec: '并行', parallelLead: '用 worktree 模式的项目，每个任务在自己的工作区里运行，可以同时进行。',
     concurrency: '同时运行的任务', concurrencyHelp: '超出时排队，轮到时自动开始；门禁同一时间只跑一个。不用 worktree 的项目不受这个限制。',
     // 设置页"数据"里的"清理"（ar gc）
-    gc: '清理', gcHelp: (days: number) => `已合并、已驳回任务没删掉的 worktree，和超过 ${days} 天的执行者会话记录。`,
+    gc: '清理', gcHelp: (days: number) => `已合并、已驳回任务没删掉的 worktree，项目文件夹已经不存在的任务留下的 worktree，和超过 ${days} 天的执行者会话记录。`,
     gcIdle: '软件启动时检查，不会自动删除。没有可清理的内容。', gcFound: (n: number, size: string) => `发现 ${n} 项可以清理，约 ${size}`,
     gcChecking: '正在检查…', gcCheckFailed: (error: string) => `没能检查：${error}`,
     gcButton: '清理…', gcRecheck: '重新检查',
     gcTitle: (n: number) => `清理 ${n} 项？`,
     gcLead: (size: string) => `会删除下面这些 worktree 与会话记录，约 ${size}。正在运行和待验收的任务不受影响；项目主工作区、任务记录（.agent-runs）不动。`,
-    gcReason: { accepted: '已合并，没删掉', rejected: '已驳回，没删掉', 'unknown-task': '任务记录已找不到', prunable: 'git 记录里的目录已不在', slot: '占用者已退出的名额' } as Record<string, string>,
+    gcReason: { accepted: '已合并，没删掉', rejected: '已驳回，没删掉', 'unknown-task': '任务记录已找不到', prunable: 'git 记录里的目录已不在', 'repo-missing': '项目文件夹已不存在', slot: '占用者已退出的名额' } as Record<string, string>,
     gcSessionReason: (days: number) => `超过 ${days} 天的会话记录`,
     gcSession: (worker: string, date: string) => `${worker} · ${date}`,
     gcConfirm: '清理', gcRunning: '正在清理…',
@@ -453,6 +528,9 @@ export const gx = {
     argsTpl: '参数模板', argsTplHelp: '任务指令用 {prompt}（直接作参数）或 {promptFile}（写进临时文件再传路径；指令长、或程序是 .cmd 时用它）',
     argAdd: '输入后回车', argRemove: (arg: string) => `删除参数 ${arg}`, insert: '插入：',
     stdin: '标准输入', stdinHelp: '不需要时留空', stdinPh: '例如 {prompt}',
+    // Stage07b T4d⑪：空输入框里的灰色示例按 → 键填入（不占用 Tab）；字段说明末尾加一句提示，输入框聚焦且为空时右侧显示按键提示
+    examples: { stdin: '{prompt}', readOnly: '--read-only', secretVar: 'EXAMPLE_API_KEY' } as Record<string, string>,
+    exampleHint: '空着时按 → 填入示例', exampleKey: '→ 填入',
     outFormat: '输出格式', formats: { text: '文本', jsonl: 'JSONL', 'stream-json': 'Claude Code 风格' } as Record<string, string>,
     mapping: '事件映射', mappingHelp: 'JSONL 每一行按顺序找第一条符合的规则；都不符合的行丢弃（原样保存在 raw.log）', mapAdd: '添加一条', mapRemove: (n: number) => `删除第 ${n} 条映射`,
     mapWhen: '条件', mapKind: '事件', mapFields: '字段',

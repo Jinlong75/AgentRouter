@@ -93,6 +93,35 @@ test('projects show：dirty 忽略 .agent-runs/', t => {
   assert.equal(show.dirty, 1, '.agent-runs/ 不算 dirty');
 });
 
+// Stage07b 126：高级四项。类型正确、其余字段不变、非法值一个字节不改、留空删键。
+test('projects config 高级四项：合法值类型、非法值不改文件、留空删键', t => {
+  const f = fixture(t); assert.equal(f.git('init', '-q').status, 0);
+  assert.equal(f.ar(['init']).status, 0);
+  const before = JSON.parse(f.read('.agent-router/project.json'));
+  const wrote = JSON.parse(f.ar(['projects', 'config', f.repo, 'maxRetries=3', 'mergeMode=squash', 'verifyTimeoutMin=30', 'worktree=false', '--json']).stdout);
+  assert.equal(wrote.ok, true);
+  assert.deepEqual({ r: wrote.config.maxRetries, m: wrote.config.mergeMode, t: wrote.config.verifyTimeoutMin, w: wrote.config.worktree }, { r: 3, m: 'squash', t: 30, w: false });
+  const onDisk = JSON.parse(f.read('.agent-router/project.json'));
+  assert.equal(typeof onDisk.maxRetries, 'number'); assert.equal(typeof onDisk.verifyTimeoutMin, 'number'); assert.equal(onDisk.worktree, false);
+  // 模板里可能已有这四个键中的某个；其余字段必须不变。
+  const adv = ['maxRetries', 'mergeMode', 'verifyTimeoutMin', 'worktree'];
+  for (const k of Object.keys(before).filter(k => !adv.includes(k))) assert.deepEqual(onDisk[k], before[k], `${k} 不变`);
+  // 边界值
+  const edge = JSON.parse(f.ar(['projects', 'config', f.repo, 'maxRetries=0', 'verifyTimeoutMin=240', 'mergeMode=no-ff', 'worktree=true', '--json']).stdout);
+  assert.deepEqual({ r: edge.config.maxRetries, t: edge.config.verifyTimeoutMin, m: edge.config.mergeMode, w: edge.config.worktree }, { r: 0, t: 240, m: 'no-ff', w: true });
+  const snapshot = f.read('.agent-router/project.json');
+  for (const bad of ['maxRetries=6', 'maxRetries=-1', 'maxRetries=1.5', 'maxRetries=abc', 'mergeMode=rebase', 'verifyTimeoutMin=0', 'verifyTimeoutMin=241', 'worktree=yes']) {
+    const r = f.ar(['projects', 'config', f.repo, 'baseBranch=other', bad, '--json']);
+    assert.notEqual(r.status, 0, bad);
+    assert.ok(JSON.parse(r.stdout).error.length > 0, bad);
+    assert.equal(f.read('.agent-router/project.json'), snapshot, `${bad} 不修改文件`);
+  }
+  const cleared = JSON.parse(f.ar(['projects', 'config', f.repo, 'maxRetries=', 'mergeMode=', 'verifyTimeoutMin=', 'worktree=', '--json']).stdout);
+  for (const k of ['maxRetries', 'mergeMode', 'verifyTimeoutMin', 'worktree']) assert.equal(k in cleared.config, false, `${k} 已删掉`);
+  const rest = Object.fromEntries(Object.entries(before).filter(([k]) => !adv.includes(k)));
+  assert.deepEqual(JSON.parse(f.read('.agent-router/project.json')), rest, '只删了这四个键，其余字段不变');
+});
+
 test('projects config：读、合法写入、各种非法值不改文件；未初始化报错', t => {
   const f = fixture(t); assert.equal(f.git('init', '-q').status, 0);
   assert.equal(f.ar(['init']).status, 0);

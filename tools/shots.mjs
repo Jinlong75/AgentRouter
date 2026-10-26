@@ -3,7 +3,7 @@ import electron from 'electron';
 import { preferenceFixture } from './demo/preferences.mjs';
 import path from 'node:path';
 import { demo } from './demo/index.mjs';
-import { mkdtemp, readdir, readFile, rm, stat, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -74,6 +74,7 @@ async function announceFailures() {
 }
 
 const fixture=await demo();
+let reposAside='',resetTemp='';
 try {
   const out=path.resolve('app/dist/shots');
   await rm(failuresDir,{recursive:true,force:true});
@@ -185,7 +186,36 @@ try {
     await unlink(path.join(out,'reset-evidence.json')).catch(e=>{if(e.code!=='ENOENT')throw e;});
     // 清理进程拒绝删除"包含用户主目录"的路径；隔离夹具默认把 USERPROFILE 放在公共目录里，
     // 所以这一轮把用户主目录挪到公共目录旁边（其他隔离项不变），让重置走与真实安装相同的形状。
-    const resetIsolated={...isolated,USERPROFILE:fixture.home+'-user',HOME:fixture.home+'-user'};
+    // 135：公共目录里界面检查自己建的测试仓库（shots-*）在真实安装里不存在，且 git 对象文件只读、几千个文件
+    // 逐个删会超过清理进程的 30 秒预算。重置前把它们同盘 rename 到公共目录旁边，让重置走与真实安装相同的形状。
+    const countFiles=async dir=>{
+      let n=0;
+      for(const item of await readdir(dir,{withFileTypes:true})) n+=item.isDirectory()?await countFiles(path.join(dir,item.name)):1;
+      return n;
+    };
+    const reportHome=async label=>{
+      const rows=[];
+      for(const item of await readdir(fixture.home,{withFileTypes:true})) rows.push([item.name,item.isDirectory()?await countFiles(path.join(fixture.home,item.name)):1]);
+      rows.sort((a,b)=>b[1]-a[1]);
+      console.log(`公共目录文件数（${label}）：共 ${rows.reduce((s,r)=>s+r[1],0)}；顶层前 10：${rows.slice(0,10).map(r=>`${r[0]}=${r[1]}`).join(', ')}`);
+    };
+    reposAside=fixture.home+'-repos';
+    resetTemp=fixture.home+'-tmp';
+    await reportHome('移出前');
+    await mkdir(reposAside,{recursive:true});
+    const moved=[];
+    for(const item of await readdir(fixture.home,{withFileTypes:true})) {
+      if(!item.isDirectory()||!item.name.startsWith('shots-')) continue;
+      await rename(path.join(fixture.home,item.name),path.join(reposAside,item.name));
+      moved.push(item.name);
+    }
+    console.log(`重置前移出界面检查自建的测试仓库目录：${moved.join(', ')||'（无）'}`);
+    await reportHome('移出后');
+    // 重置这次启动的临时目录放在公共目录外面：清理进程的残留标记写在它自己的 os.tmpdir() 里，
+    // 放在被删的目录下就看不到（或被一起删掉）。
+    await mkdir(resetTemp,{recursive:true});
+    const resetIsolated={...isolated,USERPROFILE:fixture.home+'-user',HOME:fixture.home+'-user',TEMP:resetTemp,TMP:resetTemp};
+    if('TMPDIR' in isolated) resetIsolated.TMPDIR=resetTemp;
     const resetEnv={...env,AR_SHOTS_RESET:'1',[isolatedEnvKey]:JSON.stringify(isolationOverrides(real,resetIsolated))};
     delete resetEnv.AR_PACKAGED_VERIFY;
     const resetChild=spawn(electron,['.'],{env:resetEnv,stdio:'inherit',windowsHide:true,shell:false});
@@ -204,7 +234,7 @@ try {
     for(const until=performance.now()+40000;existsSync(fixture.home)&&performance.now()<until;) await delay(100);
     if(existsSync(fixture.home)) {
       // 失败时把清理进程留下的诊断（原因、尝试次数、仍未删掉的路径）打出来，方便定位被谁占着。
-      const leftover=path.join(fixture.home,'tmp','agent-router-reset-leftover.json');
+      const leftover=path.join(resetTemp,'agent-router-reset-leftover.json');
       console.log(`诊断：公共目录仍在。残留标记：${existsSync(leftover)?await readFile(leftover,'utf8'):'（没有）'}`);
     }
     assert.equal(existsSync(fixture.home),false,'软件退出后隔离公共目录应被删除');
@@ -215,4 +245,9 @@ try {
     },null,2));
     console.log('Windows 实测：软件退出后在隔离公共目录上完成真实重置——公共目录删除、勾选的密钥与技能删除、未勾选的不动。');
   }
-} finally {await fixture.close();await announceFailures();}
+} finally {
+  await fixture.close();
+  // 135：旁边的两个目录不管成功失败都删掉，不留在系统临时目录里。
+  for(const dir of [reposAside,resetTemp]) if(dir) await rm(dir,{recursive:true,force:true,maxRetries:5,retryDelay:200}).catch(error=>console.log(`注意：删除 ${dir} 失败：${error.message}`));
+  await announceFailures();
+}

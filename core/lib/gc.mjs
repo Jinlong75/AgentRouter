@@ -25,6 +25,18 @@ function childOfRoot(rootDir, dir) {
   return parent && root && pathKey(parent) === pathKey(root) ? path.join(rootDir, path.basename(dir)) : null;
 }
 
+// 彻底清理的删除范围限制：必须是根目录的直接子目录、名字符合 WORKTREE_ENTRY、本身不是链接 / 目录联接，
+// 且真实路径（realpathSync.native）仍然是根目录真实路径下的同名直接子项。
+function ownDirectory(rootDir, dir) {
+  if (!WORKTREE_ENTRY.test(path.basename(dir))) return false;
+  let stat;
+  try { stat = lstatSync(dir); } catch { return false; }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+  const real = realPath(dir), root = realPath(rootDir);
+  if (!real || !root) return false;
+  return pathKey(path.dirname(real)) === pathKey(root) && pathKey(real) === pathKey(path.join(root, path.basename(dir)));
+}
+
 // 目录或文件的估算大小：逐个文件 lstat 累加，不跟随链接；读不了的忽略。
 export function sizeOf(target) {
   let total = 0;
@@ -76,7 +88,8 @@ function profilesOf(task) {
 }
 
 // 孤立的 worktree（协议 15.10）：根目录下的条目，任务已 accepted / rejected，或清单里找不到对应任务。
-function findWorktrees({ tasks, rootDir, now }) {
+// repo 不为空时只找主人任务的 start.repo 等于它的条目（彻底清理已删除的项目用）：没有主人的不算，进行中的不动，不调 git。
+function findWorktrees({ tasks, rootDir, now, repo }) {
   const byDir = new Map();
   for (const [id, task] of tasks) {
     for (const row of task.rows) if (row.event === 'worktree' && typeof row.dir === 'string') byDir.set(pathKey(row.dir), { id, task, worktree: row });
@@ -88,6 +101,13 @@ function findWorktrees({ tasks, rootDir, now }) {
     if (!entry.isDirectory() || !WORKTREE_ENTRY.test(entry.name)) continue;
     const dir = path.join(rootDir, entry.name);
     const owner = byDir.get(pathKey(dir));
+    if (repo !== undefined) {
+      const ownRepo = owner?.task.start?.repo;
+      if (typeof ownRepo !== 'string' || pathKey(ownRepo) !== pathKey(repo) || running(owner.task) || !ownDirectory(rootDir, dir)) continue;
+      const outcome = worktreeOutcome(owner.task.file, owner.id);
+      found.push({ dir, reason: outcome === 'accepted' || outcome === 'rejected' ? outcome : 'repo-missing', repo: ownRepo, branch: null, deleteBranch: false, forceBranch: false });
+      continue;
+    }
     if (!owner) {
       // 保护期：建好 worktree 到写入 worktree 事件之间有一个很短的窗口，刚改过的目录不算孤立。
       let modified = null;
@@ -100,7 +120,15 @@ function findWorktrees({ tasks, rootDir, now }) {
       continue;
     }
     const outcome = worktreeOutcome(owner.task.file, owner.id);
-    if (outcome !== 'accepted' && outcome !== 'rejected') continue;
+    if (outcome !== 'accepted' && outcome !== 'rejected') {
+      // 项目文件夹已不存在：待验收、失败、已中断的 worktree 没人会再用。进行中的（没有 end / interrupted）不动；
+      // 仓库不在，不调 git、不处理分支，只删这个根目录下的条目（上面已按 WORKTREE_ENTRY 与 byDir 限定）。
+      const repo = owner.task.start?.repo;
+      if (typeof repo === 'string' && !running(owner.task) && !existsSync(repo)) {
+        found.push({ dir, reason: 'repo-missing', repo, branch: null, deleteBranch: false, forceBranch: false });
+      }
+      continue;
+    }
     const event = owner.task.rows.findLast(row => row.event === outcome);
     // 合并后分支：--no-ff 用 -d，squash 用 -D；驳回时用户要求保留分支就不删（协议 15.6、15.7）。
     const deleteBranch = outcome === 'accepted' || event?.keptBranch !== true;
@@ -205,7 +233,7 @@ function removeWorktreeItem(item, { removeDirectory }) {
 const removeDirectoryDefault = dir => rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 
 // 找出可清理项，dryRun 为假时逐项删除。返回 { ok, worktrees, slots, sessions, bytes, errors }：
-// worktrees: [{ dir, reason }]（reason：accepted / rejected / unknown-task / prunable）、slots: [{ file, id, pid }]、
+// worktrees: [{ dir, reason }]（reason：accepted / rejected / unknown-task / prunable / repo-missing）、slots: [{ file, id, pid }]、
 // sessions: [{ worker, dir, ageDays }]、bytes（成功清理的，dry-run 时为全部可释放的估算大小）、errors: [{ kind, path, error }]。
 export async function gc({
   homes, env = process.env, dryRun = false, now = Date.now(),
@@ -266,11 +294,59 @@ export async function gc({
   };
 }
 
+// 彻底清理一个已删除的项目（ar projects purge）：找出属于它的 worktree 和它的任务占着的名额，withDelete 为真时删除。
+// 返回 { tasks: [记录 id], worktrees: [{ dir, reason }], slots: [file], bytes, removed: { worktrees, slots }, errors }。
+// 只删 worktree 根目录的直接子目录（ownDirectory）与公共目录 slots/ 下的名额文件；不调 git、不改 runs.jsonl。
+export async function projectLeftovers({
+  homes, env = process.env, repo, withDelete = false, now = Date.now(),
+  isAlive = pidAlive, createdOf = processCreated, removeDirectory = removeDirectoryDefault,
+} = {}) {
+  const home = homes[0];
+  const rootDir = worktreeRoot({ env });
+  const all = readTasks(homes);
+  const ids = [...all].filter(([, task]) => typeof task.start?.repo === 'string' && pathKey(task.start.repo) === pathKey(repo)).map(([id]) => id);
+  const dirs = findWorktrees({ tasks: all, rootDir, now, repo });
+  const slots = (await findSlots({ home, isAlive, createdOf })).filter(item => item.id !== null && ids.includes(item.id));
+  let bytes = 0;
+  for (const item of dirs) bytes += sizeOf(item.dir);
+  for (const item of slots) bytes += sizeOf(item.file);
+  const removed = { worktrees: 0, slots: 0 };
+  const errors = [];
+  if (withDelete) {
+    for (const item of dirs) {
+      try {
+        // 删除前再核对一遍（范围限制）。
+        if (!ownDirectory(rootDir, item.dir)) throw new Error('不是 worktree 根目录下我们自己建的目录，没有删除');
+        removeDirectory(item.dir);
+        removed.worktrees++;
+      } catch (error) { errors.push({ kind: 'worktree', path: item.dir, error: error.message }); }
+    }
+    const slotsDir = realPath(path.join(home, 'slots'));
+    for (const item of slots) {
+      try {
+        const parent = realPath(path.dirname(item.file));
+        if (!slotsDir || !parent || pathKey(parent) !== pathKey(slotsDir) || !SLOT_FILE.test(path.basename(item.file))) throw new Error('不是公共目录 slots/ 下的名额文件，没有删除');
+        // 删之前再读一遍：内容变了说明名额已经被别人重新占用，不动。
+        if (readFileSync(item.file, 'utf8') !== item.text) continue;
+        rmSync(item.file, { force: true });
+        removed.slots++;
+      } catch (error) { errors.push({ kind: 'slot', path: item.file, error: error.message }); }
+    }
+  }
+  return {
+    tasks: ids,
+    worktrees: dirs.map(item => ({ dir: item.dir, reason: item.reason })),
+    slots: slots.map(item => item.file),
+    bytes, removed, errors,
+  };
+}
+
 const reasonText = {
   accepted: '任务已合并，清理失败留下的',
   rejected: '任务已驳回，清理失败留下的',
   'unknown-task': '任务清单里找不到对应任务',
   prunable: 'git 记录还在，目录已经不在了',
+  'repo-missing': '项目文件夹已不存在',
 };
 
 const sizeText = bytes => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`);

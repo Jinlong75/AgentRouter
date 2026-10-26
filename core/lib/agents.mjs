@@ -15,6 +15,7 @@ import { validateGeneric } from './generic-schema.mjs';
 import { killProcessTree, pidAlive, redactPaths } from './process.mjs';
 import { trace, traced, tracing } from './trace.mjs';
 import { parseJson, readJson } from './json.mjs';
+import { failureReason } from './progress.mjs';
 
 const presetDir = fileURLToPath(new URL('../templates/agents/', import.meta.url));
 const validProfileName = name => typeof name === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(name);
@@ -225,14 +226,20 @@ export function addAgent(home, { preset, name, label, model, baseUrl, secretVar,
   return { name: target, preset, madeDefault, secrets: Object.values(p.secrets ?? {}), ...(warnings.length ? { warnings } : {}) };
 }
 
+// 通用适配器声明对应的执行者配置：add --generic 与导入单独声明共用。
+function genericProfile(name, decl, label) {
+  const secrets = isObject(decl.secrets) && Object.keys(decl.secrets).length ? structuredClone(decl.secrets) : null;
+  return { adapter: 'generic', generic: name, label: label || decl.label || name, enabled: true, ...(secrets ? { auth: 'token', secrets } : { auth: 'login' }) };
+}
+
 // 自定义 CLI：用表单组装的声明直接加入执行者（声明写进 generics.<名>，执行者配置只引用名字）。
 // 声明里的 secrets 同时写进执行者配置（列表里的认证状态按执行者配置算）。声明不合法时什么都不写。
 export function addGenericAgent(home, { name, decl, label }) {
   if (!validProfileName(name)) throw new Error(`执行者名无效：${String(name).slice(0, 40)}（小写字母、数字、连字符）`);
   const checked = validateGeneric(decl, { path: 'generic' });
   if (!checked.ok) throw new Error(`通用适配器声明不合法：\n${problemLines(checked.errors.slice(0, 3)).join('\n')}`);
-  const secrets = isObject(decl.secrets) && Object.keys(decl.secrets).length ? structuredClone(decl.secrets) : null;
-  const profile = { adapter: 'generic', generic: name, label: label || decl.label, enabled: true, ...(secrets ? { auth: 'token', secrets } : { auth: 'login' }) };
+  const profile = genericProfile(name, decl, label);
+  const secrets = profile.secrets ?? null;
   let madeDefault = false;
   updateConfig(home, config => {
     config.profiles ??= {};
@@ -438,9 +445,8 @@ export async function previewDeclaration(decl, { env = process.env, timeoutSecon
     report = report == null ? null : mask(String(report).trim()).slice(0, 500) || null;
     const exit = r.timedOut || r.error ? null : r.status;
     const ok = !r.timedOut && !r.error && exit === 0 && /\bOK\b/i.test(report ?? '');
-    const first = text => String(text ?? '').split(/\r?\n/).map(line => line.trim()).findLast(Boolean) ?? null;
     const error = ok ? null : r.error ? `无法运行 ${decl.label}：${mask(r.error.message)}` : r.timedOut ? `超过 ${timeoutSeconds} 秒没有结束，已停止`
-      : adapter.failureHint?.(`${r.stderr}\n${r.stdout}`) ?? (exit === 0 ? '程序退出码是 0，但汇报里没有 OK' : first(mask(r.stderr)) ?? `退出码 ${exit}`);
+      : adapter.failureHint?.(`${r.stderr}\n${r.stdout}`) ?? (exit === 0 ? '程序退出码是 0，但汇报里没有 OK' : failureReason(mask(r.stderr)) ?? `退出码 ${exit}`);
     return { ok, valid: true, exit, timedOut: r.timedOut, seconds, report, output: shown, unmatched, truncated: lines.length > shown.length, warnings: checked.warnings, ...(error ? { error } : {}) };
   } catch (error) {
     return { ok: false, valid: true, exit: null, timedOut: false, seconds: Number(((Date.now() - started) / 1000).toFixed(1)), report: null, output: [], unmatched: [], error: redactPaths(String(error.message ?? error), [base]).slice(0, 300), warnings: checked.warnings };
@@ -554,16 +560,17 @@ export function exportAgent(home, name) {
 // 导入：先按 validate 的规则校验（不通过什么都不写），再原子写入配置。返回 { ok: true, … } 或 { ok: false, errors, warnings }。
 export function importAgent(home, value, { name, force = false } = {}) {
   const checked = checkAgentFile(value);
-  if (checked.ok && checked.kind !== 'export') {
-    return { ok: false, errors: [{ path: '(文件)', message: '这是一份单独的通用适配器声明，没有执行者配置；导入需要 ar agents export 导出的文件。' }], warnings: checked.warnings };
+  const lone = checked.ok && checked.kind === 'declaration';
+  if (lone && name === undefined) {
+    return { ok: false, errors: [{ path: '(文件)', message: '这是一份单独的通用适配器声明，没有执行者配置；导入需要 ar agents export 导出的文件。单独的声明请加 --name <名>。' }], warnings: checked.warnings };
   }
   if (!checked.ok) return { ok: false, errors: checked.errors, warnings: checked.warnings };
   const target = name ?? value.name;
   if (!validProfileName(target)) throw new Error(`执行者名无效：${String(target).slice(0, 40)}（小写字母、数字、连字符）`);
-  const profile = structuredClone(value.profile);
+  const profile = lone ? genericProfile(target, value) : structuredClone(value.profile);
   for (const key of LOCAL_FIELDS) delete profile[key];
   profile.enabled = true;
-  const declaration = profile.adapter === 'generic' ? structuredClone(value.generic) : null;
+  const declaration = lone ? structuredClone(value) : profile.adapter === 'generic' ? structuredClone(value.generic) : null;
   if (declaration) profile.generic = target;
   let madeDefault = false, overwritten = false;
   updateConfig(home, config => {
@@ -770,7 +777,7 @@ const parseMaxTurns = value => {
 };
 const parseTimeout = value => { const n = Number(value); if (!Number.isFinite(n) || n <= 0) throw new Error('--timeout 必须为正的秒数'); return n; };
 
-const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]';
+const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]（单独的声明必须加 --name）';
 
 // --decl / --generic 的值：解析声明 JSON；不是 JSON 或不是对象时抛出带原因的错误。
 function parseDecl(text) {

@@ -51,24 +51,38 @@ export function menu(anchor: HTMLElement, items: {
 export function confirmStop(name: string, executor: string, trigger: HTMLElement): Promise<boolean> {
     return confirmAction(c.stopTitle(name), c.stopBody(executor), c.stop, trigger, true);
 }
-export function confirmAction(title: string, body: string, label: string, trigger: HTMLElement, danger = false): Promise<boolean> {
+// option：确认框里可选的一个勾选项（说明下面、按钮上面）。checked 是初始值，用户点选后原地改写；调用方在 await 之后读它。
+// 不传时与以前完全一样：默认焦点在"取消"，Tab 只在两个按钮之间切换。
+export interface ConfirmOption { label: string; help?: string; checked: boolean }
+export function confirmAction(title: string, body: string, label: string, trigger: HTMLElement, danger = false, option?: ConfirmOption): Promise<boolean> {
     return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'confirm-overlay';
-        overlay.innerHTML = `<section class="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body"><h2 id="confirm-title">${esc(title)}</h2><p id="confirm-body">${esc(body)}</p><div class="confirm-actions"><button class="btn">${c.cancel}</button><button class="btn ${danger ? 'danger' : 'primary'}">${esc(label)}</button></div></section>`;
+        const choice = option ? `<button class="choice" role="checkbox" aria-checked="${option.checked}" data-confirm-opt><span class="cb ${option.checked ? 'on' : ''}">${option.checked ? icon('check-line') : ''}</span><span class="ct">${esc(option.label)}${option.help ? `<span>${esc(option.help)}</span>` : ''}</span></button>` : '';
+        overlay.innerHTML = `<section class="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-body"><h2 id="confirm-title">${esc(title)}</h2><p id="confirm-body">${esc(body)}</p>${choice}<div class="confirm-actions"><button class="btn">${c.cancel}</button><button class="btn ${danger ? 'danger' : 'primary'}">${esc(label)}</button></div></section>`;
         const background = [...document.body.children].filter((e): e is HTMLElement => e instanceof HTMLElement).map(e => ({ e, inert: e.inert }));
         background.forEach(({ e }) => e.inert = true);
         document.body.append(overlay);
-        const buttons = [...overlay.querySelectorAll<HTMLButtonElement>('button')];
+        const buttons = [...overlay.querySelectorAll<HTMLButtonElement>('.confirm-actions button')];
+        // Tab 在框内循环：勾选项（如果有）在两个按钮之前。
+        const cycle = [...overlay.querySelectorAll<HTMLButtonElement>('button')];
         const close = (ok: boolean) => { background.forEach(({ e, inert }) => e.inert = inert); overlay.remove(); trigger.focus({ preventScroll: true }); resolve(ok); };
         buttons[0].onclick = () => close(false);
         buttons[1].onclick = () => close(true);
+        const box = overlay.querySelector<HTMLButtonElement>('[data-confirm-opt]');
+        if (box && option) box.onclick = () => {
+            option.checked = !option.checked;
+            box.setAttribute('aria-checked', String(option.checked));
+            const cb = box.querySelector('.cb')!;
+            cb.classList.toggle('on', option.checked);
+            cb.innerHTML = option.checked ? icon('check-line') : '';
+        };
         overlay.onkeydown = e => { if (e.key === 'Escape') {
             e.preventDefault();
             close(false);
         } if (e.key === 'Tab') {
             e.preventDefault();
-            buttons[document.activeElement === buttons[0] ? 1 : 0].focus();
+            cycle[(cycle.indexOf(document.activeElement as HTMLButtonElement) + (e.shiftKey ? -1 : 1) + cycle.length) % cycle.length].focus();
         } };
         requestAnimationFrame(() => overlay.classList.add('motion-open'));
         buttons[0].focus();

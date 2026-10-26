@@ -188,6 +188,20 @@ test('进程查询的普通失败：只写第一行原因，不含整段命令�
   assert.deepEqual(rows, [{ pid: 5, parent: 1, created: 9, name: 'a.exe', command: '' }]);
 });
 
+test('非 Windows 按 pid 查询：ps 退出码 1 且没有任何输出 = 没有这个进程；其他情况照旧报错（119）', async () => {
+  const exit = props => async () => { throw Object.assign(new Error('Command failed: ps -p 12345'), props); };
+  assert.deepEqual(await processList(12345, 'linux', 5000, exit({ code: 1, stdout: '', stderr: '' })), []);
+  // 有标准错误：照旧报失败，原因取标准错误第一行。
+  await assert.rejects(processList(12345, 'linux', 5000, exit({ code: 1, stdout: '', stderr: 'ps: 出错了\n' })), /^Error: 进程查询失败：ps: 出错了$/);
+  // 退出码不是 1。
+  await assert.rejects(processList(12345, 'linux', 5000, exit({ code: 2, stdout: '', stderr: '' })), /^Error: 进程查询失败：退出码 2$/);
+  // 不给 pid（-A）时退出码 1 不算"没有进程"。
+  await assert.rejects(processList(undefined, 'linux', 5000, exit({ code: 1, stdout: '', stderr: '' })), /^Error: 进程查询失败：退出码 1$/);
+  // 程序不存在、超时：照旧。
+  await assert.rejects(processList(12345, 'linux', 5000, exit({ code: 'ENOENT' })), /^Error: 进程查询失败：ENOENT$/);
+  await assert.rejects(processList(12345, 'linux', 5000, exit({ code: 1, stdout: '', stderr: '', killed: true, signal: 'SIGTERM' })), /进程查询超时（5 秒）/);
+});
+
 test('killProcessTree：查询超时的原因原样传给调用方', async () => {
   const raw = Object.assign(new Error('Command failed: powershell.exe …'), { killed: true, signal: 'SIGTERM' });
   await assert.rejects(

@@ -1,7 +1,7 @@
 import { worktreeState, type GateFile, type Task, type WtState } from '../shared/types';
 import { c, gt, wt as w } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import { icon } from './ui';
+import { confirmAction, icon, toast } from './ui';
 import { gateState, trackNode, trackParts } from './gate';
 
 // worktree 任务（Stage06，协议第 15 节）的列表标记、第二行、状态行、五段轨道与进展顶部横幅。
@@ -53,7 +53,10 @@ export function wtStateLine(t: Task, now = Date.now()): { cls: string; text: str
     if (s === 'preparing') return { cls: 'run', text: w.linePreparing };
     if (s === 'awaiting') return { cls: 'brand', text: w.lineAwaiting(waitedSince(t, now)) };
     if (s === 'conflict') return { cls: 'brand', text: w.lineConflict(wi.conflictFiles?.length ?? 0) };
-    if (s === 'accepted') return { cls: 'ok', text: w.lineAccepted(clock(wi.accepted?.at ?? 0), by(wi.accepted?.by)) };
+    if (s === 'accepted') {
+        const reverted = revertedOf(t);
+        return { cls: 'ok', text: reverted ? w.revertedState(sha7(reverted.commit), clock(reverted.at)) : w.lineAccepted(clock(wi.accepted?.at ?? 0), by(wi.accepted?.by)) };
+    }
     if (s === 'rejected') return { cls: 'stale', text: w.lineRejected(clock(wi.rejected?.at ?? 0), by(wi.rejected?.by)) };
     return null;
 }
@@ -134,8 +137,58 @@ export async function readdProject(t: Task, changed: () => void) {
 export const writeBlocked = (t: Task) => repoState(t) !== 'ok';
 export const closeBlocked = (t: Task) => repoState(t) === 'missing';
 
+// 撤销合并（Stage07b 129，D36）：已合并横幅上的“撤销这次合并…”。核心只追加一个反向提交（ar revert），界面不自己改任何文件。
+// 进行中、冲突、失败只存在这个界面里（核心冲突时不写事件）；成功后核心写 reverted 事件，快照里的 wt.reverted 是最终来源，done 只是快照到来之前的过渡。
+type RevertUi = { kind: 'busy' } | { kind: 'conflict'; files: string[] } | { kind: 'failed'; reason: string } | { kind: 'done'; commit: string; at: number };
+const reverts = new Map<string, RevertUi>();
+let revertShownFor = '';
+// 这个任务的撤销界面状态；换到别的任务显示后，上一个任务的冲突 / 失败提示作废（回来时重新给出“撤销这次合并…”）。
+function revertUi(t: Task): RevertUi | undefined {
+    if (revertShownFor !== t.id) {
+        const old = reverts.get(revertShownFor);
+        if (old && (old.kind === 'conflict' || old.kind === 'failed')) reverts.delete(revertShownFor);
+        revertShownFor = t.id;
+    }
+    return reverts.get(t.id);
+}
+// 已撤销的记录：先看快照，快照还没到时用刚收到的结果。
+export function revertedOf(t: Task): { commit: string; at: number; by: string } | null {
+    if (t.wt?.reverted) return t.wt.reverted;
+    const ui = reverts.get(t.id);
+    return ui?.kind === 'done' && t.wt?.phase === 'accepted' ? { commit: ui.commit, at: ui.at, by: 'human' } : null;
+}
+// 有合并提交（不是确认）、还没撤销的已合并任务才能撤销。
+const revertable = (t: Task) => worktreeState(t) === 'accepted' && !!t.wt?.accepted?.merge && t.wt.accepted.mode !== 'confirm' && !revertedOf(t);
+// 冲突时给用户在终端里处理的命令：no-ff 合并要 -m 1，squash 合并不要。
+export const revertCommand = (t: Task) => w.undoText(t.wt?.accepted?.merge ?? '', t.wt?.accepted?.mode ?? 'no-ff');
+const revertButton = (t: Task, busy: boolean) => {
+    const blocked = writeBlocked(t);
+    return `<button class="btn sm" data-revert-open="${esc(t.id)}" ${busy || blocked ? 'disabled' : ''}${blocked && !busy ? ` data-tip="${esc(c.projectGoneBlocked)}"` : ''}>${busy ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(w.reverting)}` : esc(w.revertOpen)}</button>`;
+};
+// 点“撤销这次合并…”：确认框（默认焦点在“取消”）→ ar revert。changed 在状态变化时重画横幅与状态行。
+export async function revertTask(t: Task, trigger: HTMLElement, changed: () => void) {
+    if (reverts.get(t.id)?.kind === 'busy' || writeBlocked(t) || !revertable(t)) return;
+    if (!await confirmAction(w.revertTitle(t.title), w.revertBody(baseBranchOf(t)), w.revertConfirm, trigger, true)) return;
+    reverts.set(t.id, { kind: 'busy' });
+    changed();
+    try {
+        const result = await window.dock.console('tasks:revert', { project: t.repo, name: t.name }) as { commit?: string; conflict?: boolean; files?: string[] };
+        if (result.conflict) reverts.set(t.id, { kind: 'conflict', files: result.files ?? [] });
+        else {
+            reverts.set(t.id, { kind: 'done', commit: result.commit ?? '', at: Date.now() });
+            toast(w.revertedToast(t.title, sha7(result.commit)));
+        }
+    }
+    catch (error) {
+        reverts.set(t.id, { kind: 'failed', reason: String((error as { message?: unknown } | null)?.message ?? error) });
+    }
+    changed();
+}
+
 // 进展顶部横幅：排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回 / 准备失败；其余状态返回 null（用任务页已有的横幅）。
 export function wtBanner(t: Task, limit: number): { html: string; replacesFailure: boolean } | null {
+    // 每个任务的横幅都先过一遍：换到别的任务时，上一个任务的撤销冲突 / 失败提示在这里作废。
+    const ui = revertUi(t);
     const s = worktreeState(t), wi = t.wt;
     if (!s || !wi) return null;
     const base = baseBranchOf(t), time = (n: number | undefined) => clock(n ?? 0), by = (key: string | undefined) => byName(key ?? 'cli');
@@ -146,7 +199,13 @@ export function wtBanner(t: Task, limit: number): { html: string; replacesFailur
     if (s === 'conflict') return { html: bannerHtml('fail', w.conflictTitle, w.conflictHelp(base, wi.conflictFiles?.length ?? 0), goAcceptButton(t)), replacesFailure: true };
     if (s === 'accepted') {
         const note = wi.cleanupFailed ? `<span>${esc(w.acceptedCleanup)}</span>` : '';
-        return { html: bannerHtml('ok', w.acceptedTitle(base), w.acceptedHelp(sha7(wi.accepted?.merge), time(wi.accepted?.at), by(wi.accepted?.by), wi.accepted?.mode ?? 'no-ff'), '', note), replacesFailure: false };
+        const reverted = revertedOf(t);
+        if (reverted) return { html: bannerHtml('stale', w.revertedTitle, w.revertedHelp(sha7(wi.accepted?.merge), sha7(reverted.commit), time(reverted.at), by(reverted.by)), '', note), replacesFailure: false };
+        if (ui?.kind === 'conflict') return { html: bannerHtml('fail', w.revertConflictTitle, w.revertConflictHelp(base, ui.files), `<button class="btn sm" data-revert-copy="${esc(t.id)}">${esc(w.copyCommand)}</button>`), replacesFailure: false };
+        // 主工作区不干净等被拒绝的情况：原因是核心的中文原文；横幅上保留“撤销这次合并…”，处理好之后可以直接再试。
+        // TODO(lead): 125（不用命令行的提交）合入后，核心错误码为 DIRTY_MAIN 时这里要加 wt.goCommit（“去提交”）按钮，打开同一个提交弹窗；现在还没有这个弹窗，先不放。
+        if (ui?.kind === 'failed') return { html: bannerHtml('fail', w.revertFailedTitle, w.revertFailedHelp(ui.reason), revertButton(t, false)), replacesFailure: false };
+        return { html: bannerHtml('ok', w.acceptedTitle(base), w.acceptedHelp(sha7(wi.accepted?.merge), time(wi.accepted?.at), by(wi.accepted?.by), wi.accepted?.mode ?? 'no-ff'), revertable(t) ? revertButton(t, ui?.kind === 'busy') : '', note), replacesFailure: false };
     }
     if (s === 'rejected') {
         const note = wi.cleanupFailed ? `<span>${esc(w.acceptedCleanup)}</span>` : '';

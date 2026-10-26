@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scanText, EMPTY_WORDS, maskWords, loadWordlist, exportPathOf } from '../../tools/public-scan.mjs';
+import { scanText, EMPTY_WORDS, maskWords, loadWordlist, exportPathOf, collectSpecStems } from '../../tools/public-scan.mjs';
 
 // lint-tree R8 与共用扫描模块：在系统临时目录的临时 git 仓库里跑真实的 tools/lint-tree.mjs，不碰本仓库。
 const lintTool = fileURLToPath(new URL('../../tools/lint-tree.mjs', import.meta.url));
@@ -141,4 +141,12 @@ test('R8：README.public.md 按源路径扫描，二进制按 .gitattributes 跳
   const lines = r8Lines(out);
   assert.equal(lines.length, 1, out);
   assert.ok(lines[0].includes('README.public.md') && lines[0].includes('第 2 行'), out);
+});
+
+test('collectSpecStems：收进三位及以上编号的任务说明，不收 README 与子目录', () => {
+  const stems = collectSpecStems([
+    { path: 'docs/specs/001-a.md' }, { path: 'docs/specs/1000-x.md' }, { path: 'docs/specs/README.md' },
+    { path: 'docs/specs/sub/1001-y.md' }, { path: 'docs/specs/12-z.md' },
+  ]);
+  assert.deepEqual(stems, ['001-a', '1000-x']);
 });

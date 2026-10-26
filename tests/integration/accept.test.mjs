@@ -248,9 +248,13 @@ test('3 四项检查各自拒绝：原文、退出码 2、什么都不改', asyn
   write(path.join(f.repo, 'notes/草稿.txt'), '草稿\n');
   const dirty = await f.ar(['accept', '检查任务', '--json']);
   assert.equal(dirty.code, 2);
-  const message = JSON.parse(dirty.stdout).error;
+  const dirtyJson = JSON.parse(dirty.stdout);
+  const message = dirtyJson.error;
   assert.match(message, /^主工作区有未提交的改动，先提交或暂存：/);
   assert.ok(message.includes('README.md') && message.includes('notes/草稿.txt'), message);
+  // 125：结构化原因，软件据此显示"去提交"。
+  assert.equal(dirtyJson.code, 'DIRTY_MAIN');
+  assert.deepEqual([...dirtyJson.files].sort(), ['README.md', 'notes/草稿.txt']);
   git(f.repo, ['checkout', '-q', '--', 'README.md']);
   rmSync(path.join(f.repo, 'notes'), { recursive: true, force: true });
 

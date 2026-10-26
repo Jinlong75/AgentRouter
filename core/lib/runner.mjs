@@ -3,6 +3,8 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, rmSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { failureReason } from './progress.mjs';
+import { longPath } from './paths.mjs';
 
 // 汇报取标准输出全文的适配器（adapter.keepStdout）：最多保留这么多字节。
 const STDOUT_LIMIT = 256 * 1024;
@@ -32,6 +34,7 @@ function removeFiles(files, progress) {
 // - stderrTail：最多 4096 字符的 stderr 尾部（失败原因常只出现在这里）。
 // workdir 是执行者的工作目录：非 worktree 模式就是项目根，worktree 模式是任务自己的 worktree（协议 15.2）；
 // 记录目录（paths）不受影响，始终在项目主工作区。
+// 交给执行者的工作目录（cwd、命令里的 root、事件里绝对路径转相对的 root）统一用长路径（execDir）；存下来的路径不动（124）。
 // attemptFiles 是这次尝试的目录（attempts/<n>/，prompt.md 已由 pipeline 写好）：
 // 原始输出同时追加到顶层 raw.log 与它下面的 raw.log，汇报路径（command 的 report）指到它下面的 report.md。
 // readOnly 为真时（调研 / 审查类任务）以只读模式构造命令（adapter.command 的 readOnly 参数）。
@@ -42,6 +45,7 @@ export async function runOnce({
   prompt, envError, emit, errors, mapLine, onSpawn, beforeSpawn, stopped,
   attempt = 1, attemptFiles = null, progress = null, readOnly = false,
 }) {
+  const execDir = longPath(workdir);
   const rawFiles = attemptFiles ? [paths.raw, attemptFiles.raw] : [paths.raw];
   const reportPath = attemptFiles ? attemptFiles.report : paths.report;
   // 原始输出两份都追加（协议 14.2 第 3、4 条）：顶层跨尝试连续，attempts/<n>/ 只有这次。
@@ -51,7 +55,7 @@ export async function runOnce({
     if (envError) throw envError;
     // report 指到这次的 attempts/<n>/report.md（协议 14.2 第 3 条）；attempt 供假执行者按次回放。
     // readOnly（调研 / 审查类任务）只在为真时传，其余任务的调用参数与原来逐项相同。
-    command = adapter.command({ root: workdir, report: reportPath, prompt, settings, detection, env: childEnv, profile, profileName, attempt, ...(readOnly ? { readOnly: true } : {}) });
+    command = adapter.command({ root: execDir, report: reportPath, prompt, settings, detection, env: childEnv, profile, profileName, attempt, ...(readOnly ? { readOnly: true } : {}) });
   } catch (error) {
     // 多行原因（如通用适配器声明的前 3 条校验错误）逐行成事件，进度里每行都看得见。
     const [first, ...rest] = String(error.message).split('\n').filter(line => line.trim());
@@ -69,7 +73,7 @@ export async function runOnce({
     const resolve = value => { removeFiles(cleanup, progress); resolveRun(value); };
     let child;
     try {
-      child = spawn(command.executable, command.args, { cwd: workdir, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, windowsVerbatimArguments: command.verbatim === true });
+      child = spawn(command.executable, command.args, { cwd: execDir, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false, windowsHide: true, windowsVerbatimArguments: command.verbatim === true });
     } catch (error) {
       emit({ kind: 'error', text: `启动 ${label} 失败：${error.message}` });
       resolve({ exit: 1, lastSay: null, result: null, stderrTail: '', startFailed: true });
@@ -87,7 +91,7 @@ export async function runOnce({
       let event;
       try { event = JSON.parse(line); } catch { /* 非 JSON 行仍保留原文。 */ }
       appendRaw(`${event && typeof event === 'object' && !Array.isArray(event) ? JSON.stringify({ ...event, _at: at }) : line}\n`);
-      for (const mapped of mapLine(line, { root: workdir })) {
+      for (const mapped of mapLine(line, { root: execDir })) {
         if (mapped.kind === 'say') lastSay = mapped.text;
         emit(mapped, at);
       }
@@ -110,7 +114,7 @@ export async function runOnce({
       if (stopped()) { resolve({ exit: failed ? 1 : code, lastSay, result: mapLine.lastResult ?? null, stdoutText, stderrTail: stderr, startFailed: failed }); return; }
       // 干活方启动即退出时，原因往往只在 stderr 里（例如 Codex 拒绝在非 git 目录运行），补成出错事件。
       if (!failed && code !== 0) {
-        const tail = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-5).join('\n');
+        const tail = failureReason(stderr);
         if (tail) emit({ kind: 'error', text: tail });
         // 失败原因可能只在 stderr，也可能在执行者自己的出错事件里（如接口返回 401）：两处一起交给适配器判断。
         const hint = adapter.failureHint?.([stderr, ...errors].join('\n'), { profile });

@@ -147,6 +147,67 @@ test('spec new：frontmatter 可读回（冒号、引号、中文、列表），
   assert.deepEqual(fm.verify, ['npm test', 'echo "hi"']);
   assert.match(body, /## 目标\n\n只写目标/);
   assert.doesNotMatch(body, /## 不做什么|## 参照|## 验收标准|## 汇报要回答的问题/, '空小节不写');
+  assert.doesNotMatch(body, /## 受影响的已有测试/, '不传 affectedTests 不写');
+  const empty = await f.call(['spec', 'new', f.repo, '--dry-run', '--json'], { form: JSON.stringify({ title: '空', goal: '目标', affectedTests: '  ' }) });
+  assert.doesNotMatch(empty.json.content, /## 受影响的已有测试/, 'affectedTests 为空不写');
+});
+
+test('spec new：affectedTests 写成一节，位置在验收标准之后、汇报问题之前，可被 v1 解析器读回', async t => {
+  const f = fixture(t);
+  const r = await f.call(['spec', 'new', f.repo, '--json'], { form: JSON.stringify({
+    title: '带受影响测试', goal: '目标', acceptance: '验收一', affectedTests: 'tests/a.test.mjs:10', questions: '问题一',
+  }) });
+  assert.equal(r.code, 0);
+  const c = r.json.content;
+  assert.match(c, /## 受影响的已有测试\n\ntests\/a\.test\.mjs:10/);
+  assert.ok(c.indexOf('## 验收标准') < c.indexOf('## 受影响的已有测试'));
+  assert.ok(c.indexOf('## 受影响的已有测试') < c.indexOf('## 汇报要回答的问题'));
+  const text = fs.readFileSync(r.json.file, 'utf8');
+  validateSpec(parseSpecV1(text, path.basename(r.json.file)), path.basename(r.json.file));
+});
+
+test('spec new：编号超过 999 后继续递增；只有四位编号时接着往后', async t => {
+  const f = fixture(t);
+  const dir = path.join(f.repo, 'docs/specs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '998-a.md'), '---\ntitle: a\n---\n');
+  const ids = [];
+  for (let i = 0; i < 5; i++) {
+    const r = await f.call(['spec', 'new', f.repo, '--json'], { form: JSON.stringify({ title: `任务${i}`, goal: '目标' }) });
+    assert.equal(r.code, 0, r.out.join('\n'));
+    ids.push(r.json.id);
+  }
+  assert.deepEqual(ids, ['999', '1000', '1001', '1002', '1003']);
+  const list = await f.call(['spec', 'list', f.repo, '--json']);
+  assert.ok(list.json.specs.some(s => s.id === '1000'), 'spec list 的 id 认四位编号');
+
+  const g = fixture(t);
+  const gdir = path.join(g.repo, 'docs/specs');
+  fs.mkdirSync(gdir, { recursive: true });
+  fs.writeFileSync(path.join(gdir, '1000-x.md'), '---\ntitle: x\n---\n');
+  const next = await g.call(['spec', 'new', g.repo, '--json'], { form: JSON.stringify({ title: '下一个', goal: '目标' }) });
+  assert.equal(next.json.id, '1001');
+});
+
+test('spec new：两个同时运行的进程从 999 起新建不撞号', async t => {
+  const f = fixture(t);
+  const dir = path.join(f.repo, 'docs/specs');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '998-a.md'), '---\ntitle: a\n---\n');
+  const form = JSON.stringify({ title: '并发任务', goal: '同时创建' });
+  const run = () => new Promise(resolve => {
+    const child = spawn(process.execPath, [entry, 'spec', 'new', f.repo], { env: { ...process.env, AGENT_ROUTER_HOME: f.home }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false });
+    let stderr = '';
+    child.stderr.on('data', b => stderr += b);
+    child.on('close', code => resolve({ code, stderr }));
+    child.stdin.end(form);
+  });
+  const [a, b] = await Promise.all([run(), run()]);
+  assert.equal(a.code, 0, a.stderr); assert.equal(b.code, 0, b.stderr);
+  const ids = fs.readdirSync(dir).filter(n => !n.startsWith('998-')).map(n => /^(\d+)-/.exec(n)[1]).sort();
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+  assert.ok(ids.every(id => Number(id) >= 999));
 });
 
 test('spec list：按修改时间排序、title 取值、dispatched 计数；目录不存在返回空', async t => {

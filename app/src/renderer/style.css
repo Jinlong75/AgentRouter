@@ -270,6 +270,17 @@ body.dragging, body.dragging * { user-select: none !important; }
 .r.add > i { color: var(--ok); } .r.delete > i { color: var(--fail); }
 .sec-t { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; font-size: var(--fs-small); color: var(--text-3); }
 .sec-t:first-child { margin-top: 0; }
+/* 项目页"远程"一节（Stage07b 132，界面稿 .rows.remote）：第一行远程名 + 地址（单行截断），第二行状态说明 + 右边按钮。
+   说明可以折行（分叉的说明很长），按钮不被挤出；最小窗口 960×600 下不溢出。 */
+.rows.remote .r .v { flex: 0 1 auto; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+.rows.remote .r:first-child .v { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rows.remote .r > .mk, .rows.remote .r > .btn { flex: 0 0 auto; }
+.rows.remote .r > .btn { margin-left: 0; }
+/* 批准确认框里的勾选项（合并后推送）：夹在说明和按钮之间。 */
+.confirm-card .choice { margin: var(--sp-3) 0 var(--sp-4); }
+/* 合并成功但推送失败的提示比普通提示长：允许折行，不截断。 */
+.toast.long { white-space: normal; }
+.toast.long > span:not(.mk) { overflow: visible; text-overflow: clip; }
 
 /* ---------- 文档页：连接、设置 ---------- */
 .doc { flex: 1 1 auto; min-height: 0; }
@@ -350,6 +361,8 @@ body.dragging, body.dragging * { user-select: none !important; }
 .ctx button:hover, .ctx button:focus-visible { background: var(--surface-2); outline: none; }
 .ctx button:disabled { color: var(--text-3); background: transparent; }
 .ctx button:disabled i { opacity: 0.5; }
+/* Stage07b T4o：详情 ⋯ 菜单的“删除任务…”用危险色（界面稿 .menu button.danger）。 */
+.ctx button.danger:not(:disabled) { color: var(--fail); }
 .ctx hr { border-right: 0px; border-bottom: 0px; border-left: 0px; border-image: none; border-top: 1px solid var(--divider); margin: 4px 6px; }
 html, body { width:100%; height:100%; overflow:hidden; }
 body { background:var(--bg);color:var(--text);font:var(--fs-body)/var(--lh) var(--font-ui);-webkit-font-smoothing:antialiased;user-select:none; }
@@ -507,6 +520,10 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .fc { min-width: 0; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .fc > .inp, .fc > .sel { width: 100%; max-width: 520px; }
 .fhint { color: var(--text-3); font-size: 11.5px; }
+/* 编辑配置的"高级"折叠标题（界面稿 .fold）；折叠时内容用 hidden 属性隐藏 */
+.fold { display: flex; align-items: center; gap: 4px; margin: 8px 0 0; padding: 0; border: 0; background: transparent; color: var(--text-2); font-size: 13px; font-weight: 600; cursor: default; }
+.fold > span { display: inline-flex; }
+[data-pj-adv][hidden] { display: none; }
 .inp.mono { font-family: var(--font-mono); font-size: var(--fs-mono); }
 .inp.area { height: auto; min-height: 56px; padding: 7px 12px; line-height: 20px; resize: vertical; }
 .statusline { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 520px; color: var(--text-2); font-size: var(--fs-small); line-height: var(--lh-small); }
@@ -552,6 +569,21 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .prow-file .cmd { gap: 8px; }
 .prow-file .cmd code { color: var(--text); }
 .ri-sp { width: 14px; flex: 0 0 auto; }
+/* 更新协作约定：角色文档一行（展开按钮 + 分段按钮）和展开的差异（沿用 diff 视图的 .dl 行着色）。 */
+.rolehead { display: flex; align-items: center; gap: 8px; }
+.rolehead .cmd { flex: 1 1 auto; min-width: 0; }
+.out.rolediff { padding: 0; }
+.out.rolediff .dl { white-space: pre-wrap; }
+/* 提交弹窗的文件列表（界面稿 .filepick）：行与表头都是可勾选的按钮。 */
+.filepick { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface); width: 100%; }
+.filepick button { background: none; border: 0; width: 100%; text-align: left; font: inherit; color: var(--text); }
+.filepick .fp-h, .filepick .fp-r { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 0 12px; }
+.filepick .fp-h { color: var(--text-3); font-size: var(--fs-small); border-bottom: 1px solid var(--divider); }
+.filepick .fp-r + .fp-r { border-top: 1px solid var(--divider); }
+.filepick .fp-r:hover { background: var(--surface-2); }
+.filepick .fp-r .mono { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.filepick .cb { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
+.filepick .cb.on { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); font-size: 12px; }
 .pd .dbody { margin-top: 12px; }
 .inline-f { display: flex; align-items: center; gap: 8px; padding: 14px 0 4px; }
 /* 项目页标题行的副标题（任务页没有），以及整行可点的最近任务。 */
@@ -628,6 +660,11 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .pv-e { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 8px; border-radius: var(--r-inner); background: var(--surface-2); overflow-wrap: anywhere; }
 .pv-e > i { color: var(--text-3); }
 .pv-e.skip { background: transparent; color: var(--text-3); }
+/* Stage07b T4d⑪：带示例的输入框（界面稿 .exw / .kbd）。按键提示只在输入框聚焦且为空时显示（:focus + :placeholder-shown），右侧留出内边距不挡文字。 */
+.exw { position: relative; width: 100%; max-width: 520px; }
+.exw .inp, .exw .argbox { width: 100%; padding-right: 72px; }
+.exw .kbd { display: none; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); padding: 1px 6px; border: 1px solid var(--border); border-radius: var(--r-inner); background: var(--surface-2); color: var(--text-3); font-family: var(--font-mono); font-size: 11px; pointer-events: none; }
+.exw:has(:is(.inp, .arginp):focus:placeholder-shown) .kbd { display: block; }
 .ferr { display: none; color: var(--fail); font-size: var(--fs-small); line-height: var(--lh-small); white-space: pre-line; max-width: 520px; }
 .ferr.on { display: block; }
 .ferr.general { margin: 8px 0 0; max-width: none; }

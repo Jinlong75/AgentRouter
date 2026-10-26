@@ -665,6 +665,43 @@ export async function captureNewtask(h: Harness) {
             await coreRun(['projects', 'remove', pathsRepo], { timeoutMs: 60000 }).catch(() => { });
         }
 
+        // ---- UI16（Stage07b T4m）：已归档的任务说明——列表默认不含，展开后带"已归档"标签，选中照样能派发 ----
+        // 在 sample 项目里新建一份说明、用核心归档并提交（和软件走同一条命令），再看界面。
+        {
+            const archivedRel = 'docs/specs/archive/003-归档演示.md';
+            await writeFile(path.join(specs, '003-归档演示.md'), [
+                '---', 'id: 003', 'title: 归档演示：检查 README 标题', 'type: docs', 'worker: auto', 'allowed_paths: []', 'verify: []', '---', '',
+                '## 目标', '', '看一眼 README 的标题。', '',
+            ].join('\n'));
+            git(repo, ['add', '--', 'docs/specs/003-归档演示.md']);
+            commitAs(repo, '演示：提交归档用的说明', ['docs/specs/003-归档演示.md']);
+            await core(['spec', 'archive', repo, 'docs/specs/003-归档演示.md', '--commit']);
+            await reenter('existing');
+            await wait('!!document.querySelector("[data-nt-spec]")');
+            await check('UI16 有归档时列表下面出现"显示已归档的 1 份"，默认列表不含已归档', `(() => { const more = document.querySelector('[data-nt-archived]'); return !!more && more.textContent === '显示已归档的 1 份' && !document.querySelector('[data-nt-spec*="archive/"]') && more.classList.contains('quiet'); })()`);
+            await press('[data-nt-archived]');
+            await wait(`!!document.querySelector('[data-nt-spec="${archivedRel}"]')`, 'UI16 展开已归档的');
+            await check('UI16 展开后已归档的项带"已归档"标签、排在未归档的后面，按钮变"收起已归档的"', `(() => { const rows = [...document.querySelectorAll('[data-nt-spec]')], last = rows.at(-1); return last?.dataset.ntSpec === ${JSON.stringify(archivedRel)} && last.querySelector('.xtag')?.textContent === '已归档' && rows.slice(0, -1).every(r => !r.querySelector('.xtag')) && document.querySelector('[data-nt-archived]')?.textContent === '收起已归档的'; })()`);
+            await shot('newtask-archived');
+            await press(`[data-nt-spec="${archivedRel}"]`);
+            await check('UI16 选中已归档的说明后派发说明栏照常', `document.querySelector('[data-nt-spec].on')?.dataset.ntSpec === ${JSON.stringify(archivedRel)} && document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify(`派发 ${archivedRel} 给 假执行者`)} && !document.querySelector('[data-nt-dispatch]').disabled`);
+            await press('[data-nt-dispatch]');
+            await wait('document.querySelector("[data-page=tasks]")?.getAttribute("aria-current") === "page" && !!document.querySelector(".trow.on")', '已归档说明派发后切回任务页并选中', 20000);
+            const archivedId = await selectedId();
+            await verify('UI16 派发已归档的说明：start 行的 spec 是 archive/ 下的路径', async () => {
+                const start = (await runs()).find(r => r.event === 'start' && r.id === archivedId);
+                assert.ok(start, `runs.jsonl 里没有 ${archivedId} 的 start 行`);
+                assert.equal(start.spec, archivedRel);
+            });
+            await until(async () => (await runs()).some(r => r.event === 'end' && r.id === archivedId), '已归档说明派发的假执行者结束');
+            // 再进页面：展开状态缓存在视图里，点"收起已归档的"后列表回到只有未归档的。
+            await reenter('existing');
+            await wait(`document.querySelector('[data-nt-archived]')?.textContent === '收起已归档的'`, 'UI16 重新进入后仍是展开状态');
+            await press('[data-nt-archived]');
+            await wait(`!document.querySelector('[data-nt-spec*="archive/"]')`, 'UI16 收起已归档的');
+            await check('UI16 收起后按钮变回"显示已归档的 1 份"', `document.querySelector('[data-nt-archived]')?.textContent === '显示已归档的 1 份'`);
+        }
+
         // 每页通用检查：三种来源各走一遍（沿用缓存，不重新加载，避免打断 Tab 检查）。
         await goto('existing');
         await h.audit('新建任务页（已有说明）', async () => { await goto('existing'); });

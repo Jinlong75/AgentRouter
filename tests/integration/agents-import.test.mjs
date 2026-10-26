@@ -472,7 +472,7 @@ test('import：覆盖导出文件里的本机状态——文件里带 enabled / 
   const { call, config, writeJson } = setup(t);
   await call(['agents', 'add', '--preset', 'claude-native', '--name', 'src']);
   const bundle = (await call(['agents', 'export', 'src', '--json'])).json.bundle;
-  bundle.profile = { ...bundle.profile, enabled: false, price: { inputPer1M: 9, outputPer1M: 9, currency: 'USD' }, limits: { maxTasksPerDay: 1 }, path: 'C:\\本机\\x.exe' };
+  bundle.profile = { ...bundle.profile, enabled: false, price: { inputPer1M: 9, outputPer1M: 9, currency: 'USD' }, limits: { maxTasksPerDay: 1 }, path: path.join(os.tmpdir(), '本机', 'x.exe') };
   const r = await call(['agents', 'import', writeJson('local.agent.json', bundle), '--name', 'copy', '--json']);
   assert.equal(r.code, 0);
   const copy = config().profiles.copy;
@@ -617,4 +617,36 @@ test('presets --json：预设给了默认模型 / 推理强度（Qoder 国内版
   const by = Object.fromEntries((await call(['agents', 'presets', '--json'])).json.presets.map(p => [p.name, p]));
   assert.deepEqual([by['qoder-cn'].model, by['qoder-cn'].effort], ['DeepSeek-Flash', 'ultracode']);
   for (const name of ['qoder', 'deepseek', 'codex', 'openai-compat']) assert.ok(!('model' in by[name]) && !('effort' in by[name]), name);
+});
+test('import：单独的声明加 --name 导入，结果与 add --generic 逐字段相同；同名拒绝；不合法什么都不写；无 --name 提示加 --name', async t => {
+  const a = setup(t), b = setup(t);
+  const decl = declarationOf();
+  const lone = a.writeJson('lone.json', decl);
+  const imported = await a.call(['agents', 'import', lone, '--name', 'my-cli', '--json']);
+  assert.equal(imported.code, 0, imported.text); assert.equal(imported.json.name, 'my-cli');
+  const added = await b.call(['agents', 'add', '--generic', JSON.stringify(decl), '--name', 'my-cli', '--json']);
+  assert.equal(added.code, 0, added.text);
+  assert.deepEqual(a.config().profiles['my-cli'], b.config().profiles['my-cli']);
+  assert.deepEqual(a.config().generics, b.config().generics);
+  assert.equal(a.config().profiles['my-cli'].generic, 'my-cli');
+  assert.equal(a.config().profiles['my-cli'].label, decl.label);
+  noToken(a.outputs);
+
+  // 同名不加 --force 拒绝，配置一个字节不动。
+  const before = fs.readFileSync(a.configFile, 'utf8');
+  const same = await a.call(['agents', 'import', lone, '--name', 'my-cli', '--json']);
+  assert.equal(same.code, 2); assert.match(same.json.error, /已有执行者 my-cli.*--force/);
+  assert.equal(fs.readFileSync(a.configFile, 'utf8'), before);
+  assert.equal((await a.call(['agents', 'import', lone, '--name', 'my-cli', '--force', '--json'])).code, 0);
+
+  // 不合法：什么都不写。
+  const c = setup(t);
+  const bad = c.writeJson('bad.json', { ...decl, args: ['-p', '{nope}'] });
+  const refused = await c.call(['agents', 'import', bad, '--name', 'my-cli', '--json']);
+  assert.equal(refused.code, 2); assert.equal(refused.json.ok, false);
+  assert.equal(fs.existsSync(c.configFile), false, '什么都没写');
+
+  // 没有 --name：照旧报错，并提示加 --name。
+  const noName = await a.call(['agents', 'import', lone, '--json']);
+  assert.equal(noName.code, 2); assert.match(noName.json.errors[0].message, /单独的通用适配器声明.*单独的声明请加 --name <名>/);
 });

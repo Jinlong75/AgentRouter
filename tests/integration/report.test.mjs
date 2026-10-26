@@ -69,7 +69,7 @@ function fixture(t) {
 }
 const find = (role, key) => role.items.find(item => item.key === key);
 
-test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因到任务说明后执行者 90、主导 85；文字输出两节；对通过的尝试归因退出码 2', async t => {
+test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因到任务说明后执行者 100、主导 85；文字输出两节；对通过的尝试归因退出码 2', async t => {
   const f = fixture(t);
   f.setProfile({
     // 第 1 次改了范围外的 README.md；第 2 次把它改回去，只留范围内的改动。
@@ -97,18 +97,19 @@ test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因�
   assert.equal(report.executor.perf.cost, null, '没有价格');
   assert.deepEqual(report.executor.perf.profiles, ['fake']);
 
-  // 归因到任务说明：越界文件仍算执行者的，多一次尝试的扣分移到主导。
+  // 归因到任务说明：第 1 次的越界文件和多一次尝试的扣分都不算执行者的，多一次尝试的扣分移到主导。
   const blamed = await f.ar(['report', '链路', '--blame', '1=spec', '--json']);
   assert.equal(blamed.code, 0, blamed.stderr + blamed.stdout);
   const after = JSON.parse(blamed.stdout);
-  assert.equal(after.executor.score, 90);
+  assert.equal(after.executor.score, 100);
+  assert.equal(find(after.executor, 'outsideFile').count, 0);
   assert.equal(after.lead.score, 85);
   assert.deepEqual([find(after.lead, 'specBlame').count, find(after.lead, 'specBlame').points], [1, -15]);
   assert.equal(after.attempts[0].blame, 'spec');
   assert.deepEqual(f.marks('链路'), { v: 1, blame: { 1: 'spec' } });
 
   // 之后不带 --blame 读到的也是新归因；改回 worker 恢复。
-  assert.equal(JSON.parse((await f.ar(['report', '链路', '--json'])).stdout).executor.score, 90);
+  assert.equal(JSON.parse((await f.ar(['report', '链路', '--json'])).stdout).executor.score, 100);
   const restored = JSON.parse((await f.ar(['report', '链路', '--blame', '1=worker', '--json'])).stdout);
   assert.equal(restored.executor.score, 75);
   assert.deepEqual(f.marks('链路'), { v: 1, blame: {} }, 'worker 是默认，写 worker 删掉这个键');
@@ -126,11 +127,12 @@ test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因�
   for (const bad of ['1', '0=spec', '1=lead', 'x=spec']) assert.equal((await f.ar(['report', '链路', '--blame', bad])).code, 2, bad);
   assert.equal((await f.ar(['report', '没有这个任务'])).code, 2);
 
-  // 归因到环境：执行者不扣多一次尝试（越界文件仍扣），主导不扣；marks.json 写 environment；改回 worker 删掉这一键。
+  // 归因到环境：执行者不扣多一次尝试和第 1 次的越界文件，主导不扣；marks.json 写 environment；改回 worker 删掉这一键。
   const env = await f.ar(['report', '链路', '--blame', '1=environment', '--json']);
   assert.equal(env.code, 0, env.stderr + env.stdout);
   const envReport = JSON.parse(env.stdout);
-  assert.equal(envReport.executor.score, 90);
+  assert.equal(envReport.executor.score, 100);
+  assert.equal(find(envReport.executor, 'outsideFile').count, 0);
   assert.equal(envReport.lead.score, 100);
   assert.deepEqual(find(envReport.executor, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
   assert.deepEqual(find(envReport.lead, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
@@ -158,9 +160,9 @@ test('门禁第 1 次越界失败、第 2 次通过：执行者 75 分；归因�
   t.diagnostic(`文字输出样例：\n${text.stdout}`);
   t.diagnostic(`--json 样例：${blamed.stdout}`);
   const lines = text.stdout.split(/\r?\n/);
-  assert.ok(lines.includes('执行者 90/100'), text.stdout);
+  assert.ok(lines.includes('执行者 100/100'), text.stdout);
   assert.ok(lines.includes('主导 85/100'), text.stdout);
-  assert.ok(lines.includes('  越界文件：1 个：README.md（−10）'), text.stdout);
+  assert.ok(lines.includes('  越界文件：0 个（0）'), text.stdout);
   assert.ok(lines.includes('  门禁失败归因到任务说明：1 次（−15）'), text.stdout);
   assert.equal(lines.filter(line => line.startsWith('  性能：')).length, 2, '每节一行性能');
 });

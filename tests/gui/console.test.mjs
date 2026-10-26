@@ -135,12 +135,175 @@ test('projects:remove/show/git-init/commit-init 先核对已登记项目', async
   }
 });
 
+test('projects:purge-plan / projects:purge 不核对已登记（文件夹已不存在），参数数组正确，plan 带 worktree 总大小', async () => {
+  const gone = path.resolve('gone-project');
+  const dir = await mkdtemp(path.join(tmpdir(), 'ar-purge-'));
+  try {
+    await writeFile(path.join(dir, 'a.txt'), '12345');
+    await writeFile(path.join(dir, 'b.txt'), '123');
+    const { calls, coreRun } = fakeCore([
+      { resolve: { code: 0, json: { ok: true, listed: true, tasks: ['t1'], worktrees: [{ dir, reason: 'repo-missing' }, { dir: path.join(dir, 'nope'), reason: 'repo-missing' }], slots: [] }, stderr: '' } },
+      { resolve: { code: 0, json: { ok: true, removed: true, worktrees: 1, slots: 0, bytes: 8 }, stderr: '' } },
+      { resolve: { code: 0, json: { ok: true, removed: true, worktrees: 0, slots: 0, bytes: 0 }, stderr: '' } },
+    ]);
+    const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+    const plan = await service.call('projects:purge-plan', { path: gone });
+    assert.deepEqual(calls[0].args, ['projects', 'purge', gone, '--dry-run']);
+    assert.equal(plan.bytes, 8);
+    assert.equal(plan.listed, true);
+    await service.call('projects:purge', { path: gone, worktrees: true });
+    assert.deepEqual(calls[1].args, ['projects', 'purge', gone, '--worktrees']);
+    await service.call('projects:purge', { path: gone, worktrees: false });
+    assert.deepEqual(calls[2].args, ['projects', 'purge', gone]);
+    assert.equal(calls.length, 3, '没有先调 projects list');
+    await assert.rejects(service.call('projects:purge', { path: gone }), /参数无效/);
+    await assert.rejects(service.call('projects:purge', { path: 'relative', worktrees: false }), /参数无效/);
+    await assert.rejects(service.call('projects:purge-plan', { path: 'relative' }), /参数无效/);
+    assert.equal(calls.length, 3);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// 125：不用命令行的提交。新通道都先核对已登记项目；表单经标准输入（JSON）传给核心，不拼命令行。
+test('projects:changes 先核对已登记项目再调 projects changes', async () => {
+  const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, files: [{ path: 'a.txt', kind: 'add' }] }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('projects:changes', { path: proj }), { ok: true, files: [{ path: 'a.txt', kind: 'add' }] });
+  assert.deepEqual(calls[0].args, ['projects', 'list', '--registry-only']);
+  assert.deepEqual(calls[1].args, ['projects', 'changes', proj]);
+  const bad = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(bad.call('projects:changes', { path: 'relative' }), /参数无效/);
+  await assert.rejects(fakeUnregistered().call('projects:changes', { path: proj }), /没有登记/);
+});
+
+test('projects:commit 说明与文件经标准输入传 JSON，先核对已登记项目；参数校验', async () => {
+  const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, commit: 'abc1234', files: ['a.txt', '中文 b.txt'] }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('projects:commit', { path: proj, message: '补充 README', files: ['a.txt', '中文 b.txt'] });
+  assert.deepEqual(calls[0].args, ['projects', 'list', '--registry-only']);
+  assert.deepEqual(calls[1].args, ['projects', 'commit', proj], '路径之外的参数都不进命令行');
+  assert.deepEqual(JSON.parse(calls[1].input), { message: '补充 README', files: ['a.txt', '中文 b.txt'] });
+  const bad = createConsole({ coreRun: fakeCore().coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [
+    { path: 'relative', message: 'x', files: ['a'] },
+    { path: proj, message: 5, files: ['a'] },
+    { path: proj, message: 'x', files: 'a' },
+    { path: proj, message: 'x', files: [''] },
+    { path: proj, message: 'x', files: [1] },
+    { path: proj, message: 'x', files: ['a\0b'] },
+  ]) await assert.rejects(bad.call('projects:commit', payload), /参数无效/);
+  await assert.rejects(fakeUnregistered().call('projects:commit', { path: proj, message: 'x', files: ['a'] }), /没有登记/);
+});
+
+test('projects:commit 核心的错误码（NEED_GIT_IDENTITY）原样带给界面', async () => {
+  const { coreRun } = fakeCore(registered({ resolve: { code: 2, json: { ok: false, error: '还没有设置 git 提交身份', code: 'NEED_GIT_IDENTITY' }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(service.call('projects:commit', { path: proj, message: 'x', files: ['a'] }), error => error instanceof Error && error.code === 'NEED_GIT_IDENTITY');
+});
+
+test('projects:commit-init 带 withExisting 时加 --with-existing，类型不对时拒绝', async () => {
+  const ok = { resolve: { code: 0, json: { ok: true, commit: 'abc1234', files: [], withExisting: true }, stderr: '' } };
+  const { calls, coreRun } = fakeCore([...registered(ok), ...registered(ok)]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('projects:commit-init', { path: proj, withExisting: true });
+  assert.deepEqual(calls[1].args, ['projects', 'commit-init', proj, '--with-existing']);
+  await service.call('projects:commit-init', { path: proj, withExisting: false });
+  assert.deepEqual(calls[3].args, ['projects', 'commit-init', proj]);
+  await assert.rejects(service.call('projects:commit-init', { path: proj, withExisting: 'yes' }), /参数无效/);
+});
+
+function fakeUnregistered() {
+  const { coreRun } = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: other }] }, stderr: '' } }]);
+  return createConsole({ coreRun, chooseFolder: async () => null, messages });
+}
+
 test('projects:config 数组用 JSON.stringify，键白名单校验', async () => {
   const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, config: {} }, stderr: '' } }));
   const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
   await service.call('projects:config', { path: proj, set: { baseBranch: 'main', allowedPaths: ['src/**', 'a/b'], specsDir: 'docs/specs' } });
   assert.deepEqual(calls[1].args, ['projects', 'config', proj, 'baseBranch=main', `allowedPaths=${JSON.stringify(['src/**', 'a/b'])}`, 'specsDir=docs/specs']);
   await assert.rejects(service.call('projects:config', { path: proj, set: { unknown: 'x' } }), /参数无效/);
+});
+
+// Stage07b 132：推送三键的类型校验。字符串 / null（远程）、布尔 / null（两个开关）；null 传空串让核心删掉这个键；其他类型不调用核心。
+test('projects:config 推送三键：值与 null 的写法，类型不对不调用核心', async () => {
+  const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, config: {} }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('projects:config', { path: proj, set: { 'push.remote': ' upstream ', 'push.afterAccept': true, 'push.allowLead': false } });
+  assert.deepEqual(calls[1].args, ['projects', 'config', proj, 'push.remote=upstream', 'push.afterAccept=true', 'push.allowLead=false']);
+  const cleared = fakeCore(registered({ resolve: { code: 0, json: { ok: true, config: {} }, stderr: '' } }));
+  await createConsole({ coreRun: cleared.coreRun, chooseFolder: async () => null, messages }).call('projects:config', { path: proj, set: { 'push.remote': null, 'push.afterAccept': null, 'push.allowLead': null } });
+  assert.deepEqual(cleared.calls[1].args, ['projects', 'config', proj, 'push.remote=', 'push.afterAccept=', 'push.allowLead=']);
+  const bad = fakeCore();
+  const rejecting = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const set of [
+    { 'push.remote': 3 }, { 'push.remote': '' }, { 'push.remote': '  ' }, { 'push.remote': 'a\nb' }, { 'push.remote': true },
+    { 'push.afterAccept': 'true' }, { 'push.afterAccept': 1 }, { 'push.allowLead': 'false' }, { 'push.allowLead': {} },
+    { 'push.other': true },
+  ]) await assert.rejects(rejecting.call('projects:config', { path: proj, set }), /参数无效/, JSON.stringify(set));
+  assert.equal(bad.calls.length, 0, '类型不对时不调用核心');
+});
+
+// Stage07b 126：高级四项的类型校验（范围交给核心）；null 写成"键="。
+test('projects:config 高级四项：值与 null 的写法，类型不对不调用核心', async () => {
+  const { calls, coreRun } = fakeCore(registered({ resolve: { code: 0, json: { ok: true, config: {} }, stderr: '' } }));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('projects:config', { path: proj, set: { maxRetries: 1, mergeMode: 'squash', verifyTimeoutMin: 30, worktree: false } });
+  assert.deepEqual(calls[1].args, ['projects', 'config', proj, 'maxRetries=1', 'mergeMode=squash', 'verifyTimeoutMin=30', 'worktree=false']);
+  const cleared = fakeCore(registered({ resolve: { code: 0, json: { ok: true, config: {} }, stderr: '' } }));
+  await createConsole({ coreRun: cleared.coreRun, chooseFolder: async () => null, messages }).call('projects:config', { path: proj, set: { maxRetries: null, mergeMode: null, verifyTimeoutMin: null, worktree: null } });
+  assert.deepEqual(cleared.calls[1].args, ['projects', 'config', proj, 'maxRetries=', 'mergeMode=', 'verifyTimeoutMin=', 'worktree=']);
+  const bad = fakeCore();
+  const rejecting = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const set of [
+    { maxRetries: '1' }, { maxRetries: 1.5 }, { maxRetries: true }, { verifyTimeoutMin: '10' }, { verifyTimeoutMin: 2.5 },
+    { mergeMode: 'rebase' }, { mergeMode: 1 }, { worktree: 'true' }, { worktree: 1 },
+  ]) await assert.rejects(rejecting.call('projects:config', { path: proj, set }), /参数无效/, JSON.stringify(set));
+  assert.equal(bad.calls.length, 0, '类型不对时不调用核心');
+});
+
+// 132：远程状态 / 推送 / 拉取。都先核对已登记项目，超时 150 秒（核心的网络操作 120 秒）；失败时核心的 code 与中文原因原样交给界面。
+test('projects:remote / push / pull：参数（--dry-run、--no-fetch、--by human）、超时与已登记项目核对', async () => {
+  const status = { ok: true, remote: 'origin', url: 'https://example.invalid/x.git', branch: 'main', ahead: 2, behind: 0, state: 'ahead', lastPush: null };
+  const ok = json => ({ resolve: { code: 0, json, stderr: '' } });
+  const { calls, coreRun } = fakeCore([...registered(ok(status)), ...registered(ok(status)), ...registered(ok(status)), ...registered(ok({ ok: true, pushed: true, from: 'a', to: 'b' })), ...registered(ok({ ok: true, pulled: false }))]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('projects:remote', { path: proj }), status);
+  assert.deepEqual(calls[0].args, ['projects', 'list', '--registry-only']);
+  assert.deepEqual(calls[1].args, ['push', proj, '--dry-run', '--by', 'human']);
+  await service.call('projects:remote', { path: proj, fetch: false });
+  assert.deepEqual(calls[3].args, ['push', proj, '--dry-run', '--by', 'human', '--no-fetch']);
+  await service.call('projects:remote', { path: proj, fetch: true });
+  assert.deepEqual(calls[5].args, ['push', proj, '--dry-run', '--by', 'human']);
+  assert.deepEqual(await service.call('projects:push', { path: proj }), { ok: true, pushed: true, from: 'a', to: 'b' });
+  assert.deepEqual(calls[7].args, ['push', proj, '--by', 'human']);
+  assert.deepEqual(await service.call('projects:pull', { path: proj }), { ok: true, pulled: false });
+  assert.deepEqual(calls[9].args, ['pull', proj, '--by', 'human']);
+  for (const i of [1, 3, 5, 7, 9]) assert.equal(calls[i].timeoutMs, 150000);
+  // 参数无效或没有登记时不调用核心的推送命令。
+  const none = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: other }] }, stderr: '' } }]);
+  const unregistered = createConsole({ coreRun: none.coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(unregistered.call('projects:push', { path: proj }), /这个项目没有登记/);
+  assert.equal(none.calls.length, 1);
+  const bad = fakeCore();
+  const rejecting = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const [action, payload] of [['projects:remote', {}], ['projects:remote', { path: 'relative' }], ['projects:remote', { path: proj, fetch: 'no' }], ['projects:push', { path: 'relative' }], ['projects:pull', {}]])
+    await assert.rejects(rejecting.call(action, payload), /参数无效/, `${action} ${JSON.stringify(payload)}`);
+  assert.equal(bad.calls.length, 0);
+});
+
+test('projects:push / pull / remote 失败：核心的 code 与中文原因原样交给界面；超时是通道错误', async () => {
+  const failing = (code, error) => registered({ resolve: { code: 2, json: { ok: false, code, error }, stderr: '' } });
+  for (const [action, code, error] of [['projects:push', 'NO_CREDENTIAL', 'git 没有拿到可用的登录'], ['projects:pull', 'DIVERGED', '本机和远程各有新提交'], ['projects:remote', 'FETCH_FAILED', '取远程状态失败：网络不通']]) {
+    const service = createConsole({ coreRun: fakeCore(failing(code, error)).coreRun, chooseFolder: async () => null, messages });
+    await assert.rejects(service.call(action, { path: proj }), e => e.message === error && e.code === code);
+  }
+  // 取远程状态时就没有登录：核心的 code 是 FETCH_FAILED、cause 是 NO_CREDENTIAL。主进程只把 code 转给界面，所以这时 code 换成 NO_CREDENTIAL；其他原因（网络不通）的 FETCH_FAILED 保持原样。
+  const fetchFailed = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 2, json: { ok: false, code: 'FETCH_FAILED', cause: 'NO_CREDENTIAL', error: '取远程状态失败：git 没有拿到可用的登录' }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(fetchFailed.call('projects:push', { path: proj }), e => e.code === 'NO_CREDENTIAL' && /取远程状态失败/.test(e.message));
+  const netFailed = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 2, json: { ok: false, code: 'FETCH_FAILED', cause: 'NETWORK', error: '取远程状态失败：连不上远程' }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(netFailed.call('projects:remote', { path: proj }), e => e.code === 'FETCH_FAILED');
+  const timedOut = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 1, json: { ok: false }, timedOut: true, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(timedOut.call('projects:push', { path: proj }), /核心没有在 150 秒内返回/);
 });
 
 test('projects:git-identity 传 --name/--email 与 --global；先校验再查登记', async () => {
@@ -174,6 +337,23 @@ test('projects:init-plan / init-apply 调 init', async () => {
   assert.deepEqual(calls[3].args, ['init', proj]);
 });
 
+test('projects:upgrade-plan / upgrade-apply 调 init --upgrade；角色与字段名校验，无效时不调用核心', async () => {
+  const ok = () => registered({ resolve: { code: 0, json: { ok: true }, stderr: '' } });
+  const { calls, coreRun } = fakeCore([...ok(), ...ok(), ...ok()]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('projects:upgrade-plan', { path: proj });
+  await service.call('projects:upgrade-apply', { path: proj });
+  await service.call('projects:upgrade-apply', { path: proj, replaceRoles: ['worker', 'lead'], addFields: ['worktree', 'setup'] });
+  assert.deepEqual(calls[1].args, ['init', proj, '--upgrade', '--dry-run']);
+  assert.deepEqual(calls[3].args, ['init', proj, '--upgrade']);
+  assert.deepEqual(calls[5].args, ['init', proj, '--upgrade', '--replace-role', 'worker,lead', '--add-field', 'worktree,setup']);
+  const bad = fakeCore();
+  const rejecting = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [{ path: 'relative' }, { path: proj, replaceRoles: ['boss'] }, { path: proj, replaceRoles: 'worker' }, { path: proj, addFields: ['Worktree'] }, { path: proj, addFields: ['a b'] }, { path: proj, addFields: ['--dry-run'] }, { path: proj, addFields: [3] }])
+    await assert.rejects(rejecting.call('projects:upgrade-apply', payload), /参数无效/, JSON.stringify(payload));
+  assert.equal(bad.calls.length, 0);
+});
+
 test('specs:list / specs:read 调 spec 子命令', async () => {
   const { calls, coreRun } = fakeCore([...registered({ resolve: { code: 0, json: { ok: true }, stderr: '' } }), ...registered({ resolve: { code: 0, json: { ok: true }, stderr: '' } })]);
   const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
@@ -181,6 +361,24 @@ test('specs:list / specs:read 调 spec 子命令', async () => {
   await service.call('specs:read', { project: proj, rel: 'docs/specs/001-demo.md' });
   assert.deepEqual(calls[1].args, ['spec', 'list', proj]);
   assert.deepEqual(calls[3].args, ['spec', 'read', proj, 'docs/specs/001-demo.md']);
+});
+
+test('specs:list 带 archived 加 --include-archived；specs:archive 先核对已登记、逐项校验路径、带 --commit', async () => {
+  const ok = { resolve: { code: 0, json: { ok: true, moved: [], commit: 'abc1234' }, stderr: '' } };
+  const { calls, coreRun } = fakeCore([...registered(ok), ...registered(ok), ...registered(ok)]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('specs:list', { project: proj, archived: true });
+  await service.call('specs:list', { project: proj, archived: false });
+  assert.deepEqual(calls[1].args, ['spec', 'list', proj, '--include-archived']);
+  assert.deepEqual(calls[3].args, ['spec', 'list', proj]);
+  const result = await service.call('specs:archive', { project: proj, rels: ['docs/specs/002-a.md', 'docs/specs/003-b.md'] });
+  assert.equal(result.commit, 'abc1234');
+  assert.deepEqual(calls[5].args, ['spec', 'archive', proj, 'docs/specs/002-a.md', 'docs/specs/003-b.md', '--commit']);
+  // 参数无效：不调用核心。
+  const count = calls.length;
+  for (const bad of [{ project: proj }, { project: proj, rels: [] }, { project: proj, rels: ['a.txt'] }, { project: proj, rels: ['/abs/x.md'] }, { project: proj, rels: ['C:\\x.md'] }, { project: proj, rels: ['a\n.md'] }, { project: 'rel', rels: ['a.md'] }, { project: proj, rels: Array.from({ length: 201 }, (_, i) => `docs/specs/${i}.md`) }])
+    await assert.rejects(service.call('specs:archive', bad), new RegExp(messages.invalid));
+  assert.equal(calls.length, count);
 });
 
 test('spec:check-paths：项目要先核对已登记，路径数组作为 JSON 字符串传给核心，limit 按需；核心的错误原样抛出', async () => {
@@ -489,6 +687,56 @@ test('tasks:accept 先核对已登记项目，再调 accept <记录名> --by hum
   // 其他命令的失败即使带 conflict 字段也仍是错误（只有 accept 把冲突当结果）。
   const retryFail = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 4, json: { ok: false, conflict: true, files: [] }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
   await assert.rejects(retryFail.call('tasks:retry', { project: proj, name: 'x' }), /核心没有返回结果/);
+});
+
+// 129 撤销合并：与 tasks:accept 同一套规则（先核对已登记项目、cwd 为项目根、超时 120 秒、冲突退出码 4 原样返回）；项目已移除报 projectGoneBlocked。
+test('129 tasks:revert 先核对已登记项目，再调 revert <记录名> --by human，cwd 为项目路径，超时 120 秒；冲突不当错误；核心错误码原样带出', async () => {
+  const ok = { resolve: { code: 0, json: { ok: true, commit: 'abc1234', lines: ['x'] }, stderr: '' } };
+  const { calls, coreRun } = fakeCore(registered(ok));
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('tasks:revert', { project: proj, name: '013-音量 滑块' }), { ok: true, commit: 'abc1234' });
+  assert.deepEqual(calls[0].args, ['projects', 'list', '--registry-only']);
+  assert.deepEqual(calls[1].args, ['revert', '013-音量 滑块', '--by', 'human']);
+  assert.equal(calls[1].cwd, proj);
+  assert.equal(calls[1].timeoutMs, 120000);
+  const conflict = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 4, json: { ok: false, conflict: true, files: ['src/a.ts', 3, 'b.ts'] }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await conflict.call('tasks:revert', { project: proj, name: 'x' }), { conflict: true, files: ['src/a.ts', 'b.ts'] });
+  // 检查不通过（退出码 2）：核心的中文原因作为错误抛出，错误码一起带出。
+  const dirty = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 2, json: { ok: false, error: '主工作区有未提交的改动，先提交或暂存：a.txt', code: 'DIRTY_MAIN', files: ['a.txt'] }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(dirty.call('tasks:revert', { project: proj, name: 'x' }), error => error instanceof Error && error.code === 'DIRTY_MAIN' && /先提交或暂存/.test(error.message));
+  // 参数不合法不调用核心；项目已移除（不在登记表里）报 projectGoneBlocked，即使任务是已读到的。
+  const bad = fakeCore();
+  const guarded = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages, knownTask: () => true });
+  for (const payload of [{ name: 'a' }, { project: proj }, { project: 'relative', name: 'a' }, { project: proj, name: 'a/b' }, { project: proj, name: '' }, { project: proj, name: 'con' }])
+    await assert.rejects(guarded.call('tasks:revert', payload), /参数无效/);
+  assert.equal(bad.calls.length, 0);
+  const gone = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: proj }] }, stderr: '' } }]);
+  await assert.rejects(createConsole({ coreRun: gone.coreRun, chooseFolder: async () => null, messages, knownTask: () => true }).call('tasks:revert', { project: other, name: 'task-a' }), /项目已从项目列表移除，先重新添加项目/);
+  assert.deepEqual(gone.calls.map(call => call.args), [['projects', 'list', '--registry-only']], '只查了登记，没有调用 revert');
+  // 其他命令的失败即使带 conflict 字段也仍是错误（只有 accept / revert 把冲突当结果）。
+  const retryFail = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 4, json: { ok: false, conflict: true, files: [] }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(retryFail.call('tasks:retry', { project: proj, name: 'x' }), /核心没有返回结果/);
+});
+
+// 132：批准时可选的 push 参数。不传时参数与原来完全相同（上面那条测试逐字核对）；true → --push，false → --no-push；其他类型不调用核心。
+test('tasks:accept 的 push：true 传 --push，false 传 --no-push，不传时没有这两个参数；push 结果原样带回', async () => {
+  const merged = { ok: true, merge: 'abc1234', mode: 'no-ff', cleanup: true };
+  const ok = json => ({ resolve: { code: 0, json, stderr: '' } });
+  const { calls, coreRun } = fakeCore([...registered(ok({ ...merged, push: { ok: true, pushed: true } })), ...registered(ok(merged)), ...registered(ok({ ...merged, push: { ok: false, code: 'NO_CREDENTIAL', error: '没有登录' } })), ...registered(ok(merged))]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('tasks:accept', { project: proj, name: 'x', push: true }), { ...merged, push: { ok: true, pushed: true } });
+  assert.deepEqual(calls[1].args, ['accept', 'x', '--by', 'human', '--push']);
+  await service.call('tasks:accept', { project: proj, name: 'x', push: false });
+  assert.deepEqual(calls[3].args, ['accept', 'x', '--by', 'human', '--no-push']);
+  const failedPush = await service.call('tasks:accept', { project: proj, name: 'x', push: true });
+  assert.deepEqual(failedPush.push, { ok: false, code: 'NO_CREDENTIAL', error: '没有登录' });
+  await service.call('tasks:accept', { project: proj, name: 'x' });
+  assert.deepEqual(calls[7].args, ['accept', 'x', '--by', 'human']);
+  for (const calledWith of calls.filter((_, i) => i % 2 === 1)) assert.equal(calledWith.timeoutMs, 120000);
+  const bad = fakeCore();
+  const rejecting = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const push of ['yes', 1, null, {}]) await assert.rejects(rejecting.call('tasks:accept', { project: proj, name: 'x', push }), /参数无效/);
+  assert.equal(bad.calls.length, 0);
 });
 
 test('tasks:reject：原因必填，--reason 与 --keep-branch 与 --by human 按序传入；参数不合法不调用核心', async () => {

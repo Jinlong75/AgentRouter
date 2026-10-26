@@ -195,18 +195,21 @@ export function openCustomForm(o: CustomFormOptions): Sheet {
     const seg = (key: string, items: readonly string[], labels: Record<string, string>, on: string, aria: string) => `<div class="segm" role="group" aria-label="${esc(aria)}">${items.map(v => `<button type="button" data-seg="${key}" data-v="${v}" class="${on === v ? 'on' : ''}" aria-pressed="${on === v}">${esc(labels[v])}</button>`).join('')}</div>`;
     const err = (key: string) => `<div class="ferr" data-err="${key}"></div>`;
     const input = (key: string, value: string, label: string, { mono = true, ph = '' } = {}) => `<input class="inp${mono ? ' mono' : ''}" data-c="${key}" value="${esc(value)}" placeholder="${esc(ph)}" aria-label="${esc(label)}">`;
+    // 带示例的输入框（Stage07b T4d⑪）：空着时按 → 填入示例；聚焦且为空时右侧显示按键提示（纯 CSS，见 style.css 的 .exw）。
+    const example = (control: string) => `<div class="exw">${control}<kbd class="kbd">${esc(gx.exampleKey)}</kbd></div>`;
+    const exampleHelp = (help: string) => esc(`${help} · ${gx.exampleHint}`);
     const formBody = () => `<div class="form"><div class="ferr general" data-err="general"></div>
         ${field(ag.name, esc(ag.nameHelp), input('name', S.name, ag.name) + err('name'), true)}
         ${field(ag.label, esc(ag.labelHelp), input('label', S.label, ag.label, { mono: false }) + err('label'))}
         ${field(gx.program, esc(gx.programHelp), `<div class="statusline">${input('program', S.program, gx.program)}<button type="button" class="btn" data-c-act="browse">${icon('folder-open-line')}${esc(gx.browse)}</button><span data-prog-status></span></div>${err('program')}`, true)}
         ${field(gx.detectArgs, esc(gx.detectArgsHelp), input('detectArgs', S.detectArgs, gx.detectArgs) + err('detectArgs'))}
         ${field(gx.argsTpl, esc(gx.argsTplHelp), tagsHtml('args', S.args, gx.argsTpl, gx.argAdd, true) + err('args'), true)}
-        ${field(gx.stdin, esc(gx.stdinHelp), input('stdin', S.stdin, gx.stdin, { ph: gx.stdinPh }) + err('stdin'))}
+        ${field(gx.stdin, exampleHelp(gx.stdinHelp), example(input('stdin', S.stdin, gx.stdin, { ph: gx.stdinPh })) + err('stdin'))}
         ${field(gx.outFormat, '', seg('format', FORMATS, gx.formats, S.format, gx.outFormat) + err('format'), true)}
         ${S.format === 'jsonl' ? field(gx.mapping, esc(gx.mappingHelp), `<div class="map-list">${mapRows()}<button type="button" class="btn sm" data-map-add>${icon('add-line')}${esc(gx.mapAdd)}</button></div>${err('map')}`, true) : ''}
         ${S.format === 'stream-json' ? '' : field(gx.reportFrom, '', seg('report', REPORTS, gx.reports, S.report, gx.reportFrom) + err('report'))}
-        ${field(gx.readOnlyArgs, esc(gx.readOnlyArgsHelp), tagsHtml('readOnly', S.readOnly, gx.readOnlyArgs, gx.readOnlyPh, false) + err('readOnly'))}
-        ${field(gx.secretVar, esc(gx.secretVarHelp), input('secretVar', S.secretVar, gx.secretVar, { ph: gx.secretVarPh }) + err('secretVar'))}</div>`;
+        ${field(gx.readOnlyArgs, exampleHelp(gx.readOnlyArgsHelp), example(tagsHtml('readOnly', S.readOnly, gx.readOnlyArgs, gx.readOnlyPh, false)) + err('readOnly'))}
+        ${field(gx.secretVar, exampleHelp(gx.secretVarHelp), example(input('secretVar', S.secretVar, gx.secretVar, { ph: gx.secretVarPh })) + err('secretVar'))}</div>`;
 
     // ---- 预览 ----
     const previewBody = () => {
@@ -217,10 +220,11 @@ export function openCustomForm(o: CustomFormOptions): Sheet {
         const rows = r.output.flatMap((l, i) => l.stream !== 'stdout' ? [] : l.events.length
             ? l.events.map(e => `<div class="pv-e">${icon(KIND_ICON[e.kind] ?? 'text')}<span>${esc(eventLine(e))}</span></div>`)
             : l.text.trim() ? [`<div class="pv-e skip"><span class="mk skip">${icon('subtract-line')}</span><span>${esc(gx.unmatched(i + 1))}</span></div>`] : []);
-        const reason = r.error ?? previewFailure;
+        // 失败原因可能是多行（没找到像错误的行时取最后几行）：换行改成空格；nt-path 允许在长路径中间折行，右栏里完整显示。
+        const reason = (r.error ?? previewFailure).replace(/\s*\r?\n\s*/g, ' ');
         const result = r.ok
             ? `<div class="testbox ok" data-pv="ok">${mark('ok')}<div><b>${esc(gx.previewOk)}</b><span>${esc(gx.previewOkHelp(r.exit ?? 0, String(r.seconds), (r.report ?? '').split(/\r?\n/)[0].slice(0, 120)))}</span></div></div>`
-            : `<div class="testbox fail" data-pv="fail">${mark('fail')}<div><b>${esc(gx.previewFail)}</b><span>${esc(reason)}</span></div></div>`;
+            : `<div class="testbox fail" data-pv="fail">${mark('fail')}<div><b>${esc(gx.previewFail)}</b><span class="nt-path">${esc(reason)}</span></div></div>`;
         return `<div class="pv2"><div><div class="sec-t">${esc(gx.rawOut)}</div><pre class="out selectable" data-pv-raw>${esc(raw)}</pre></div><div><div class="sec-t">${esc(gx.mapped)}</div><div class="pv-ev" data-pv-events>${rows.join('')}</div>${result}</div></div>`;
     };
     const mark = (state: string) => `<span class="mk ${state}">${icon(({ ok: 'checkbox-circle-line', fail: 'close-circle-line', run: 'loader-4-line' } as Record<string, string>)[state])}</span>`;
@@ -404,6 +408,18 @@ export function openCustomForm(o: CustomFormOptions): Sheet {
     root.addEventListener('focusout', e => {
         const t = e.target as HTMLElement;
         if (t.matches('[data-c="program"], [data-c="detectArgs"]')) void detectNow();
+    });
+    // 空输入框里按 → 填入示例，光标放到末尾，并触发和手动输入一样的 input 事件；不为空时保持默认（移动光标）。
+    // 只读参数只填进输入框文字，不自动加成小方块（回车才加）。Tab 不受影响。
+    root.addEventListener('keydown', e => {
+        const t = e.target as HTMLInputElement;
+        if (e.key !== 'ArrowRight' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.isComposing || !t.matches?.('input') || t.value) return;
+        const key = t.dataset.c === 'stdin' ? 'stdin' : t.dataset.c === 'secretVar' ? 'secretVar' : t.dataset.tagIn === 'readOnly' ? 'readOnly' : '';
+        if (!key) return;
+        e.preventDefault();
+        t.value = gx.examples[key];
+        t.setSelectionRange(t.value.length, t.value.length);
+        t.dispatchEvent(new Event('input', { bubbles: true }));
     });
     // 标签式输入：回车把文字加成一项；输入框为空时退格删除最后一项。
     root.addEventListener('keydown', e => {

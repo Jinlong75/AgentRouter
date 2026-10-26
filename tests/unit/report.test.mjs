@@ -259,6 +259,39 @@ test('归因混合：第 1 次 environment、第 2 次 spec；执行者两次的
   assert.equal(half.lead.score, 100);
 });
 
+test('归因时那次尝试的越界、受保护路径、工作区外写入一并不算执行者的，也不转给主导', t => {
+  const attempts = [
+    { n: 1, reason: 'first', gate: false, gateFile: { scope: { outside: ['a.txt'], protected: ['docs/specs/001-x.md'] }, outsideWrites: { checked: true, added: [{ root: 'home', name: 'x.txt', type: 'file' }] } } },
+    { n: 2, reason: 'gate', gate: true },
+  ];
+  const three = role => ['outsideFile', 'protectedFile', 'outsideWrites'].map(key => item(role, key).count);
+  const plain = scene(t, { name: '不归因', attempts }).report();
+  assert.deepEqual(three(plain.executor), [1, 1, 1]);
+
+  const spec = scene(t, { name: '归说明', attempts, marks: { v: 1, blame: { 1: 'spec' } } }).report();
+  assert.deepEqual(three(spec.executor), [0, 0, 0]);
+  assert.equal(spec.executor.score, 100);
+  assert.deepEqual([item(spec.lead, 'specBlame').count, item(spec.lead, 'specBlame').points], [1, -15]);
+  assert.equal(spec.lead.score, 85);
+  assert.deepEqual(spec.lead.items.map(entry => [entry.key, entry.count, entry.points]), plain.lead.items.map(entry => entry.key === 'specBlame' ? [entry.key, 1, -15] : [entry.key, entry.count, entry.points]));
+
+  const env = scene(t, { name: '归环境', attempts, marks: { v: 1, blame: { 1: 'environment' } } }).report();
+  assert.deepEqual(three(env.executor), [0, 0, 0]);
+  assert.deepEqual([env.executor.score, env.lead.score], [100, 100]);
+  for (const role of [env.executor, env.lead]) assert.deepEqual(item(role, 'envBlame'), { key: 'envBlame', count: 1, points: 0, detail: null });
+});
+
+test('归因只移走被归因那次的越界：另一次未被归因的尝试里还有同一路径，仍然算', t => {
+  const out = (n, reason, file, gate) => ({ n, reason, gate, gateFile: { scope: { outside: [file], protected: [] } } });
+  const same = scene(t, { name: '同一路径', attempts: [out(1, 'first', 'a.txt', false), out(2, 'gate', 'a.txt', false), { n: 3, reason: 'gate', gate: true }], marks: { v: 1, blame: { 1: 'spec' } } }).report();
+  assert.equal(item(same.executor, 'outsideFile').count, 1);
+  assert.equal(item(same.executor, 'outsideFile').detail, 'a.txt');
+
+  const diff = scene(t, { name: '不同路径', attempts: [out(1, 'first', 'a.txt', false), out(2, 'gate', 'b.txt', false), { n: 3, reason: 'gate', gate: true }], marks: { v: 1, blame: { 1: 'spec' } } }).report();
+  assert.equal(item(diff.executor, 'outsideFile').count, 1);
+  assert.equal(item(diff.executor, 'outsideFile').detail, 'b.txt');
+});
+
 test('marks.json 里的未知值当作没有；多余的编号不算；其他合法项照常读', t => {
   const attempts = [{ n: 1, reason: 'first', gate: false }, { n: 2, reason: 'gate', gate: false }, { n: 3, reason: 'gate', gate: true }];
   const f = scene(t, { name: '未知值', attempts, marks: { v: 1, blame: { 1: 'lead', 2: 'environment', 3: 'environment', 9: 'environment' } } }).report();
@@ -381,6 +414,22 @@ test('非 worktree 任务：验收两项写"不用 worktree，没有验收"；wo
   assert.equal(accepted.state, 'accepted');
   assert.equal(accepted.lead.perf.awaitMs, 1000);
   assert.equal(accepted.lead.perf.ms, 7000, '主导用时是 start 到最后一条 end');
+});
+
+test('129 已撤销的合并：评分不变，只在"驳回"项的说明里写"已撤销（提交 xxxxxxx）"；文字输出同样带出', t => {
+  const merge = { event: 'accepted', merge: 'b'.repeat(40), mode: 'no-ff', by: 'cli' };
+  const plain = scene(t, { name: '合并未撤销', worktree: true, attempts: [{ n: 1, gate: true }], extra: [merge] }).report();
+  const reverted = scene(t, { name: '合并已撤销', worktree: true, attempts: [{ n: 1, gate: true }], extra: [merge, { event: 'reverted', commit: 'e'.repeat(40), by: 'human' }] }).report();
+  assert.equal(reverted.state, 'accepted');
+  assert.equal(item(plain.lead, 'rejected').detail, null, '没撤销时没有说明');
+  assert.deepEqual([item(reverted.lead, 'rejected').count, item(reverted.lead, 'rejected').points, item(reverted.lead, 'rejected').detail], [0, 0, '已撤销（提交 eeeeeee）']);
+  assert.equal(reverted.lead.score, plain.lead.score);
+  assert.equal(reverted.executor.score, plain.executor.score);
+  assert.deepEqual(brief(reverted.lead), brief(plain.lead), '撤销不改任何一项的计数与扣分');
+  assert.match(reportLines(reverted).join('\n'), /^ {2}驳回：已撤销（提交 eeeeeee）（0）$/m);
+  // 只看 accepted 之后的 reverted：之前的不算（不会发生，但读法要确定）。
+  const before = scene(t, { name: '撤销在前', worktree: true, attempts: [{ n: 1, gate: true }], extra: [{ event: 'reverted', commit: 'e'.repeat(40), by: 'human' }, merge] }).report();
+  assert.equal(item(before.lead, 'rejected').detail, null);
 });
 
 test('被拒绝时的原文：找不到记录、进行中、直接文字派发的任务、旧任务', t => {

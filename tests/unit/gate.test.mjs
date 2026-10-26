@@ -201,7 +201,8 @@ test('isRootSpecFile：根目录下三位编号加连字符、.md 结尾才算�
   assert.equal(isRootSpecFile('065-x.md', { caseInsensitive: false }), true);
   assert.equal(isRootSpecFile('65-x.md'), false, '两位编号不算');
   assert.equal(isRootSpecFile('06-5x.md'), false);
-  assert.equal(isRootSpecFile('1234-x.md'), false, '四位不算三位');
+  assert.equal(isRootSpecFile('1234-x.md'), true, '四位编号也算（编号超过 999 后）');
+  assert.equal(isRootSpecFile('1000-x.md'), true);
   assert.equal(isRootSpecFile('065-x.txt'), false);
   assert.equal(isRootSpecFile('065x.md'), false, '缺连字符不算');
   assert.equal(isRootSpecFile('README.md'), false);
@@ -222,6 +223,10 @@ test('explicitlyAllowedRootSpec：放行的模式要明确写到编号（字面�
   assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: false }), false);
   assert.equal(explicitlyAllowedRootSpec('065-x.MD', ['065-*.md'], { caseInsensitive: false }), false);
   assert.equal(explicitlyAllowedRootSpec('065-x.md', ['065-*.MD'], { caseInsensitive: true }), true);
+  // 四位编号：按完整的数字加连字符比较。
+  assert.equal(explicitlyAllowedRootSpec('1000-x.md', ['1000-*.md']), true);
+  assert.equal(explicitlyAllowedRootSpec('1000-x.md', ['100-*.md']), false);
+  assert.equal(explicitlyAllowedRootSpec('100-x.md', ['1000-*.md']), false);
 });
 
 // 093：runGate 的 extraEnv 在 removeEnv 之后合并；不传时验收命令的环境与原来相同。

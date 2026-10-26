@@ -116,6 +116,9 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       const error = new Error(json.error || messages.noResult);
       // 核心的错误码（如 NEED_GIT_IDENTITY）原样带给渲染层，界面据此显示对应的指引。
       if (typeof json.code === 'string' && json.code) error.code = json.code;
+      // 推送 / 拉取的取远程状态失败（FETCH_FAILED）带 cause（NO_CREDENTIAL / NETWORK / OTHER）：没有登录多半在这一步暴露。
+      // 主进程到渲染层只转交 code，所以 cause 是 NO_CREDENTIAL 时把 code 也换成 NO_CREDENTIAL，界面据此显示登录指引（中文原因不变）。
+      if (json.code === 'FETCH_FAILED' && json.cause === 'NO_CREDENTIAL') error.code = 'NO_CREDENTIAL';
       throw error;
     }
     throw new Error(messages.noResult);
@@ -310,6 +313,18 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     async 'projects:choose'() { return chooseFolder(); },
     async 'projects:add'(p) { if (!validAbsPath(p?.path)) invalid(); return run(['projects', 'add', p.path, '--allow-non-git'], { timeoutMs: 60000 }); },
     async 'projects:remove'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'remove', p.path], { timeoutMs: 60000 }); },
+    // 彻底清理已删除的项目（T4m）：项目文件夹已不存在，所以不要求"已登记"；路径在项目列表里或任务清单里有它的任务由核心核对。
+    // plan 是 --dry-run，另量出 worktree 的总大小（bytes）；run 的 worktrees 为真时才删残留的 worktree 与名额。
+    async 'projects:purge-plan'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      const result = await run(['projects', 'purge', p.path, '--dry-run'], { timeoutMs: 60000 });
+      const sizes = await Promise.all((Array.isArray(result.worktrees) ? result.worktrees : []).map(item => sizeOf(item?.dir)));
+      return { ...result, bytes: sizes.reduce((sum, n) => sum + n, 0) };
+    },
+    async 'projects:purge'(p) {
+      if (!validAbsPath(p?.path) || typeof p?.worktrees !== 'boolean') invalid();
+      return run(['projects', 'purge', p.path, ...(p.worktrees ? ['--worktrees'] : [])], { timeoutMs: 120000 });
+    },
     async 'projects:show'(p) {
       if (!validAbsPath(p?.path)) invalid();
       await registeredProject(p.path);
@@ -318,7 +333,22 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       return run(['projects', 'show', p.path], { timeoutMs: 60000 });
     },
     async 'projects:git-init'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'git-init', p.path], { timeoutMs: 60000 }); },
-    async 'projects:commit-init'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'commit-init', p.path], { timeoutMs: 60000 }); },
+    // withExisting：项目还没有任何提交时，把已有文件和 init 文件放进同一个提交（项目已有提交时核心忽略它）。
+    async 'projects:commit-init'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      if (p.withExisting !== undefined && typeof p.withExisting !== 'boolean') invalid();
+      await registeredProject(p.path);
+      return run(['projects', 'commit-init', p.path, ...(p.withExisting === true ? ['--with-existing'] : [])], { timeoutMs: 60000 });
+    },
+    // 主工作区里未提交的文件（只读）与提交：表单（说明、文件列表）经标准输入传给核心，不拼命令行。
+    async 'projects:changes'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['projects', 'changes', p.path], { timeoutMs: 60000 }); },
+    async 'projects:commit'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      if (typeof p.message !== 'string' || p.message.length > 20000) invalid();
+      if (!Array.isArray(p.files) || p.files.length > 5000 || p.files.some(file => typeof file !== 'string' || !file || file.length > 1000 || file.includes('\0'))) invalid();
+      await registeredProject(p.path);
+      return run(['projects', 'commit', p.path], { input: JSON.stringify({ message: p.message, files: p.files }), timeoutMs: 60000 });
+    },
     async 'projects:git-identity'(p) {
       if (!validAbsPath(p?.path)) invalid();
       const identity = identityInput(p?.name, p?.email);
@@ -328,9 +358,28 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       await registeredProject(p.path);
       return run(args, { timeoutMs: 60000 });
     },
+    // 远程状态（Stage07b 132）：ar push --dry-run，只报告领先 / 落后，不推送。记为 human：软件从带 CLAUDECODE=1 的终端启动时，核心不会把它当成主导而拒绝。fetch 为 false 时加 --no-fetch（不联网，只读本地已有的远程跟踪分支）。
+    // 联网读取最多 120 秒（核心的网络超时），这里给 150 秒。失败时核心的 code 与中文原因原样交给界面。
+    async 'projects:remote'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      if (p.fetch !== undefined && typeof p.fetch !== 'boolean') invalid();
+      await registeredProject(p.path);
+      return run(['push', p.path, '--dry-run', '--by', 'human', ...(p.fetch === false ? ['--no-fetch'] : [])], { timeoutMs: 150000 });
+    },
+    // 推送 / 快进拉取：软件里用户点的，记为 human。只推主分支、普通推送、只快进（核心保证）。
+    async 'projects:push'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      await registeredProject(p.path);
+      return run(['push', p.path, '--by', 'human'], { timeoutMs: 150000 });
+    },
+    async 'projects:pull'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      await registeredProject(p.path);
+      return run(['pull', p.path, '--by', 'human'], { timeoutMs: 150000 });
+    },
     async 'projects:config'(p) {
       if (!validAbsPath(p?.path)) invalid();
-      const keys = ['baseBranch', 'setup', 'verify', 'allowedPaths', 'specsDir'];
+      const keys = ['baseBranch', 'setup', 'verify', 'allowedPaths', 'specsDir', 'push.remote', 'push.afterAccept', 'push.allowLead', 'maxRetries', 'mergeMode', 'verifyTimeoutMin', 'worktree'];
       const set = p?.set;
       if (set !== undefined && (!set || typeof set !== 'object' || Array.isArray(set))) invalid();
       const args = ['projects', 'config', p.path];
@@ -342,6 +391,24 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
           if (key === 'setup' || key === 'verify' || key === 'allowedPaths') {
             if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || /[\r\n]/.test(item))) invalid();
             args.push(`${key}=${JSON.stringify(value)}`);
+          } else if (key === 'push.remote') {
+            // 远程名：单行字符串，或 null（删掉这个键，回到默认 origin）；有效性交给核心。
+            if (value !== null && !(validLine(value) && value.trim())) invalid();
+            args.push(`${key}=${value === null ? '' : value.trim()}`);
+          } else if (key === 'push.afterAccept' || key === 'push.allowLead') {
+            // 布尔，或 null（删掉这个键，回到默认 false）。
+            if (value !== null && typeof value !== 'boolean') invalid();
+            args.push(`${key}=${value === null ? '' : String(value)}`);
+          } else if (key === 'maxRetries' || key === 'verifyTimeoutMin') {
+            // 整数，或 null（删掉这个键，回到默认值）；范围交给核心。
+            if (value !== null && !Number.isInteger(value)) invalid();
+            args.push(`${key}=${value === null ? '' : String(value)}`);
+          } else if (key === 'mergeMode') {
+            if (value !== null && value !== 'no-ff' && value !== 'squash') invalid();
+            args.push(`${key}=${value === null ? '' : value}`);
+          } else if (key === 'worktree') {
+            if (value !== null && typeof value !== 'boolean') invalid();
+            args.push(`${key}=${value === null ? '' : String(value)}`);
           } else {
             if (!validLine(value)) invalid();
             args.push(`${key}=${value}`);
@@ -353,7 +420,27 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     },
     async 'projects:init-plan'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['init', p.path, '--dry-run'], { timeoutMs: 60000 }); },
     async 'projects:init-apply'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['init', p.path], { timeoutMs: 60000 }); },
-    async 'specs:list'(p) { if (!validAbsPath(p?.project)) invalid(); await registeredProject(p.project); return run(['spec', 'list', p.project], { timeoutMs: 60000 }); },
+    // 更新协作约定（ar init --upgrade）：角色只能是 lead / worker / reviewer；字段名只做格式校验（小写字母开头的字母数字），是否真缺由核心核对。
+    async 'projects:upgrade-plan'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); return run(['init', p.path, '--upgrade', '--dry-run'], { timeoutMs: 60000 }); },
+    async 'projects:upgrade-apply'(p) {
+      if (!validAbsPath(p?.path)) invalid();
+      const roles = p.replaceRoles ?? [], fields = p.addFields ?? [];
+      if (!Array.isArray(roles) || !Array.isArray(fields) || roles.length > 3 || fields.length > 20) invalid();
+      if (!roles.every(r => r === 'lead' || r === 'worker' || r === 'reviewer') || !fields.every(k => typeof k === 'string' && /^[a-z][A-Za-z0-9]*$/.test(k))) invalid();
+      await registeredProject(p.path);
+      return run(['init', p.path, '--upgrade', ...(roles.length ? ['--replace-role', roles.join(',')] : []), ...(fields.length ? ['--add-field', fields.join(',')] : [])], { timeoutMs: 60000 });
+    },
+    async 'specs:list'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      await registeredProject(p.project);
+      return run(['spec', 'list', p.project, ...(p.archived === true ? ['--include-archived'] : [])], { timeoutMs: 60000 });
+    },
+    // 归档任务说明：把顶层说明 git mv 到 archive/ 并提交（只移动，不删除）；路径逐项校验，最多 200 项。
+    async 'specs:archive'(p) {
+      if (!validAbsPath(p?.project) || !Array.isArray(p.rels) || !p.rels.length || p.rels.length > 200 || !p.rels.every(validSpecRel)) invalid();
+      await registeredProject(p.project);
+      return run(['spec', 'archive', p.project, ...p.rels, '--commit'], { timeoutMs: 60000 });
+    },
     async 'specs:read'(p) { if (!validAbsPath(p?.project) || !validSpecRel(p?.rel)) invalid(); await registeredProject(p.project); return run(['spec', 'read', p.project, p.rel], { timeoutMs: 60000 }); },
     async 'specs:new'(p) {
       if (!validAbsPath(p?.project)) invalid();
@@ -436,9 +523,19 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
       if (p.confirm !== undefined && typeof p.confirm !== 'boolean') invalid();
+      // push：true 合并后推送（--push），false 不推送（--no-push）；不传时参数与原来完全相同（核心按项目配置 push.afterAccept 决定）。
+      if (p.push !== undefined && typeof p.push !== 'boolean') invalid();
       if (p.confirm === true) await closableTask(p.project, p.name);
       else await registeredProject(p.project, { blocked: true });
-      return run(['accept', p.name, '--by', 'human'], { timeoutMs: 120000, cwd: p.project, conflict: true });
+      return run(['accept', p.name, '--by', 'human', ...(p.push === undefined ? [] : [p.push ? '--push' : '--no-push'])], { timeoutMs: 120000, cwd: p.project, conflict: true });
+    },
+    // 撤销合并（Stage07b 129）：在项目根运行 ar revert，软件发起记为 human。会改项目，所以项目必须已登记（移除后报 projectGoneBlocked）。
+    // 成功返回 { commit }（反向提交的短 SHA）；冲突（退出码 4）返回 { conflict: true, files }；检查不通过时核心的中文原因作为错误抛出（带核心错误码）。超时 120 秒。
+    async 'tasks:revert'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await registeredProject(p.project, { blocked: true });
+      return run(['revert', p.name, '--by', 'human'], { timeoutMs: 120000, cwd: p.project, conflict: true });
     },
     // 驳回（协议 15.7）：原因必填（空白不算）；keepBranch 为 true 时保留分支。项目被移除后仍可驳回（核心按任务记录里的仓库路径工作）。
     async 'tasks:reject'(p) {

@@ -76,7 +76,9 @@ test('claude-code 执行者环境：清掉主导会话变量、注入密钥、�
   assert.equal(e.configDir, path.join(s.home, 'workers', 'deepseek', 'claude')); assert.ok(fs.statSync(e.configDir).isDirectory());
   assert.equal(e.disableAutoupdater, '1');
   assert.deepEqual(e.args, ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions']);
-  assert.equal(path.resolve(e.cwd), path.resolve(s.root));
+  // 执行者的 cwd 是长路径（124）：两边都取真实路径再比较，Windows 上不含 8.3 短名的 ~1。
+  assert.equal(fs.realpathSync.native(e.cwd), fs.realpathSync.native(s.root));
+  if (process.platform === 'win32') assert.ok(!/~\d/.test(e.cwd), `cwd 不应含 8.3 短名：${e.cwd}`);
   s.assertNoSecret(result);
 });
 

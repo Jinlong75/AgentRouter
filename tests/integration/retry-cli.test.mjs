@@ -570,7 +570,7 @@ test('--json 与参数错误：找不到记录、缺记录名、无效派活方�
   const noName = await f.ar(['retry', '--json']);
   assert.equal(noName.code, 2, noName.stderr + noName.stdout);
   assert.deepEqual(JSON.parse(noName.stdout),
-    { ok: false, error: '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--detach] [--host claude-code|agentrouter]' });
+    { ok: false, error: '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]' });
 
   const badHost = await f.ar(['retry', '某记录', '--host', 'bad', '--json']);
   assert.equal(badHost.code, 2, badHost.stderr + badHost.stdout);

@@ -58,6 +58,9 @@ export class NewTaskView {
     private agents: AgentRow[] = [];
     private show: ProjectShow | null = null;
     private specs: SpecRow[] = [];
+    // 归档的任务说明（Stage07b T4m）：archivedCount 来自 specs:list，showArchived 为真时列表带上已归档的。
+    private archivedCount = 0;
+    private showArchived = false;
     private project = '';
     private source: Source = 'new';
     private selectedSpec = '';
@@ -384,11 +387,12 @@ export class NewTaskView {
         try {
             const [show, specs] = await Promise.all([
                 window.dock.console('projects:show', { path }),
-                window.dock.console('specs:list', { project: path }),
+                window.dock.console('specs:list', this.showArchived ? { project: path, archived: true } : { project: path }),
             ]);
             if (token !== this.projectSeq || loadToken !== this.loadSeq || this.project !== path) return;
             this.show = show?.project ?? null;
             this.specs = Array.isArray(specs?.specs) ? specs.specs : [];
+            this.archivedCount = Number.isSafeInteger(specs?.archivedCount) ? specs.archivedCount : 0;
             if (!this.specs.some(s => s.rel === this.selectedSpec)) this.selectedSpec = this.specs[0]?.rel ?? '';
             if (this.defaultsFrom !== path) {
                 this.defaultsFrom = path;
@@ -408,7 +412,7 @@ export class NewTaskView {
     }
 
     private dataKey() {
-        return JSON.stringify([this.loaded, this.projects, this.agents, this.show, this.specs, this.selectedSpec, this.project, this.defaultsFrom, this.routeConfig]);
+        return JSON.stringify([this.loaded, this.projects, this.agents, this.show, this.specs, this.archivedCount, this.showArchived, this.selectedSpec, this.project, this.defaultsFrom, this.routeConfig]);
     }
 
     private setReady(ready: boolean) {
@@ -490,9 +494,13 @@ export class NewTaskView {
         if (!this.specs.length) return field(nt.specs, help, `<p class="fhint" data-nt-specs-empty>${esc(nt.specsEmpty)}</p>`);
         const rows = this.specs.map(s => {
             const on = s.rel === this.selectedSpec;
-            return `<button class="pick ${on ? 'on' : ''}" data-nt-spec="${esc(s.rel)}" role="radio" aria-checked="${on}" ${disabled}><span class="rd ${on ? 'on' : ''}"></span><span class="pk"><b class="mono">${esc(s.file)}</b><span>${esc(s.title)} · ${esc(nt.dispatched(s.dispatched))}</span></span><span class="mono muted">${esc(formatMtime(s.mtime))}</span></button>`;
+            // TODO(lead): SpecRow（shared/types.ts，不在允许清单）还没有 archived 字段，这里先用交叉类型读取。
+            const tag = (s as SpecRow & { archived?: boolean }).archived ? `<span class="xtag mono" data-nt-archived-tag>${esc(nt.specsArchivedTag)}</span>` : '';
+            return `<button class="pick ${on ? 'on' : ''}" data-nt-spec="${esc(s.rel)}" role="radio" aria-checked="${on}" ${disabled}><span class="rd ${on ? 'on' : ''}"></span><span class="pk"><b class="mono">${tag}${esc(s.file)}</b><span>${esc(s.title)} · ${esc(nt.dispatched(s.dispatched))}</span></span><span class="mono muted">${esc(formatMtime(s.mtime))}</span></button>`;
         }).join('');
-        return field(nt.specs, help, `<div class="picks" data-nt-picks role="radiogroup" aria-label="${esc(nt.specs)}">${rows}</div>`);
+        // 有归档的说明时，列表下面一个文字按钮：展开 / 收起已归档的。
+        const more = this.archivedCount > 0 ? `<div><button class="btn quiet" data-nt-archived ${disabled}>${esc(this.showArchived ? nt.specsArchivedHide : nt.specsArchived(this.archivedCount))}</button></div>` : '';
+        return field(nt.specs, help, `<div class="picks" data-nt-picks role="radiogroup" aria-label="${esc(nt.specs)}">${rows}</div>${more}`);
     }
 
     private textBody(disabled: string) {
@@ -532,6 +540,7 @@ export class NewTaskView {
         if (d.ntSource) return `[data-nt-source="${d.ntSource}"]`;
         if (d.ntType) return `[data-nt-type="${d.ntType}"]`;
         if (d.ntSpec) return `[data-nt-spec="${CSS.escape(d.ntSpec)}"]`;
+        if (d.ntArchived !== undefined) return '[data-nt-archived]';
         if (d.ntF) return `[data-nt-f="${d.ntF}"]`;
         return null;
     }
@@ -560,6 +569,13 @@ export class NewTaskView {
             this.invalid = '';
             this.render();
             this.scheduleRoute();
+            return;
+        }
+        if (d.ntArchived !== undefined) {
+            this.showArchived = !this.showArchived;
+            this.render();
+            this.container?.querySelector<HTMLElement>('[data-nt-archived]')?.focus({ preventScroll: true });
+            void this.loadProject(this.project);
             return;
         }
         if (d.ntProject !== undefined) { this.chooseProject(button); return; }
@@ -592,6 +608,8 @@ export class NewTaskView {
                 this.selectedSpec = '';
                 this.show = null;
                 this.specs = [];
+                this.archivedCount = 0;
+                this.showArchived = false;
                 this.dry = null;
                 this.invalid = '';
                 this.failure = '';

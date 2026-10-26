@@ -260,6 +260,8 @@ export interface Harness {
     hits: (selector: string) => Promise<{ x: number; y: number } | { error: string }>;
     save: (name: string) => Promise<void>;
     audit: (page: string, prepare: () => Promise<void>) => Promise<void>;
+    // 失败现场：最近 30 秒的核心调用与核心进程、此刻的 CPU（只在失败时调用）。
+    scene: () => Promise<string>;
     checks: string[];
     consoleErrors: string[];
 }
@@ -513,5 +515,5 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         }
         await evaluate('document.querySelectorAll("[data-audit]").forEach(el => el.removeAttribute("data-audit")); document.activeElement?.blur(); true');
     };
-    return { pause, evaluate, wait, check, within, happened, verify, press, key, type, tabTo, focusRing, wheel, hits, save, audit, checks, consoleErrors };
+    return { pause, evaluate, wait, check, within, happened, verify, press, key, type, tabTo, focusRing, wheel, hits, save, audit, scene, checks, consoleErrors };
 }

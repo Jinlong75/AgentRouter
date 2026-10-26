@@ -75,7 +75,7 @@ test('端到端：参数完整、清单兼容、事件顺序、原始日志和�
   assert.equal(fs.readFileSync(start.report, 'utf8'), 'OK\n');
   const echo = JSON.parse(fs.readFileSync(s.env.FAKE_ECHO, 'utf8'));
   // 058：汇报路径指到第 1 次尝试的 attempts/1/report.md（顶层 report.md 是复制过去的最新一份）。
-  assert.deepEqual(echo.args, ['exec', '--json', '-C', s.root, '-s', 'workspace-write', '-o', path.join(start.dir, 'attempts', '1', 'report.md'), '-']);
+  assert.deepEqual(echo.args, ['exec', '--json', '-C', fs.realpathSync.native(s.root), '-s', 'workspace-write', '-o', path.join(start.dir, 'attempts', '1', 'report.md'), '-']);
   assert.equal(echo.prompt, '任务：\n只回复 OK');
   const events = jsonl(start.events);
   events.forEach((e, n) => { assert.equal(e.seq, n + 1); assert.equal(e.v, 1); assert.ok(e.at >= start.started); });

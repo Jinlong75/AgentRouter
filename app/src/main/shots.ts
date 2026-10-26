@@ -15,7 +15,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { c, p, pj, nt } from '../shared/copy';
 import type { Registry } from './registry';
 import { dispatchMatches, windowsPlatform } from './platform';
@@ -241,6 +241,39 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
             assert.equal(copies()[0].text, t3.name);
         });
     };
+    // UI05 详情 ⋯ 菜单"删除任务…"（Stage07b T4o）：进行中没有；已结束有（在「从列表隐藏」后面）；
+    // 点开是同一个删除确认框（标题换成任务名）；勾"同时删除项目里的任务记录文件"后真实删除，选中列表里的下一个任务。
+    // 演示数据 t13 是已结束任务；单独复现用 AR_SHOTS_FOCUS=delete-one。
+    const ui05DeleteOne = async () => {
+        const recordDir = (t: { repo: string; name: string }) => path.join(t.repo, '.agent-runs', t.name);
+        const one = registry.tasks.find(t => t.id === 't13')!;
+        assert.ok(one && one.status !== 'run', 'UI05 删除任务：演示数据 t13 应是已结束任务');
+        await press('[data-task=t1]'); await press('[data-more]');
+        await check('UI05 进行中任务的 ⋯ 菜单没有「删除任务…」', `![...document.querySelectorAll('.ctx button')].some(b => b.textContent.trim() === ${JSON.stringify(c.deleteOne)})`);
+        await key('Escape');
+        await press(`[data-task=${one.id}]`); await press('[data-more]');
+        await check('UI05 已结束任务的 ⋯ 菜单有「删除任务…」，紧跟在「从列表隐藏」后面且可用', `(() => { const items = [...document.querySelectorAll('.ctx button')].map(b => ({ text: b.textContent.trim(), off: b.disabled })), i = items.findIndex(x => x.text === ${JSON.stringify(c.hide)}); return i >= 0 && items[i + 1]?.text === ${JSON.stringify(c.deleteOne)} && !items[i + 1].off; })()`);
+        await check('UI05 「删除任务…」是危险样式（颜色是令牌 --fail），「从列表隐藏」不是', `(() => { const p = document.createElement('i'); p.style.color = 'var(--fail)'; document.body.append(p); const fail = getComputedStyle(p).color; p.remove(); const items = [...document.querySelectorAll('.ctx button')]; const del = items.find(b => b.textContent.trim() === ${JSON.stringify(c.deleteOne)}), hide = items.find(b => b.textContent.trim() === ${JSON.stringify(c.hide)}); return getComputedStyle(del).color === fail && getComputedStyle(hide).color !== fail; })()`);
+        const order = await evaluate(`[...document.querySelectorAll('[data-task]')].map(r => r.dataset.task)`) as string[];
+        const at = order.indexOf(one.id), expected = order[at + 1] ?? order[at - 1];
+        assert.ok(at >= 0 && expected, `UI05 删除任务：列表里应有 ${one.id} 与相邻任务`);
+        await verify('UI05 删除任务前记录目录存在', () => { assert.ok(existsSync(recordDir(one)), recordDir(one)); });
+        await press(await menuItem(c.deleteOne));
+        await check('UI05 点「删除任务…」弹出同一个删除确认框：标题是任务名、正文、记录文件勾选项、默认焦点在取消', `document.querySelector('.sheet-h > b').textContent === ${JSON.stringify(c.deleteOneTitle(one.title))} && document.querySelector('.sheet-lead').textContent === ${JSON.stringify(c.deleteBody)} && document.querySelector('[data-delete-files]').textContent.includes(${JSON.stringify(c.deleteFiles)}) && document.querySelector('.sheet-btns .btn.danger')?.textContent === ${JSON.stringify(c.deleteConfirm)} && document.activeElement.textContent === ${JSON.stringify(c.cancel)}`);
+        await press('[data-delete-files]');
+        await check('UI05 勾选「同时删除项目里的任务记录文件」后复选项点亮', 'document.querySelector("[data-delete-files]").getAttribute("aria-checked")==="true" && !!document.querySelector("[data-delete-files] .cb.on")');
+        await press('.sheet-btns .btn.danger');
+        await wait(`!document.querySelector("[data-task=${one.id}]")`, 'UI05 删除任务后从列表消失');
+        await wait(`document.querySelector(".notice")?.textContent === ${JSON.stringify(c.deletedOne(one.title))}`, 'UI05 删除任务成功提示');
+        await verify('UI05 删除任务：tasks.json 记下，记录目录被删，runs.jsonl 不改', async () => {
+            const saved = JSON.parse(await readFile(path.join(registry.data, 'tasks.json'), 'utf8'));
+            assert.ok(saved.hidden.some((k: string) => k.startsWith(`${one.id}:`)));
+            assert.equal(existsSync(recordDir(one)), false, '记录目录应已删除');
+            assert.ok((await runs()).some(r => r.id === one.id && r.event === 'start'), 'runs.jsonl 不改');
+        });
+        await wait(`document.querySelector(".trow.on")?.dataset.task === ${JSON.stringify(expected)}`, 'UI05 删除后选中列表里的下一个任务');
+        await check('UI05 删除后详情显示下一个任务', `!!document.querySelector('.dh h2') && !document.querySelector('.detail > .empty')`);
+    };
 
     // 确认核心追踪确实启用（PR #5 CI）：跑一次 ar version，看主进程收到了几行进程内追踪。
     {
@@ -341,6 +374,20 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         for (let round = 1; round <= rounds; round++) await ui05Opens(round);
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'UI05', rounds, checks }, null, 2));
         console.log(`只跑 UI05：${rounds} 轮，${checks.length} 项检查全部通过。`);
+        return;
+    }
+    // 单独复现详情 ⋯ 菜单的“删除任务…”（127，AR_SHOTS_FOCUS=delete-one）与进程查询失败的检查（UI21，AR_SHOTS_FOCUS=process-unknown）：演示数据是原样的。
+    if (process.env.AR_SHOTS_FOCUS === 'delete-one' || process.env.AR_SHOTS_FOCUS === 'process-unknown') {
+        await press('[data-page=tasks]'); await wait('!!document.querySelector("[data-task=t1]")');
+        if (process.env.AR_SHOTS_FOCUS === 'delete-one') await ui05DeleteOne();
+        else {
+            // UI21 需要一条带 pid 的已结束任务：与 UI04 一样先真实停止 t2。
+            await press('[data-task=t2]'); await press('[data-stop]'); await press('.confirm-actions .danger');
+            await wait('document.querySelector("[data-task=t2] .mk")?.classList.contains("stale")', 'UI04 停止后列表标记变为中断', 30000);
+            await captureProcessUnknown(h, registry, save, menuItem, runs);
+        }
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: process.env.AR_SHOTS_FOCUS, checks, focusRestored: progress.focusRestored }, null, 2));
+        console.log(`只跑 ${process.env.AR_SHOTS_FOCUS}：${checks.length} 项检查全部通过。`);
         return;
     }
     await press('[data-page=tasks]');
@@ -724,6 +771,65 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     });
     await check('UI02 删除当前选中的任务后详情回到空状态', 'document.querySelector(".detail .empty b")?.textContent === "选择一个任务"');
 
+    // UI02 归档任务说明（Stage07b T4m）：勾选两个已结束的、用任务说明派发的演示任务 → 确认框列出文件 → 归档并提交。
+    // 演示仓库只 git init 没提交：先提交这两份说明（一次性身份写进仓库本地配置），再用界面归档，最后读 git 核对。
+    {
+        const gitIn = (cwd: string, args: string[]) => {
+            const r = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false, windowsHide: true, env: appEnv });
+            assert.equal(r.status, 0, `git ${args.join(' ')}：${r.stderr}`);
+            return String(r.stdout).trim();
+        };
+        const visible = new Set<string>(await evaluate(`[...document.querySelectorAll('[data-task]')].map(r => r.dataset.task)`));
+        const picked: typeof registry.tasks = [];
+        for (const t of registry.tasks) {
+            if (picked.length === 2) break;
+            if (t.status === 'run' || !t.spec || !visible.has(t.id) || !/^(pixel-garden|notes-web)$/.test(path.basename(t.repo))) continue;
+            if (!existsSync(path.resolve(t.repo, t.spec)) || picked.some(p => p.repo === t.repo && p.spec === t.spec)) continue;
+            picked.push(t);
+        }
+        assert.equal(picked.length, 2, `演示数据里找不到两个可归档的任务（找到 ${picked.map(t => t.id).join(',')}）`);
+        const rels = picked.map(t => t.spec!.replace(/\\/g, '/'));
+        for (const t of picked) {
+            gitIn(t.repo, ['config', 'user.name', 'AgentRouter Shots']);
+            gitIn(t.repo, ['config', 'user.email', 'shots@example.invalid']);
+            gitIn(t.repo, ['add', '--', t.spec!]);
+            gitIn(t.repo, ['commit', '-m', '演示：提交任务说明', '--', t.spec!]);
+        }
+        const heads = new Map(picked.map(t => [t.repo, gitIn(t.repo, ['rev-parse', 'HEAD'])]));
+        await press('[data-multi=select]');
+        await check('UI02 选择模式没勾选时“归档任务说明…”禁用，在“删除…”左边', `(() => { const a = document.querySelector('[data-multi=archive]'), d = document.querySelector('[data-multi=delete]'); return !!a && a.disabled && a.textContent === '归档任务说明…' && a.classList.contains('btn') && !a.classList.contains('danger') && (a.compareDocumentPosition(d) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0; })()`);
+        for (const t of picked) await press(`[data-task=${t.id}]`);
+        await check('UI02 勾选两个任务后“归档任务说明…”可用', `!document.querySelector('[data-multi=archive]').disabled && document.querySelector('.page-h h1').textContent === '已选 2 个'`);
+        await press('[data-multi=archive]');
+        await check('UI02 归档确认框：标题数量、正文、列出要移动的文件、底栏说明、主按钮、默认焦点在取消', `(() => { const files = [...document.querySelectorAll('[data-archive-file]')].map(e => e.textContent).sort(); return document.querySelector('.sheet-h > b').textContent === '归档 2 份任务说明？' && JSON.stringify(files) === ${JSON.stringify(JSON.stringify([...rels].sort()))} && document.querySelector('.sheet-btns .btn.primary')?.textContent === '归档并提交' && document.activeElement.textContent === '取消' && document.body.textContent.includes('git mv 这 2 个文件，并提交'); })()`);
+        nativeTheme.themeSource = 'dark'; await save('archive-confirm-dark');
+        nativeTheme.themeSource = 'light'; await save('archive-confirm-light'); nativeTheme.themeSource = 'dark';
+        await press('.sheet-btns .btn.primary');
+        await wait('/^已归档 2 份任务说明（提交 [0-9a-f]+/.test(document.querySelector(".notice")?.textContent ?? "")', 'UI02 归档成功提示');
+        await check('UI02 归档成功后退出选择模式回到普通标题行', 'document.querySelector(".page-h h1").textContent === "任务" && !!document.querySelector("[data-multi=select]") && !document.querySelector("[data-multi=done]")');
+        await verify('UI02 归档：说明文件移到 archive/、原位置没有，各仓库多一个提交且只含这两个路径的变化，任务仍在列表', async () => {
+            for (const t of picked) {
+                const rel = t.spec!.replace(/\\/g, '/'), to = path.posix.join(path.posix.dirname(rel), 'archive', path.posix.basename(rel));
+                assert.equal(existsSync(path.resolve(t.repo, rel)), false, `${rel} 还在原位置`);
+                assert.ok(existsSync(path.resolve(t.repo, to)), `${to} 不在 archive/ 里`);
+                assert.equal(gitIn(t.repo, ['rev-parse', 'HEAD~1']), heads.get(t.repo), `${t.repo} 应只多一个提交`);
+                const changed = gitIn(t.repo, ['-c', 'core.quotepath=false', 'show', '--name-status', '--pretty=format:', '--no-renames', 'HEAD']).split('\n').filter(Boolean).map(l => l.replace(/\t/g, ' ')).sort();
+                assert.deepEqual(changed, [`A ${to}`, `D ${rel}`].sort());
+                assert.ok(existsSync(recordDir(t)), '任务记录目录不动');
+            }
+            assert.ok(await evaluate(`${JSON.stringify(picked.map(t => t.id))}.every(id => !!document.querySelector('[data-task=' + id + ']'))`), '归档不删除任务');
+        });
+        // 只勾没有任务说明的任务（直接文字派发）：没有可归档的说明，给出提示、不弹确认框。
+        const textTask = registry.tasks.find(t => t.status !== 'run' && !t.spec && visible.has(t.id));
+        assert.ok(textTask, '演示数据里找不到没有任务说明的已结束任务');
+        await press('[data-multi=select]');
+        await press(`[data-task=${textTask.id}]`);
+        await press('[data-multi=archive]');
+        await wait('document.querySelector(".notice")?.textContent === "选中的任务没有可以归档的任务说明（直接文字派发的任务、或说明已经归档）"', 'UI02 没有可归档的说明时的提示');
+        await check('UI02 没有可归档的说明时不弹确认框', '!document.querySelector(".sheet")');
+        await key('Escape');
+    }
+
     // UI05 从列表隐藏（已结束的任务）：真实写入 tasks.json。
     await press('[data-task=t9]'); await press('[data-more]'); await press(await menuItem('从列表隐藏'));
     await wait('!document.querySelector("[data-task=t9]")');
@@ -731,6 +837,9 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         const saved = JSON.parse(await readFile(path.join(registry.data, 'tasks.json'), 'utf8'));
         assert.ok(saved.hidden.some((k: string) => k.startsWith('t9:')));
     });
+
+    // UI05 详情 ⋯ 菜单"删除任务…"（Stage07b T4o）：见上面的 ui05DeleteOne。
+    await ui05DeleteOne();
 
     // UI04 确认后真实停止：假派发进程树结束、清单写 interrupted、列表变中断。
     const t2 = registry.tasks.find(t => t.id === 't2')!;
@@ -1212,6 +1321,7 @@ async function captureProcessUnknown(h: Harness, registry: Registry, save: (name
         await check('UI21 进程横幅与详情的失败横幅同时存在、各在自己的区域（详情横幅不写进任务页顶部）', `document.querySelectorAll('[data-process-banner] .banner').length === 1 && !document.querySelector('[data-process-banner] .banner.fail') && !!document.querySelector('.detail .banner-holder .banner.fail') && !document.querySelector('.detail [data-process-banner]')`);
         await press(`[data-task=${id}]`); await press('[data-more]');
         await verify('UI21 已结束任务的「从列表隐藏」禁用（命中测试报已禁用）', async () => { await assert.rejects(press(await menuItem('从列表隐藏')), /已禁用/); });
+        await verify('UI21 已结束任务的「删除任务…」禁用（命中测试报已禁用）', async () => { await assert.rejects(press(await menuItem(c.deleteOne)), /已禁用/); });
         await key('Escape');
         await press('[data-multi=select]'); await press(`[data-task=${id}]`);
         await check('UI21 选择模式勾选已结束任务后，删除仍禁用', `document.querySelector('[data-task=${id}]').getAttribute('aria-checked') === 'true' && document.querySelector('[data-multi=delete]').disabled`);

@@ -21,6 +21,14 @@ export function withProxy(env, home, { readSystem = () => readSystemProxy({ env 
   return { base: applyProxyEnv(env, proxy), proxy };
 }
 
+// 联网 git 操作（ar push / ar pull 的 fetch、push，Stage07b 128）的子进程环境：继承调用方环境（git 要用本机已有的登录：
+// 凭据助手、SSH 代理等，所以不走执行者白名单），加上 D33 的代理变量，并关掉所有交互：
+// GIT_TERMINAL_PROMPT=0 与 GCM_INTERACTIVE=never 让没有凭据时直接失败；GIT_ASKPASS / SSH_ASKPASS 置空，不弹图形登录窗口；
+// LC_ALL=C 让 git 的报错是英文，失败原因才能稳定归类。返回的对象只交给 spawn，不含也不打印任何密钥。
+export function gitNetworkEnv(env, home) {
+  return { ...withProxy(env, home).base, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: '', SSH_ASKPASS: '', LC_ALL: 'C' };
+}
+
 // 064：执行者进程的用户目录指向沙箱 <公共目录>/workers/<profile>/home（协议第 7 节"执行者的用户目录"）。
 // 原因：执行者在 PowerShell 里给只读的 $home 赋值失败后，$home 仍是真实用户目录根，脚本随后把文件直接写进去
 //（Stage04 041、Stage05 058、063）；文字规则拦不住。PowerShell 的 $HOME 与 Node 的 os.homedir() 都跟随 USERPROFILE / HOME，
