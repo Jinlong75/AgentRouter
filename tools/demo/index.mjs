@@ -5,9 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fork, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, wtReport, wtMerged } from './data.mjs';
+import { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, wtReport, wtMerged, reviews } from './data.mjs';
 import { legacyRunsDir } from '../../core/lib/compat.mjs';
-export async function demo(){
+// confirmations：演示里"人确认审查问题"的 review-confirm 事件（185，D117）。默认不写：界面验收的夹具与 npm run demo 共用这个生成器，
+// 而全量验收里路由页的准确率（UI31，ar review stats）要求从"还没有确认过的审查问题"开始；写在共享清单里的确认会让它一开始就多出
+// 演示审查者的一行、并跳过那条"还没有确认"的检查。npm run demo（run.mjs）传 true，演示里仍能看到确认与准确率。
+export async function demo({ confirmations = false } = {}){
   const home=await mkdtemp(path.join(os.tmpdir(),'agentrouter-demo-'));const children=[];
   // 087：AR_DEMO_SHOW_WORKTREE=1 时多拉起两个假派发进程，给排队中、准备中的 worktree 演示任务用；平时只有两个。
   const showWorktree=process.env.AR_DEMO_SHOW_WORKTREE==='1';
@@ -53,7 +56,7 @@ export async function demo(){
       rows.push({v:1,event:'end',id:t.id,exit:t.exit??0,at:endedAt,minutes:parseFloat(t.dur),...(g?{agentExit:t.agentExit??0}:{})});
     }
     // 087 worktree 演示任务：事件序列按 wt.phase 生成（协议 15.3 / 15.6 / 15.7）。
-    if(t.wt)rows.push(...wtEvents(t,started,home,showWorktree));
+    if(t.wt)rows.push(...wtEvents(t,started,home,showWorktree,confirmations));
     // t25（state retrying）演示里没有存活的派发进程：写 interrupted，UI23 检查时的 resume 让它回到进行中。
     if(t.state==='stop'||t.state==='retrying')rows.push({v:1,event:'interrupted',id:t.id,at:started+(A?A.at(-1).offset+60000:192000),signal:t.signal??'session-closed'});
     const events=[];let seq=0;const add=e=>events.push({v:1,seq:++seq,at:started+seq*1000,...e});
@@ -80,6 +83,15 @@ export async function demo(){
     if(t.wt&&['awaiting','conflict','accepted','rejected'].includes(t.wt.phase)){
       await writeFile(entry.report,t.id==='t32'?wtReport:`# 完成了什么\n已完成。\n提交：\`${t.commit}\`\n`);
       await writeFile(path.join(dir,'dispatch.json'),JSON.stringify({v:1,task:entry.spec,extra:'',role:null,spec:entry.spec,profile:x.profile,name,gate:{enabled:true,base:entry.base,merged:wtMerged}}));
+    }
+    // Stage08 审查演示（185，D117）：顶层 review.json（协议 18）；对应的 reviewing / review / review-confirm 事件在 wtEvents 里。
+    // 每条确认的 at 取对应 review-confirm 事件的时刻，review.json 与清单对得上。
+    if(reviews[t.id]){
+      const r=reviews[t.id],endedAt=started+60000*parseFloat(t.dur),pad=sha=>String(sha).padEnd(40,'0');
+      const confirmAt=Object.fromEntries(r.events.filter(e=>e.event==='review-confirm').map(e=>[e.issue,endedAt+e.after]));
+      const body={...r.review,attempt:1,at:endedAt-1000,base:pad(t.base??'a1b2c3d'),head:pad(t.wt.head),
+        issues:r.review.issues.map(issue=>({...issue,confirmation:issue.confirmation?{...issue.confirmation,at:confirmAt[issue.id]}:null}))};
+      await writeFile(path.join(dir,'review.json'),JSON.stringify(body,null,2)+'\n');
     }
     // 每次尝试的指令、汇报与门禁（attempts/<n>/，协议 14.2 第 3 条）；顶层 report.md / gate.json 保持"最新"（这次没有就保留上一次的）。
     if(A){
@@ -144,7 +156,7 @@ export async function demo(){
 
 // 087：worktree 演示任务的事件（协议 15.3 / 15.6 / 15.7）：queued → preparing → worktree → setup → attempt → gating → gate → attempt-end → end，
 // 之后按阶段补 conflict / accepted / rejected。排队与准备中的任务只写到各自的阶段；没有存活的派发进程时再补一行 interrupted（它们才会被隐藏）。
-function wtEvents(t,started,home,live){
+function wtEvents(t,started,home,live,confirmations){
   const w=t.wt,id=t.id,dir=path.join(home,'wt',`${t.project}-${id}`),base=(t.base??'a1b2c3d').padEnd(40,'0');
   const rows=[{v:1,event:'queued',id,at:started+300}];
   const stop=()=>live?[]:[{v:1,event:'interrupted',id,at:started+2000,signal:'session-closed'}];
@@ -154,7 +166,12 @@ function wtEvents(t,started,home,live){
   const endedAt=started+60000*parseFloat(t.dur),g=gates[id];
   rows.push({v:1,event:'setup',id,ok:true,ms:18000,at:started+20000,summary:'准备命令通过'},{v:1,event:'attempt',id,n:1,total:3,profile:(t.executor?.profile??'codex'),reason:'first',at:started+21000});
   rows.push({v:1,event:'gating',id,at:endedAt-g.ms},{v:1,event:'gate',id,ok:true,attempt:1,at:endedAt-100,summary:g.summary},{v:1,event:'attempt-end',id,n:1,ok:true,exit:0,gate:true,usage:{input:null,output:null},ms:endedAt-started-21000,at:endedAt-50});
+  // 审查（协议 18.3）：gate → attempt-end → reviewing → review → end；人确认问题（review-confirm）在 end 之后。时刻相对任务结束，见 data.mjs 的 reviews。
+  const rv=(reviews[id]?.events??[]).map(({after,...e})=>({v:1,id,...(e.event==='review-confirm'?{}:{attempt:1}),...e,at:endedAt+after}));
+  rows.push(...rv.filter(e=>e.event!=='review-confirm'));
   rows.push({v:1,event:'end',id,exit:0,at:endedAt,minutes:parseFloat(t.dur),agentExit:0,attempts:1});
+  // 只有 npm run demo 写人确认的 review-confirm（见 demo() 的 confirmations）；review.json 里的确认状态照样有（at 取这里的时刻）。
+  if(confirmations)rows.push(...rv.filter(e=>e.event==='review-confirm'));
   if(w.phase==='conflict')rows.push({v:1,event:'conflict',id,files:w.files,at:endedAt+60000});
   if(w.phase==='accepted')rows.push({v:1,event:'accepted',id,merge:w.merge.padEnd(40,'0'),mode:'no-ff',by:w.by,at:endedAt+120000});
   if(w.phase==='rejected')rows.push({v:1,event:'rejected',id,reason:w.reason,keptBranch:false,by:w.by,at:endedAt+120000});

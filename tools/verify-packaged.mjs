@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { unlink, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -23,6 +23,29 @@ try {
     console.log(`打包程序实测通过：${evidence.tasks} 个演示任务、首次引导安装、Agent 页重装、实际 MiSans 绘制；软件内 coreRun 使用内置 Node ${evidence.coreNode}（Electron ${evidence.coreElectron}）。`);
   } finally { clearTimeout(timer); }
 } finally { await fixture.close(); }
+
+// 打包后的软件代码里不能有测试注入点（153）：asar 关闭，软件自己的代码是 resources/app 顶层的 .cjs / .js / .mjs（core、installer、skills 不查：
+// 核心的 AR_TEST_* 钩子是协议里写明的，门禁与准备命令的环境里会被去掉）。
+//  - 所有软件代码：不能出现 test-load.json（负载注入文件名只应由 tools/shots.mjs 经环境给出）；
+//  - 界面（renderer.js、preload.cjs）与设置 / 托管线程（preferences.mjs、managed.mjs）：不能出现 AR_TEST_*，
+//    只有 preferences.mjs 允许读核心已有的 AR_TEST_LOAD_FILE（设置页要和核心排队时的忙闲判断一致）。
+// main.cjs 里打进了 shots 代码，AR_SHOTS_* 等验收开关本来就在，不查。
+{
+  const appDir = path.resolve('release/win-unpacked/resources/app');
+  const files = readdirSync(appDir).filter(name => /\.(c|m)?js$/.test(name));
+  assert.ok(files.includes('main.cjs'), `${appDir} 里找不到 main.cjs，无法检查测试注入点`);
+  const problems = [];
+  for (const name of files) {
+    const text = readFileSync(path.join(appDir, name), 'utf8');
+    if (text.includes('test-load.json')) problems.push(`${name}：出现 test-load.json`);
+    if (name !== 'main.cjs') {
+      const found = [...new Set(text.match(/\bAR_TEST_[A-Z_]+/g) ?? [])].filter(hook => !(name === 'preferences.mjs' && hook === 'AR_TEST_LOAD_FILE'));
+      if (found.length) problems.push(`${name}：出现测试钩子 ${found.join('、')}`);
+    }
+  }
+  assert.deepEqual(problems, [], `打包后的软件代码里不应有测试注入点：\n${problems.join('\n')}`);
+  console.log(`打包检查：${files.join('、')} 里没有 test-load.json，界面与设置 / 托管线程里没有 AR_TEST_* 钩子（preferences.mjs 只读 AR_TEST_LOAD_FILE）。`);
+}
 
 // 安装后的 AgentRouter.exe 直接运行核心：PATH 里去掉 Node，证明不依赖系统 Node。
 const exe = path.resolve('release/win-unpacked/AgentRouter.exe'), script = path.resolve('release/win-unpacked/resources/app/core/ar.mjs');

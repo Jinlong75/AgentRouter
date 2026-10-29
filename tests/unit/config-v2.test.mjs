@@ -106,3 +106,44 @@ test('默认执行者不是 Codex 时：Codex 设置仍写进 codex profile，�
   assert.equal(lines[1], '以下是 Codex 执行者（可选）的设置：');
   assert.match(lines[2], /^model\s+codex-model\s+config\.json$/);
 });
+
+test('writeConfig 带 profile：只改指定的 Codex 执行者（改过名的 codex-pro），codex 不变；profile 不存在或不是 Codex 适配器时报错且文件字节不变；不带 profile 与以前相同（166）', t => {
+  const d = dirs(t);
+  fs.mkdirSync(d.home);
+  const file = path.join(d.home, 'config.json');
+  const deepseek = { adapter: 'claude-code', label: '示例执行者', enabled: true, env: { ANTHROPIC_MODEL: 'example-model' }, auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'EXAMPLE_KEY' } };
+  const original = { v: 2, defaultProfile: 'deepseek', profiles: { codex: { adapter: 'codex', label: 'Codex', enabled: true, model: 'base-model' }, 'codex-pro': { adapter: 'codex', label: 'Codex Pro', enabled: true, model: 'pro-model', effort: 'high' }, deepseek } };
+  fs.writeFileSync(file, JSON.stringify(original));
+  const bytes = () => fs.readFileSync(file);
+  const before = bytes();
+
+  // 指定 profile：只改 codex-pro；写 null 清掉某一项
+  writeConfig(d.home, { model: 'pro-model-2', effort: null, sandbox: 'read-only' }, { profile: 'codex-pro' });
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(after.profiles.codex, original.profiles.codex, 'codex 不变');
+  assert.deepEqual(after.profiles.deepseek, deepseek);
+  assert.equal(after.profiles['codex-pro'].model, 'pro-model-2'); assert.equal(after.profiles['codex-pro'].effort, null); assert.equal(after.profiles['codex-pro'].sandbox, 'read-only');
+  assert.equal(after.defaultProfile, 'deepseek');
+
+  // 不存在、不是 Codex 适配器、原型链上的名字：报错，文件字节不变（codex 也不会被新建或改动）
+  const kept = bytes();
+  for (const [profile, pattern] of [['nope', /找不到执行者：nope/], ['deepseek', /执行者 deepseek 不是 Codex 适配器/], ['__proto__', /找不到执行者：__proto__/], ['toString', /找不到执行者：toString/]]) {
+    assert.throws(() => writeConfig(d.home, { model: 'x' }, { profile }), pattern);
+    assert.deepEqual(bytes(), kept, `${profile}：文件字节不变`);
+  }
+  assert.notDeepEqual(kept, before);
+
+  // 不带 profile：仍写 codex
+  writeConfig(d.home, { model: 'base-model-2' });
+  const plain = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(plain.profiles.codex.model, 'base-model-2');
+  assert.equal(plain.profiles['codex-pro'].model, 'pro-model-2');
+
+  // 不带 profile 且没有 codex：仍新建 codex（原行为），不碰别的 Codex 执行者
+  const empty = dirs(t);
+  fs.mkdirSync(empty.home); fs.writeFileSync(path.join(empty.home, 'config.json'), JSON.stringify({ v: 2, profiles: { 'codex-pro': { adapter: 'codex', enabled: true } } }));
+  writeConfig(empty.home, { model: 'm' });
+  const created = JSON.parse(fs.readFileSync(path.join(empty.home, 'config.json'), 'utf8'));
+  assert.deepEqual(created.profiles.codex, { adapter: 'codex', label: 'Codex', enabled: true, model: 'm' });
+  assert.equal(created.profiles['codex-pro'].model, undefined);
+});

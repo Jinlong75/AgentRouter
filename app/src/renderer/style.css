@@ -276,6 +276,10 @@ body.dragging, body.dragging * { user-select: none !important; }
 .rows.remote .r:first-child .v { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rows.remote .r > .mk, .rows.remote .r > .btn { flex: 0 0 auto; }
 .rows.remote .r > .btn { margin-left: 0; }
+/* 分叉时的做法（155 B8）：接在"远程"那组行下面，一句说明 + 两行命令（命令、说明、复制）；说明可以折行，按钮不被挤出。 */
+.dv-how .r .v { min-width: 0; white-space: normal; overflow: visible; overflow-wrap: anywhere; }
+.dv-how .r .v.mono { flex: 0 0 auto; color: var(--text); }
+.dv-how .r .btn { flex: 0 0 auto; }
 /* 批准确认框里的勾选项（合并后推送）：夹在说明和按钮之间。 */
 .confirm-card .choice { margin: var(--sp-3) 0 var(--sp-4); }
 /* 合并成功但推送失败的提示比普通提示长：允许折行，不截断。 */
@@ -385,7 +389,8 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .toggle{padding:0;border:0;cursor:default;flex-shrink:0;}
 .ctx{max-height:calc(100vh - 80px);overflow:auto;}.ctx button:focus-visible{outline:2px solid var(--focus);outline-offset:-2px;}
 .tip{position:fixed;z-index:70;max-width:360px;padding:6px 10px;border-radius:var(--r-inner);background:var(--surface-2);color:var(--text);box-shadow:var(--shadow-pop);font-size:var(--fs-small);pointer-events:none;}
-.notice{position:fixed;right:24px;bottom:16px;max-width:420px;padding:12px 16px;z-index:80;background:var(--brand-soft);border:1px solid var(--brand);border-radius:var(--r-ctl);}
+/* 底部留出 .actbar（60px）加 16px：验收页的"批准并合并"那一排按钮不被盖住；背景用 --surface 垫底，--brand-soft 只是色调，整体不透明（走查 W3）。 */
+.notice{position:fixed;right:24px;bottom:76px;max-width:420px;padding:12px 16px;z-index:80;background:linear-gradient(var(--brand-soft),var(--brand-soft)),var(--surface);border:1px solid var(--brand);border-radius:var(--r-ctl);}
 .md a{color:var(--run);}.md pre{white-space:pre-wrap;}.tl .c{overflow-wrap:anywhere;}.out{scrollbar-width:none;}.out::-webkit-scrollbar{display:none;}
 .banner-holder{padding:0 var(--sp-6);}.banner-holder:empty{display:none;}.banner-holder .banner{margin-top:0;}
 /* 命令输出嵌在时间线里：滚到头（或本身不够长）时把滚轮交还给时间线，不截住滚动。 */
@@ -406,7 +411,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 @font-face { font-family: 'AgentRouter MiSans'; src: url('./fonts/MiSansVF.ttf') format('truetype'); font-weight: 150 700; font-display: swap; }
 .card-f { flex-wrap: wrap; }
 .card-b .path { margin: -6px 0 6px; overflow-wrap: anywhere; }
-.set-r .l .override { color: var(--run); }
+.set-r .l .override, .fl .override { color: var(--run); }
 .model-input { width: 200px; height: 32px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface); color: var(--text); padding: 0 10px; }
 .choice { width: 100%; text-align: left; color: var(--text); font: inherit; }
 .wiz-body { overflow-y: auto; }
@@ -495,6 +500,32 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .gbadge i { font-size: 12px; }
 .gbadge.ok { color: var(--ok); } .gbadge.fail { color: var(--fail); } .gbadge.running { color: var(--run); }
 .trow .tm span .gbadge.ok { color: var(--ok); } .trow .tm span .gbadge.fail { color: var(--fail); } .trow .tm span .gbadge.running { color: var(--run); }
+/* 188（D125，替换 185 的折行）：列表行第二行的审查徽标不折行、不收缩，行高与别的行一样。
+   结构：有审查徽标的行，徽标成一组（.bds，不收缩），项目名与状态（.rest）占剩下的宽度、在那里用省略号截断——省略号不再和徽标抢位置。
+   两种写法：宽度够时图标 + 文字（rvb-t）；窄时只剩图标，有问题数时再加数字（data-n，伪元素画；文字节点留在 DOM 里，textContent 不变）。
+   悬停提示（title）与 aria-label 在两种写法下都是全文。宽窄由行（.tm）的容器宽度切换，纯 CSS，不量宽度。
+   阈值是徽标组放得下所需的宽度（量过：默认窗口 198px，最小窗口 166px）：执行者标签 + 门禁 + 审查文字（最长的"审查 N 个问题"）约 193px；
+   有尝试徽标（att）的行再加约 60px。最小窗口里 att 行的徽标组即使只剩图标也要 183px，所以再窄的一档把徽标间距与标签内边距收紧；
+   有尝试徽标的行在这一档只剩 1～2px 给项目名，露出半个字比不显示更怪，就不显示。 */
+.trow .tm { container: tm / inline-size; }
+.trow .tm span .rvb-t { color: inherit; }
+.trow .tm > span:has(> .bds) { display: flex; align-items: baseline; }
+.trow .tm .bds { flex: none; }
+.trow .tm .rest { flex: 1 1 0; min-width: 0; }
+@container tm (max-width: 194px) {
+  .trow .tm .rvb .rvb-t { display: none; }
+  .trow .tm .rvb[data-n]::after { content: attr(data-n); }
+}
+@container tm (max-width: 254px) {
+  .trow .tm > span:has(.att) .rvb .rvb-t { display: none; }
+  .trow .tm > span:has(.att) .rvb[data-n]::after { content: attr(data-n); }
+}
+@container tm (max-width: 183px) {
+  .trow .tm .bds > .xtag, .trow .tm .bds > .att { margin-right: 3px; padding: 0 3px; }
+  .trow .tm .bds > .gbadge { margin-right: 3px; }
+  .trow .tm .bds > .rvb { gap: 0; }
+  .trow .tm > span:has(.att) > .rest { display: none; }
+}
 
 /* 门禁标签：区块标题 + 细线分隔的行；超出范围的文件、失败的命令标红 */
 .grow { display: grid; grid-template-columns: var(--mark) minmax(0, 1fr) auto; align-items: start; column-gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--divider); }
@@ -528,6 +559,10 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .inp.area { height: auto; min-height: 56px; padding: 7px 12px; line-height: 20px; resize: vertical; }
 .statusline { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 520px; color: var(--text-2); font-size: var(--fs-small); line-height: var(--lh-small); }
 .statusline .inp { flex: 1 1 auto; min-width: 0; }
+/* 模型下拉旁边的"刷新列表"（Stage07c T2）：下拉在左、按钮在右；下拉自己是"输入框 + 箭头"时让它占满剩余宽度，按钮不被挤扁。 */
+.statusline > .statusline { flex: 1 1 auto; min-width: 0; width: auto; }
+.statusline > .btn { flex: 0 0 auto; white-space: nowrap; }
+.statusline .inp[data-wizard-limit] { flex: 0 0 120px; }
 
 /* 单选列表（已有任务说明、预设卡片） */
 .picks { width: 100%; max-width: 520px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface); padding: 4px; display: flex; flex-direction: column; gap: 2px; }
@@ -595,7 +630,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .xlist { padding: 4px 0; }
 .xrow { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px 16px; }
 .xrow + .xrow { border-top: 1px solid var(--divider); }
-.xrow > .xtag { margin: 3px 0 0; justify-self: start; }
+.xrow > .xtag { margin: 3px 0 0; justify-self: start; white-space: nowrap; }
 .xm { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .x1 { display: flex; align-items: center; gap: 8px; }
 .x1 b { font-weight: 500; }
@@ -835,6 +870,13 @@ mark.hit { background: var(--brand-soft); color: var(--text); border-radius: 2px
 .ro-esc { font-size: var(--fs-small); white-space: nowrap; }
 .ro-act { display: inline-flex; gap: 2px; }
 .ro-note { margin: 8px 0 0; font-size: var(--fs-small); }
+/* 规则列表下面的"按我的执行者生成建议规则"（Stage07c T5）；建议弹窗里每条一个勾选项：标题一行（类型 → 执行者），why 在下面。 */
+.ro-sug-row { margin-top: 10px; }
+.ro-sug { padding: 0; border: 0; background: transparent; }
+.choice .ct .ro-sug-t { display: block; color: var(--text); font-size: inherit; line-height: inherit; }
+.choice .ct .ro-sug-t b { font-weight: var(--fw-strong); }
+.choice .ct .ro-sug-t .xtag { color: var(--text-2); font-size: 10px; line-height: 14px; }
+.ro-sug-row + .ro-note { margin-top: 12px; }
 .ro-note > i { margin-right: 6px; vertical-align: -2px; }
 .ro-lim-list { padding: 0; }
 .ro-lim-row { display: grid; grid-template-columns: auto minmax(120px, 1fr) 150px 170px minmax(150px, auto); align-items: center; gap: 12px; min-height: 48px; padding: 6px 14px; border-bottom: 1px solid var(--divider); }
@@ -862,6 +904,33 @@ mark.hit { background: var(--brand-soft); color: var(--text); border-radius: 2px
 .ro-tog { height: var(--ctl-sm); padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-pill); background: transparent; color: var(--text-2); font: inherit; }
 .ro-tog:hover { background: var(--surface-2); }
 .ro-tog.on { border-color: var(--brand-fill); background: var(--brand-soft); color: var(--brand); }
+/* Agent 页编辑里的"可能用到的模型范围"（Stage07c T4）：当前结果一行，"修改…"展开后家族多选在它下面（沿用 .ro-tog 的切换样式）。 */
+.fam-box { width: 100%; max-width: 520px; }
+.fam-pick { margin-top: 8px; }
+/* Stage08 158（D92）：验收页与任务详情的"审查"标签——问题卡片（界面稿 preview.css 的 .rv-*）；每张卡片底部多一行说明输入框。只用令牌。 */
+.rv-list-issues { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.rv-issue { border: 1px solid var(--border); border-radius: var(--r-card); padding: 10px 12px; }
+.rv-h { display: flex; align-items: center; gap: 8px; }
+.rv-h b { min-width: 0; font-weight: var(--fw-strong); overflow-wrap: anywhere; }
+.rv-h .sp { flex: 1; }
+.rv-b { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; }
+.rv-b p { margin: 0; min-width: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.rv-b .btn { flex: none; }
+.rv-n { margin-top: 8px; }
+.rv-n .inp { width: 100%; }
+.rv-issue .fhint { margin-top: 6px; }
+/* 点"文件:行"跳到改动之后，这一行标出来。 */
+.dl.rv-hit { background: var(--brand-soft); box-shadow: inset 2px 0 0 var(--brand); }
+/* 批准确认框里"审查还有问题没确认"的一句提示（不拦着批准）。 */
+.confirm-card p.note { margin: 8px 0 0; color: var(--text-2); font-size: var(--fs-small); }
+/* 路由页"审查者候选"下面的审查设置与准确率。 */
+.ro-rv-set { margin-top: 12px; }
+.ro-acc { margin-top: 12px; padding: 0; }
+.ro-acc-h { margin: 0; padding: 10px 14px 6px; }
+.ro-acc ~ .ro-note { margin-top: 10px; }
+.ro-acc-row { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 12px; min-height: 40px; padding: 4px 14px; border-top: 1px solid var(--divider); }
+.ro-acc-row b { font-weight: var(--fw-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ro-acc-row .xtag { margin-right: 0; }
 @media (max-width: 1000px) {
     .ro-row { grid-template-columns: 20px minmax(90px, 1fr) minmax(120px, 1.2fr) auto; }
     .ro-esc { display: none; }
@@ -880,3 +949,11 @@ mark.hit { background: var(--brand-soft); color: var(--text); border-radius: 2px
 .pm > span { min-width: 0; overflow-wrap: anywhere; }
 .pm.warn { gap: 6px; flex-wrap: nowrap; }
 .pm.warn > .mk { flex: none; }
+/* 171：与待验收任务重叠的提示行（任务页横幅区与验收页概览顶部），以及验收页列表里互相重叠的待验收任务组 */
+.ovnote { padding: 0 0 8px; min-width: 0; }
+.ovnote .tag { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; line-height: 20px; vertical-align: top; }
+.tab-body > .ovnote { padding-bottom: 12px; }
+.ovgroup { margin: 6px 0 2px; padding-left: 6px; border-left: 2px solid var(--brand-soft); min-width: 0; }
+.ovg-h { display: flex; flex-direction: column; gap: 2px; padding: 4px 10px 6px; font-size: var(--fs-small); line-height: var(--lh-small); color: var(--text-3); min-width: 0; }
+.ovg-h > * { min-width: 0; overflow-wrap: anywhere; }
+.ovg-h b { font-weight: 500; color: var(--text-2); }

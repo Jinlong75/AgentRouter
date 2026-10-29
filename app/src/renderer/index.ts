@@ -1,4 +1,4 @@
-import { c, cx, gt, p, ro, rt, s6, sc, wt as wtc } from '../shared/copy';
+import { c, cx, gt, p, ro, rt, rv, s6, sc, wt as wtc } from '../shared/copy';
 import { dayGroup } from '../shared/types';
 import type { Task, Snapshot, Event as TaskEvent, GateResult, AttemptFiles, AgentRow, TaskSort } from '../shared/types';
 import { esc, markdown } from '../shared/markdown';
@@ -13,8 +13,9 @@ import { NewTaskView } from './newtask';
 import { RoutingView } from './routing';
 import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack, trackNode } from './gate';
 import { AcceptView } from './accept';
+import { ReviewView } from './review';
 import { ScoreView, scoreVisible } from './score';
-import { baseBranchOf, bannerHtml, loadRepoState, needsAccept, readdProject, repoBanner, revertCommand, revertTask, routeHeadRow, writeBlocked, wtBanner as wtBannerBase, wtHeadRow, wtMark, wtState, wtStateLine as wtStateLineBase, wtSub as wtSubBase, wtTailRow, wtTrack as wtTrackBase } from './wt';
+import { baseBranchOf, bannerHtml, hasReviewTab, listMeta, loadRepoState, needsAccept, overlapLines, readdProject, repoBanner, reviewBadge, revertCommand, revertTask, routeHeadRow, sourceNote, writeBlocked, wtBanner as wtBannerBase, wtHeadRow, wtMark, wtState, wtStateLine as wtStateLineBase, wtSub as wtSubBase, wtTailRow, wtTrack as wtTrackBase } from './wt';
 import { attemptBadge, attemptBar, attemptList, attemptPick, attemptPickItems, historyTab, lastFailure, multiAttempts, openRetrySheet, separators, attemptLabel, type Labels } from './attempts';
 import brandSVG from '../../design/icons/mark.svg';
 const root = document.querySelector<HTMLElement>('#app')!;
@@ -105,7 +106,22 @@ const newTaskView = new NewTaskView({ tasks: () => state.tasks, openTask: showTa
 // 路由页：每次进入都重新读取路由配置（Stage07 O4）。
 const routingView = new RoutingView();
 // 验收页：点轨道上的派发 / 执行 / 待验收 / 合并节点回到任务页对应的标签。
-const acceptView = new AcceptView({ tasks: () => state.tasks, openTask: (id, tabName) => { showTask(id); switchTab(tabName); } });
+// 交叉审查的"审查"标签（Stage08 158）：验收页与任务详情共用一份；点击、回车、失去焦点的监听只在 #app 上挂一次。
+// 点"文件:行"：待验收的任务去验收页的改动标签并定位；别的状态（改动已不可查）停在任务详情的"改动"标签。
+const reviewView = new ReviewView({
+    tasks: () => state.tasks,
+    jump: (t, file, line) => {
+        if (needsAccept(t)) { acceptSelected = t.id; page = 'accept'; nav(); pageView(); acceptView.openDiffAt(t.id, file, line); }
+        else if (page === 'tasks' && selected === t.id) switchTab('files');
+    },
+    changed: id => {
+        if (preferences.wizard) return;
+        if (page === 'accept') acceptView.reviewChanged(id);
+        else if (page === 'tasks' && selected === id && tab === 'review') renderTab();
+    },
+});
+reviewView.attach(root);
+const acceptView = new AcceptView({ tasks: () => state.tasks, openTask: (id, tabName) => { showTask(id); switchTab(tabName); }, reviews: reviewView });
 const current = () => state.tasks.find(t => t.id === selected);
 // 评分标签：报告读完后，标签还开着就重画。
 const scoreView = new ScoreView({ changed: id => { if (page === 'tasks' && tab === 'score' && selected === id && !preferences.wizard) renderTab(); }, leadName: host });
@@ -118,7 +134,7 @@ function attView(t: Task, att: { n: number }): { report: string; gate: GateResul
         return null;
     return attFiles.exists ? { report: attFiles.report, gate: attFiles.gate } : { report, gate: gateResult };
 }
-const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit, t.attempts, t.needsScope, t.outsideWrites, t.wt, state.concurrency]);
+const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit, t.attempts, t.needsScope, t.outsideWrites, t.wt, t.review, t.reviewing, state.concurrency, overlapLines(t, state.tasks)]);
 const action = (name: string, value?: string) => { trace('action-send', { task: selected, name }); return window.dock.action(selected, name, value).then(() => trace('action-done', { name }), error => { trace('action-error', { name, error: String((error as Error)?.message ?? error) }); notice(error); }); };
 function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="wordmark">${c.app}</span></div><div class="tb-r"></div><nav class="nav"></nav><section class="content"></section>`; nav(); pageView(); }
 // 侧栏只在内容变化时重建：异步刷新晚到时不替换按钮，避免吞掉正在进行的点击；重建后焦点放回同一个导航按钮。
@@ -319,18 +335,28 @@ function openArchive(trigger: HTMLElement) {
             s.busy(true);
             s.fail('');
             void (async () => {
-                const hashes: string[] = [];
+                // 说明已经被归档过（任务记录里还是旧路径）时核心不整体失败：已归档的列在 skipped 里，没归档的照常归档。
+                // 每个项目各调一次；某个项目整体失败（包括里面的说明全是已归档的）不拦着别的项目，全都没归档成才留在确认框里报原因。
+                const hashes: string[] = [], failures: string[] = [];
+                let moved = 0, coreSkipped = 0;
                 for (const [repo, specs] of groups) {
-                    const result = await window.dock.console('specs:archive', { project: repo, rels: specs });
-                    if (result?.commit && !hashes.includes(result.commit)) hashes.push(result.commit);
+                    try {
+                        const result = await window.dock.console('specs:archive', { project: repo, rels: specs });
+                        if (result?.commit && !hashes.includes(result.commit)) hashes.push(result.commit);
+                        moved += Array.isArray(result?.moved) ? result.moved.length : specs.length;
+                        coreSkipped += Array.isArray(result?.skipped) ? result.skipped.length : 0;
+                    }
+                    catch (error) { failures.push(String((error as Error)?.message || error)); }
                 }
+                if (!moved) throw new Error(failures.join('；') || c.archiveNone);
                 s.busy(false);
                 s.close();
                 selecting = false;
                 checked.clear();
                 list();
                 root.querySelector<HTMLElement>('[data-multi=select]')?.focus({ preventScroll: true });
-                toast(c.archived(total, hashes.join('、')) + (skipped ? `；${c.archiveSkipped(skipped)}` : ''));
+                const notArchived = skipped + coreSkipped;
+                toast(c.archived(moved, hashes.join('、')) + (notArchived ? `；${c.archiveSkipped(notArchived)}` : '') + (failures.length ? `；${failures.join('；')}` : ''));
             })().catch(error => { s.busy(false); s.fail(String((error as Error)?.message || error)); });
         } });
     sheet.root.querySelectorAll<HTMLButtonElement>('.sheet-btns button')[0]?.focus({ preventScroll: true });
@@ -374,7 +400,7 @@ function list() {
     const box = root.querySelector<HTMLElement>('.tlist')!, scroll = box.scrollTop;
     // 有搜索关键字时列表顶部先写结果数量（或“没有任务包含…”）和“清除”。
     const found = query ? foundRow(tasks.length ? s6.taskFound(tasks.length, query) : s6.taskNone(query), 'data-found-clear') : '';
-    box.innerHTML = found + (tasks.length ? groups.map(({ title, meta, rows }) => `<div class="tgroup">${esc(title)}<span class="mono">${esc(meta)}</span></div>${rows.map(t => { const gateFail = t.status === 'fail' && gateState(t) === 'fail'; const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : gateFail ? '' : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : taskMark(t); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t, query)}</b><span class="${t.status === 'run' && wtState(t) !== 'queued' ? 'live' : ''}"><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${attemptBadge(t)}${gateBadge(t)}${hit(project(t), query)}${wtSub(t) !== null ? ' · ' + wtSub(t) : tail ? ' · ' + esc(tail) : ''}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : query ? '' : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`);
+    box.innerHTML = found + (tasks.length ? groups.map(({ title, meta, rows }) => `<div class="tgroup">${esc(title)}<span class="mono">${esc(meta)}</span></div>${rows.map(t => { const gateFail = t.status === 'fail' && gateState(t) === 'fail'; const tail = t.imported ? c.imported : t.processState === 'unknown' ? c.processUnknownTag : t.status === 'run' ? t.last : gateFail ? '' : t.status === 'fail' ? `exit=${t.exit}` : t.status === 'stop' ? (t.signal === 'stopped-by-app' ? c.stoppedShort : t.signal === 'stopped-by-command' ? c.stoppedByCommandShort : c.closed) : t.commit ?? (t.sandbox === 'read-only' ? c.readonly : ''); const on = checked.has(t.id); const lead = selecting ? `<span class="cb ${on ? 'on' : ''}" aria-hidden="true">${on ? icon('check-line') : ''}</span>` : taskMark(t); const multi = selecting ? ` role="checkbox" aria-checked="${on}"${t.status === 'run' ? ` disabled aria-disabled="true" data-tip="${esc(c.multiRunning)}"` : ''}` : ''; return `<button class="trow ${selecting ? 'multi ' : ''}is-${t.status === 'run' ? 'running' : t.status} ${selected === t.id ? 'on' : ''}" data-task="${esc(t.id)}"${multi}>${lead}<span class="tm"><b>${taskTitle(t, query)}</b><span class="${t.status === 'run' && wtState(t) !== 'queued' ? 'live' : ''}">${listMeta(`<span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${attemptBadge(t)}${gateBadge(t)}`, reviewBadge(t), `${hit(project(t), query)}${wtSub(t) !== null ? ' · ' + wtSub(t) : tail ? ' · ' + esc(tail) : ''}`)}</span></span><span class="ts"><span class="mono" ${t.status === 'run' ? `data-elapsed="${esc(t.id)}"` : ''}>${t.status === 'run' ? elapsed(t) : clock(t.started)}</span></span></button>`; }).join('')}`).join('') : query ? '' : `<div class="empty">${icon('stack-line')}<b>${c.empty}</b><p>${c.emptyHelp}</p></div>`);
     box.scrollTop = scroll;
     restoreFocus(focus);
 }
@@ -399,6 +425,8 @@ function detail() {
     if (tab === 'retry' && !multiAttempts(t))
         tab = 'flow';
     if (tab === 'score' && !scoreVisible(t))
+        tab = 'flow';
+    if (tab === 'review' && !hasReviewTab(t))
         tab = 'flow';
     // 换了任务：尝试切换、下拉和执行者显示名都重新开始（同一任务反复重建详情时保留）。
     if (attTask !== selected) {
@@ -522,6 +550,11 @@ function header() {
         tab = 'flow';
         renderTab();
     }
+    // 正在看"审查"时审查结果没了（新一次尝试开始）：回到进展；还在时按清单里的 review 事件更新内容。
+    if (tab === 'review') {
+        if (!hasReviewTab(t)) { tab = 'flow'; renderTab(); }
+        else void reviewView.ensure(t);
+    }
     banners(t);
     tabs();
 }
@@ -554,13 +587,16 @@ function banners(t: Task) {
         : '';
     // worktree 任务：排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回 / 准备失败的横幅放在详情顶部（门禁标签里已有自己的横幅，不显示）；冲突与准备失败的横幅取代通用的失败横幅。
     const wtb = tab !== 'gate' ? wtBanner(t, state.concurrency ?? 2) : null;
-    holder.innerHTML = repoBanner(t) + failed + rebaseFailed + (wtb?.html ?? '') + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
+    // 与待验收任务重叠的提示行（171）：放在 worktree 横幅下面；门禁标签里不显示（同 worktree 横幅）。
+    const overlap = tab !== 'gate' ? overlapLines(t, state.tasks) : '';
+    holder.innerHTML = repoBanner(t) + failed + rebaseFailed + (wtb?.html ?? '') + overlap + outside + scope + gateBanner +((['fail', 'stop'].includes(t.status) && !gateFail && !wtb?.replacesFailure) ?`<div class="banner ${t.status === 'fail' ? 'fail' : 'stale'}">${mark(t.status)}<div class="rt"><b>${esc(t.status === 'fail' ? c.failedTitle(executorLabel(t), t.exit) : t.signal === 'stopped-by-app' ? c.stopped : t.signal === 'stopped-by-command' ? c.stoppedByCommand : c.interruptedTitle)}</b><span>${t.status === 'fail' ? c.failedHelp : ['stopped-by-app','stopped-by-command'].includes(t.signal ?? '') ? c.stoppedHelp : c.interruptedHelp}</span></div>${t.status==='stop'&&!['stopped-by-app','stopped-by-command'].includes(t.signal ?? '')&&!preferences.settings?.managed?`<button class="btn sm" data-managed-settings>${c.goSettings}</button>`:''}</div>` : '');
 }
 function tabs() {
     const files = changedFiles().size, bar = root.querySelector<HTMLElement>('.dtabs')!, t = current();
     // "门禁"插在"汇报"后面、"重试"在"改动"后面；其它标签顺序与选中逻辑不变。
     // 门禁只有启用了门禁的任务才有，"重试"只在有 2 次及以上尝试时出现；标签集合变了才重建（尝试增加时出现"重试"）。
-    const items: [string, string][] = [['flow', c.flow], ['report', c.report], ...(t && gateEnabled(t) ? [['gate', gt.tab] as [string, string]] : []), ['files', c.files], ...(t && multiAttempts(t) ? [['retry', rt.tab] as [string, string]] : []), ...(t && scoreVisible(t) ? [['score', sc.tab] as [string, string]] : []), ['params', c.params]];
+    // "审查"（Stage08 158）只有有审查结果的任务才有，紧跟在"门禁"后面。
+    const items: [string, string][] = [['flow', c.flow], ['report', c.report], ...(t && gateEnabled(t) ? [['gate', gt.tab] as [string, string]] : []), ...(t && hasReviewTab(t) ? [['review', rv.tab] as [string, string]] : []), ['files', c.files], ...(t && multiAttempts(t) ? [['retry', rt.tab] as [string, string]] : []), ...(t && scoreVisible(t) ? [['score', sc.tab] as [string, string]] : []), ['params', c.params]];
     const signature = items.map(([key]) => key).join();
     if (!bar.children.length || bar.dataset.tabs !== signature) {
         const focused = document.activeElement instanceof HTMLElement && bar.contains(document.activeElement) ? document.activeElement.dataset.tab : undefined;
@@ -639,6 +675,13 @@ function renderTab() {
     }
     else if (tab === 'retry')
         body.innerHTML = historyTab(t, attLabels, histGates);
+    else if (tab === 'review') {
+        // 说明输入框里有文字、焦点在里面时，重画前后保住（任务列表定时刷新、审查结果更新都会走到这里）。
+        void reviewView.ensure(t);
+        const focus = reviewView.capture(body);
+        body.innerHTML = reviewView.html(t);
+        reviewView.restore(body, focus);
+    }
     else if (tab === 'score') {
         body.innerHTML = scoreView.html(t);
         scoreView.fit(body);
@@ -649,7 +692,7 @@ function renderTab() {
     }
     else {
         const row = (key: string, value: unknown, open?: string) => `<div class="r"><span class="k">${key}</span><span class="v mono">${esc(value)}</span>${open ? `<button class="btn sm quiet" data-open="${open}">${c.open}</button>` : ''}</div>`;
-        body.innerHTML = `<div class="rows">${[[c.record, t.name], [c.spec, t.spec ?? c.direct, t.spec ? 'spec' : undefined], [c.role, t.role ?? c.noRole], [c.dispatcher, host(t)], [c.executor, `${executorLabel(t)}（${[...new Set([t.profile, executorAdapter(t)].filter(Boolean))].join(' · ')}）`], ...(t.route ? [[c.route, t.route]] : []), [c.agent, t.agentVersion ?? (isCodexTask(t) ? 'Codex CLI' : '—')], [c.model, t.model ?? (isCodexTask(t) ? c.followCodex : '—')], [c.effort, t.effort ?? (isCodexTask(t) ? c.followCodex : c.effortDefault)], ...(isCodexTask(t) ? [[c.tier, t.tier ?? c.followCodex]] : []), [c.managed, t.managed?c.yes:c.no], ...(isCodexTask(t) ? [[c.sandbox, t.sandbox ?? '—']] : []), [c.repo, t.repo, 'repo']].map(([k, v, o]) => row(k!, v, o)).join('')}</div><div class="sec-t">${c.records}</div><div class="rows">${[[c.progress, 'progress'], [c.events, 'events'], [c.raw, 'raw']].map(([label, key]) => row(label, t[key as 'progress'] ?? '—', t[key as 'progress'] ? key : undefined)).join('')}</div>`;
+        body.innerHTML = `<div class="rows">${[[c.record, t.name], [c.spec, t.spec ?? c.direct, t.spec ? 'spec' : undefined], [c.role, t.role ?? c.noRole], [c.dispatcher, host(t)], [c.executor, `${executorLabel(t)}（${[...new Set([t.profile, executorAdapter(t)].filter(Boolean))].join(' · ')}）`], ...(t.route ? [[c.route, t.route]] : []), [c.agent, t.agentVersion ?? (isCodexTask(t) ? 'Codex CLI' : '—')], [c.model, t.model ? t.model + sourceNote(t, 'model') : isCodexTask(t) ? c.followCodex : '—'], [c.effort, t.effort ? t.effort + sourceNote(t, 'effort') : isCodexTask(t) ? c.followCodex : c.effortDefault], ...(isCodexTask(t) ? [[c.tier, t.tier ?? c.followCodex]] : []), [c.managed, t.managed?c.yes:c.no], ...(isCodexTask(t) ? [[c.sandbox, t.sandbox ?? '—']] : []), [c.repo, t.repo, 'repo']].map(([k, v, o]) => row(k!, v, o)).join('')}</div><div class="sec-t">${c.records}</div><div class="rows">${[[c.progress, 'progress'], [c.events, 'events'], [c.raw, 'raw']].map(([label, key]) => row(label, t[key as 'progress'] ?? '—', t[key as 'progress'] ? key : undefined)).join('')}</div>`;
     }
     if (tab !== 'flow') {
         const compact = root.querySelector<HTMLButtonElement>('[data-plan-top]')!;

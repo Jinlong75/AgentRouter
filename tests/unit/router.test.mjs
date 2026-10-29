@@ -255,13 +255,14 @@ test('loadConfig 的 choose：用路由器的选择，附带信息带回；limit
 });
 
 // Stage07 T8：路由配置的读写（命令行层的完整覆盖在 tests/integration/route-cli.test.mjs）。
-test('reviewerOf：没有 / null 按空处理，旧的单值写法读成 profiles，mustDiffer 默认 true', () => {
-  assert.deepEqual(reviewerOf(undefined), { profiles: [], mustDiffer: true });
-  assert.deepEqual(reviewerOf({ reviewer: null }), { profiles: [], mustDiffer: true });
-  assert.deepEqual(reviewerOf({ reviewer: { profile: 'a' } }), { profiles: ['a'], mustDiffer: true });
-  assert.deepEqual(reviewerOf({ reviewer: 'a' }), { profiles: ['a'], mustDiffer: true });
-  assert.deepEqual(reviewerOf({ reviewer: { profiles: ['a', 'b', 5, ''], mustDiffer: false } }), { profiles: ['a', 'b'], mustDiffer: false });
-  assert.deepEqual(reviewerOf({ reviewer: { profiles: ['a'], profile: 'z' } }), { profiles: ['a'], mustDiffer: true }, 'profiles 优先于旧的 profile');
+test('reviewerOf：没有 / null 按空处理，旧的单值写法读成 profiles；三个开关的默认值', () => {
+  assert.deepEqual(reviewerOf(undefined), { profiles: [], mustDiffer: true, differFamily: true, differFromLead: true });
+  assert.deepEqual(reviewerOf({ reviewer: null }), { profiles: [], mustDiffer: true, differFamily: true, differFromLead: true });
+  assert.deepEqual(reviewerOf({ reviewer: { profile: 'a' } }), { profiles: ['a'], mustDiffer: true, differFamily: true, differFromLead: true });
+  assert.deepEqual(reviewerOf({ reviewer: 'a' }), { profiles: ['a'], mustDiffer: true, differFamily: true, differFromLead: true });
+  assert.deepEqual(reviewerOf({ reviewer: { profiles: ['a', 'b', 5, ''], mustDiffer: false } }), { profiles: ['a', 'b'], mustDiffer: false, differFamily: false, differFromLead: true }, '没写 differFamily 时随 mustDiffer');
+  assert.deepEqual(reviewerOf({ reviewer: { profiles: ['a'], mustDiffer: true, differFamily: false, differFromLead: false } }), { profiles: ['a'], mustDiffer: true, differFamily: false, differFromLead: false });
+  assert.deepEqual(reviewerOf({ reviewer: { profiles: ['a'], profile: 'z' } }), { profiles: ['a'], mustDiffer: true, differFamily: true, differFromLead: true }, 'profiles 优先于旧的 profile');
 });
 
 test('routeConfigView：按路由器同一份判断给出只读能力、上限与今天用量；没有项目登记表时没有项目规则', t => {
@@ -271,7 +272,7 @@ test('routeConfigView：按路由器同一份判断给出只读能力、上限�
   const view = routeConfigView(h, { now: noon });
   assert.deepEqual(view.rules, [{ types: ['docs'], profile: 'qoder' }]);
   assert.equal(view.fallback, 'sonnet');
-  assert.deepEqual(view.reviewer, { profiles: ['qoder'], mustDiffer: true });
+  assert.deepEqual(view.reviewer, { profiles: ['qoder'], mustDiffer: true, differFamily: true, differFromLead: true });
   assert.equal(view.defaultProfile, 'deepseek');
   assert.deepEqual(view.profiles.map(p => [p.name, p.readOnly]), [['deepseek', true], ['sonnet', true], ['qoder', true], ['plain', false]]);
   assert.deepEqual(view.profiles.find(p => p.name === 'qoder').usage, { tasks: 1, tokens: 15 });

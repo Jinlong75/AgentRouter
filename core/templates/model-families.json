@@ -1,0 +1,18 @@
+[
+  { "prefix": "deepseek", "family": "deepseek", "host": true },
+  { "prefix": "qwen", "family": "qwen" },
+  { "prefix": "glm", "family": "glm" },
+  { "prefix": "kimi", "family": "kimi" },
+  { "prefix": "claude", "family": "claude" },
+  { "prefix": "opus", "family": "claude" },
+  { "prefix": "sonnet", "family": "claude" },
+  { "prefix": "haiku", "family": "claude" },
+  { "prefix": "fable", "family": "claude" },
+  { "prefix": "gpt", "family": "gpt" },
+  { "prefix": "o1", "family": "gpt" },
+  { "prefix": "o3", "family": "gpt" },
+  { "prefix": "o4", "family": "gpt" },
+  { "prefix": "codex", "family": "gpt" },
+  { "prefix": "mimo", "family": "mimo", "host": true },
+  { "prefix": "minimax", "family": "minimax" }
+]

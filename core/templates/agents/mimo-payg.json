@@ -15,6 +15,7 @@
   "description": "经 Claude Code 外壳运行，按量付费，用 sk- 开头的 API Key",
   "recommended": false,
   "effortOptions": ["low", "medium", "high", "xhigh", "max"],
+  "types": ["test", "docs"],
   "card": { "id": "mimo", "title": "Xiaomi MiMo", "description": "经 Claude Code 外壳运行，Token Plan 或按量付费" },
   "variant": { "label": "套餐", "option": "按量付费", "help": "按量付费，用 sk- 开头的 API Key" },
   "order": 3

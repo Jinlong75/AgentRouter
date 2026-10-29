@@ -239,6 +239,23 @@ test('failureHints text 为空', () => {
 test('failureHints 不是数组', () => {
   expectError(textDecl({ failureHints: {} }), 'generic.failureHints', '数组');
 });
+// 任务 148（T7）：kind 可选，只能是 limit（限流 / 额度用完）或 unavailable（服务不可用 / 网络）。
+test('failureHints 的 kind：limit / unavailable / 不写都合法', () => {
+  const r = validateGeneric(textDecl({ failureHints: [
+    { match: '429', text: '限流', kind: 'limit' },
+    { match: 'ECONNRESET', text: '网络', kind: 'unavailable' },
+    { match: 'x', text: '没写 kind' },
+  ] }));
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+test('failureHints 的 kind 写了别的值：报错，路径是 generic.failureHints[i].kind', () => {
+  for (const kind of ['rate', 'Limit', '', null, 5, true]) {
+    expectError(textDecl({ failureHints: [{ match: 'x', text: '好' }, { match: '429', text: '限流', kind }] }), 'generic.failureHints[1].kind', 'limit');
+  }
+  // 只有 kind 错，match / text 没问题时不会多报别的错。
+  const r = validateGeneric(textDecl({ failureHints: [{ match: '429', text: '限流', kind: 'rate' }] }));
+  assert.deepEqual(r.errors.map((e) => e.path), ['generic.failureHints[0].kind']);
+});
 
 test('timeoutMin 不是正整数', () => {
   for (const v of [0, -1, 1.5, '5']) {

@@ -60,6 +60,17 @@ test('--upgrade --dry-run：列出新建、角色差异、配置新字段，什�
   assert.match(f.ar(['init', '--upgrade', '--dry-run']).stdout, /和最新模板不同/);
 });
 
+test('--upgrade 把旧项目 AGENTS 段落更新成含"交互会话里的你默认是主导"的新模板', t => {
+  const f = fixture(t);
+  f.write('AGENTS.md', '# 旧 项目\n\n<!-- agent-router:begin -->\n## AgentRouter 协作\n\n- 开工前你会被告知自己的角色，然后读对应的角色文档。\n<!-- agent-router:end -->\n');
+  run(f, ['init', '--upgrade', '--json']);
+  const text = f.read('AGENTS.md');
+  assert.match(text, /交互会话里的你默认是主导；由 AgentRouter 派发启动、指令开头写明角色的才是执行者或审查者。/);
+  assert.match(text, /指令开头写明了角色时，读对应的角色文档/);
+  assert.doesNotMatch(text, /开工前你会被告知/);
+  assert.ok(text.startsWith('# 旧 项目\n'));
+});
+
 test('不选任何角色和字段应用：只补文件，结果与普通 ar init 相同', t => {
   const f = fixture(t), plain = fixture(t);
   const result = run(f, ['init', '--upgrade', '--json']);

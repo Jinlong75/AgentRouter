@@ -6,11 +6,14 @@
 // （AR_VERIFY_LOG_DIR 可注入目录，测试用），只保留最近 20 份，最后一行打印日志路径。
 // 不改退出码与哨兵行为。
 // 069：同时让 node --test 另写一份同名 .tap（TAP 里整个测试文件失败时带 exitCode / signal 等细节），同样只保留 20 份。
+// 186（D121）：测试进程的 TEMP / TMP / TMPDIR 指向这次 verify 专用的临时目录，里面每个测试文件一个子目录；
+// 测试结束后还剩东西（临时目录、还在运行的进程）就让 verify 失败并按测试文件列出，最后整个专用目录删掉。
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { killProcessTree, processList } from '../core/lib/process.mjs';
 
 // 保留的日志份数（协议外的工程约定）。
 export const KEEP_LOGS = 20;
@@ -57,6 +60,100 @@ export function saveVerifyLog(dir, content, now = new Date()) {
   return file;
 }
 
+// 186：这次 verify 专用的临时目录。建在系统临时目录下，TEMP / TMP / TMPDIR 指向它的是测试进程，不影响同时在跑的别的任务。
+export function createTempRoot(prefix = 'ar-verify-tmp-') {
+  return mkdtempSync(path.join(tmpdir(), prefix));
+}
+
+// 测试进程的预加载（node --import 的 data: 地址，不需要额外文件）：每个测试文件的进程把自己的 TEMP / TMP / TMPDIR
+// 换成专用目录下以测试文件名命名的子目录，它起的子进程继承这个环境，遗留物就能按测试文件分开。
+export function tempImportArg(root) {
+  // 子目录名是测试文件相对当前目录的路径（分隔符换成 __），不同目录下的同名文件（unit/ 与 integration/ 的 command.test.mjs）不混。
+  const source = `import { mkdirSync } from 'node:fs'; import { basename, isAbsolute, join, relative, sep } from 'node:path';
+const rel = process.argv[1] ? relative(process.cwd(), process.argv[1]) : '';
+const file = rel ? (rel.startsWith('..') || isAbsolute(rel) ? basename(rel) : rel).split(sep).join('__').replace(/[^\\w.-]/g, '_') : '';
+if (file) {
+  const dir = join(${JSON.stringify(root)}, file);
+  mkdirSync(dir, { recursive: true });
+  for (const key of ['TEMP', 'TMP', 'TMPDIR']) process.env[key] = dir;
+}
+`;
+  return `--import=data:text/javascript,${encodeURIComponent(source)}`;
+}
+
+// 测试进程（node --test 本身）的环境：TEMP 等也指向专用目录。
+export function withTempRoot(env, root) {
+  return { ...env, TEMP: root, TMP: root, TMPDIR: root };
+}
+
+const TEST_FILE_DIR = /\.(?:mjs|cjs|js|ts)$/;
+// 子目录名还原成测试文件路径（tests__unit__a.test.mjs → tests/unit/a.test.mjs）；不属于任何测试文件的是 null。
+const fileLabel = name => name === null ? '（不属于任何测试文件）' : name.replaceAll('__', '/');
+
+// 列出专用目录里还剩的东西：[{ file, entries }]，file 是测试文件名（不属于任何测试文件的是 null）。空的子目录不算。
+export function scanTempLeftovers(root) {
+  let top;
+  try { top = readdirSync(root, { withFileTypes: true }); }
+  catch { return []; }
+  const found = [];
+  for (const entry of top) {
+    if (entry.isDirectory() && TEST_FILE_DIR.test(entry.name)) {
+      let inside = [];
+      try { inside = readdirSync(path.join(root, entry.name)); } catch { /* 读不了就当没有。 */ }
+      if (inside.length) found.push({ file: entry.name, entries: inside });
+    } else {
+      const other = found.find(item => item.file === null) ?? (found.push({ file: null, entries: [] }), found.at(-1));
+      other.entries.push(entry.name);
+    }
+  }
+  return found;
+}
+
+// 命令行里带着专用目录路径的进程（测试留下的、还在运行的进程）：[{ pid, name, file }]；file 是它所在的测试文件子目录名。
+// 查询失败返回 null。
+export async function findLeftoverProcesses(root, list = processList) {
+  let rows;
+  try { rows = await list(); }
+  catch { return null; }
+  const norm = text => String(text ?? '').toLowerCase().replaceAll('/', '\\');
+  const needle = `${norm(root)}\\`;
+  return rows
+    .filter(row => row.pid !== process.pid && row.parent !== process.pid && norm(row.command).includes(needle))
+    .map(row => {
+      const rest = norm(row.command).split(needle)[1] ?? '';
+      const first = rest.split(/[\\"'\s]/)[0];
+      return { pid: row.pid, name: row.name ?? '', file: TEST_FILE_DIR.test(first) ? first : null };
+    });
+}
+
+// 测试结束后的检查与收尾：有遗留的临时目录或进程时按测试文件打印并返回 false；最后把专用目录整个删掉（先结束遗留进程）。
+export async function finishTempRoot(root, { print = line => console.log(line), printError = line => console.error(line), list = processList, kill = pid => killProcessTree(pid) } = {}) {
+  let ok = true;
+  const leftovers = scanTempLeftovers(root);
+  if (leftovers.length) {
+    ok = false;
+    const total = leftovers.reduce((sum, item) => sum + item.entries.length, 0);
+    printError(`\nverify 遗留检查：测试结束后临时目录里还剩 ${total} 项（测试必须在结束时删掉自己建的临时目录）：`);
+    for (const item of leftovers) {
+      const shown = item.entries.slice(0, 8).join('、');
+      printError(`  ${fileLabel(item.file)}：${item.entries.length} 项：${shown}${item.entries.length > 8 ? ' …' : ''}`);
+    }
+  }
+  const processes = await findLeftoverProcesses(root, list);
+  if (processes === null) {
+    printError('verify 遗留检查：查询进程列表失败，没能检查遗留进程');
+  } else if (processes.length) {
+    ok = false;
+    printError(`\nverify 遗留检查：测试结束后还有 ${processes.length} 个进程在运行（测试必须结束自己起的进程），已结束：`);
+    for (const item of processes) printError(`  ${item.file === null ? '（无法判断测试文件）' : fileLabel(item.file)}：pid ${item.pid} ${item.name}`);
+    for (const item of processes) { try { await kill(item.pid); } catch { /* 结束不了的留给人看。 */ } }
+  }
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+  catch { printError(`verify 遗留检查：专用临时目录没能删掉：${root}`); }
+  if (ok) print('verify 遗留检查：测试没有留下临时目录和进程');
+  return ok;
+}
+
 // write / print 可由测试替换，避免把嵌套 verify 的输出写进外层测试的标准输出。
 export async function runVerify({ argv = [], env = process.env, write = chunk => process.stdout.write(chunk), print = line => console.log(line), printError = line => console.error(line) } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'ar-codex-sentinel-'));
@@ -75,7 +172,9 @@ else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex�
     chmodSync(path.join(dir, 'codex'), 0o755);
   }
 
-  const childEnv = { ...env };
+  // 186：测试进程用这次专用的临时目录（哨兵目录与日志目录建在它外面，不算遗留）。
+  const tempRoot = createTempRoot();
+  const childEnv = withTempRoot(env, tempRoot);
   const pathKey = Object.keys(childEnv).find(key => key.toLowerCase() === 'path') ?? 'PATH';
   childEnv[pathKey] = `${dir}${path.delimiter}${childEnv[pathKey] ?? ''}`;
   // 069：终端仍是原来的 spec 输出；另让 node --test 同时写一份 TAP（失败的测试文件带 exitCode / signal 等细节）。
@@ -87,7 +186,7 @@ else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex�
     ? []
     : ['--test-reporter=spec', '--test-reporter-destination=stdout', '--test-reporter=tap', `--test-reporter-destination=${tapFile}`];
   if (reporters.length) mkdirSync(logDir, { recursive: true });
-  const child = spawn(process.execPath, ['--test', ...reporters, ...argv], { env: childEnv, shell: false });
+  const child = spawn(process.execPath, ['--test', tempImportArg(tempRoot), ...reporters, ...argv], { env: childEnv, shell: false });
   // 终端照常输出的同时收下完整输出（065：偶发失败要有现场可查）。
   let output = '';
   const capture = chunk => { output += chunk; write(chunk); };
@@ -97,6 +196,7 @@ else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex�
   const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
   rmSync(dir, { recursive: true, force: true });
   let finalCode = code;
+  if (!await finishTempRoot(tempRoot, { print, printError })) finalCode = 1;
   if (calls.length) {
     printError(`\nverify 哨兵：有测试调用了 PATH 里的 codex（${calls.length} 次）。测试必须用自己的假 codex，不能碰真实 Codex 与 ~/.codex：`);
     for (const line of calls) printError(`  ${line}`);

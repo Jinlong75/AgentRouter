@@ -97,7 +97,11 @@ function fixture(t) {
   // 手写一个任务的清单行：start 之后依次追加 events（每个事件补 v 与 at）。
   f.fabricate = (name, events, { worktree = true } = {}) => {
     const id = `fab-${name}`;
-    const lines = [{ v: 2, event: 'start', id, repo, name, spec: null, title: name, role: null, pid: process.pid, started: Date.now() - 60000, profile: 'fake', adapter: 'fake', ...(worktree ? { worktree: true, base: 'b'.repeat(40) } : {}), at: Date.now() },
+    // 手写的进行中任务也带一份派发记录，allowed_paths 与真实任务的 src/** 不重叠（否则按 140 的规则，后面真派发的任务会排队等它）。
+    const dir = path.join(base, 'fab', id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'dispatch.json'), JSON.stringify({ v: 1, gate: { enabled: true, base: 'b'.repeat(40), merged: { allowed_paths: ['fab/**'] } } }));
+    const lines = [{ v: 2, event: 'start', id, repo, name, dir, spec: null, title: name, role: null, pid: process.pid, started: Date.now() - 60000, profile: 'fake', adapter: 'fake', ...(worktree ? { worktree: true, base: 'b'.repeat(40) } : {}), at: Date.now() },
       ...events.map(event => ({ v: 1, id, at: Date.now(), ...event }))];
     appendFileSync(path.join(home, 'runs.jsonl'), lines.map(line => `${JSON.stringify(line)}\n`).join(''));
     return id;
@@ -117,7 +121,9 @@ function fixture(t) {
   return f;
 }
 
-const keys = ['ok', 'id', 'name', 'state', 'attempts', 'gate', 'needsScope', 'outsideWrites', 'worktree', 'merge', 'conflict'];
+// 手写的记录没有参数来源（旧任务），--json 没有 params；真实派发的任务每次都记来源，多一个 params（154）。
+const legacyKeys = ['ok', 'id', 'name', 'state', 'attempts', 'gate', 'needsScope', 'outsideWrites', 'worktree', 'merge', 'conflict'];
+const keys = [...legacyKeys, 'params'];
 const change = { writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改 src/a.js' };
 
 test('1 worktree 任务的十种状态各一例：排队、准备、运行、门禁中、待验收、冲突、已合并、已驳回、失败、已停止', async t => {
@@ -145,7 +151,7 @@ test('1 worktree 任务的十种状态各一例：排队、准备、运行、门
   for (const [name, , expected] of fab) {
     const value = await f.status(name);
     assert.equal(value.state, expected, `${name} 应为 ${expected}`);
-    assert.deepEqual(Object.keys(value), keys, name);
+    assert.deepEqual(Object.keys(value), legacyKeys, name);
     assert.equal(value.ok, true);
     assert.equal(value.name, name);
   }
@@ -183,8 +189,11 @@ test('1 worktree 任务的十种状态各一例：排队、准备、运行、门
   assert.equal(merged.state, 'accepted');
   assert.equal(merged.merge, git(f.repo, ['rev-parse', 'HEAD']), 'merge 是合并提交的 SHA');
   assert.equal(merged.conflict, null);
-  const clash = await f.ar(['accept', '冲突乙', '--json']);
-  assert.equal(clash.code, 4, clash.stderr + clash.stdout);
+  // 批准甲之后，乙自动按新基线重跑门禁，有冲突：撤销合并，进入冲突状态（不再等批准乙才得到退出码 4）。
+  for (const deadline = Date.now() + 60000; (await f.status('冲突乙')).state !== 'conflict';) {
+    assert.ok(Date.now() < deadline, '等待超时：冲突乙的自动重跑冲突');
+    await delay(200);
+  }
   value = await f.status('冲突乙');
   assert.equal(value.state, 'conflict');
   assert.deepEqual(value.conflict, { files: ['src/a.js'] });
@@ -260,7 +269,7 @@ test('3b 已撤销的合并（129）：状态仍是 accepted，JSON 多 reverted
 
   const value = await f.status('合并后撤销');
   assert.equal(value.state, 'accepted');
-  assert.deepEqual(Object.keys(value), [...keys, 'reverted']);
+  assert.deepEqual(Object.keys(value), [...legacyKeys, 'reverted']);
   assert.equal(value.merge, 'c'.repeat(40));
   assert.deepEqual(value.reverted, { commit, at, by: 'human' });
   const text = await f.ar(['status', '合并后撤销']);
@@ -269,7 +278,7 @@ test('3b 已撤销的合并（129）：状态仍是 accepted，JSON 多 reverted
   for (const name of ['合并没撤销', '撤销在合并前']) {
     const other = await f.status(name);
     assert.equal(other.state, 'accepted', name);
-    assert.deepEqual(Object.keys(other), keys, `${name}：没有 reverted 键`);
+    assert.deepEqual(Object.keys(other), legacyKeys, `${name}：没有 reverted 键`);
     assert.ok(!(await f.ar(['status', name])).stdout.includes('已撤销'), name);
   }
 });

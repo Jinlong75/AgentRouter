@@ -2,7 +2,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -611,4 +611,39 @@ test('23 projects show --json 的 remote 字段：有远程（地址去掉用户
   git(f.repo, ['remote', 'remove', 'origin']);
   assert.deepEqual(show().json().project.remote, { name: 'origin', exists: false });
   assert.match(f.ar(['projects', 'show', f.repo]).stdout, /远程：没有/);
+});
+
+test('24 GH007：远程拒绝并输出邮箱隐私那一行 → EMAIL_PRIVACY，带要推送的提交的作者邮箱；不改提交、不改写历史；其他拒绝照旧', t => {
+  const f = fixture(t);
+  const hook = path.join(f.remote, 'hooks', 'pre-receive');
+  write(hook, '#!/bin/sh\necho "remote: error: GH007: Your push would publish a private email address." >&2\nexit 1\n');
+  try { chmodSync(hook, 0o755); } catch { /* Windows 上没有执行位，Git for Windows 用自带的 sh 跑。 */ }
+  git(f.repo, ['config', 'user.email', 'private@example.test']);
+  commitFile(f.repo, 'src/a.js', '一\n');
+  commitFile(f.repo, 'src/a.js', '二\n');
+  const before = git(f.repo, ['rev-parse', 'HEAD']);
+  const remoteBefore = f.remoteHead();
+  const run = f.ar(['push', f.repo, '--json']);
+  // 钩子没跑起来（没有 sh）时远程会正常接收：在这里说明并跳过。
+  if (f.remoteHead() !== remoteBefore) { t.skip('本机跑不了 pre-receive 钩子（需要 sh）'); return; }
+  const result = run.json();
+  assert.equal(run.code, 2, run.stdout + run.stderr);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'EMAIL_PRIVACY');
+  assert.equal(result.email, 'private@example.test', '要推送的提交的作者邮箱');
+  assert.match(result.error, /GitHub 拒绝了这次推送：账号开了邮箱隐私保护，提交用的邮箱是 private@example\.test；把提交身份的邮箱换成 GitHub 的 noreply 地址后重新提交、推送/);
+  assert.equal(git(f.repo, ['rev-parse', 'HEAD']), before, '不改已有提交');
+  assert.equal(f.rows().at(-1).code, 'EMAIL_PRIVACY');
+  assert.ok(!JSON.stringify(f.rows()).includes('private@example.test'), 'push.jsonl 不记邮箱');
+  const text = f.ar(['push', f.repo]);
+  assert.match(text.stderr + text.stdout, /GitHub 拒绝了这次推送/);
+  // 其他拒绝照旧：同一个钩子换成别的输出 → PUSH_FAILED。
+  write(hook, '#!/bin/sh\necho "remote: error: 别的原因" >&2\nexit 1\n');
+  assert.equal(f.ar(['push', f.repo, '--json']).json().code, 'PUSH_FAILED');
+  // 注入执行函数：远程没有这个分支时取分支最近的提交的邮箱。
+  const empty = path.join(f.base, 'empty.git');
+  git(f.base, ['init', '-q', '--bare', '-b', 'main', empty]);
+  git(f.repo, ['remote', 'set-url', 'origin', empty]);
+  const injected = pushBranch({ root: f.repo, home: f.home, exec: (root, args) => (args[0] === 'push' ? { status: 1, stdout: '', stderr: 'remote: error: GH007: Your push would publish a private email address.', timedOut: false } : runNetworkGit(root, args, { env: process.env })) });
+  assert.deepEqual({ code: injected.code, email: injected.email }, { code: 'EMAIL_PRIVACY', email: 'private@example.test' });
 });

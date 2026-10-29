@@ -67,6 +67,17 @@ const AUTH = /Authentication failed|could not read (Username|Password)|terminal 
 const NETWORK = /Could not resolve host|unable to access|Failed to connect|Connection (refused|timed out|reset|closed)|Network is unreachable|Could not connect|Operation timed out|Timed out|SSL |TLS |proxy|Unable to connect|early EOF|RPC failed|unexpected disconnect/i;
 const tailText = (text, count = 3) => scrubUrls(text).split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-count).join('；');
 
+const EMAIL_PRIVACY = /\bGH007\b/;
+
+// 要推送的提交里的作者邮箱：远程跟踪分支..分支 的提交（没有跟踪分支时取分支最近一个提交）。
+// 取第一个不是 noreply 的邮箱（被拒的一定是私人邮箱）；全是 noreply 时取第一个；读不到返回 null。
+function pushedAuthorEmail(root, branch, tracking) {
+  // 用 rev-list --format 取（推送只用到几种 git 子命令，源码扫描测试限定了清单）；输出里每个提交前有一行 "commit <哈希>"。
+  const log = tracking ? git(root, ['rev-list', '--format=%ae', `${tracking}..refs/heads/${branch}`]) : git(root, ['rev-list', '-1', '--format=%ae', `refs/heads/${branch}`]);
+  const emails = log.status === 0 ? log.stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line && !/^commit [0-9a-f]+$/.test(line)) : [];
+  return emails.find(email => !/noreply\.github\.com$/i.test(email)) ?? emails[0] ?? null;
+}
+
 export const NO_CREDENTIAL_TEXT = 'git 没有拿到可用的登录：在终端里手动 git push 一次完成登录，之后就能推送';
 
 // 把 git 的失败输出归类为 { cause, error }：NO_CREDENTIAL（没有可用登录）、NETWORK（网络不通 / 超时）、OTHER（原样转述最后几行）。
@@ -204,6 +215,12 @@ export function pushBranch({ root, home, by = null, dryRun = false, noFetch = fa
   const refspec = `refs/heads/${ctx.branch}:refs/heads/${ctx.branch}`;
   const result = exec(ctx.root, ['push', '--no-follow-tags', ctx.remote, refspec], { env: gitNetworkEnv(env, home), timeout: NET_TIMEOUT });
   if (result.status !== 0) {
+    // GitHub 的邮箱隐私保护（GH007）：提交里有账号不允许公开的邮箱。不改已有提交，只告诉用户该怎么办。
+    if (EMAIL_PRIVACY.test(`${result.stderr}\n${result.stdout}`)) {
+      const email = pushedAuthorEmail(ctx.root, ctx.branch, status.tracking);
+      logOperation(home, 'push', ctx, { ...record, ok: false, code: 'EMAIL_PRIVACY' });
+      return fail('EMAIL_PRIVACY', `GitHub 拒绝了这次推送：账号开了邮箱隐私保护，提交用的邮箱是 ${email ?? '（读不到）'}；把提交身份的邮箱换成 GitHub 的 noreply 地址后重新提交、推送`, { ...info, email });
+    }
     let { cause, error } = classifyFailure(result);
     let code = cause === 'OTHER' ? 'PUSH_FAILED' : cause;
     if (cause === 'OTHER' && /non-fast-forward|fetch first|\[rejected\]/i.test(`${result.stderr}`)) { code = 'BEHIND'; error = '远程刚刚有了新提交，推送被拒绝：先拉取'; }

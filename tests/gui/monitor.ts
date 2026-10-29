@@ -1,8 +1,12 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,writeFile,readFile,appendFile,mkdir,symlink,readdir } from 'node:fs/promises';
+import { mkdtemp as makeTemp,rm,writeFile,readFile,appendFile,mkdir,symlink,readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+// 186：本文件建的临时目录都登记下来，所有测试跑完后统一删掉（被占用删不掉就重试几次，仍不行就忽略）。
+const madeTemp:string[]=[];
+const mkdtemp=async(prefix:string)=>{const dir=await makeTemp(prefix);madeTemp.push(dir);return dir;};
+after(async()=>{for(const dir of madeTemp)await rm(dir,{recursive:true,force:true,maxRetries:5,retryDelay:100}).catch(()=>{});});
 import { parseRegistry, RegistryReader, statusOf, Registry, importTasks, validRecordName, matchTime } from '../../app/src/main/registry';
 import { dispatchMatches } from '../../app/src/main/platform';
 import { parseEvent,readEvents,PAGE_BYTES } from '../../app/src/main/events';

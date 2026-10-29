@@ -23,6 +23,27 @@ test('旧写法与新写法解析结果相同', () => {
   assert.ok(commands.includes('init') && commands.includes('projects'));
 });
 
+test('不认识的子命令：只含小写字母、数字、连字符且不是文件时不派发；其他写法照旧当成 dispatch', () => {
+  const dir = fs.mkdtempSync(path.join(tmpdir(), 'ar unknown '));
+  try {
+    fs.writeFileSync(path.join(dir, 'notes'), 'x');
+    fs.mkdirSync(path.join(dir, 'folder'));
+    assert.deepEqual(normalizeArgs(['list'], dir), { command: 'unknown', rest: ['list'], json: false });
+    assert.deepEqual(normalizeArgs(['lsit', '--json'], dir), { command: 'unknown', rest: ['lsit'], json: true });
+    assert.deepEqual(normalizeArgs(['fix-bug2', '补充'], dir), { command: 'unknown', rest: ['fix-bug2'], json: false });
+    // 目录不算文件。
+    assert.equal(normalizeArgs(['folder'], dir).command, 'unknown');
+    // 存在的文件照旧派发。
+    assert.deepEqual(normalizeArgs(['notes'], dir), { command: 'dispatch', rest: ['notes'], json: false });
+    // 空格、中文、路径分隔符、扩展名、大写、数字开头、-- 开头都不是子命令的样子。
+    for (const word of ['只回复 OK', '只回复', 'docs/specs/x.md', 'x.md', 'List', '2list', 'a_b', '-x', '--name'])
+      assert.equal(normalizeArgs([word], dir).command, 'dispatch', word);
+    // 已知子命令与 dispatch 本身不受影响。
+    assert.equal(normalizeArgs(['dispatch', 'list'], dir).command, 'dispatch');
+    assert.equal(normalizeArgs(['status', 'x'], dir).command, 'status');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('help / --help / -h 识别成帮助命令，任务文字里含 help 仍是派发', () => {
   for (const argv of [['help'], ['--help'], ['-h'], ['--help', '--json'], ['-h', 'retry']]) {
     assert.equal(normalizeArgs(argv).command, 'help', argv.join(' '));
@@ -54,7 +75,10 @@ test('ar help：退出码 0、打印用法，不派发、不建任何文件', ()
       const r = spawnSync(process.execPath, [script, word], { cwd, env, encoding: 'utf8' });
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stdout, /用法：/);
-      assert.match(r.stdout, /ar retry .*--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：在原 worktree 合并主分支后重跑门禁，协议 15\.8/);
+      // 原断言：retry 一行里含"--rebase 用于合并冲突、…，协议 15.8"；新断言：用法按用途分组、说明另起一行，句子仍在但分两行（用户反馈 ar help 难读）。
+      assert.match(r.stdout, /ar retry [^\n]*--rebase[^\n]*\n(?:[^\n]*\n)*?\s+同一工作区手动重试下一次尝试（协议 14\.3）；--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：\n\s+在原 worktree 合并主分支后重跑门禁（协议 15\.8）/);
+      // D102 新增用法：导入之前查模型列表。原断言：models 与 --preset 写在同一行；新断言：拆成两条用法，说明各另起一行，--preset 那条以 ar agents models --preset 开头。
+      assert.match(r.stdout, /ar agents models <名> \[--probe\]\n\s+可选的模型\n\s+ar agents models --preset <预设>[^\n]*\n\s+导入之前查[^\n]*可加 --probe/);
       assert.deepEqual(fs.readdirSync(home), [], '公共目录里没有 runs.jsonl 等文件');
       assert.deepEqual(fs.readdirSync(cwd), [], '当前目录没有 .agent-runs');
     }

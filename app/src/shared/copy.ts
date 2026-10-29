@@ -1,7 +1,7 @@
-// 文案来自任务 003 与定稿；后续由设计负责人维护。
+// 文案来自任务 003 与定稿；后续由主导维护。
 // Stage03：执行者不再统称"Codex"（O8），需要名字的地方用执行者显示名（派发时的 label）。
 export const c = {
-    app: 'AgentRouter', tasks: '任务', connect: 'Agent', settings: '设置', about: '关于', placeholder: '【待 004 实现】', protocol: '文件协议 v2',
+    app: 'AgentRouter', tasks: '任务', connect: 'Agent', settings: '设置', about: '关于', protocol: '文件协议 v2',
     newTask: '新建任务', projectsNav: '项目', configGroup: '配置',
     status: { run: '进行中', done: '已完成', fail: '失败', stop: '已中断' },
     all: '全部', issues: '失败或中断', projects: '全部项目', import: '导入旧任务', today: '今天', yesterday: '昨天',
@@ -45,6 +45,12 @@ export const c = {
     projectGoneReAdd: '重新添加项目', projectGoneMissing: (path: string) => `项目文件夹 ${path} 已经不存在：只能从列表删除这个任务。它留下的 worktree 可以在设置 → 数据 → 清理里清掉。`,
     projectGoneBlocked: '项目已从项目列表移除，先重新添加项目',
     record: '记录名', route: '路由', effortDefault: '默认（不传参数）', spec: '任务说明', direct: '直接给的任务文字', role: '角色', noRole: '不指定', dispatcher: '派活方', agent: '干活方', executor: '执行者', model: '模型', effort: '推理强度', tier: '档位', sandbox: '沙箱', repo: '仓库', records: '记录文件', progress: '进度', events: '统一事件', raw: '原始输出', followCodex: '跟随 Codex', turn: '一轮结束', input: '输入', output: '输出',
+    // Stage07c D81（151）：参数标签里每个值后面写来源；键是核心 settingSources 的取值（命令行、环境变量 X 都算单次派发）
+    sourceLabels: { cli: '单次派发', spec: '任务说明', rule: '路由规则', profile: '执行者配置', builtin: '程序自己的设置', escalate: '升级链', ignored: '不支持推理强度，已忽略' } as Record<string, string>,
+    fromSource: (label: string) => `（来自${label}）`,
+    // Stage07c D86（151）：和待验收的任务改动范围重叠（核心 overlap-note 事件）
+    overlapAwaiting: (name: string) => `与待验收的「${name}」改动范围重叠，「${name}」合并后可能冲突`,
+    rebaseAfterMerge: (name: string) => `「${name}」已合并，与它的改动范围重叠：正在按新基线重跑门禁`,
     error: '操作没有完成，请重试', reportMissing: '汇报尚未生成或文件已不存在', fileMissing: '文件已不存在', earlier: '加载更早的进展', unknownHost: '其他派活方', appHost: 'AgentRouter（软件）',
     // 用户在本软件里停止的任务（signal 为 stopped-by-app）
     stopped: '你停止了这个任务', stoppedHelp: '工作区里没提交的改动还在。要继续，点"再派一次"，或在派活方的会话里重新派发。', stoppedShort: '手动停止',
@@ -59,7 +65,7 @@ export const c = {
 // 以下逐项取自 004 任务说明与界面定稿。
 export const p = {
     subtitle: '谁在派活、谁在干活', detect: '重新检测', detected: '已检测到', missingHost: '未检测到',
-    dispatchers: '主导', workers: '执行者', dispatchHelp: '在这些工具里装上技能，它们就能写任务说明、把工作派给执行者。装之前会备份原来的版本，可以回退。', workerHelp: '实际执行任务的 Agent。没有指定执行者的任务派给"默认"那一个；其余只在指定时使用。',
+    dispatchers: '主导', workers: '执行者', dispatchHelp: '在这些工具里装上技能，它们就能写任务说明、把工作派给执行者。装之前会备份原来的版本，可以回退。', workerHelp: '实际执行任务的 Agent。任务按路由页的规则分配给它们；没有规则命中时派给"默认"那一个。',
     hostMissing: (host: string) => `没有找到 ${host}。装好以后点右上角"重新检测"。`,
     latest: '最新', update: (version: string) => `可更新到 ${version}`, missing: '未安装', custom: '自己改过的版本', protected: '不会自动替换',
     actions: { install: '安装', update: '更新', reinstall: '重新安装', rollback: '回退', replace: '备份后替换…' } as Record<string, string>,
@@ -74,8 +80,6 @@ export const p = {
     version: '版本', location: '位置', login: '登录', auto: '自动查找', choose: '指定位置…', reset: '改回自动查找',
     loginStates: { in: '已登录', out: '未登录', unknown: '无法确定' } as Record<string, string>,
     versionChange: (old: string, next: string) => `Codex 从 ${old} 升级到了 ${next}。如果任务进展里出现大量没整理过的原始文本，可能是它的输出格式变了。`, ack: '知道了',
-    codexSection: 'Codex（可选执行者）', codexSectionHelp: 'Codex 只在派发时显式指定（--profile codex）或审查时使用。没有单独指定的参数用这里的值；"跟随 Codex"表示不传这个参数，由 Codex 自己的配置决定。',
-    defaults: '派发默认值', defaultsHelp: '派活方派发时没有单独指定的，就用这里的值。"跟随 Codex"表示不传这个参数，由 Codex 自己的配置决定。单次任务的参数（例如调研用只读）仍由派活方决定。',
     follow: (value?: string) => `跟随 Codex（${value || '未设置'}）`, customModel: '自定义…', currentHelp: '括号里是 Codex 现在的配置',
     tier: '服务档位', sandboxHelp: '派出的工作要写文件、提交，所以默认可写工作区', writable: '可写工作区', readonly: '只读',
     override: (name: string, value: string) => `环境变量 ${name} 正在覆盖这一项（${value}）`,
@@ -83,10 +87,10 @@ export const p = {
     notifications: '通知', notify: '任务结束时通知', notifyHelp: '完成、失败、中断都会通知；点通知直接打开这个任务',
     appearance: '外观', theme: '主题', themes: ['跟随系统', '浅色', '深色'], config: '配置文件', openFolder: '打开所在文件夹',
     configError: (reason: string) => `config.json 无法读取（${reason}）。修好或删掉它之后，这里才能修改派发默认值。`,
-    steps: ['检测', '技能', '默认值'], welcome: '欢迎使用 AgentRouter', welcomeHelp: '强的 Agent 当主导写任务说明，便宜或专长的 Agent 当执行者干活，你在这里统一派发、查看、停止和验收。先看看这台电脑上有什么。',
+    welcome: '欢迎使用 AgentRouter', welcomeHelp: '强的 Agent 当主导写任务说明，便宜或专长的 Agent 当执行者干活，你在这里统一派发、查看、停止和验收。先看看这台电脑上有什么。',
     installSkills: '安装技能', installHelp: '技能装在主导（Claude Code）里，告诉它怎么写任务说明、怎么派活、怎么看结果。已有的版本会先备份。',
     skillHelp: { 'agent-router': '派活、看进度、收汇报', 'lead-workflow': '可选：让对话的模型当主导，执行者负责实现' } as Record<string, string>,
-    customChoice: '已有自己改过的版本，勾选后会先备份再替换', wizardDefaults: '不确定就保持"跟随 Codex"，以后在设置里随时改。',
+    customChoice: '已有自己改过的版本，勾选后会先备份再替换',
     next: '下一步', previous: '上一步', skip: '跳过', installNext: '安装并继续', finish: '完成', rerun: '重新运行首次引导',
     about: '让强的 Agent 当主导、把执行工作派给便宜或专长的 Agent，在这里统一派发、查看、停止和验收。',
     detecting: '正在检测…', installing: '正在安装…',
@@ -102,6 +106,12 @@ export const p = {
     // Stage03 首次引导：检测 → 技能（含托管开关）→ 导入第一个 Agent → 添加第一个项目（O5）
     wizardSteps: ['检测', '技能', 'Agent', '项目'],
     wizardAgent: '导入第一个 Agent', wizardAgentHelp: '执行者是实际写代码的 Agent。先导入一个标着"推荐"的预设，以后可以在 Agent 页导入更多。',
+    // Stage07c T0d（D60①、D73）：第 3 步测试通过后可选填每日上限；空着就是不限，不写 limits
+    wizardLimitQ: '这个执行者的用量有限吗？', wizardLimitHelp: '比如订阅套餐每天只能跑几个任务。填了上限，当天用满后路由会换别的执行者；空着就是不限，以后在路由页随时改。',
+    wizardLimitLabel: '每天最多', wizardLimitUnit: '个任务', wizardLimitNone: '不限', wizardLimitBad: '填 1 以上的整数，或者空着（不限）',
+    // Stage07c D82（150）：第 3 步可跳过的问题"失败时想换用的强执行者"；只有一个执行者时不出下拉，只写一句说明
+    wizardStrongQ: '失败时想换用的强执行者', wizardStrongHelp: '自动重试的最后一次换它来做，例如用更强的模型；不设就一直用原来的执行者，全部失败后提示主导接手。以后在路由页"兜底"随时改。',
+    wizardStrongNone: '不设', wizardStrongOnly: '现在只有这一个执行者。以后导入了更强的执行者，可以在路由页"兜底"把它设为强执行者。',
     wizardAgentNext: '导入并测试', wizardNoPresets: '没有读到可用的预设，可以先跳过，之后在 Agent 页导入。',
     wizardProject: '添加第一个项目', wizardProjectHelp: '选一个 git 仓库文件夹。添加后到项目页初始化协作约定（先预览改动，确认后才写入），然后就能新建任务派发。',
     // 关闭窗口（012）：点 × 时询问；托盘
@@ -136,7 +146,24 @@ export const p = {
 // Stage03 Agent 页（原"连接"页）：主导区沿用 p 的文案，执行者区与导入向导用这里的。
 export const ag = {
     import: '导入 Agent', importFirst: '导入第一个 Agent', empty: '还没有导入执行者', emptyHelp: '执行者是实际写代码的 Agent。导入一个，设置密钥或确认登录、测试连接后就能派发任务。',
-    isDefault: '默认', onlyExplicit: '只在指定时使用', disabled: '已停用', enable: '启用',
+    isDefault: '默认', disabled: '已停用', enable: '启用',
+    // Stage07c T2 / T3（D79）：模型与推理强度的下拉来自探针；"刷新列表"重新查；查不到时用预设值并写原因
+    refreshList: '刷新列表', refreshingList: '正在查询…',
+    // Stage07c T4（D85）：可担任、模型家族；T7（D83）：被限流的执行者
+    canDo: '可担任', canDoHelp: '路由只在"执行者"里选；审查者候选的顺序在路由页；设为"主导"的 Agent 用来判断审查者与主导是否同家族（D128）', roleNames: { lead: '主导', executor: '执行者', reviewer: '审查者' } as Record<string, string>,
+    // 2026-10-27 走查 U6：两个角色都取消时的提示（替换 agents.ts 里的占位）。
+    canDoNeedOne: '至少保留一个角色才能保存', modelRangeChange: '修改…',
+    // 2026-10-27 走查 U5：按核心 ar roles 的 familiesSource 写实际依据（model / host / adapter / declared）；替换 modelRangeAuto，168 换过去后删掉旧键。
+    modelRangeAutoBy: (families: string, source: string) => `${families}（${({ model: '按模型名自动识别', host: '按接口地址自动识别', adapter: '按适配器默认', declared: '按声明' } as Record<string, string>)[source] ?? '自动识别'}）`,
+    canDoRow: (roles: string) => `可担任 ${roles}`, familyRow: (families: string) => `家族 ${families}`, familyUnknown: '家族未知',
+    modelRange: '可能用到的模型范围', modelRangeHelp: '模型认不出、或由 Agent 自己选模型（如 Auto）时用它判断家族；路由页要求"家族不同"时用它比较审查者、执行者与主导', modelRangeAuto: (families: string) => `${families}（按模型名自动识别）`,
+    limitedUntil: (time: string) => `额度到 ${time} 恢复`, limitedLater: '被限流，稍后再试', limitedEvidence: (text: string) => `限流原文：${text}`,
+    limitedClear: '已恢复', limitedClearHelp: '额度已经恢复时点这里，路由马上重新选它', limitedClearFail: (why: string) => `没能清除限流标记：${why}`,
+    probeFrom: (source: 'api' | 'program', at: string) => `${source === 'api' ? '列表来自接口' : '列表来自程序'} · ${at} 更新`,
+    // 168：导入向导第 2 步改了接口地址、密钥变量名或认证方式，之前查到的列表作废。
+    probeStale: '接口地址、密钥变量或认证方式改了，点"刷新列表"重新查询',
+    probeFallback: (reason: string) => `没有查到（${reason}），用预设的可选值`,
+    effortSupported: (levels: string, def: string | null) => `这个模型支持 ${levels}${def ? `（默认 ${def}）` : ''}`,
     followCodex: '跟随 Codex', keySet: '已设置', keyMissing: '未设置', key: '密钥', chatgptLogin: 'ChatGPT 登录', claudeLogin: 'Claude 订阅',
     test: '测试连接', testing: '正在测试连接…', testOk: (seconds: string, version: string) => `连接成功（${seconds} 秒，${version}）`, testFail: '测试没有通过', testTimeout: '超过 3 分钟没有结束，测试已停止',
     lastTest: (time: string, text: string) => `上次测试 ${time}：${text}`,
@@ -192,11 +219,19 @@ export const pj = {
     remoteSame: (branch: string, remote: string) => `${branch} 与 ${remote} 同步`, remoteAhead: (branch: string, remote: string, n: number) => `${branch} 领先 ${remote} ${n} 个提交`,
     remoteBehind: (branch: string, remote: string, n: number) => `${branch} 落后 ${remote} ${n} 个提交（只快进，不合并）`,
     remoteDiverged: (ahead: number, behind: number) => `本机和远程各有新提交（领先 ${ahead} · 落后 ${behind}），需要在终端里合并或 rebase。软件不做合并。`,
+    // 155（B8）：分叉时给出两条可复制的命令，做完回来点"推送到 origin"
+    remoteDivergedHow: '在项目文件夹里运行下面任意一条，解决冲突（如果有）后回到这里点"推送到 origin"：',
+    remoteDivergedRebase: 'git pull --rebase', remoteDivergedRebaseHelp: '把本机的新提交接到远程后面，历史是一条直线',
+    remoteDivergedMerge: 'git pull --no-rebase', remoteDivergedMergeHelp: '多一个合并提交，不改动已有的提交',
     remoteNoUpstream: (branch: string, remote: string) => `${remote} 上还没有 ${branch}，推送后会新建`,
     remoteLastPush: (time: string) => `最后推送 ${time}`, remoteNotFetched: '还没有读取远程的最新状态，点"刷新"',
     pushTo: (remote: string) => `推送到 ${remote}`, pushing: '正在推送…', pushed: (remote: string, range: string) => `已推送到 ${remote}：${range}`, pushNothing: (remote: string) => `已经和 ${remote} 一样，不用推送`,
     pull: '拉取', pulling: '正在拉取…', pulled: (n: number) => `已拉取 ${n} 个提交`, pullNothing: '已经是最新的',
     pushFailedTitle: '没有推送', pullFailedTitle: '没有拉取', pushFailedHelp: (reason: string) => `${reason}。什么都没有改动。`,
+    // 155（W2）：GitHub 拒绝了暴露邮箱的推送（GH007）
+    pushEmailPrivacy: (email: string) => `GitHub 拒绝了这次推送：你的账号开了"阻止暴露邮箱的命令行推送"，而要推送的提交用的是邮箱 ${email}。把提交身份的邮箱换成 GitHub 设置 → Emails 里给出的 …@users.noreply.github.com 地址，以后的提交就能推送；已经做好、还没推送的提交仍带原来的邮箱，需要在终端里改作者后再推送（见用户指南"推送被 GitHub 拒绝"）。`,
+    pushEmailPrivacyNoEmail: `GitHub 拒绝了这次推送：你的账号开了"阻止暴露邮箱的命令行推送"，而要推送的提交用的邮箱不是 GitHub 给的 …@users.noreply.github.com 地址。把提交身份的邮箱换成 GitHub 设置 → Emails 里给出的那个地址，以后的提交就能推送；已经做好、还没推送的提交仍带原来的邮箱，需要在终端里改作者后再推送（见用户指南"推送被 GitHub 拒绝"）。`,
+    pushEmailPrivacyAction: '修改提交身份…',
     pushNoCredential: 'git 没有拿到可用的登录，软件不会弹登录窗口。在终端里手动 git push 一次完成登录（Git Credential Manager 会记住），之后软件就能推送',
     pushCopyCommand: '复制命令', pushRetry: '重试',
     // 编辑配置：推送三项（批准合并后自动推送、允许主导推送默认都关）
@@ -256,6 +291,8 @@ export const pj = {
 export const nt = {
     title: '新建任务', lead: '选项目、写清要求、选执行者',
     noProject: '先添加一个项目', noProjectHelp: '任务要在某个 git 项目里运行。添加项目后，这里可以选任务说明和执行者派发。', addProject: '添加项目',
+    // 151：新建任务说明里的推理强度一行。
+    effortHelp: '写进任务说明；不选就按路由规则或执行者自己的设置',
     project: '项目', source: '来源', sources: { existing: '选择已有任务说明', new: '新建任务说明', text: '直接写任务文字' } as Record<string, string>,
     specs: '任务说明', specsHelp: (dir: string) => `列出 ${dir} 下的说明，最新的在上面`, specsEmpty: '还没有任务说明。改用"新建任务说明"写一份。',
     specsArchived: (n: number) => `显示已归档的 ${n} 份`, specsArchivedHide: '收起已归档的', specsArchivedTag: '已归档',
@@ -279,7 +316,7 @@ export const nt = {
     // 底栏后果说明的门禁后缀（接在 conseqNew / conseqExisting 后面）：没有验收命令时门禁只检查提交与改动范围
     conseqGate: (commands: number) => commands ? `；结束后跑门禁（${commands} 条验收命令）` : '；结束后跑门禁（检查提交与改动范围）',
     preview: '预览', previewTitle: '预览任务说明', previewViews: { rendered: '排版', source: '源码' } as Record<string, string>, close: '关闭', dispatch: '派发', dispatching: '正在派发…', dispatchingNote: '正在写任务说明并派发……',
-    conseqText: (label: string) => `直接把这段文字派给 ${label}`, conseqExisting: (spec: string, label: string) => `派发 ${spec} 给 ${label}`,
+    conseqText: (label: string) => `直接把这段文字派给 ${label}：在项目里直接改，不跑门禁，也不进验收页`, conseqExisting: (spec: string, label: string) => `派发 ${spec} 给 ${label}`,
     conseqNew: (spec: string, label: string, commit: boolean) => `写入 ${spec}${commit ? '，提交后' : '，'}派给 ${label}`,
     failed: '派发没有完成',
     identityWarn: '这个项目还没有设置 git 提交身份："先提交任务说明"和执行者提交改动都会失败。',
@@ -376,6 +413,16 @@ export const wt = {
     nodeMergePending: (base: string) => `批准后合并到 ${base}`, nodeMerged: (base: string, sha: string) => `已合并到 ${base}：${sha}`,
     nodeConflict: (files: string[]) => `合并冲突：${files.join('、')}`, nodeNoMerge: '已驳回，不合并',
     // 进展标签顶部横幅
+    // Stage07c T0c（D59、D77）：排队原因。改动范围重叠 / 独占门禁 / 机器正忙时替换 queuedHelp 的正文（不带"现在停止…"那半句时由界面补上 queuedStopSafe）
+    // Stage07c D86（151）：验收页把互相重叠的待验收任务放在一起（ar overlaps）
+    overlapGroupTitle: '这几个任务的改动范围重叠', overlapOrder: (names: string) => `建议按这个顺序批准：${names}`,
+    overlapOrderHelp: '先派发的先批准；批准一个之后，后面的会自动按新基线重跑门禁，冲突的会进"冲突"。',
+    queuedOverlap: (name: string, paths: string) => `与「${name}」的改动范围重叠（${paths}），等它结束后再开始，免得合并时冲突。`,
+    queuedExclusive: (name: string, command: string) => `「${name}」的门禁正在独占运行（${command}），它结束后再开始。`,
+    queuedBusyMem: (freeGb: string) => `可用内存不够（${freeGb} GB），暂停启动新任务，空下来后自动开始。`,
+    queuedBusy: (cpu: number) => `机器正忙（CPU ${cpu}%），暂停启动新任务，空下来后自动开始。`,
+    queuedStopSafe: '现在停止不会留下任何东西。',
+    baseBranchRow: (branch: string) => `这次派发指定的基线分支：${branch}（不是项目主分支）`,
     queuedTitle: '排队中', queuedHelp: (limit: number, ahead: number) => `同时最多运行 ${limit} 个任务。${ahead ? `前面还有 ${ahead} 个任务，` : ''}轮到时自动开始；现在停止不会留下任何东西。`,
     preparingTitle: '准备工作区', preparingNoWorktree: '正在建立独立的 worktree 与分支。', preparingHelp: (branch: string, base: string) => `已在独立的 worktree 里建好分支 ${branch}（基线 ${base}），正在运行准备命令。`,
     worktreeRow: (branch: string, base: string, sha: string) => `建好 worktree · 分支 ${branch} · 基线 ${base} ${sha}`,
@@ -401,7 +448,7 @@ export const wt = {
     pageTitle: '验收', pageLead: '门禁通过的任务在这里等你批准合并或驳回', listGroup: '待验收与冲突',
     emptyTitle: '没有待验收的任务', emptyHelp: 'worktree 模式的任务门禁通过后会出现在这里，同时发一条系统通知。',
     rowWaited: (waited: string) => `已等 ${waited}`,
-    tabs: { overview: '概览', diff: '改动', gate: '门禁', review: '审查' } as Record<string, string>, reviewLater: '交叉审查在后续版本加入',
+    tabs: { overview: '概览', diff: '改动', gate: '门禁', review: '审查' } as Record<string, string>,
     moreTip: '更多：打开 worktree、复制分支名', openWorktree: '打开 worktree 文件夹', copyBranch: '复制分支名',
     baseToHead: (base: string, from: string, to: string) => `${base} ${from} → ${to}`,
     specBox: '任务说明', specAllowed: '允许改动', specVerify: '验收命令', specAll: '全部文件', specNone: '没有',
@@ -463,6 +510,19 @@ export const s6 = {
     loadTip: (label: string, n: number, limit: number) => `${label} 正在运行 ${n} 个任务；同时最多运行 ${limit} 个（设置里的并发上限）`,
     // 设置页"并行"
     parallelSec: '并行', parallelLead: '用 worktree 模式的项目，每个任务在自己的工作区里运行，可以同时进行。',
+    // Stage07c T0c（D59、D77）："自动 / 固定"分段 + 固定时 1～8 的下拉；自动时显示估算值与是否暂停，另有自动档的上限
+    concurrencyModes: { auto: '自动', fixed: '固定' } as Record<string, string>,
+    concurrencyAutoNow: (n: number, cores: number, freeGb: string) => `现在估算 ${n} 个（${cores} 核、可用内存 ${freeGb} GB）`,
+    // 2026-10-27：实际使用中这一行只会因为可用内存不够才出现（preferences.mjs 的 machineLoad），按原因写，不要写成 CPU。
+    concurrencyAutoBusyMem: (freeGb: string) => `可用内存只有 ${freeGb} GB，暂停启动新任务；已经在跑的不受影响`,
+    concurrencyAutoBusy: (cpu: number) => `机器正忙（CPU ${cpu}%），暂停启动新任务；已经在跑的不受影响`,
+    concurrencyMax: '自动时最多', concurrencyMaxHelp: '自动估算不会超过这个数。',
+    concurrencyFixedHelp: '固定时同时最多运行这么多个任务（1～8）。',
+    concurrencyFixed: '固定数量', concurrencyAuto: '自动估算',
+    concurrencyAutoHelp: '按 CPU 核数与可用内存估算；CPU 连续 1 分钟超过 85% 或可用内存低于下面的比例时暂停启动新任务。',
+    // D114（2026-10-28）：自动档"内存不够"的比例可调，写进 config.json；下限 1.5 GB 不变
+    memLowPercent: '内存不够时暂停', memLowPercentHelp: (gb: string) => `可用内存低于总内存的这个比例（且不低于 1.5 GB）时不启动新任务；这台电脑现在是 ${gb} GB。`,
+    memLowPercentOption: (n: number) => `低于 ${n}%`,
     concurrency: '同时运行的任务', concurrencyHelp: '超出时排队，轮到时自动开始；门禁同一时间只跑一个。不用 worktree 的项目不受这个限制。',
     // 设置页"数据"里的"清理"（ar gc）
     gc: '清理', gcHelp: (days: number) => `已合并、已驳回任务没删掉的 worktree，项目文件夹已经不存在的任务留下的 worktree，和超过 ${days} 天的执行者会话记录。`,
@@ -481,6 +541,15 @@ export const s6 = {
 // Stage07 O4 / O5：路由页与新建任务页"执行者：自动"的路由结果（界面稿 app/design/preview.js 路由页场景"规则 / 添加规则 / 试算·为什么选它 / 已达每日上限 / 没有规则"，新建任务页场景"自动·路由结果"）
 export const ro = {
     nav: '路由', title: '路由', lead: '按任务类型自动选执行者', addRule: '添加规则', addFirst: '添加第一条规则',
+    // Stage07c T5（D84）：路由建议。T6：规则的推理强度
+    suggest: '按我的执行者生成建议规则', suggestTitle: '建议规则', suggestLead: '根据你已导入、启用并测试通过的执行者生成。勾选后点"采用"才写入。',
+    suggestAdopt: (n: number) => `采用 ${n} 条`, suggestNote: '只写入勾选的条目；已有规则不动，和已有规则冲突的条目不出现',
+    suggestNone: '没有可以建议的规则：先导入并测试通过至少一个执行者。', suggestSkipped: (text: string) => `没有列出：${text}`,
+    suggestAdopted: (n: number) => `已采用 ${n} 条建议规则`, suggestHint: '可以按你的执行者生成建议规则（路由页）',
+    effortUnsupported: '这个执行者不支持推理强度，已忽略',
+    ruleEffort: '推理强度', ruleEffortHelp: '可选：这条规则派出的任务用这个强度；任务说明或单次派发写了时以它们为准。选项来自所选执行者', ruleEffortNone: '不指定',
+    // 151：换执行者后原来的推理强度不在新选项里（规则弹窗与新建任务表单共用）。
+    effortReset: (old: string) => `推理强度 ${old} 不在这个执行者的选项里，已改为不指定`,
     types: { code: '代码', test: '测试', fix: '修复', refactor: '重构', research: '调研', docs: '文档', review: '审查' } as Record<string, string>,
     rulesSec: '规则', rulesLead: '按顺序匹配：任务说明指定了执行者时直接用它；否则找第一条类型相符、执行者可用的规则；都不符合时用兜底。停用、不支持只读、今天已达上限的执行者会被跳过。',
     emptyTitle: '还没有规则', emptyHelp: (label: string) => `所有任务都派给默认执行者 ${label}。按任务类型分给不同的执行者，就添加一条规则。`,
@@ -499,7 +568,13 @@ export const ro = {
     limitTasks: '任务数', limitTokens: 'token', limitNone: '不限', limitInvalid: '填正整数，或留空表示不限',
     usedTasks: (n: number, max: number | null) => max ? `今天 ${n}/${max} 个任务` : `今天 ${n} 个任务`, usedTokens: (n: string, max: string | null) => max ? ` · ${n} / ${max} token` : ` · ${n} token`,
     reviewSec: '审查者候选', reviewLead: '交叉审查（v0.8.0 起）按顺序取第一个可用的；必须支持只读。', reviewAdd: '添加', reviewRemove: (label: string) => `移除 ${label}`,
-    reviewDiffer: '必须与执行者不同', reviewDifferHelp: '同一个模型审查自己的改动，容易带着同样的盲点',
+    // D128（2026-10-29 用户决定）：三条约束都由用户决定，可以关
+    reviewDiffer: '不能是执行者本人', reviewDifferHelp: '关掉后，同一个 Agent 也可以审查自己做的任务',
+    reviewDifferFamily: '与执行者的模型家族不同', reviewDifferFamilyHelp: '同一个模型家族审查自己的改动，容易带着同样的盲点；关掉后只看上一条',
+    // Stage07c T4（D80、D85）：审查者的模型家族默认也与主导不同；T8（D82）：强执行者
+    reviewDifferLead: '与主导的模型家族不同', reviewDifferLeadHelp: '在 Agent 页给某个 Agent 勾上"主导"就按它的家族算；都没勾时按 Claude Code（claude 家族）',
+    leadNow: (lead: string, families: string) => `现在的主导：${lead}（家族 ${families}）`, leadDefault: '未设置，按 Claude Code',
+    strong: '强执行者', strongHelp: '自动重试的最后一次改用它；不设时最后一次仍用原执行者，都失败就提示主导接手', strongNone: '不设',
     // 新建任务页"执行者：自动"
     autoByRule: '自动（按路由规则）', hint: (label: string, why: string) => `将派给 ${label}（${why}）`, hintWhy: '为什么', hintFail: (reason: string) => `派发不了：${reason}`,
     whyRule: (scope: string, n: number, types: string) => `${scope}规则 ${n}：${types}`, whyFallback: '兜底', whySpec: '任务说明指定', whyExplicit: '手动指定',
@@ -569,7 +644,9 @@ export const px = {
 
 // Stage06 链路报告第一版：任务详情"评分"标签与设置页"评分"一节（界面稿 app/design/preview.js 的"评分 / 评分·归因到任务说明"场景）
 export const sc = {
-    tab: '评分', executor: '执行者', lead: '主导', outOf: '/ 100', scoreLabel: (n: number) => `综合分 ${n}`,
+    tab: '评分', executor: '执行者', lead: '主导', reviewer: '审查者', reviewerCrossed: (name: string, crossed: boolean) => `${name}${crossed ? '（交叉）' : '（非交叉）'}`,
+    reviewPerfIssues: '问题', reviewPerfIssuesValue: (n: number, h: number, m: number, l: number) => `${n} 个（高 ${h} · 中 ${m} · 低 ${l}）`,
+    reviewPerfValid: '成立', reviewPerfValidValue: (ok: number, all: number) => `${ok} / 已确认 ${all}`, outOf: '/ 100', scoreLabel: (n: number) => `综合分 ${n}`,
     // 每一项的名称（键同 ar report --json 的 key）
     items: {
         attemptGate: '多一次尝试：门禁未通过', attemptAgent: '多一次尝试：执行者异常退出', outsideFile: '越界文件', protectedFile: '动了受保护的路径',
@@ -577,6 +654,8 @@ export const sc = {
         specEdit: '派发后改任务说明', specBlame: '门禁失败归因到任务说明', manualRetry: '手动重试', rejected: '驳回', conflict: '合并时冲突',
         // Stage07 O12（D39）：归因到"环境"的门禁失败，两张卡片各列一行，不扣分
         envBlame: '环境原因',
+        // Stage08 T6b（D93）：审查者一组
+        reviewInvalid: '改了文件（审查无效）', reviewFormat: '没按格式给结论', reviewFalse: '被标为"不成立"的问题', reviewFalseHigh: '被标为"不成立"的高严重度问题',
     } as Record<string, string>,
     // 主导一节里"需要越界"的名称与执行者不同（含义是范围划窄了）
     leadNeedsScope: '执行者写了"需要越界"',
@@ -606,4 +685,37 @@ export const cx = {
     // Stage07 116：任务的项目已从列表移除时，合并、重试、再派一次、合并主分支后重跑的提示（与 c.projectGoneBlocked 同一句）
     projectGoneBlocked: '项目已从项目列表移除，先重新添加项目',
     failed: (reason: string) => `没有启动核心：${reason}`, timeout: (seconds: number) => `核心没有在 ${seconds} 秒内返回，操作已停止`,
+};
+
+// Stage08 交叉审查（158 用；界面稿 app/design/preview.js 的 reviewTab / reviewBadge / reviewSettings，主导决定 D92）
+export const rv = {
+    tab: '审查', none: '这个任务没有审查', noneHelp: '任务说明写 review: true，或在路由页打开"默认审查所有任务"。',
+    verdict: { pass: '审查通过', concerns: '审查发现问题，只供参考', fail: '审查不通过', unknown: '没审成', invalid: '审查无效', skipped: '没有审查' } as Record<string, string>,
+    badge: { pass: '审查通过', fail: '审查不通过', unknown: '没审成', invalid: '没审成', skipped: '没审成' } as Record<string, string>,
+    badgeIssues: (n: number) => `审查 ${n} 个问题`,
+    // D125（2026-10-28 用户决定）：窄时徽标只显示图标与数字，悬停与读屏写全
+    badgeIssuesFull: (n: number) => `审查：${n} 个问题`,
+    node: '审查', nodePass: '通过', nodeIssues: (n: number) => `${n} 个问题`, nodeFail: '不通过', nodeUnknown: '没审成', nodeRunning: '审查中',
+    nodeHelpUnknown: '没有可用的审查者或审查失败，不影响验收',
+    by: (reviewer: string, crossed: boolean, dur: string) => `${reviewer} 审查${crossed ? '（交叉：与执行者、主导都不是同一家族）' : '（非交叉：和执行者是同一个配置）'}，用时 ${dur}。`,
+    severity: { high: '高', medium: '中', low: '低' } as Record<string, string>,
+    valid: '成立', invalid: '不成立', note: '说明（可选）', jump: '跳到改动里的这一行',
+    reviewed: '看过的文件', again: '再审一次…', againTitle: '再审一次', againHelp: '用最近一次的提交与门禁结果，换一个审查者或同一个再审；不改任务状态。',
+    overviewRow: '审查', notCrossed: '（非交叉）',
+    needsHuman: '审查问题未解决，需人工处理',
+    needsHumanHelp: (ids: string) => `拦截模式下审查发现高严重度问题，自动返工后仍有：${ids}。审查只是意见，你可以把问题标为"不成立"后批准，或者驳回、重试。`,
+    approveUnconfirmed: (n: number, ids: string) => `审查还有 ${n} 个高 / 中问题没有确认（${ids}）。可以照常批准；确认结果用来统计审查者的准确率。`,
+    // 路由页
+    defaultAll: '默认审查所有任务', defaultAllHelp: '关着时只审任务说明里写了 review: true 的任务；调研类任务不审',
+    block: '审查发现问题时', blockHelp: '建议模式：只记录，不打回，由你验收时判断；拦截：高严重度问题自动返工',
+    blockModes: { none: '只建议', high: '高严重度拦截' } as Record<string, string>,
+    maxReworks: '最多返工几次', maxReworksHelp: '拦截模式下由审查触发的返工次数，不占门禁的自动重试次数；用完还有问题就交给你',
+    accuracy: '审查者准确率（你和主导标的"成立 / 不成立"）', accuracyRow: (all: number, ok: number) => `已确认 ${all} 条 · 成立 ${ok} 条`,
+    accuracyNone: '还没有确认过的审查问题',
+    suggestBlock: (reviewer: string) => `${reviewer} 的高严重度问题已确认 20 条以上、准确率 80% 以上，可以考虑开启高严重度拦截。开关由你决定。`,
+    suggestBlockHelp: '某个审查者的高严重度问题已确认 20 条以上、准确率 80% 以上时，这里会提示"可以考虑开启高严重度拦截"。开关始终由你决定。',
+    // 158 汇报里的占位（2026-10-28 主导补）："再审一次"弹窗、跳到改动找不到这一行
+    rerunAuto: '按规则自动选', rerunReviewer: '审查者', rerunning: '正在审查…',
+    rerunNone: '没有可以担任审查者的执行者：在 Agent 页给一个支持只读的执行者勾上"审查者"。',
+    jumpNoLine: '改动里没有这一行，已定位到这个文件的开头',
 };

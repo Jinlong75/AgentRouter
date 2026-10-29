@@ -40,6 +40,8 @@ export interface Task {
     label?: string;
     // 路由说明（start.route，Stage07 111）：路由器选这个执行者的那一句，例如"全局规则 2：[research] → qoder-cn"；没经过路由的任务没有。
     route?: string;
+    // 派发时记的模型、推理强度各自的来源（start / dispatch.json 的 settingSources，154）：值是核心写的中文原文（命令行、环境变量 X、任务说明、路由规则、config.json、内置默认、升级链、已忽略）；旧记录没有。
+    settingSources?: { model: string | null; effort: string | null };
     commit?: string;
     // 汇报文件是否存在（按文件实际存在判断，不按任务是否结束）。
     hasReport?: boolean;
@@ -69,8 +71,55 @@ export interface Task {
     // worktree 模式（Stage06，协议 15.3）：start 有 worktree: true 的任务才带这两个字段，非 worktree 与旧任务的对象保持原样。
     worktree?: true;
     wt?: WtInfo;
+    // 交叉审查（Stage08，协议第 18 节）：reviewing 是审查进行中（reviewing 事件，review 事件到达后清掉）；review 是最近一次有结论的 review 事件的摘要。
+    // 没有审查的任务两个字段都没有，任务对象与以前一致。
+    reviewing?: { attempt: number; at: number };
+    review?: TaskReview;
     last: string;
 }
+// review 事件的摘要（verdict 为 pass / concerns / fail / unknown / invalid）；needsHuman 来自 review-needs-human，confirmedAt 是最近一条 review-confirm 的时刻。
+export interface TaskReview {
+    attempt: number;
+    run?: number;
+    reviewer: string | null;
+    crossed: boolean;
+    verdict: string;
+    issues: number;
+    high: number;
+    at: number;
+    needsHuman?: boolean;
+    confirmedAt?: number;
+}
+// ar review show --json 的 review（顶层 review.json，协议 18.3）：只读展示。
+export interface ReviewIssue {
+    id: string;
+    severity: 'high' | 'medium' | 'low';
+    file?: string | null;
+    line?: number | null;
+    title: string;
+    detail?: string;
+    confirmation?: { result: 'valid' | 'invalid'; by: string; note: string | null; at: number } | null;
+}
+export interface ReviewFile {
+    attempt?: number;
+    run?: number;
+    reviewer: string | null;
+    crossed: boolean;
+    verdict: string;
+    summary?: string;
+    reviewed?: string[];
+    issues: ReviewIssue[];
+    ms?: number;
+    needsHuman?: boolean;
+    at?: number;
+}
+// ar review stats --json：每个审查者 × 严重度的已确认条数与成立条数；suggestBlock 表示高严重度问题的准确率够高。
+export interface ReviewStatsRow {
+    reviewer: string;
+    severities: Record<'high' | 'medium' | 'low', { confirmed: number; valid: number; accuracy: number | null }>;
+    suggestBlock?: boolean;
+}
+export interface ReviewSettingsView { default: boolean; block: 'none' | 'high'; maxReworks: number }
 // 清单里 worktree 任务最后一次影响状态的事件所处的阶段；十种状态由 worktreeState 在它之上再按 status / 门禁事件推出。
 export type WtPhase = 'queued' | 'preparing' | 'live' | 'awaiting' | 'accepted' | 'rejected' | 'conflict' | 'failed';
 export type WtState = 'queued' | 'preparing' | 'running' | 'gating' | 'awaiting' | 'accepted' | 'rejected' | 'conflict' | 'failed' | 'stopped';
@@ -98,6 +147,15 @@ export interface WtInfo {
     cleanupFailed?: boolean;
     // 比它先排队、现在仍在排队的任务数（Registry 每次刷新重算；不在排队时没有）。
     ahead?: number;
+    // 最近一条 queued 事件带的排队原因（并行调度 140）：overlap 带阻挡任务（名字与前 3 个重叠模式），exclusive 带独占门禁的任务名与命令，busy 带 CPU 百分比；没有 reason 的 queued 事件把它清掉。
+    // busy 在可用内存不够时 memLow 为真并带 freeGb（可用内存，GB，一位小数），横幅写内存而不是 CPU（171）。
+    queuedWhy?: { reason: 'overlap' | 'exclusive' | 'busy'; name?: string; paths?: string[]; command?: string; cpu?: number; memLow?: boolean; freeGb?: number };
+    // 新派发 / 手动重试时与待验收任务改动范围重叠的提示（overlap-note 事件，171）：对方任务的 id 与名字；一个任务可以有多条，之后的事件不清它（界面按对方现在是不是还在待验收决定显示）。
+    overlapNotes?: { id: string; name: string }[];
+    // 被批准合并后自动按新基线重跑门禁（resume.reason === 'after-merge'，171）：刚合并的任务的 id；下一次不是 after-merge 的 resume 把它清掉。
+    rebaseAfter?: string;
+    // 这次派发用 --base 指定的基线分支（start 事件的 baseBranch，136）；没指定就没有。和下面 baseBranch（项目主分支）不是一回事。
+    startBase?: string;
     // 项目配置里的主分支与合并方式（Registry 读 .agent-router/project.json；读不到为空）。
     baseBranch?: string;
     mergeMode?: 'no-ff' | 'squash';
@@ -269,8 +327,26 @@ export interface AgentPreset {
     env?: Record<string, string>; secrets?: Record<string, string>;
     model?: string | null; effort?: string | null; provider?: { baseUrl?: string | null; wireApi?: string };
     modelOptions?: string[]; effortOptions?: string[]; baseUrlOptions?: string[]; listModels?: string[]; types?: string[];
+    // 预设声明这个执行者不支持推理强度时为 false（Stage07c 154，D87）；核心总会给，旧数据没有时按支持。
+    supportsEffort?: boolean;
     // 导入向导把同一 card.id 的预设合成一张卡片，第 2 步用 variant 的分段按钮选具体预设（只给界面用）。
     card?: { id: string; title: string; description: string }; variant?: { label: string; option: string; help: string };
+}
+// agents:models（payload 带 probe: true，带 name 查已导入的执行者，带 preset 是导入之前查）的返回，字段照核心 ar agents models <名> | --preset <预设> --probe --json（Stage07c 142、169）：
+// 查到时 ok 为 true，source 是 api / program，details 是 [{ id, name?, efforts?, defaultEffort? }]；
+// 没查到时 ok 为 false，source 是 preset，models 是预设的可选值，reason 是中文原因。
+export interface ProbeDetail { id: string; name?: string; efforts?: string[]; defaultEffort?: string }
+export interface ProbeResult { ok: boolean; source: 'api' | 'program' | 'preset'; models: string[]; details?: ProbeDetail[]; reason?: string }
+// roles:list 的返回（核心 ar roles --json，Stage07c 145）：families 是可选的家族名（模板 + familyRules）；
+// profiles 只有启用的执行者：roles 是可担任的角色，modelFamilies 是用户声明的范围，families 是核心判断出的家族（familiesUnknown 为 true 时看不出）。
+export interface RolesProfile {
+    name: string; label: string; roles: ('executor' | 'reviewer' | 'lead')[]; rolesSource: 'default' | 'set';
+    model: string | null; modelFamilies: string[]; families: string[]; familiesUnknown: boolean; familiesSource: string;
+}
+// lead 是 D128（190）加的：设为主导的 Agent、它们家族的并集；一个都没设时 profiles 为空、families 是 claude、source 为 default。
+export interface RolesView {
+    families: string[]; profiles: RolesProfile[]; reviewerOrder: string[]; mustDiffer: boolean; differFamily: boolean; differFromLead: boolean;
+    lead: { profiles: string[]; families: string[]; source: 'default' | 'set' }; leadFamily: string;
 }
 // 自定义 CLI 预览（agents:test-decl）：原始输出每行带映射出的统一事件。
 export interface PreviewLine { stream: 'stdout' | 'stderr'; text: string; events: { kind: string; [key: string]: unknown }[] }
@@ -280,7 +356,13 @@ export interface PreviewResult {
 }
 export interface DeclProblem { path: string; message: string }
 // 路由页（Stage07 T8）：console 通道 route:config / route:rules / route:fallback / route:reviewer / route:limit 的返回，字段照核心 ar route config --json。
-export interface RouteRule { types: string[]; profile: string; escalate?: string | null }
+export interface RouteRule { types: string[]; profile: string; escalate?: string | null; effort?: string | null }
+// route:suggest 的返回（核心 ar route suggest --json，Stage07c 149）：rules 是建议的规则（每条带一句 why），skipped 是没有列出的执行者 / 类型与原因，write 是核心给的采用命令（界面不用）。
+export interface RouteSuggestion {
+    rules: { types: string[]; profile: string; why: string }[];
+    skipped: { profile?: string; types?: string[]; why: string }[];
+    write?: string;
+}
 export interface RouteProfile {
     name: string;
     label: string;
@@ -288,11 +370,14 @@ export interface RouteProfile {
     readOnly: boolean;
     limits: { maxTasksPerDay: number | null; maxTokensPerDay: number | null };
     usage: { tasks: number; tokens: number };
+    // 现在被限流（额度用完）才有：until 是恢复时间（毫秒时间戳）；evidence 是限流原文片段（核心 ar route config 给，D104；没有就没有这个字段）。
+    limited?: { kind: 'limit' | 'unavailable'; until: number; since: number; evidence?: string | null };
 }
 export interface RouteConfig {
     rules: RouteRule[];
     fallback: string | null;
-    reviewer: { profiles: string[]; mustDiffer: boolean };
+    strongExecutor?: string | null;
+    reviewer: { profiles: string[]; mustDiffer: boolean; differFamily?: boolean; differFromLead?: boolean };
     defaultProfile: string | null;
     profiles: RouteProfile[];
     projectRules: { project: string; path: string; count: number }[];
@@ -464,6 +549,14 @@ export interface Report {
         items: ReportItem[];
         perf: { ms: number | null; awaitMs: number | null; usage: ReportUsage | null; usageState: 'off' | 'ok' | 'unavailable' };
     };
+    // 有审查的任务才有这一组（Stage08 T6b）：问题数与严重度、成立 / 已确认、用时、token 只列出，不进分数。
+    reviewer?: {
+        score: number;
+        items: ReportItem[];
+        perf: { issues: { total: number; high: number; medium: number; low: number }; confirmed: number; valid: number; ms: number; usage: ReportUsage | null };
+        profile: string;
+        crossed: boolean;
+    };
     attempts: ReportAttempt[];
     warnings?: string[];
 }
@@ -493,9 +586,19 @@ export interface Settings {
     //（url 为 null 表示没有；reason 取 found / disabled / pac / unreadable / unsupported），其余模式为 null。
     proxy: { mode: 'off' | 'system' | 'manual'; url: string; system: { url: string | null; reason: string } | null };
     // 同时运行的任务数上限与会话保留天数（config.json 的 concurrency / sessionRetentionDays，没写按默认 2 / 14；手写的越界值原样给出）。
-    concurrency: number;
+    // concurrency 也可以是 "auto"（并行调度 140）；concurrencyMax 是自动档的上限（1～8，没写为 8）。
+    // parallel 是核心给的估算信息：估算值、核数、可用内存（GB，一位小数的文字）；自动档才有 cpu（CPU 使用率）与 busy（机器正忙、暂停启动新任务），固定档两者为空。
+    concurrency: number | 'auto';
+    concurrencyMax: number;
+    // 自动档"内存不够时暂停"的比例（config.json 的 memLowPercent，1～50 的整数，没写或不合法为 5；182）。
+    memLowPercent: number;
+    // busyReason / busyFreeGb：机器正忙的原因（memory = 可用内存不够，此时 busyFreeGb 是忙时的可用内存 GB，一位小数；cpu）；不忙时为 null。
+    // memLowGb：按当前比例算出的"内存不够"阈值（GB，一位小数；核心的 memLowThreshold）。
+    parallel: { estimate: number; cores: number; freeGb: string; cpu: number | null; busy: boolean; busyReason: 'cpu' | 'memory' | null; busyFreeGb: string | null; memLowGb: string };
     retentionDays: number;
     values: Record<string, string | null>;
+    // 每个 Codex 适配器的执行者（含改过名的，如 codex-pro）各自的 model / effort / tier / sandbox / path（Codex 编辑预填用）；设置页"Codex"那一节仍用 values。
+    codexProfiles: Record<string, Record<'model' | 'effort' | 'tier' | 'sandbox' | 'path', string | null>>;
     // 执行者配置原样交给 Agent 页（编辑 claude-code 执行者需要 env / maxTurns / secrets 等预填值）。
     profiles: Record<string, {
         adapter?: string;
@@ -510,6 +613,8 @@ export interface Settings {
         model?: string | null;
         effort?: string | null;
         escalate?: string | null;
+        roles?: string[];
+        modelFamilies?: string[];
         provider?: { baseUrl?: string | null; wireApi?: string };
         generic?: unknown;
     }>;

@@ -15,6 +15,7 @@
   "description": "经 Claude Code 外壳运行，用 Token Plan 的 API Key（tp- 开头）",
   "recommended": false,
   "effortOptions": ["low", "medium", "high", "xhigh", "max"],
+  "types": ["test", "docs"],
   "card": { "id": "mimo", "title": "Xiaomi MiMo", "description": "经 Claude Code 外壳运行，Token Plan 或按量付费" },
   "variant": { "label": "套餐", "option": "Token Plan", "help": "用 Token Plan 的 API Key（tp- 开头）" },
   "order": 2

@@ -141,7 +141,6 @@ test('拒绝的情况：README、已在 archive/、未跟踪、项目外、目�
   const snapshot = f.status();
   const cases = [
     [[`${SPECS}/README.md`], /README/],
-    [[`${SPECS}/archive/001-old.md`], /已经在归档里/],
     [[`${SPECS}/005-untracked.md`], /没有被 git 跟踪/],
     [[outside], /项目内/],
     [['../项目外.md'], /项目内/],
@@ -162,6 +161,38 @@ test('拒绝的情况：README、已在 archive/、未跟踪、项目外、目�
   assert.equal((await f.call(['spec', 'archive', f.repo, '--json'])).json.ok, false, '没给路径是用法错误');
 });
 
+test('已经归档过：单个报准确提示；多选时没归档的照常归档、已归档的列进 skipped；归档里有同名而顶层没有也算', async t => {
+  const f = fixture(t);
+  f.write(`${SPECS}/archive/001-old.md`);
+  f.commitAll('old', [`${SPECS}/archive/001-old.md`]);
+  const head = f.git('rev-parse', 'HEAD');
+  // 归档里的路径
+  const inArchive = await f.call(['spec', 'archive', f.repo, `${SPECS}/archive/001-old.md`, '--commit', '--json']);
+  assert.equal(inArchive.json.ok, false);
+  assert.equal(inArchive.json.error, `已经归档过：${SPECS}/archive/001-old.md（在 ${SPECS}/archive/ 里）`);
+  assert.deepEqual(inArchive.json.skipped, [{ path: `${SPECS}/archive/001-old.md`, why: inArchive.json.error }]);
+  // 顶层没有、归档里有同名文件
+  const gone = await f.call(['spec', 'archive', f.repo, `${SPECS}/001-old.md`, '--json']);
+  assert.equal(gone.json.ok, false);
+  assert.match(gone.json.error, /^已经归档过：docs\/specs\/archive\/001-old\.md（在 docs\/specs\/archive\/ 里）$/);
+  assert.equal(f.git('rev-parse', 'HEAD'), head);
+  // 文字输出
+  const plain = await f.call(['spec', 'archive', f.repo, `${SPECS}/001-old.md`]);
+  assert.equal(plain.code, 1);
+  assert.match(plain.out.at(-1), /^已经归档过：/);
+  // 多选：已归档的跳过，其余照常
+  const mixed = await f.call(['spec', 'archive', f.repo, `${SPECS}/002-a.md`, `${SPECS}/001-old.md`, `${SPECS}/archive/001-old.md`, '--commit', '--json']);
+  assert.equal(mixed.code, 2, '顶层名和归档路径指向同一份已归档文件，算重复路径');
+  assert.match(mixed.json.error, /重复/);
+  const ok = await f.call(['spec', 'archive', f.repo, `${SPECS}/002-a.md`, `${SPECS}/001-old.md`, '--commit', '--json']);
+  assert.equal(ok.code, 0);
+  assert.equal(ok.json.ok, true);
+  assert.deepEqual(ok.json.moved, [{ from: `${SPECS}/002-a.md`, to: `${SPECS}/archive/002-a.md` }]);
+  assert.deepEqual(ok.json.skipped.map(item => item.path), [`${SPECS}/archive/001-old.md`]);
+  assert.match(ok.json.skipped[0].why, /^已经归档过：/);
+  assert.ok(f.exists(`${SPECS}/archive/002-a.md`));
+  assert.ok(f.exists(`${SPECS}/003-b.md`), '没点名的不动');
+});
 test('缺提交身份：NEED_GIT_IDENTITY，文件没有被移动', async t => {
   const f = fixture(t, { identity: false });
   const head = f.git('rev-parse', 'HEAD');

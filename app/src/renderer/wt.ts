@@ -1,5 +1,5 @@
 import { worktreeState, type GateFile, type Task, type WtState } from '../shared/types';
-import { c, gt, wt as w } from '../shared/copy';
+import { c, gt, rv, wt as w } from '../shared/copy';
 import { esc } from '../shared/markdown';
 import { confirmAction, icon, toast } from './ui';
 import { gateState, trackNode, trackParts } from './gate';
@@ -9,7 +9,8 @@ import { gateState, trackNode, trackParts } from './gate';
 export const wtState = (t: Task): WtState | null => worktreeState(t);
 // 待验收与冲突：需要人处理，验收页只列这两种，侧栏徽标与任务页"待验收"筛选也只数它们。
 export const needsAccept = (t: Task) => { const s = worktreeState(t); return s === 'awaiting' || s === 'conflict'; };
-export const baseBranchOf = (t: Task) => t.wt?.baseBranch ?? 'main';
+// 这个任务批准后合并到哪个分支：派发时用 --base 指定的基线分支（136）优先，没指定的用项目配置的主分支。
+export const baseBranchOf = (t: Task) => t.wt?.startBase ?? t.wt?.baseBranch ?? 'main';
 export const sha7 = (value: string | null | undefined) => (value ?? '').slice(0, 7);
 const clock = (n: number) => new Date(n).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 const byName = (by: string) => w.by[by] ?? by;
@@ -61,7 +62,45 @@ export function wtStateLine(t: Task, now = Date.now()): { cls: string; text: str
     return null;
 }
 
-// 流水线轨道五段：派发 · 执行 · 门禁 · 待验收 · 合并（节点都是按钮，带 aria-label）。
+// ---- 交叉审查（Stage08 158，界面稿 reviewBadge() / wtTrack() 里的"审查"节点）----
+// 没有审查（没有 review 事件、也不在审查中）的任务以下几个函数都返回空，轨道与列表和以前完全一样。
+// 审查进行中：reviewing 事件之后、review 事件之前，而且任务还没结束。
+export const reviewingNow = (t: Task) => !!t.reviewing && t.status === 'run';
+// 轨道上的"审查"节点：门禁与待验收之间；点它到"审查"标签。
+export function reviewNode(t: Task): string {
+    const r = t.review;
+    // 审查进行中还没有结果：没有"审查"标签可去，点节点回到进展。
+    if (reviewingNow(t)) return trackNode(rv.node, 'running', '', rv.nodeRunning, rv.nodeRunning, 'flow');
+    if (!r) return '';
+    const who = r.reviewer ? `（${r.reviewer}）` : '';
+    const parts = r.verdict === 'pass' ? ['done', icon('check-line'), rv.nodePass, `${rv.verdict.pass}${who}`]
+        : r.verdict === 'concerns' ? ['attn', '<span class="pip"></span>', rv.nodeIssues(r.issues), `${rv.badgeIssues(r.issues)}${who}`]
+            : r.verdict === 'fail' ? ['failed', icon('close-line'), rv.nodeFail, `${rv.verdict.fail}${who}`]
+                : ['skip', '', rv.nodeUnknown, rv.nodeHelpUnknown];
+    return trackNode(rv.node, parts[0], parts[1], parts[2], parts[3], 'review');
+}
+// 列表第二行的审查徽标（跟在门禁徽标后面）：进行中 / 通过 / N 个问题 / 不通过 / 没审成。
+// 188（D125）：不折行。宽时图标 + 文字，窄时（style.css 的容器查询）只剩图标，有问题数时再加数字（data-n）；
+// 悬停提示与 aria-label 两种情况下都是全文（有问题数时 rv.badgeIssuesFull）。
+export function reviewBadge(t: Task): string {
+    const r = t.review;
+    const badge = (cls: string, glyph: string, text: string, full = text, n: number | null = null) =>
+        `<span class="gbadge rvb ${cls}" data-review-badge${n === null ? '' : ` data-n="${n}"`} role="img" title="${esc(full)}" aria-label="${esc(full)}">${icon(glyph)}<span class="rvb-t">${esc(text)}</span></span>`;
+    if (reviewingNow(t)) return badge('running', 'loader-4-line', rv.nodeRunning);
+    if (!r) return '';
+    return r.verdict === 'pass' ? badge('ok', 'shield-check-line', rv.badge.pass)
+        : r.verdict === 'concerns' ? badge('', 'error-warning-line', rv.badgeIssues(r.issues), rv.badgeIssuesFull(r.issues), r.issues)
+            : r.verdict === 'fail' ? badge('fail', 'shield-cross-line', rv.badge.fail)
+                : badge('', 'question-line', rv.badge.unknown);
+}
+// 列表第二行的内容：徽标在前（执行者标签、尝试、门禁、审查），项目名与状态在后。有审查徽标时徽标成一组、不收缩，
+// 项目名与状态占剩下的宽度、在那里用省略号截断（style.css 的 .bds / .rest）：省略号不再和徽标抢位置，审查徽标不会被挤掉（158 已知问题，188）。
+// 没有审查徽标的行保持原来的写法。
+export const listMeta = (badges: string, review: string, rest: string) => review ? `<span class="bds">${badges}${review}</span><span class="rest">${rest}</span>` : badges + rest;
+// 详情页"审查"标签：有审查结果的任务才有（没有审查的任务标签栏与以前一样）。
+export const hasReviewTab = (t: Task) => !!t.review;
+
+// 流水线轨道五段：派发 · 执行 · 门禁 · 待验收 · 合并（节点都是按钮，带 aria-label）；有审查的任务在门禁与待验收之间多一个"审查"节点。
 export function wtTrack(t: Task, file: GateFile | null) {
     const s = worktreeState(t), wi = t.wt;
     if (!s || !wi) return '';
@@ -85,7 +124,8 @@ export function wtTrack(t: Task, file: GateFile | null) {
     const link = (on: boolean) => `<span class="link ${on ? 'done' : ''}"></span>`;
     const gateDone = !early && (gateState(t) === 'ok' || gateState(t) === 'fail' || gateState(t) === 'running');
     const clockAt = clock(t.started);
-    return `<div class="track" role="group" aria-label="流水线">${trackNode(gt.track.dispatch, 'done', icon('check-line'), clockAt, `${clockAt} 派发`, 'params')}${link(true)}${trackNode(gt.track.run, exec[0], exec[1], exec[2], exec[3], 'flow')}${link(gateDone || after)}${trackNode(gt.track.gate, gate[0], gate[1], gate[2], `${gate[3]}，${gate[4]}`, (gateState(t) ?? 'off') === 'off' ? 'params' : 'gate')}${link(after)}${trackNode(w.track.awaiting, awaiting[0], awaiting[1], awaiting[2], awaiting[3], 'flow')}${link(s === 'accepted' || s === 'conflict')}${trackNode(w.track.merge, merge[0], merge[1], merge[2], merge[3], 'flow')}</div>`;
+    const review = reviewNode(t), reviewPart = review ? `${link(after || reviewingNow(t))}${review}` : '';
+    return `<div class="track" role="group" aria-label="流水线">${trackNode(gt.track.dispatch, 'done', icon('check-line'), clockAt, `${clockAt} 派发`, 'params')}${link(true)}${trackNode(gt.track.run, exec[0], exec[1], exec[2], exec[3], 'flow')}${link(gateDone || after)}${trackNode(gt.track.gate, gate[0], gate[1], gate[2], `${gate[3]}，${gate[4]}`, (gateState(t) ?? 'off') === 'off' ? 'params' : 'gate')}${reviewPart}${link(after)}${trackNode(w.track.awaiting, awaiting[0], awaiting[1], awaiting[2], awaiting[3], 'flow')}${link(s === 'accepted' || s === 'conflict')}${trackNode(w.track.merge, merge[0], merge[1], merge[2], merge[3], 'flow')}</div>`;
 }
 
 // 横幅（结构同任务页已有的横幅）：kind 为 fail / info / brand / ok / stale。
@@ -96,6 +136,31 @@ const BANNER_MARK: Record<string, string> = {
 };
 export const bannerHtml = (kind: string, title: string, text: string, button = '', extra = '') =>
     `<div class="banner ${kind}" role="${kind === 'fail' ? 'alert' : 'status'}">${BANNER_MARK[kind]}<div class="rt"><b>${esc(title)}</b><span>${esc(text)}</span>${extra}</div>${button}</div>`;
+// 参数标签里模型、推理强度的来源（Stage07c 154、171，D81）：核心写的中文来源 → copy.ts 的 sourceLabels 键；命令行与环境变量都算单次派发。
+// 不认识的来源返回 null（不写）。
+export function sourceKey(source: string | null | undefined): string | null {
+    if (!source) return null;
+    if (source === '命令行' || source.startsWith('环境变量')) return 'cli';
+    const keys: Record<string, string> = { '任务说明': 'spec', '路由规则': 'rule', 'config.json': 'profile', '内置默认': 'builtin', '升级链': 'escalate', '已忽略': 'ignored' };
+    return keys[source] ?? null;
+}
+// 值后面的"（来自…）"；旧任务（没有 settingSources）、来源不认识都返回空串。
+export function sourceNote(t: Task, which: 'model' | 'effort'): string {
+    const key = sourceKey(t.settingSources?.[which]);
+    return key && c.sourceLabels[key] ? c.fromSource(c.sourceLabels[key]) : '';
+}
+// 与待验收任务重叠的提示（Stage07c 154、171，D86）：每行一个 tag info。
+// overlap-note 里的对方现在还是待验收 / 冲突时才写（合并或驳回之后提示作废）；被批准合并后自动重跑门禁的任务（resume.reason === after-merge），
+// 重跑期间写 rebaseAfterMerge(刚合并的任务名)，重跑结束回到待验收后不再写（那句话说的是"正在重跑"）。tasks 是快照里的全部任务，用来查对方现在的状态与名字。
+export function overlapLines(t: Task, tasks: Task[]): string {
+    const wi = t.wt;
+    if (!wi) return '';
+    const waiting = new Set(tasks.filter(x => x.id !== t.id && needsAccept(x)).map(x => x.id));
+    const texts = (wi.overlapNotes ?? []).filter(note => waiting.has(note.id)).map(note => c.overlapAwaiting(note.name));
+    const merged = wi.rebaseAfter && t.status === 'run' ? tasks.find(x => x.id === wi.rebaseAfter) : undefined;
+    if (merged) texts.push(c.rebaseAfterMerge(merged.name));
+    return texts.map(text => `<div class="ovnote" data-overlap-note><span class="tag info" title="${esc(text)}">${esc(text)}</span></div>`).join('');
+}
 export const goAcceptButton = (t: Task) => `<button class="btn sm" data-go-accept="${esc(t.id)}">${esc(w.goAccept)}</button>`;
 
 // 任务的项目现在的样子（Stage07 116）：ok = 还在项目列表里；gone = 已从项目列表移除（文件夹还在）；missing = 文件夹也没了。
@@ -192,7 +257,15 @@ export function wtBanner(t: Task, limit: number): { html: string; replacesFailur
     const s = worktreeState(t), wi = t.wt;
     if (!s || !wi) return null;
     const base = baseBranchOf(t), time = (n: number | undefined) => clock(n ?? 0), by = (key: string | undefined) => byName(key ?? 'cli');
-    if (s === 'queued') return { html: bannerHtml('info', w.queuedTitle, w.queuedHelp(limit, wi.ahead ?? 0)), replacesFailure: false };
+    if (s === 'queued') {
+        const why = wi.queuedWhy;
+        // 按最近一条 queued 事件的原因换正文，后面都接“现在停止不会留下任何东西”；没有原因照旧是等名额的说明。
+        const body = why?.reason === 'overlap' ? `${w.queuedOverlap(why.name ?? '', (why.paths ?? []).slice(0, 3).join('、'))}${w.queuedStopSafe}`
+            : why?.reason === 'exclusive' ? `${w.queuedExclusive(why.name ?? '', why.command ?? '')}${w.queuedStopSafe}`
+                // 机器忙：可用内存不够（memLow）写内存，其余写 CPU。
+                : why?.reason === 'busy' ? `${why.memLow && why.freeGb !== undefined ? w.queuedBusyMem(why.freeGb.toFixed(1)) : w.queuedBusy(why.cpu ?? 0)}${w.queuedStopSafe}` : w.queuedHelp(limit, wi.ahead ?? 0);
+        return { html: bannerHtml('info', w.queuedTitle, body), replacesFailure: false };
+    }
     // 刚写 preparing、还没有 worktree 事件时没有分支名，正文说正在建 worktree。
     if (s === 'preparing') return { html: bannerHtml('info', w.preparingTitle, wi.branch ? w.preparingHelp(wi.branch, base) : w.preparingNoWorktree), replacesFailure: false };
     if (s === 'awaiting') return { html: bannerHtml('brand', w.awaitingTitle, w.awaitingHelp(base), goAcceptButton(t)), replacesFailure: false };
@@ -220,7 +293,9 @@ export function wtBanner(t: Task, limit: number): { html: string; replacesFailur
 const turnRow = (at: number | undefined, text: string) => `<div class="tl k-turn"><span class="t mono">${at ? clock(at) : ''}</span><div class="c">${esc(text)}</div></div>`;
 export function wtHeadRow(t: Task) {
     const wi = t.wt;
-    return wi?.branch ? turnRow(wi.worktreeAt, w.worktreeRow(wi.branch, baseBranchOf(t), sha7(wi.base))) : '';
+    // 这次派发用 --base 指定了基线分支（136）才多一行；没指定的任务和以前完全一样。
+    const base = wi?.startBase ? turnRow(t.started, w.baseBranchRow(wi.startBase)) : '';
+    return base + (wi?.branch ? turnRow(wi.worktreeAt, w.worktreeRow(wi.branch, baseBranchOf(t), sha7(wi.base))) : '');
 }
 // 路由结果一行（样式同 worktreeRow），时间取任务开始时间；没有路由结果返回空。
 export const routeHeadRow = (t: Task) => t.route ? turnRow(t.started, w.routeRow(t.route)) : '';

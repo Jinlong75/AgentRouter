@@ -25,10 +25,14 @@ export function redactPaths(text, extra = []) {
       out = out.replace(new RegExp(escape(variant), 'gi'), to);
     }
   };
-  // 系统临时目录可能以短路径（TEMP）或长路径（命令行里）出现，两种都按 <TEMP> 处理；用户目录最后替换。
+  // 系统临时目录可能以短路径（TEMP）或长路径（命令行里）出现，两种都按 <TEMP> 处理。
+  // 按路径长度从长到短替换（同长度保持临时目录在前）：用户目录在临时目录之下时写成 <HOME>，临时目录在用户目录之下时写成 <TEMP>。
   const temps = [tmpdir(), process.env.TEMP, process.env.TMP, ...(process.platform === 'win32' ? [join(homedir(), 'AppData', 'Local', 'Temp')] : [])];
-  for (const value of [...extra, ...temps]) swap(value, '<TEMP>');
-  for (const value of [homedir(), process.env.USERPROFILE, process.env.HOME]) swap(value, '<HOME>');
+  const homes = [homedir(), process.env.USERPROFILE, process.env.HOME];
+  const pairs = [...[...extra, ...temps].map(from => [from, '<TEMP>']), ...homes.map(from => [from, '<HOME>'])]
+    .filter(([from]) => from)
+    .sort((a, b) => b[0].length - a[0].length);
+  for (const [from, to] of pairs) swap(from, to);
   return out;
 }
 
@@ -109,6 +113,21 @@ export async function taskAlive(start, { alive = pidAlive, created = processCrea
   if (!alive(start.pid)) return false;
   const time = await created(start.pid);
   return alive(start.pid) && (time === null || time <= start.started);
+}
+
+// 控制台宿主（Windows 给每个控制台程序配的 conhost / OpenConsole）：挂在执行者下面但不干活，判断"还有没有子进程在跑"时不算。
+export const CONSOLE_HOSTS = new Set(['conhost.exe', 'openconsole.exe']);
+// pid 的进程树里除控制台宿主以外还在运行的子孙（子孙按父 PID 与创建时间认定，和 killProcessTree 一致）。
+// 一次成功的查询：根已经不在快照里返回 []；查询失败直接抛出，调用方不能把"查不到"当成"没有子进程"。
+export async function busyDescendants(pid, { list = processList, platform = process.platform, timeout = PROCESS_LIST_TIMEOUT_MS } = {}) {
+  const snapshot = await list(undefined, platform, timeout);
+  const root = snapshot.find(p => p.pid === pid);
+  if (!root) return [];
+  const tree = [root], seen = new Set([pid]);
+  for (let i = 0; i < tree.length; i++) for (const p of snapshot) {
+    if (p.parent === tree[i].pid && !seen.has(p.pid) && p.created >= tree[i].created) { tree.push(p); seen.add(p.pid); }
+  }
+  return tree.slice(1).filter(p => !CONSOLE_HOSTS.has(String(p.name ?? '').toLowerCase()));
 }
 
 // 进程身份 = PID + 创建时间（协议第 9 节）：PID 相同、创建时间不同的是系统复用了这个 PID 的另一个进程。

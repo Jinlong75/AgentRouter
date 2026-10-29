@@ -7,6 +7,7 @@ const COMMIT_TYPES = new Set(['code', 'test', 'fix', 'refactor']);
 const KNOWN_FIELDS = new Set([
   'id', 'title', 'type', 'worker', 'allowed_paths', 'verify', 'expect_commit',
   'timeout_min', 'verify_timeout_min', 'max_retries', 'review', 'read_only',
+  'effort', 'model', 'reviewer', 'review_block',
 ]);
 const FIELD_NAME = /^[a-z_]+$/;
 
@@ -195,6 +196,7 @@ export function validateSpec(parsed, file = '任务说明') {
     id: undefined, title: undefined, type: undefined, worker: undefined,
     allowed_paths: undefined, verify: undefined, expect_commit: undefined,
     timeout_min: undefined, verify_timeout_min: undefined, max_retries: undefined, review: undefined, read_only: undefined,
+    effort: undefined, model: undefined, reviewer: undefined, review_block: undefined,
   };
   if (has('id')) spec.id = asString('id');
   if (has('title')) spec.title = asString('title');
@@ -222,6 +224,23 @@ export function validateSpec(parsed, file = '任务说明') {
   if (has('max_retries')) spec.max_retries = asInteger('max_retries', 0);
   if (has('review')) spec.review = asBoolean('review');
   if (has('read_only')) spec.read_only = asBoolean('read_only');
+  // effort / model（Stage07c T6）：可选，非空字符串；取值是否被执行者支持由派发时检查，这里只管类型。
+  for (const key of ['effort', 'model']) {
+    if (!has(key)) continue;
+    spec[key] = asString(key);
+    if (spec[key].trim() === '') fail(key, '不能为空');
+    spec[key] = spec[key].trim();
+  }
+  // reviewer（审查者执行者配置名，非空字符串）与 review_block（none | high，Stage08 T3）：这里只管类型，reviewer 是否存在、可用由审查时检查。
+  if (has('reviewer')) {
+    spec.reviewer = asString('reviewer').trim();
+    if (spec.reviewer === '') fail('reviewer', '不能为空');
+  }
+  if (has('review_block')) {
+    const value = meta.review_block;
+    if (value !== 'none' && value !== 'high') fail('review_block', `只能是 none 或 high（当前：${show(value)}）`);
+    spec.review_block = value;
+  }
   return spec;
 }
 

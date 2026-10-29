@@ -22,8 +22,8 @@ async function settleIdentity(pid) {
 }
 
 // 065 B：`ar stop` 返回 0 之前必须确认派发进程本身（start.pid）已经退出（协议第 9 节）。
-// 用一个"晚一点才退出"的真实假进程扮演派发进程：命令行含 ar.mjs（身份核对能通过），2 秒后自己退出；
-// 注入的 killTree 立刻返回、什么也不结束——模拟"结束进程树后派发进程晚一点才退出"。
+// 用一个"晚一点才退出"的真实假进程扮演派发进程：命令行含 ar.mjs（身份核对能通过），活到 killTree 被调用后 800ms 由计时器结束；
+// 注入的 killTree 立刻返回、自己不结束进程——模拟"结束进程树后派发进程晚一点才退出"。
 // 预检查询注入已核实的假进程身份（B 的确认按实现固定用真实查询，不受注入影响）。
 // 修复前：stopTask 在 killTree 返回后立刻写 interrupted 并返回 0，此时 pidAlive 仍为真，本用例失败（负向对照）。
 test('注入的 killTree 提前返回：ar stop 等派发进程真正退出（pidAlive 为假）才写 interrupted 返回 0', async t => {
@@ -32,7 +32,7 @@ test('注入的 killTree 提前返回：ar stop 等派发进程真正退出（pi
   const scriptDir = join(home, 'fake-core');
   mkdirSync(scriptDir);
   const fake = join(scriptDir, 'ar.mjs');
-  writeFileSync(fake, 'setTimeout(() => {}, 2000);\n', 'utf8');
+  writeFileSync(fake, 'setTimeout(() => {}, 120000);\n', 'utf8');
   const child = spawn(process.execPath, [fake, '隔离的假派发'], { stdio: 'ignore', windowsHide: true, shell: false });
   t.after(() => { if (pidAlive(child.pid)) { try { process.kill(child.pid); } catch { /* 已退出。 */ } } });
   const identity = await settleIdentity(child.pid);
@@ -42,7 +42,9 @@ test('注入的 killTree 提前返回：ar stop 等派发进程真正退出（pi
   const code = await stopTask(home, home, '延迟退出', {
     info: async () => identity,
     alive: async () => true,
-    killTree: async () => { killCalls += 1; }, // 提前返回：不结束假进程，也不等它
+    // 提前返回：killTree 本身不结束假进程、不等它；假进程改为在 stopTask 等待期间（killTree 调用后 800ms）被计时器真正结束，
+    // 仍是"树结束后根晚一点才退出"。时机从 killTree 调用起算，与机器负载无关；最后的断言验证的还是同一件事。
+    killTree: async () => { killCalls += 1; setTimeout(() => { try { process.kill(child.pid); } catch { /* 已退出。 */ } }, 800); },
     log: line => stdout.push(line),
   });
   assert.equal(killCalls, 1);

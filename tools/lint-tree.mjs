@@ -112,6 +112,18 @@ if (scan.error) report('R8 公开内容', '.agent-router/public-scan.json', scan
 else if (scan.wordlist === 'none') console.log('R8：没有私有词表，个人词与本机路径词表的扫描跳过');
 for (const h of scan.hits) report('R8 公开内容', h.file, `第 ${h.line} 行：${h.category} ${h.masked}`);
 
+// R9 控制字符（D116）：文本文件里除制表、换行、回车以外的 C0 控制字符（U+0000～U+001F）报错，每个文件只报第一处。
+const badControl = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
+for (const [f, s] of corpus) {
+  if (s.includes('\u0000')) continue; // 二进制文件按 R2 的判断跳过
+  const lines = s.split('\n');
+  const at = lines.findIndex(l => badControl.test(l));
+  if (at < 0) continue;
+  const col = lines[at].search(badControl);
+  const code = lines[at].charCodeAt(col).toString(16).toUpperCase().padStart(4, '0');
+  report('R9 控制字符', f, `第 ${at + 1} 行第 ${col + 1} 列：U+${code}`);
+}
+
 if (problems.length === 0) { console.log(`目录检查通过：${tracked.length} 个已跟踪文件`); process.exit(0); }
 for (const p of problems) console.log(`${p.rule}  ${p.file}${p.detail ? '  ' + p.detail : ''}`);
 console.log(`\n共 ${problems.length} 个问题`);

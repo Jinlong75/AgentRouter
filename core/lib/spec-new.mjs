@@ -10,6 +10,8 @@ import { traced } from './trace.mjs';
 import { readJson } from './json.mjs';
 import { matchesAny } from './glob.mjs';
 import { git as runGit } from './git.mjs';
+import { readEffectiveConfig } from './config.mjs';
+import { effortRefusal } from './router.mjs';
 
 const MAX_BYTES = 256 * 1024;
 const DEFAULT_CHECK_LIMIT = 20;
@@ -50,8 +52,8 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
       if (positional.length < 2 || positional.some(a => !a || a.startsWith('--'))) throw new Error(usageSpec);
       const archived = archiveSpecs(resolve(cwd, positional[0]), positional.slice(1), { commit });
       const text = archived.ok
-        ? `已归档 ${archived.moved.length} 份任务说明${archived.commit ? `（已提交 ${archived.commit}）` : ''}`
-        : `任务说明没有归档：${archived.error}`;
+        ? `已归档 ${archived.moved.length} 份任务说明${archived.commit ? `（已提交 ${archived.commit}）` : ''}${archived.skipped ? `；跳过 ${archived.skipped.length} 份：${archived.skipped.map(item => item.why).join('；')}` : ''}`
+        : archived.skipped ? archived.error : `任务说明没有归档：${archived.error}`;
       return { result: archived, text, code: archived.ok ? 0 : 1 };
     }
     case 'read': {
@@ -240,13 +242,34 @@ function newSpec(root, form, { dryRun, commit, home }) {
     affectedTests: textField(form.affectedTests),
     questions: textField(form.questions),
     worker: typeof form.worker === 'string' && form.worker.trim() ? form.worker.trim() : 'auto',
+    model: optionalLine(form.model, '模型'),
+    effort: optionalLine(form.effort, '推理强度'),
   };
+  checkFormEffort(fields, home);
   const { id, file, content } = renderSpecFile(dir, fields, dryRun);
   const rel = relative(root, file).split(sep).join('/');
   if (dryRun) return { ok: true, file, rel, id, content };
   if (!commit) return { ok: true, file, rel, id, content };
   const committed = commitSpec(root, rel, id, title);
   return committed.ok ? { ok: true, file, rel, id, content, commit: committed.commit } : { ok: false, error: committed.error, ...(committed.code ? { code: committed.code } : {}), file, rel, id };
+}
+
+// 表单里可选的单行文字（模型、推理强度）：不写（undefined / null / 空白）返回 null；写了不是单行字符串就拒绝。
+function optionalLine(value, label) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || /[\r\n]/.test(value)) throw new Error(`${label}必须是单行文字`);
+  return value.trim() || null;
+}
+
+// 任务说明写了 effort 并且指定了具体的执行者（worker 不是 auto）时，和派发时同样的校验：不在预设的 effortOptions 里就拒绝。
+// 不能确定执行者（worker 是 auto、执行者不在配置里、配置读不了）就不校验，派发时再查。
+function checkFormEffort(fields, home) {
+  if (!fields.effort || fields.worker === 'auto' || !home) return;
+  let config;
+  try { config = readEffectiveConfig(home); } catch { return; }
+  const profile = config.profiles?.[fields.worker];
+  const refusal = profile && effortRefusal({ effort: fields.effort, from: '任务说明', name: fields.worker, profile, config });
+  if (refusal) throw new Error(refusal);
 }
 
 function stringArray(value) {
@@ -296,6 +319,8 @@ function renderSpec(id, f) {
     `title: ${yamlScalar(f.title)}`,
     `type: ${f.type}`,
     `worker: ${f.worker}`,
+    ...(f.effort ? [`effort: ${yamlScalar(f.effort)}`] : []),
+    ...(f.model ? [`model: ${yamlScalar(f.model)}`] : []),
     ...listBlock('allowed_paths', f.allowedPaths),
     ...listBlock('verify', f.verify),
     '---',
@@ -371,6 +396,13 @@ function archiveSpecs(root, rels, { commit }) {
   const archiveDir = join(dir, ARCHIVE_DIR);
   const git = gitIn(root);
   const plan = [];
+  const skipped = [];
+  const archiveShown = `${relative(root, archiveDir).split(sep).join('/')}/`;
+  // 已经归档过的：不整体失败，列进 skipped；没有别的可归档时由调用处报错。
+  const skip = (rel, target) => {
+    const shownPath = relative(root, target).split(sep).join('/');
+    skipped.push({ path: shownPath, why: `已经归档过：${shownPath}（在 ${archiveShown} 里）` });
+  };
   for (const rel of rels) {
     const abs = resolve(root, rel);
     if (!isInside(root, abs)) throw new Error(`只能归档项目内的任务说明：${rel}`);
@@ -378,16 +410,27 @@ function archiveSpecs(root, rels, { commit }) {
     const file = basename(abs);
     const shown = relative(root, dir).split(sep).join('/') || '.';
     if (norm(join(dir, file)) !== norm(abs)) {
-      throw new Error(isInside(archiveDir, abs) ? `已经在归档里：${rel}` : `只能归档任务说明目录（${shown}）顶层的文件：${rel}`);
+      if (isInside(archiveDir, abs)) {
+        if (norm(join(archiveDir, file)) !== norm(abs)) throw new Error(`只能归档任务说明目录（${shown}）顶层的文件：${rel}`);
+        if (!existsSync(abs)) throw new Error(`找不到文件：${rel}`);
+        if (skipped.some(item => norm(resolve(root, item.path)) === norm(abs))) throw new Error(`路径重复：${rel}`);
+        skip(rel, abs);
+        continue;
+      }
+      throw new Error(`只能归档任务说明目录（${shown}）顶层的文件：${rel}`);
     }
     if (file.toLowerCase() === 'readme.md') throw new Error(`不能归档 README.md：${rel}`);
     const from = relative(root, abs).split(sep).join('/');
-    if (plan.some(item => norm(item.abs) === norm(abs))) throw new Error(`路径重复：${rel}`);
+    if (plan.some(item => norm(item.abs) === norm(abs)) || skipped.some(item => norm(resolve(root, item.path)) === norm(join(archiveDir, file)))) throw new Error(`路径重复：${rel}`);
+    // 顶层已经没有、归档里有同名文件：说明之前归档过。
+    if (!existsSync(abs) && existsSync(join(archiveDir, file))) { skip(rel, join(archiveDir, file)); continue; }
     if (git(['ls-files', '--error-unmatch', '--', from]).status !== 0) throw new Error(`任务说明还没有被 git 跟踪，不能归档：${rel}`);
     const target = join(archiveDir, file);
     if (existsSync(target)) throw new Error(`归档里已经有同名文件：${relative(root, target).split(sep).join('/')}`);
     plan.push({ abs, from, to: relative(root, target).split(sep).join('/'), target, file });
   }
+  const skippedField = skipped.length ? { skipped } : {};
+  if (!plan.length) return { ok: false, error: skipped.map(item => item.why).join('；'), ...skippedField };
   // 先查提交身份，再 git mv：缺身份时什么都没移动。
   if (commit) {
     try { requireGitIdentity(root); }
@@ -405,13 +448,13 @@ function archiveSpecs(root, rels, { commit }) {
     done.push(item);
   }
   const movedList = plan.map(({ from, to }) => ({ from, to }));
-  if (!commit) return { ok: true, moved: movedList };
+  if (!commit) return { ok: true, moved: movedList, ...skippedField };
   const ids = plan.map(item => /^(\d{3,})-/.exec(item.file)?.[1]).filter(Boolean).sort();
   const label = ids.length === plan.length ? (ids[0] === ids.at(-1) ? ids[0] : `${ids[0]}～${ids.at(-1)}`) : `${plan.length} 份`;
   const paths = plan.flatMap(item => [item.from, item.to]);
   const made = git(['commit', '-m', `[主导] 归档任务说明 ${label}`, '--', ...paths]);
-  if (made.status !== 0) return { ok: false, error: `git commit 失败：${tail(made.stderr)}`, moved: movedList };
-  return { ok: true, moved: movedList, commit: git(['rev-parse', '--short', 'HEAD']).stdout.trim() };
+  if (made.status !== 0) return { ok: false, error: `git commit 失败：${tail(made.stderr)}`, moved: movedList, ...skippedField };
+  return { ok: true, moved: movedList, commit: git(['rev-parse', '--short', 'HEAD']).stdout.trim(), ...skippedField };
 }
 
 // 提交信息里的 id 与标题：用 v1 解析器从文件读，读不到时按文件名回退（与 spec list 的回退规则一致）。

@@ -21,7 +21,8 @@ test('真跑 npm --version：计划不经 cmd.exe，退出 0 且输出版本号'
   assert.match(plan.executable, /node(\.exe)?$/i);
   assert.match(plan.args[0], /npm-cli\.js$/i);
 
-  const result = await runCommand('npm --version', { cwd: dir, env: process.env, timeoutMs: 120000 });
+  // 186：npm 会在临时目录建 node-compile-cache；关掉编译缓存，免得测试留下东西。
+  const result = await runCommand('npm --version', { cwd: dir, env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: '1' }, timeoutMs: 120000 });
   assert.equal(result.exit, 0, result.error ?? result.output);
   assert.equal(result.timedOut, false);
   assert.match(result.output.trim(), /^\d+\.\d+\.\d+/);

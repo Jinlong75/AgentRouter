@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { KILL_TREE_TIMEOUT_MS, PROCESS_LIST_TIMEOUT_MS, STOP_WAIT_TIMEOUT_MS, TERMINATE_TIMEOUT_MS, killProcessTree, processList, terminateByIdentity } from '../../core/lib/process.mjs';
+import { KILL_TREE_TIMEOUT_MS, PROCESS_LIST_TIMEOUT_MS, STOP_WAIT_TIMEOUT_MS, TERMINATE_TIMEOUT_MS, killProcessTree, processList, redactPaths, terminateByIdentity } from '../../core/lib/process.mjs';
 
 // 049：结束顺序的确定性测试。list / executeFile / alive 全部注入，不碰真实进程。
 // 固定进程表：根 100 → 执行者 200 → 孙进程 300；可选的 late 是"初次快照之后才出现"的进程。
@@ -208,4 +208,42 @@ test('killProcessTree：查询超时的原因原样传给调用方', async () =>
     killProcessTree(100, { platform: 'win32', alive: () => true, list: (pid, platform, timeout) => processList(pid, platform, timeout, async () => { throw raw; }), timeout: 3000 }),
     /^Error: 进程查询超时（3 秒）：机器负载很高时可能发生，稍后再试$/,
   );
+});
+
+// 160：redactPaths 按最长前缀替换。用环境变量构造路径（假路径），用例结束还原。
+function withEnv(values, fn) {
+  const keys = ['USERPROFILE', 'HOME', 'TEMP', 'TMP', 'TMPDIR'];
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  Object.assign(process.env, Object.fromEntries(keys.map(key => [key, key === 'HOME' || key === 'USERPROFILE' ? values.home : values.temp])));
+  try { fn(); }
+  finally { for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; } }
+}
+
+test('redactPaths：临时目录在用户目录之下（平常情况）→ <TEMP>，用户目录其余部分 → <HOME>', () => {
+  withEnv({ home: 'C:\\Fake\\Home', temp: 'C:\\Fake\\Home\\AppData\\Local\\Temp' }, () => {
+    assert.equal(redactPaths('C:\\Fake\\Home\\AppData\\Local\\Temp\\run1\\a.txt'), '<TEMP>\\run1\\a.txt');
+    assert.equal(redactPaths('C:\\Fake\\Home\\Documents\\b.txt'), '<HOME>\\Documents\\b.txt');
+  });
+});
+
+test('redactPaths：用户目录在临时目录之下（隔离环境）→ <HOME>', () => {
+  withEnv({ home: 'C:\\Fake\\Temp\\iso\\user', temp: 'C:\\Fake\\Temp' }, () => {
+    assert.equal(redactPaths('C:\\Fake\\Temp\\iso\\user\\proj\\a.txt'), '<HOME>\\proj\\a.txt');
+    assert.equal(redactPaths('C:\\Fake\\Temp\\other\\a.txt'), '<TEMP>\\other\\a.txt');
+  });
+});
+
+test('redactPaths：两种斜杠都处理', () => {
+  withEnv({ home: 'C:\\Fake\\Temp\\iso\\user', temp: 'C:\\Fake\\Temp' }, () => {
+    assert.equal(redactPaths('C:/Fake/Temp/iso/user/proj/a.txt'), '<HOME>/proj/a.txt');
+    assert.equal(redactPaths('C:/Fake/Temp/other/a.txt'), '<TEMP>/other/a.txt');
+  });
+});
+
+test('redactPaths：extra 照旧按 <TEMP> 处理，且同样按长度优先', () => {
+  withEnv({ home: 'C:\\Fake\\Home', temp: 'C:\\Fake\\Temp' }, () => {
+    assert.equal(redactPaths('D:\\work\\run9\\x', ['D:\\work\\run9']), '<TEMP>\\x');
+    assert.equal(redactPaths('C:\\Fake\\Home\\sub\\x', ['C:\\Fake\\Home\\sub']), '<TEMP>\\x');
+    assert.equal(redactPaths(''), '');
+  });
 });

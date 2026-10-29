@@ -45,7 +45,7 @@ test('dispatch.json：带 --model --sandbox --watch-window → options 恰好是
   assert.equal(b.status, 0, b.stderr);
   const plain = JSON.parse(fs.readFileSync(f.dispatchJson('no-opts'), 'utf8'));
   assert.equal(Object.hasOwn(plain, 'options'), false);
-  assert.deepEqual(plain, { v: 1, task: '任务乙', extra: '', role: null, spec: null, profile: 'fake', name: 'no-opts' });
+  assert.deepEqual(plain, { v: 1, task: '任务乙', extra: '', role: null, spec: null, profile: 'fake', name: 'no-opts', settingSources: { model: '内置默认', effort: '内置默认' } });
 });
 
 test('readDispatch：options 有坏值的文件照常读，坏值被忽略；旧文件（没有 options）照常读', t => {

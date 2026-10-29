@@ -881,6 +881,113 @@ test('tasks:report 与 tasks:blame：参数数组、项目根为 cwd、超时 60
   await assert.rejects(unknown.call('tasks:report', { project: proj, name: 'a' }), /没有登记/);
 });
 
+test('171 tasks:overlaps：只读，参数数组是 overlaps --project <项目>，项目根为 cwd、超时 30 秒；不要求项目已登记；参数不合法不调用核心；核心拒绝的原文原样抛出', async () => {
+  const groups = [{ tasks: [{ id: 'a', name: '甲', paths: ['src/**'] }, { id: 'b', name: '乙', paths: ['src/a.js'] }], order: ['a', 'b'], why: '先派发的先批准：甲 → 乙；后派发的任务会在前一个合并后自动按新基线重跑门禁' }];
+  const { calls, coreRun } = fakeCore([{ resolve: { code: 0, json: { ok: true, groups }, stderr: '' } }, { resolve: { code: 0, json: { ok: true, groups: [] }, stderr: '' } }]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('tasks:overlaps', { project: proj }), { ok: true, groups });
+  assert.equal(calls.length, 1, '没有先查项目登记表');
+  assert.deepEqual(calls[0].args, ['overlaps', '--project', proj]);
+  assert.equal(calls[0].cwd, proj);
+  assert.equal(calls[0].timeoutMs, 30000);
+  assert.deepEqual(await service.call('tasks:overlaps', { project: proj }), { ok: true, groups: [] });
+  // 路径里有空格也只是数组里的一项，不拼命令字符串。
+  const spaced = path.join(proj, '带 空格', '--x');
+  const spacedCore = fakeCore([{ resolve: { code: 0, json: { ok: true, groups: [] }, stderr: '' } }]);
+  await createConsole({ coreRun: spacedCore.coreRun, chooseFolder: async () => null, messages }).call('tasks:overlaps', { project: spaced });
+  assert.deepEqual(spacedCore.calls[0].args, ['overlaps', '--project', spaced]);
+  const refused = createConsole({ coreRun: fakeCore([{ resolve: { code: 2, json: { ok: false, error: '用法：ar overlaps [--project <路径>] [--json]' }, stderr: '' } }]).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(refused.call('tasks:overlaps', { project: proj }), /用法：ar overlaps/);
+  const bad = fakeCore();
+  const guarded = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [undefined, {}, { project: 'relative' }, { project: '' }, { project: 7 }, { project: ['x'] }, { name: 'a' }])
+    await assert.rejects(guarded.call('tasks:overlaps', payload), /参数无效/);
+  assert.equal(bad.calls.length, 0, '参数不合法时一条核心命令都不调用');
+});
+
+test('158 review:show / review:confirm：参数数组、项目根为 cwd、超时 60 秒；只收尾的操作不要求项目已登记；说明可选、以 -- 开头的说明前面补空格；参数不合法不调用核心；核心拒绝的原文原样抛出', async () => {
+  const review = { verdict: 'concerns', reviewer: 'codex', crossed: true, issues: [{ id: 'R1-1', severity: 'high', file: 'src/a.js', line: 3, title: '问题', detail: '说明', confirmation: null }] };
+  const { calls, coreRun } = fakeCore([
+    { resolve: { code: 0, json: { ok: true, name: '任务 一', review }, stderr: '' } },
+    { resolve: { code: 0, json: { ok: true, name: '任务 一', issue: 'R1-1', severity: 'high', result: 'valid', by: 'human', note: null }, stderr: '' } },
+    { resolve: { code: 0, json: { ok: true, name: '任务 一', issue: 'R1.2-3', severity: 'low', result: 'invalid', by: 'human', note: '不对' }, stderr: '' } },
+    { resolve: { code: 0, json: { ok: true }, stderr: '' } },
+  ]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages, knownTask: () => true });
+  assert.deepEqual(await service.call('review:show', { project: proj, name: '任务 一' }), { ok: true, name: '任务 一', review });
+  assert.deepEqual(calls[0].args, ['review', 'show', '任务 一']);
+  assert.equal(calls[0].cwd, proj);
+  assert.equal(calls[0].timeoutMs, 60000);
+  await service.call('review:confirm', { project: proj, name: '任务 一', issue: 'R1-1', result: 'valid' });
+  assert.deepEqual(calls[1].args, ['review', 'confirm', '任务 一', 'R1-1', 'valid', '--by', 'human'], '软件里点的记为 human，没写说明就没有 --note');
+  assert.equal(calls[1].cwd, proj);
+  await service.call('review:confirm', { project: proj, name: '任务 一', issue: 'R1.2-3', result: 'invalid', note: '  不对  ' });
+  assert.deepEqual(calls[2].args, ['review', 'confirm', '任务 一', 'R1.2-3', 'invalid', '--by', 'human', '--note', '不对']);
+  await service.call('review:confirm', { project: proj, name: '任务 一', issue: 'R1-1', result: 'valid', note: '--json 开头的说明' });
+  assert.deepEqual(calls[3].args.slice(-2), ['--note', ' --json 开头的说明'], '核心把以 -- 开头的值当缺值，前面补一个空格');
+  // 项目不在列表里也能读 / 确认（knownTask 为真时不查登记表）：上面四次一共只有四次核心调用。
+  assert.equal(calls.length, 4);
+  // 不是主进程读到的任务、项目也没登记：参数无效（和 tasks:diff 一样）。
+  const unknown = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [] }, stderr: '' } }]);
+  await assert.rejects(createConsole({ coreRun: unknown.coreRun, chooseFolder: async () => null, messages }).call('review:show', { project: proj, name: 'a' }), /参数无效/);
+  const refused = createConsole({ coreRun: fakeCore([{ resolve: { code: 2, json: { ok: false, error: '审查：任务 一 的审查结果里没有问题 R9-9（现有：R1-1）' }, stderr: '' } }]).coreRun, chooseFolder: async () => null, messages, knownTask: () => true });
+  await assert.rejects(refused.call('review:confirm', { project: proj, name: '任务 一', issue: 'R1-1', result: 'valid' }), /没有问题 R9-9/);
+  const bad = fakeCore();
+  const guarded = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages, knownTask: () => true });
+  for (const payload of [undefined, {}, { project: 'relative', name: 'a' }, { project: proj }, { project: proj, name: '../a' }, { project: proj, name: 'con' }])
+    await assert.rejects(guarded.call('review:show', payload), /参数无效/);
+  const base = { project: proj, name: 'a', issue: 'R1-1', result: 'valid' };
+  for (const payload of [{ ...base, issue: undefined }, { ...base, issue: 'R1' }, { ...base, issue: 'R1-1 --by lead' }, { ...base, issue: '../R1-1' }, { ...base, issue: 'R1-' }, { ...base, result: 'maybe' }, { ...base, result: undefined }, { ...base, note: 7 }, { ...base, note: 'x'.repeat(2001) }, { ...base, name: 'a/b' }])
+    await assert.rejects(guarded.call('review:confirm', payload), /参数无效/);
+  assert.equal(bad.calls.length, 0, '参数不合法时一条核心命令都不调用');
+});
+
+test('158 review:rerun：有 profile 才带 --profile；要求项目已登记（移除后报 projectGoneBlocked）；超时放宽到 50 分钟；核心没有结论时的原因原样抛出', async () => {
+  const done = { ok: true, name: '任务 一', attempt: 1, run: 2, review: { verdict: 'pass' } };
+  const { calls, coreRun } = fakeCore([...registered({ resolve: { code: 0, json: done, stderr: '' } }), ...registered({ resolve: { code: 0, json: done, stderr: '' } })]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.equal((await service.call('review:rerun', { project: proj, name: '任务 一' })).run, 2);
+  assert.deepEqual(calls[1].args, ['review', '任务 一']);
+  assert.equal(calls[1].cwd, proj);
+  assert.equal(calls[1].timeoutMs, 50 * 60 * 1000);
+  await service.call('review:rerun', { project: proj, name: '任务 一', profile: 'rev-two' });
+  assert.deepEqual(calls[3].args, ['review', '任务 一', '--profile', 'rev-two']);
+  // 项目已从列表移除：不审（在 worktree 里跑审查者，同重试）。
+  const gone = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: other }] }, stderr: '' } }]);
+  await assert.rejects(createConsole({ coreRun: gone.coreRun, chooseFolder: async () => null, messages }).call('review:rerun', { project: proj, name: 'a' }), /项目已从项目列表移除，先重新添加项目/);
+  // 核心没有结论（退出码 1、ok:false）：错误原文原样抛出。
+  const failed = fakeCore(registered({ resolve: { code: 1, json: { ok: false, name: 'a', error: '审查没有完成：没有可用的审查者', review: { verdict: 'unknown' } }, stderr: '' } }));
+  await assert.rejects(createConsole({ coreRun: failed.coreRun, chooseFolder: async () => null, messages }).call('review:rerun', { project: proj, name: 'a' }), /审查没有完成：没有可用的审查者/);
+  const bad = fakeCore();
+  const guarded = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [undefined, {}, { project: 'relative', name: 'a' }, { project: proj }, { project: proj, name: 'a:b' }, { project: proj, name: 'a', profile: '' }, { project: proj, name: 'a', profile: '--json' }, { project: proj, name: 'a', profile: 'a b' }, { project: proj, name: 'a', profile: 7 }])
+    await assert.rejects(guarded.call('review:rerun', payload), /参数无效/);
+  assert.equal(bad.calls.length, 0, '参数不合法时一条核心命令都不调用');
+});
+
+test('158 review:stats / review:config / review:config-set：参数数组；config-set 至少给一项、值的类型与范围不对不调用核心；核心拒绝的原文原样抛出', async () => {
+  const stats = { ok: true, reviewers: [{ reviewer: 'codex', severities: { high: { confirmed: 2, valid: 1, accuracy: 0.5 }, medium: { confirmed: 0, valid: 0, accuracy: null }, low: { confirmed: 0, valid: 0, accuracy: null } } }] };
+  const view = { ok: true, review: { default: false, block: 'none', maxReworks: 1 } };
+  const { calls, coreRun } = fakeCore([{ resolve: { code: 0, json: stats, stderr: '' } }, { resolve: { code: 0, json: view, stderr: '' } }, { resolve: { code: 0, json: { ok: true, review: { default: true, block: 'high', maxReworks: 0 } }, stderr: '' } }, { resolve: { code: 0, json: view, stderr: '' } }]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('review:stats'), stats);
+  assert.deepEqual(calls[0].args, ['review', 'stats']);
+  assert.equal(calls[0].timeoutMs, 60000);
+  assert.deepEqual(await service.call('review:config'), view);
+  assert.deepEqual(calls[1].args, ['review', 'config']);
+  assert.equal((await service.call('review:config-set', { default: true, block: 'high', maxReworks: 0 })).review.maxReworks, 0);
+  assert.deepEqual(calls[2].args, ['review', 'config', 'set', 'default=true', 'block=high', 'maxReworks=0']);
+  await service.call('review:config-set', { default: false });
+  assert.deepEqual(calls[3].args, ['review', 'config', 'set', 'default=false']);
+  const refused = createConsole({ coreRun: fakeCore([{ resolve: { code: 2, json: { ok: false, error: '配置无效，这次没有改动配置' }, stderr: '' } }]).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(refused.call('review:config-set', { block: 'high' }), /这次没有改动配置/);
+  const bad = fakeCore();
+  const guarded = createConsole({ coreRun: bad.coreRun, chooseFolder: async () => null, messages });
+  for (const payload of [undefined, {}, { default: 'true' }, { default: 1 }, { block: 'low' }, { block: 'high --json' }, { maxReworks: -1 }, { maxReworks: 6 }, { maxReworks: 1.5 }, { maxReworks: '2' }])
+    await assert.rejects(guarded.call('review:config-set', payload), /参数无效/);
+  assert.equal(bad.calls.length, 0, '参数不合法时一条核心命令都不调用');
+});
+
 test('tasks:overview：读 dispatch.json 的 gate.merged 与任务说明的目标；目录不在清单里或路径越界拒绝；读不到的项为 null', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ar-overview-'));
   try {
@@ -1051,6 +1158,27 @@ test('route:rules 整体替换，规则 JSON 作为一项参数传；规则形�
   assert.equal(calls.length, 2);
 });
 
+// Stage07c 151：规则可带推理强度 effort（不写、null 或非空单行字符串）；route:suggest 只读，调 route suggest。
+test('route:rules 规则可带 effort（不写 / null / 非空单行字符串）；effort 不合法不调用核心', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  const rules = [{ types: ['code'], profile: 'ds', effort: 'high' }, { types: ['docs'], profile: 'ds', effort: null }, { types: ['test'], profile: 'ds', escalate: 'qoder', effort: 'low' }];
+  await service.call('route:rules', { rules });
+  assert.deepEqual(calls[0].args, ['route', 'rules', 'set', JSON.stringify(rules)]);
+  for (const effort of ['', '  ', 5, true, 'a\nb', 'x'.repeat(201)])
+    await assert.rejects(service.call('route:rules', { rules: [{ types: ['code'], profile: 'ds', effort }] }), /参数无效/, JSON.stringify(effort).slice(0, 40));
+  assert.equal(calls.length, 1);
+});
+
+test('route:suggest 调 route suggest，只读、不带参数，结果原样交回', async () => {
+  const suggestion = { rules: [{ types: ['code'], profile: 'ds', why: '预设建议用于代码' }], skipped: [{ profile: 'cx', why: '测试连接没有通过' }], write: 'ar route rules set ...' };
+  const { calls, coreRun } = fakeCore([{ resolve: { code: 0, json: { ok: true, ...suggestion, lines: ['x'] }, stderr: '' } }]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('route:suggest', {}), { ok: true, ...suggestion });
+  assert.deepEqual(calls[0].args, ['route', 'suggest']);
+  assert.equal(calls[0].timeoutMs, 60000);
+});
+
 test('route:fallback：名字是设置，null 是清除；其余不合法', async () => {
   const { calls, coreRun } = fakeCore();
   const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
@@ -1089,6 +1217,94 @@ test('route:limit：正整数是设置，null 传空串表示删除；至少给�
   assert.equal(calls.length, 3);
 });
 
+// Stage07c 150：可担任 / 模型家族、限流标记、强执行者、审查者"与主导不同"。
+test('roles:list 调 ar roles；roles:set 把改过的项写成 roles= / modelFamilies=（空数组表示恢复默认 / 清除），参数先校验', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('roles:list');
+  assert.deepEqual(calls[0].args, ['roles']);
+  await service.call('roles:set', { name: 'ds', roles: ['reviewer'] });
+  await service.call('roles:set', { name: 'ds', roles: ['executor', 'reviewer'], modelFamilies: ['gpt', 'claude'] });
+  await service.call('roles:set', { name: 'ds', modelFamilies: [] });
+  // 改写（D128，190）：原断言 roles: ['lead'] 被拒绝 → 新断言写成 roles=lead；原因：角色由用户决定，lead 与执行者、审查者一样可设。
+  await service.call('roles:set', { name: 'ds', roles: ['lead'] });
+  assert.deepEqual(calls.slice(1).map(c => c.args), [
+    ['roles', 'set', 'ds', 'roles=reviewer'],
+    ['roles', 'set', 'ds', 'roles=executor,reviewer', 'modelFamilies=gpt,claude'],
+    ['roles', 'set', 'ds', 'modelFamilies='],
+    ['roles', 'set', 'ds', 'roles=lead'],
+  ]);
+  for (const payload of [{}, { name: 'ds' }, { name: 'a b', roles: ['executor'] }, { name: 'ds', roles: 'executor' }, { name: 'ds', roles: ['executor', 'reviewer', 'executor'] }, { name: 'ds', roles: ['executor', 'reviewer', 'lead', 'lead'] }, { name: 'ds', modelFamilies: ['GPT'] }, { name: 'ds', modelFamilies: ['a,b'] }, { name: 'ds', modelFamilies: 'gpt' }])
+    await assert.rejects(service.call('roles:set', payload), /参数无效/, JSON.stringify(payload));
+  assert.equal(calls.length, 5);
+});
+
+test('route:reviewer 可带 differFromLead（布尔）；不带时 JSON 与以前相同', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFromLead: false });
+  assert.deepEqual(calls[0].args, ['route', 'reviewer', 'set', JSON.stringify({ profiles: ['qoder'], mustDiffer: true, differFromLead: false })]);
+  await service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true });
+  assert.deepEqual(calls[1].args, ['route', 'reviewer', 'set', JSON.stringify({ profiles: ['qoder'], mustDiffer: true })]);
+  await assert.rejects(service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFromLead: 'no' }), /参数无效/);
+  assert.equal(calls.length, 2);
+});
+
+test('route:reviewer 可带 differFamily（布尔，D128）；三个开关都不带时 JSON 与以前相同，非布尔不调用核心', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFamily: false });
+  assert.deepEqual(calls[0].args, ['route', 'reviewer', 'set', JSON.stringify({ profiles: ['qoder'], mustDiffer: true, differFamily: false })]);
+  await service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFamily: true, differFromLead: false });
+  assert.deepEqual(calls[1].args, ['route', 'reviewer', 'set', JSON.stringify({ profiles: ['qoder'], mustDiffer: true, differFamily: true, differFromLead: false })]);
+  await service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true });
+  assert.deepEqual(calls[2].args, ['route', 'reviewer', 'set', JSON.stringify({ profiles: ['qoder'], mustDiffer: true })]);
+  await assert.rejects(service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFamily: 'no' }), /参数无效/);
+  await assert.rejects(service.call('route:reviewer', { profiles: ['qoder'], mustDiffer: true, differFamily: 0 }), /参数无效/);
+  assert.equal(calls.length, 3);
+});
+
+test('route:limits-clear 调 route limits clear <名>；route:strong 设置 / 清除强执行者', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('route:limits-clear', { name: 'ds' });
+  await service.call('route:strong', { name: 'sonnet' });
+  await service.call('route:strong', { name: null });
+  assert.deepEqual(calls.map(c => c.args), [['route', 'limits', 'clear', 'ds'], ['route', 'strong', 'set', 'sonnet'], ['route', 'strong', 'clear']]);
+  for (const [action, payload] of [['route:limits-clear', {}], ['route:limits-clear', { name: 'a b' }], ['route:strong', {}], ['route:strong', { name: 'a b' }]])
+    await assert.rejects(service.call(action, payload), /参数无效/, `${action} ${JSON.stringify(payload)}`);
+  assert.equal(calls.length, 3);
+});
+
+// 改写（168，D104）：原断言 route:config 从 limits.json 给被限流的执行者补上 limited.evidence（只补核心说已被限流的、没有原文就不带；没有限流时不读文件）
+// → 新断言 route:config 原样返回核心的结果（限流原文由核心给），limits.json 里有别的原文也不会被读进来，只调用一次 ar route config --json
+// → 原因：D104 限流原文由核心给，主进程不再读 limits.json。
+test('route:config：原样返回核心的结果（限流原文由核心给），主进程不读 limits.json', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ar-limits-'));
+  const saved = process.env.AGENT_ROUTER_HOME, soon = Date.now() + 3600000;
+  try {
+    process.env.AGENT_ROUTER_HOME = dir;
+    // limits.json 里的原文和核心给的不同、还有没被核心说限流的执行者的原文：主进程不读它，哪一条都不会出现在结果里。
+    await writeFile(path.join(dir, 'limits.json'), JSON.stringify({ v: 1, profiles: {
+      ds: { kind: 'limit', until: soon, since: Date.now(), evidence: '文件里的原文（不应出现）' },
+      other: { kind: 'limit', until: soon, since: Date.now(), evidence: '别的执行者的原文' },
+      noevidence: { kind: 'unavailable', until: soon, since: Date.now(), evidence: '文件里的原文（不应出现）' },
+    } }));
+    const view = { ok: true, profiles: [
+      { name: 'ds', limited: { kind: 'limit', until: soon, since: 1, evidence: 'rate_limit_event status rejected' } },
+      { name: 'noevidence', limited: { kind: 'unavailable', until: soon, since: 1 } },
+      { name: 'free' },
+    ] };
+    const { calls, coreRun } = fakeCore([{ resolve: { code: 0, json: { ...view, lines: [] }, stderr: '' } }]);
+    const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+    assert.deepEqual(await service.call('route:config'), view);
+    assert.deepEqual(calls.map(c => c.args), [['route', 'config']]);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_ROUTER_HOME; else process.env.AGENT_ROUTER_HOME = saved;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('route:trial：类型、任务说明、项目都是可选的；项目要先核对已登记；失败时返回 trace 而不是抛错', async () => {
   const ok = { resolve: { code: 0, json: { ok: true, profile: 'ds', label: 'DS', rule: null, trace: ['兜底：ds'], lines: [] }, stderr: '' } };
   const { calls, coreRun } = fakeCore([ok, ...registered(ok), ...registered(ok)]);
@@ -1117,4 +1333,61 @@ test('route:trial：类型、任务说明、项目都是可选的；项目要先
 test('路由写入通道：核心拒绝时原因原样抛出', async () => {
   const refused = createConsole({ coreRun: fakeCore([{ resolve: { code: 2, json: { ok: false, error: '第 1 条规则的执行者 ds 不存在' }, stderr: '' } }]).coreRun, chooseFolder: async () => null, messages });
   await assert.rejects(refused.call('route:rules', { rules: [{ types: ['code'], profile: 'ds' }] }), /执行者 ds 不存在/);
+});
+
+// Stage07c 144：agents:models 带 probe: true 走 ar agents models <名> --probe；查到、退回预设都是正常结果，不带 probe 的调用不变。
+test('agents:models probe：参数数组、查到与退回预设都原样返回，通道出错与参数无效抛出', async () => {
+  const found = { ok: true, source: 'program', models: ['m-1'], details: [{ id: 'm-1', name: 'M 1', efforts: ['low', 'high'], defaultEffort: 'low' }] };
+  const fallback = { ok: false, source: 'preset', models: ['p-1'], reason: '订阅令牌不能查询模型列表' };
+  const { calls, coreRun } = fakeCore([
+    { resolve: { code: 0, json: { ...found, lines: ['x'] }, stderr: '' } },
+    { resolve: { code: 0, json: fallback, stderr: '' } },
+    { resolve: { code: 2, json: { ok: false, error: '找不到执行者：x' }, stderr: '' } },
+    { resolve: { code: 0, json: { ok: true, models: ['a'], source: 'cli' }, stderr: '' } },
+  ]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('agents:models', { name: 'codex', probe: true }), found);
+  assert.deepEqual(calls[0].args, ['agents', 'models', 'codex', '--probe']);
+  assert.deepEqual(await service.call('agents:models', { name: 'sonnet', probe: true }), fallback);
+  await assert.rejects(service.call('agents:models', { name: 'x', probe: true }), /找不到执行者：x/);
+  // 不带 probe：命令不变（没有 --probe）。
+  assert.equal((await service.call('agents:models', { name: 'q' })).source, 'cli');
+  assert.deepEqual(calls[3].args, ['agents', 'models', 'q']);
+  const before = calls.length;
+  for (const bad of [{ name: 'bad name', probe: true }, { name: 'ok', probe: 'yes' }, { probe: true }]) await assert.rejects(service.call('agents:models', bad), /参数无效/);
+  assert.equal(calls.length, before, '参数无效时不调用核心');
+  // 其他不带 reason 的 ok:false（不是退回预设）仍是错误。
+  const broken = createConsole({ coreRun: fakeCore([{ resolve: { code: 1, json: { ok: false }, stderr: '' } }]).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(broken.call('agents:models', { name: 'ds', probe: true }), /核心没有返回结果/);
+});
+
+// Stage07c 168（D102）：agents:models 带 preset 是导入之前查，走 ar agents models --preset … --probe；参数和 agents:add 同样校验。
+test('agents:models preset：导入之前查的参数数组、查到与退回预设都原样返回，参数无效时不调用核心', async () => {
+  const found = { ok: true, source: 'api', models: ['m-1'], details: [{ id: 'm-1' }] };
+  const fallback = { ok: false, source: 'preset', models: ['p-1'], reason: '没有设置密钥环境变量 K' };
+  const { calls, coreRun } = fakeCore([
+    { resolve: { code: 0, json: { ...found, lines: ['x'] }, stderr: '' } },
+    { resolve: { code: 0, json: fallback, stderr: '' } },
+    { resolve: { code: 0, json: found, stderr: '' } },
+    { resolve: { code: 2, json: { ok: false, error: '没有这个预设：nope' }, stderr: '' } },
+  ]);
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  assert.deepEqual(await service.call('agents:models', { preset: 'deepseek', probe: true }), found);
+  assert.deepEqual(calls[0].args, ['agents', 'models', '--preset', 'deepseek', '--probe']);
+  assert.deepEqual(await service.call('agents:models', { preset: 'deepseek', baseUrl: 'http://127.0.0.1:1', secretVar: 'MY_KEY', model: 'm-1', auth: 'token', probe: true }), fallback);
+  assert.deepEqual(calls[1].args, ['agents', 'models', '--preset', 'deepseek', '--model', 'm-1', '--base-url', 'http://127.0.0.1:1', '--secret-var', 'MY_KEY', '--auth', 'token', '--probe']);
+  await service.call('agents:models', { preset: 'codex', auth: 'login', probe: true });
+  assert.deepEqual(calls[2].args, ['agents', 'models', '--preset', 'codex', '--auth', 'login', '--probe']);
+  await assert.rejects(service.call('agents:models', { preset: 'nope', probe: true }), /没有这个预设：nope/);
+  const before = calls.length;
+  const bad = [
+    { preset: 'bad name', probe: true }, { preset: 5, probe: true }, { preset: '', probe: true },
+    { preset: 'deepseek' }, { preset: 'deepseek', probe: false }, { preset: 'deepseek', probe: 'yes' },
+    { preset: 'deepseek', name: 'ds', probe: true },
+    { preset: 'deepseek', baseUrl: 'http://a\nb', probe: true }, { preset: 'deepseek', baseUrl: 'x'.repeat(201), probe: true }, { preset: 'deepseek', baseUrl: 5, probe: true },
+    { preset: 'deepseek', secretVar: '1bad', probe: true }, { preset: 'deepseek', secretVar: 'a b', probe: true },
+    { preset: 'deepseek', auth: 'password', probe: true }, { preset: 'deepseek', model: 'a\nb', probe: true },
+  ];
+  for (const payload of bad) await assert.rejects(service.call('agents:models', payload), /参数无效/, JSON.stringify(payload));
+  assert.equal(calls.length, before, '参数无效时不调用核心');
 });

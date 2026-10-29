@@ -185,3 +185,55 @@ test('ar config 显示链路报告的三项设置；任务还在进行 / 不是�
   assert.equal(refusedJson.code, 2);
   assert.deepEqual(JSON.parse(refusedJson.stdout), { ok: false, error: '这个任务不是用任务说明派发的，没有评分' });
 });
+
+test('159 审查者一组：有审查的任务 ar report --json 多 reviewer，文字多一段；没有审查时输出逐字节不变（其余键与审查前一致）', async t => {
+  const f = fixture(t);
+  f.setProfile({ writes: [{ path: 'src/b.js', content: '范围内\n' }], commit: '假执行者：写范围内的文件' });
+  const spec = f.spec('docs/specs/002-链路报告审查.md', ['src/**']);
+  const dispatched = await f.ar(['dispatch', spec, '--name', '审查链路', '--json']);
+  assert.equal(dispatched.code, 0, dispatched.stderr + dispatched.stdout);
+
+  const before = await f.ar(['report', '审查链路', '--json']);
+  const beforeText = await f.ar(['report', '审查链路']);
+  assert.equal(before.code, 0, before.stderr + before.stdout);
+  assert.equal('reviewer' in JSON.parse(before.stdout), false, '没有审查时没有 reviewer 键');
+  assert.equal(beforeText.stdout.includes('审查者'), false);
+  // 再跑一次：没有审查的任务两次输出逐字节相同。
+  assert.equal((await f.ar(['report', '审查链路', '--json'])).stdout, before.stdout);
+  assert.equal((await f.ar(['report', '审查链路'])).stdout, beforeText.stdout);
+
+  // 补一次审查：清单里的 review 事件与任务目录里的 review.json（这里手工写，不派发审查者）。
+  const rows = readFileSync(path.join(f.home, 'runs.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const start = rows.find(row => row.event === 'start' && row.name === '审查链路');
+  const issue = (id, severity, result) => ({ id, severity, file: 'src/b.js', line: 1, title: `问题 ${id}`, detail: '', confirmation: result ? { result, by: 'human', note: null, at: Date.now() } : null });
+  const review = {
+    v: 1, attempt: 1, at: Date.now(), reviewer: 'codex', crossed: true, base: null, head: null, verdict: 'concerns', summary: '', reviewed: [],
+    issues: [issue('R1-1', 'high', 'invalid'), issue('R1-2', 'low', 'valid'), issue('R1-3', 'medium', null)], warnings: [],
+    tries: [{ reviewer: 'codex', ok: false, why: '没有结论', kind: 'parse', ms: 500 }, { reviewer: 'codex', ok: true, ms: 1500 }], ms: 2000, usage: { input: 1200, output: 80 }, raw: null,
+  };
+  write(path.join(start.dir ?? path.join(f.repo, '.agent-runs', '审查链路'), 'review.json'), `${JSON.stringify(review, null, 2)}\n`);
+  writeFileSync(path.join(f.home, 'runs.jsonl'), `${JSON.stringify({ v: 1, event: 'review', id: start.id, attempt: 1, reviewer: 'codex', crossed: true, verdict: 'concerns', issues: 3, high: 1, at: Date.now() })}\n`, { flag: 'a' });
+
+  const after = await f.ar(['report', '审查链路', '--json']);
+  assert.equal(after.code, 0, after.stderr + after.stdout);
+  const report = JSON.parse(after.stdout);
+  assert.deepEqual(report.reviewer.items.map(entry => [entry.key, entry.count, entry.points]), [['reviewInvalid', 0, 0], ['reviewFormat', 1, -10], ['reviewFalse', 0, 0], ['reviewFalseHigh', 1, -10]]);
+  assert.equal(report.reviewer.score, 80);
+  assert.equal(report.reviewer.profile, 'codex');
+  assert.equal(report.reviewer.crossed, true);
+  assert.deepEqual(report.reviewer.perf, { issues: { total: 3, high: 1, medium: 1, low: 1 }, confirmed: 2, valid: 1, ms: 2000, usage: { input: 1200, output: 80 } });
+  // 其余部分与审查前一致（只多 reviewer 和 weights.reviewer）。
+  const { reviewer, ...rest } = report;
+  const { reviewer: _ignored, ...restBefore } = JSON.parse(before.stdout);
+  delete rest.weights.reviewer;
+  assert.deepEqual(rest, restBefore);
+  t.diagnostic(`reviewer 样例：${JSON.stringify(reviewer)}`);
+
+  const text = await f.ar(['report', '审查链路']);
+  assert.equal(text.code, 0, text.stderr + text.stdout);
+  const lines = text.stdout.split(/\r?\n/);
+  assert.ok(lines.includes('审查者 80/100'), text.stdout);
+  assert.ok(lines.includes('  被标为"不成立"的高严重度问题：1 个（−10）'), text.stdout);
+  assert.ok(lines.some(line => line.startsWith('  性能：审查者 codex（交叉）；问题 3 个（高 1 · 中 1 · 低 1）；成立 1 / 已确认 2；')), text.stdout);
+  assert.equal(lines.filter(line => line.startsWith('  性能：')).length, 3);
+});

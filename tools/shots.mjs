@@ -13,6 +13,18 @@ import { unsafeHomeReason } from '../core/lib/compat.mjs';
 // 界面验收可能跨午夜（037 第 2 项）：演示数据生成与软件里的"今天 / 昨天"分组用同一个"现在"——
 // AR_DEMO_NOW（毫秒时间戳）。这里在生成演示数据之前设好；外部已设时沿用不覆盖（负向验证要指定时刻）。
 process.env.AR_DEMO_NOW ||= String(Date.now());
+// 命令行 --focus <名>（D71）等同于环境变量 AR_SHOTS_FOCUS=<名>：门禁的验收命令不经过 shell，设不了环境变量。
+// 两个都给时以命令行为准；`npm run shots -- --focus routing` 会把参数接到 `node tools/shots.mjs` 后面。
+{
+  const args=process.argv.slice(2),at=args.findIndex(a=>a==='--focus'||a.startsWith('--focus='));
+  if(at>=0) {
+    const value=args[at]==='--focus'?args[at+1]:args[at].slice('--focus='.length);
+    if(!value||value.startsWith('--')) { console.error('--focus 后面要写焦点名，例如 npm run shots -- --focus search'); process.exit(2); }
+    const env=process.env.AR_SHOTS_FOCUS;
+    console.log(`命令行 --focus ${value}${env&&env!==value?`（覆盖环境变量 AR_SHOTS_FOCUS=${env}）`:''}：只跑这个焦点。`);
+    process.env.AR_SHOTS_FOCUS=value;
+  }
+}
 // Stage04 门禁演示任务（reader-app 的 t20～t22）默认隐藏：原有列表计数与检查不变，
 // UI22 在验收里临时显示它们，检查完再恢复 hidden。
 process.env.AR_DEMO_HIDDEN_IDS ||= 't20,t21,t22';
@@ -80,7 +92,9 @@ try {
   await rm(failuresDir,{recursive:true,force:true});
   // 与 npm run demo 相同：隔离环境只经 AR_ISOLATED_ENV 交给软件内部，Electron 进程本身拿用户真实环境（见 app/src/main/app-env.mjs）。
   const real={...process.env};delete real.ELECTRON_RUN_AS_NODE;
-  const isolated={...await preferenceFixture(fixture.home,{install:['agent-router']}),AGENT_ROUTER_HOME:fixture.home};delete isolated.ELECTRON_RUN_AS_NODE;
+  // AR_TEST_LOAD_FILE（核心已有的负载注入钩子，格式 { busy, cpu }）：测试工具在这里指到公共目录里的一个文件，软件与它的设置线程、核心子进程经隔离环境都拿得到；
+  // 文件不存在时按真实负载处理，UI07 的"机器正忙"检查写这个文件。产品代码里没有这个文件名（verify:packaged 检查）。
+  const isolated={...await preferenceFixture(fixture.home,{install:['agent-router']}),AGENT_ROUTER_HOME:fixture.home,AR_TEST_LOAD_FILE:path.join(fixture.home,'test-load.json')};delete isolated.ELECTRON_RUN_AS_NODE;
   // AR_QUIT_TRACE=1：软件退出的各阶段（窗口关闭、before-quit、各清理步骤）带时刻打到标准错误，退出后实测失败时用来对时间线。
   const env={...real,AR_SHOTS:out,AR_TEST_NODE:process.execPath,AR_SHOTS_AGENT_TIMEOUT:"8",AR_QUIT_TRACE:"1",[isolatedEnvKey]:JSON.stringify(isolationOverrides(real,isolated))};
   // 052：正式验收启动之前先做一次启动前检查（公共目录保护），失败时整个验收以非 0 退出。

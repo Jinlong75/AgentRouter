@@ -73,7 +73,7 @@ export async function runInstaller(args, { env = process.env, platform = process
   if (result.leftovers.length) output(`有临时文件没能删除，可以手动删掉：${result.leftovers.join('；')}`);
   const home = homeDirectory(env, platform);
   if (result.changed.some(i => i.action === 'install') && interactive && !options.noConfig && !readConfig(home).exists) {
-    output('设置派发默认值（直接回车 = 跟随 Codex 自己的配置）');
+    output('设置 Codex 执行者的默认值（直接回车 = 跟随 Codex 自己的配置）；其他执行者在软件 Agent 页或 ar agents update 里设置');
     const current = readCodexConfig(env);
     if (current) output(`Codex 当前配置：模型 ${current.values.model ?? '未设置'}，推理强度 ${current.values.model_reasoning_effort ?? '未设置'}，档位 ${current.values.service_tier ?? '未设置'}（来自 ${current.file}）`);
     const changes = {};

@@ -1,10 +1,10 @@
-import { c, cx, nt, pj, ro } from '../shared/copy';
+import { c, cx, gx, nt, pj, ro } from '../shared/copy';
 import { esc, markdown } from '../shared/markdown';
 import { dayGroup } from '../shared/types';
 import type { AgentRow, PathCheck, ProjectRow, ProjectShow, RouteConfig, RouteTrial, SpecRow, Task } from '../shared/types';
 import { field, icon, menu, openSheet } from './ui';
 import { openIdentitySheet } from './projects';
-import { routeWhy } from './routing';
+import { effortResetNote, loadEfforts, probedEfforts, routeWhy, type EffortInfo } from './routing';
 import { mergeSpec } from '../../../core/lib/spec.mjs';
 
 // 新建任务页：选项目 → 选来源（已有说明 / 新建说明 / 直接写文字）→ 选执行者 → 派发。
@@ -91,6 +91,13 @@ export class NewTaskView {
     private pathCheck: { state: 'checking' } | { state: 'ok'; result: PathCheck } | { state: 'failed'; reason: string } | null = null;
     private pathSeq = 0;
     private pathTimer?: ReturnType<typeof setTimeout>;
+    // Stage07c T6：新建任务说明的推理强度（空串是"默认"，不写进说明）。选项来自所选执行者（自动时是路由结果的执行者）：
+    // 探针查到的优先（probed），否则预设的 effortOptions；预设声明不支持推理强度的执行者，这一行隐藏。
+    private effort = '';
+    private effortNote = '';
+    private efforts: Map<string, EffortInfo> | null = null;
+    private probed = new Map<string, string[]>();
+    private asked = new Set<string>();
 
     constructor(private host: NewTaskHost) { }
 
@@ -102,13 +109,31 @@ export class NewTaskView {
         container.onclick = e => this.click(e);
         container.onkeydown = e => this.keys(e);
         container.oninput = e => this.input(e);
+        container.addEventListener('focusin', this.revealFocus);
         this.render();
         if (this.loaded)
             this.setReady(false);
         void this.load();
     }
 
+    // 文本框获得焦点时浏览器只把光标行滚进视野，不看 scroll-padding：键盘 Shift+Tab 回到上方的文本框时，框的上沿可能停在吸顶页头下面。
+    // 焦点控件的上沿被页头盖住时，把滚动容器往回滚到页头下面（再留 8px）；当场做一次，下一帧再核一次，防止浏览器随后自己的滚动又把它推回去。
+    private revealFocus = (e: FocusEvent) => {
+        const target = e.target;
+        if (!(target instanceof HTMLElement)) return;
+        const scroller = target.closest<HTMLElement>('.doc-scroll'), head = scroller?.querySelector<HTMLElement>(':scope > .page-h.sticky');
+        if (!scroller || !head || head.contains(target)) return;
+        const reveal = () => {
+            if (!target.isConnected || document.activeElement !== target) return;
+            const gap = head.getBoundingClientRect().bottom - target.getBoundingClientRect().top;
+            if (gap > 0) scroller.scrollTop -= gap + 8;
+        };
+        reveal();
+        requestAnimationFrame(reveal);
+    };
+
     unmount() {
+        this.container?.removeEventListener('focusin', this.revealFocus);
         this.container = undefined;
         this.loadSeq++;
         this.projectSeq++;
@@ -150,6 +175,68 @@ export class NewTaskView {
         const result = this.routeActive() ? this.route.result : null;
         if (result && !result.failed) return result.label;
         return this.autoAgent()?.label ?? '';
+    }
+
+    // ---- 推理强度（Stage07c T6）----
+    // 这个表单会派给谁：选了执行者就是它；自动且按路由规则时是路由结果的执行者（还没算出来为空）；否则是默认执行者。
+    private effectiveProfile() {
+        if (this.worker) return this.worker;
+        if (this.routeActive()) { const result = this.route.result; return result && !result.failed ? result.profile : ''; }
+        return this.autoAgent()?.name ?? '';
+    }
+
+    private effortOptions(name: string) {
+        return this.probed.get(name) ?? this.efforts?.get(name)?.options ?? [];
+    }
+
+    private effortUnsupported() {
+        return this.efforts?.get(this.effectiveProfile())?.supported === false;
+    }
+
+    // 只在"新建任务说明"来源下出现；不支持推理强度的执行者：没写强度时整行隐藏，写了的在原位置显示一句"已忽略"（生成说明时不写）。
+    private effortField() {
+        if (this.source !== 'new') return '';
+        if (this.effortUnsupported()) return this.effort ? field(gx.effort, '', `<span class="muted" data-nt-effort-ignored>${esc(ro.effortUnsupported)}</span>`) : '';
+        const note = this.effortNote ? `<span class="fhint" data-nt-effort-note role="status">${esc(this.effortNote)}</span>` : '';
+        // TODO(lead): 新建任务说明里推理强度的说明文案（nt 里还没有），先放占位。
+        return field(gx.effort, esc(nt.effortHelp), `<button class="sel" data-nt-effort aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(gx.effort)}" ${this.busy ? 'disabled' : ''}><span>${esc(this.effort || gx.effortDefault)}</span>${icon('arrow-down-s-line')}</button>${note}`);
+    }
+
+    private updateEffort() {
+        const box = this.container?.querySelector<HTMLElement>('[data-nt-effort-box]');
+        if (!box) return;
+        const refocus = document.activeElement instanceof HTMLElement && box.contains(document.activeElement) && document.activeElement.hasAttribute('data-nt-effort');
+        box.innerHTML = this.effortField();
+        if (refocus) box.querySelector<HTMLElement>('[data-nt-effort]')?.focus({ preventScroll: true });
+    }
+
+    // 执行者变了（选了别的执行者、路由结果出来、选项读完）：当前强度不在新执行者的选项里（选项已知时）就换成"默认"并提示一句；再查探针。
+    private effortChanged() {
+        const name = this.effectiveProfile(), info = this.efforts?.get(name), options = this.effortOptions(name);
+        this.effortNote = '';
+        if (this.effort && info?.supported && !options.includes(this.effort)) {
+            this.effortNote = effortResetNote(this.effort);
+            this.effort = '';
+            if (this.source === 'new') this.scheduleDry();
+        }
+        this.updateEffort();
+        void this.probeEffort(name);
+    }
+
+    private async probeEffort(name: string) {
+        const info = this.efforts?.get(name);
+        if (!name || !info?.model || !info.supported || this.asked.has(name)) return;
+        this.asked.add(name);
+        const levels = await probedEfforts(name, info.model).catch(() => null);
+        if (!levels || !this.container) return;
+        this.probed.set(name, levels);
+        if (this.effectiveProfile() === name) this.updateEffort();
+    }
+
+    private chooseEffort(anchor: HTMLElement) {
+        const options = this.effortOptions(this.effectiveProfile()), listed = this.effort && !options.includes(this.effort) ? [this.effort, ...options] : options;
+        const pick = (value: string) => () => { this.effort = value; this.effortNote = ''; this.updateEffort(); this.scheduleDry(); };
+        menu(anchor, [{ label: gx.effortDefault, run: pick('') }, ...listed.map(value => ({ label: value, run: pick(value) }))], true);
     }
 
     // "自动"下面的一行：将派给谁（哪条规则），"为什么"按钮展开路由过程。路由失败（没有可用的执行者）时写原因，派发照常可点：核心派发时会给出同样的原因。
@@ -199,6 +286,7 @@ export class NewTaskView {
         this.route.result = result;
         this.updateRouteHint();
         this.updateNote();
+        this.effortChanged();
     }
 
     private allowedLines() {
@@ -349,6 +437,8 @@ export class NewTaskView {
             allowedPaths: lines(f.allowed.split(/\r?\n/)), verify: lines(f.verify.split(/\r?\n/)),
             nonGoals: f.nonGoals, refs: f.refs, acceptance: '', questions: f.questions,
             worker: this.worker || 'auto',
+            // 推理强度：选"默认"、或这个执行者不支持（已忽略）时不写。
+            ...(this.effort && !this.effortUnsupported() ? { effort: this.effort } : {}),
         };
     }
 
@@ -365,6 +455,10 @@ export class NewTaskView {
             if (!this.projects.some(p => p.path === this.project)) this.project = this.projects[0]?.path ?? '';
             this.ensureWorker();
             this.loaded = true;
+            // 推理强度的选项（预设、配置）在后台读：读完补画这一行，不挡表单。
+            this.asked.clear();
+            this.probed.clear();
+            void loadEfforts(this.agents).then(map => { if (token !== this.loadSeq || !this.container) return; this.efforts = map; this.effortChanged(); }, () => { });
             await this.loadProject(this.project, token);
         }
         catch (error) {
@@ -486,7 +580,7 @@ export class NewTaskView {
             ? `<span class="mk run">${icon('loader-4-line')}</span>${esc(nt.dispatching)}`
             : `${icon('send-plane-line')}${esc(nt.dispatch)}`;
         const buttons = `<span class="note" data-nt-note aria-live="polite">${esc(this.note())}</span>${this.source === 'new' ? `<button class="btn" data-nt-preview ${disabled}>${esc(nt.preview)}</button>` : ''}<button class="btn primary" data-nt-dispatch ${this.canDispatch() ? '' : 'disabled'}>${dispatch}</button>`;
-        return `<div class="doc with-bar"><div class="scroll doc-scroll"><div class="page-h sticky"><h1>${esc(nt.title)}</h1><span class="lead">${esc(nt.lead)}</span></div><div class="doc-in narrow">${this.identityWarn()}<div class="form">${this.banner()}${field(nt.project, '', projectCtl)}${field(nt.source, '', sourceCtl)}${body}${field(nt.worker, '', `${workerCtl}<div data-nt-route-box>${this.routeHint()}</div>`)}${commitCtl}</div></div></div><div class="actbar">${buttons}</div></div>`;
+        return `<div class="doc with-bar"><div class="scroll doc-scroll"><div class="page-h sticky"><h1>${esc(nt.title)}</h1><span class="lead">${esc(nt.lead)}</span></div><div class="doc-in narrow">${this.identityWarn()}<div class="form">${this.banner()}${field(nt.project, '', projectCtl)}${field(nt.source, '', sourceCtl)}${body}${field(nt.worker, '', `${workerCtl}<div data-nt-route-box>${this.routeHint()}</div>`)}<div data-nt-effort-box>${this.effortField()}</div>${commitCtl}</div></div></div><div class="actbar">${buttons}</div></div>`;
     }
 
     private existingBody(disabled: string) {
@@ -532,6 +626,7 @@ export class NewTaskView {
         const d = active.dataset;
         if (d.ntProject !== undefined) return '[data-nt-project]';
         if (d.ntWorker !== undefined) return '[data-nt-worker]';
+        if (d.ntEffort !== undefined) return '[data-nt-effort]';
         if (d.ntRouteWhy !== undefined) return '[data-nt-route-why]';
         if (d.ntCommit !== undefined) return '[data-nt-commit]';
         if (d.ntPreview !== undefined) return '[data-nt-preview]';
@@ -580,6 +675,7 @@ export class NewTaskView {
         }
         if (d.ntProject !== undefined) { this.chooseProject(button); return; }
         if (d.ntWorker !== undefined) { this.chooseWorker(button); return; }
+        if (d.ntEffort !== undefined) { this.chooseEffort(button); return; }
         if (d.ntCommit !== undefined) { this.commit = !this.commit; this.render(); this.updateNote(); return; }
         if (d.ntPreview !== undefined) { void this.preview(button); return; }
         if (d.ntDispatch !== undefined) { void this.dispatch(); return; }
@@ -639,8 +735,8 @@ export class NewTaskView {
     private chooseWorker(anchor: HTMLElement) {
         const items: { label: string; run: () => void }[] = [];
         const auto = this.autoAgent();
-        if (auto) items.push({ label: this.routed() ? ro.autoByRule : nt.auto(auto.label), run: () => { this.worker = ''; this.render(); this.updateNote(); this.scheduleRoute(0); } });
-        for (const agent of this.enabledAgents()) items.push({ label: agent.label, run: () => { this.worker = agent.name; this.render(); this.updateNote(); } });
+        if (auto) items.push({ label: this.routed() ? ro.autoByRule : nt.auto(auto.label), run: () => { this.worker = ''; this.render(); this.updateNote(); this.scheduleRoute(0); this.effortChanged(); } });
+        for (const agent of this.enabledAgents()) items.push({ label: agent.label, run: () => { this.worker = agent.name; this.render(); this.updateNote(); this.effortChanged(); } });
         menu(anchor, items, true);
     }
 
@@ -799,6 +895,8 @@ export class NewTaskView {
     // 所以把 defaultsFrom 清空，下次进入页面时 loadProject 会重新取项目配置。
     private clearForm() {
         this.form = emptyForm();
+        this.effort = '';
+        this.effortNote = '';
         this.selectedSpec = '';
         this.source = 'new';
         this.commit = true;

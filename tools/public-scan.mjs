@@ -6,7 +6,8 @@ import path from 'node:path';
 
 // 允许清单：目录前缀（含 / 结尾）、整名文件、改名导出。每一项至少要匹配一个文件，否则报错（防止清单过期）。
 export const ALLOW_DIRS = [
-  'app/src/', 'app/design/icons/', 'core/', 'skills/', 'installer/', 'tools/', 'tests/', '.github/',
+  'app/src/', 'app/design/icons/', 'core/', 'skills/agent-router/', 'skills/lead-workflow/',
+  'installer/', 'tools/', 'tests/', '.github/',
 ];
 export const ALLOW_FILES = [
   'app/design/tokens.css', 'package.json', 'package-lock.json', 'tsconfig.json',
@@ -22,6 +23,7 @@ export const ALLOW_DOC_FILES = [
   'core/adapters/README.md',
   'core/templates/agents-block.md',
   'core/templates/specs-README.md',
+  'core/templates/review-prompt.md',
   'core/templates/roles/lead.md',
   'core/templates/roles/reviewer.md',
   'core/templates/roles/worker.md',
@@ -31,6 +33,7 @@ export const ALLOW_DOC_FILES = [
   'tests/fixtures/README.md',
   'tests/fixtures/expected-progress.txt',
   'tests/fixtures/fake-agent.txt',
+  'tests/fixtures/limits/README.md',
 ];
 // 文档类扩展名
 const DOC_EXTS = ['.md', '.markdown', '.rst', '.adoc', '.txt', '.pdf', '.docx', '.doc', '.odt'];

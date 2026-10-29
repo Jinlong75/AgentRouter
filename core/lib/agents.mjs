@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readConfig, builtinConfig, loadConfig, updateConfig, configInvalid, validateV2 } from './config.mjs';
-import { secretStatus, setUserSecret } from './secrets.mjs';
+import { resolveSecret, secretStatus, setUserSecret } from './secrets.mjs';
+import { PROBE_TIMEOUT_MS, formatProbe, listUrls, maskSecrets, parseCodexModels, probeApi, probeEnv } from './probe.mjs';
+import { resolveLauncher as resolveCodexLauncher } from '../adapters/codex.mjs';
 import { authOf, buildEnv, ensureSandboxHome, secretSources } from './env.mjs';
 import { adapterFor, adapters, genericDeclaration, resolveProfile } from '../adapters/index.mjs';
 import { makeGeneric } from '../adapters/generic.mjs';
@@ -53,7 +55,8 @@ export function loadPreset(name) {
 // 预设里只给界面下拉用的说明字段：add 时不写进 config.json，presets --json 里有就输出。
 // types：预设建议的任务类型；listModels：列出模型用的命令行参数（ar agents models 用）。
 // card / variant：导入向导把同一服务的几个预设合成一张卡片（card），第 2 步用 variant 的分段按钮选具体预设。
-const PRESET_ONLY = ['modelOptions', 'effortOptions', 'baseUrlOptions', 'listModels', 'types', 'card', 'variant'];
+// supportsEffort：预设声明这个执行者不支持推理强度时写 false（Stage07c 154，D87）；没写等于支持。
+const PRESET_ONLY = ['modelOptions', 'effortOptions', 'supportsEffort', 'baseUrlOptions', 'listModels', 'types', 'card', 'variant'];
 
 // 带 card 的预设按 card.id 分组：同组的 card 与 variant.label 必须一致，且 variant 完整，否则是模板错误。
 export function checkPresetCards(presets) {
@@ -81,6 +84,7 @@ export function checkPresetCards(presets) {
 function presetSummary({ name, profile }) {
   return { name, title: profile.title ?? name, description: profile.description ?? '', recommended: profile.recommended === true,
     adapter: profile.adapter, label: profile.label ?? profile.adapter, auth: authOf(profile), env: profile.env ?? {}, secrets: profile.secrets ?? {},
+    supportsEffort: profile.supportsEffort !== false,
     // 预设给了默认模型 / 推理强度（例如 Qoder 国内版）：软件导入第 2 步的下拉据此选中初始值。
     ...(typeof profile.model === 'string' && profile.model ? { model: profile.model } : {}), ...(typeof profile.effort === 'string' && profile.effort ? { effort: profile.effort } : {}),
     ...Object.fromEntries(PRESET_ONLY.filter(key => profile[key] !== undefined).map(key => [key, profile[key]])) };
@@ -193,7 +197,9 @@ function effortWarning(effort, options) {
   return [`提示：推理强度 ${effort} 不在可选值（${options.join('、')}）里；仍按你填的值传给执行者`];
 }
 
-export function addAgent(home, { preset, name, label, model, baseUrl, secretVar, auth, effort }) {
+// 按预设和参数组装"导入后会写进 config.json 的执行者配置"，不写入、不读配置。add 与 models --preset 共用，保证两边一致。
+// 返回 { target, p（执行者配置）, declaration（通用适配器预设的声明，其余为 null）, profile（预设原文） }。
+function buildPresetAgent({ preset, name, label, model, baseUrl, secretVar, auth, effort }) {
   const { name: presetName, profile } = loadPreset(preset);
   const target = name ?? presetName;
   if (!validProfileName(target)) throw new Error(`执行者名无效：${String(target).slice(0, 40)}（小写字母、数字、连字符）`);
@@ -210,6 +216,11 @@ export function addAgent(home, { preset, name, label, model, baseUrl, secretVar,
     if (auth === 'token' && p.adapter === 'codex' && p.provider == null) p.secrets = { OPENAI_API_KEY: 'OPENAI_API_KEY' };
   }
   applyProfileOptions(p, { label, model, baseUrl, secretVar, maxTurns: undefined, effort });
+  return { target, p, declaration, profile };
+}
+
+export function addAgent(home, { preset, name, label, model, baseUrl, secretVar, auth, effort }) {
+  const { target, p, declaration, profile } = buildPresetAgent({ preset, name, label, model, baseUrl, secretVar, auth, effort });
   let madeDefault = false;
   updateConfig(home, config => {
     config.profiles ??= {};
@@ -346,12 +357,35 @@ export function parseModelList(text) {
 
 // 执行者可选的模型：预设有 listModels（程序加上这些参数运行，环境与派发相同）就运行它，否则用预设的 modelOptions。
 // 运行失败时 ok 为 false，models 仍给预设的 modelOptions，方便软件继续显示下拉。
-export async function listAgentModels(home, name, { env = process.env, timeoutMs = 60000 } = {}) {
-  const state = readConfig(home);
-  if (state.reason) throw configInvalid(state, '这次没有运行任何程序');
-  const config = state.exists ? state.config : state.legacy?.config ?? builtinConfig();
+export async function listAgentModels(home, name, opts = {}) {
+  const config = readConfigForModels(home);
   const profile = config.profiles?.[name];
   if (!profile) throw new Error(`找不到执行者：${name}`);
+  return listProfileModels(home, name, profile, config, opts);
+}
+
+// 读配置给"查模型"用：配置存在却读不了时拒绝；没有配置时用内置默认。
+function readConfigForModels(home) {
+  const state = readConfig(home);
+  if (state.reason) throw configInvalid(state, '这次没有运行任何程序');
+  return state.exists ? state.config : state.legacy?.config ?? builtinConfig();
+}
+
+// 导入之前查：按预设和参数组装执行者配置（不写入），放进一份只在内存里的配置副本，配置文件一个字节不动。
+function presetModelsContext(home, spec) {
+  const built = buildPresetAgent(spec);
+  const base = readConfigForModels(home);
+  const config = { ...base, profiles: { ...base.profiles, [built.target]: built.p },
+    ...(built.declaration ? { generics: { ...base.generics, [built.target]: built.declaration } } : {}) };
+  return { name: built.target, profile: built.p, config };
+}
+
+export async function listPresetModels(home, spec, opts = {}) {
+  const { name, profile, config } = presetModelsContext(home, spec);
+  return listProfileModels(home, name, profile, config, opts);
+}
+
+async function listProfileModels(home, name, profile, config, { env = process.env, timeoutMs = 60000 } = {}) {
   const preset = presetFor(name, profile, config)?.profile;
   const fallback = Array.isArray(preset?.modelOptions) ? preset.modelOptions : [];
   const listArgs = preset?.listModels;
@@ -381,6 +415,102 @@ export async function listAgentModels(home, name, { env = process.env, timeoutMs
     for (const value of secrets) message = message.split(value).join('***');
     return { ok: false, error: message.slice(0, 300), models: fallback, source: 'preset' };
   }
+}
+
+// ---- ar agents models --probe ----
+
+const ANTHROPIC_MODELS_URL = 'https://api.anthropic.com/v1/models?limit=1000';
+
+// 用执行者自己的密钥或程序查可用模型与推理强度（任务 142）；查不到时退回预设并写明原因。
+// 返回 { result, text }：result 是 { ok, source, models, details?, reason? }（密钥值已掩码），text 是文字输出。
+// nativeUrl 只给测试注入（Claude 官方接口的地址）。
+export async function probeAgentModels(home, name, opts = {}) {
+  const config = readConfigForModels(home);
+  const profile = config.profiles?.[name];
+  if (!profile) throw new Error(`找不到执行者：${name}`);
+  return probeProfileModels(home, name, profile, config, opts);
+}
+
+// 导入之前查：按预设和参数组装的执行者配置，探针逻辑与已导入的执行者是同一份。
+export async function probePresetModels(home, spec, opts = {}) {
+  const { name, profile, config } = presetModelsContext(home, spec);
+  return probeProfileModels(home, name, profile, config, opts);
+}
+
+async function probeProfileModels(home, name, profile, config, { env = process.env, timeoutMs = PROBE_TIMEOUT_MS, nativeUrl = ANTHROPIC_MODELS_URL } = {}) {
+  const preset = presetFor(name, profile, config)?.profile;
+  const presetModels = Array.isArray(preset?.modelOptions) ? preset.modelOptions : [];
+  const presetEfforts = Array.isArray(preset?.effortOptions) ? preset.effortOptions : [];
+  const secrets = [];
+  const fallback = reason => ({ ok: false, source: 'preset', models: presetModels, reason });
+  const found = (source, details) => ({ ok: true, source, models: details.map(d => d.id), details });
+  const secretFor = from => {
+    try { const value = resolveSecret(from, { env }); secrets.push(value); return value; }
+    catch { return null; }
+  };
+  const viaApi = async (urls, headers) => {
+    const r = await probeApi(urls, headers, { env: probeEnv(env, { sources: secretSources(config) }), timeoutMs });
+    return r.ok ? found('api', r.details) : fallback(r.reason);
+  };
+  let programLabel = '程序的列表';
+  let result;
+  try {
+    const entries = Object.entries(profile.secrets ?? {});
+    const entry = entries.find(([key]) => key === 'ANTHROPIC_AUTH_TOKEN' || key === 'ANTHROPIC_API_KEY') ?? entries[0];
+    if (profile.adapter === 'generic') {
+      const r = await listProfileModels(home, name, profile, config, { env });
+      result = r.source === 'cli' ? found('program', r.models.map(id => ({ id })))
+        : fallback(r.ok ? '这个执行者没有可查询的接口' : r.error);
+    } else if (profile.adapter === 'codex' && profile.provider == null) {
+      // Codex（ChatGPT 登录或 API Key）：运行 codex debug models，不需要网络。
+      programLabel = 'codex debug models';
+      const resolved = resolveProfile(profile, config);
+      const adapter = adapterFor(resolved, { config });
+      const childEnv = buildEnv({ base: env, profile: resolved, adapter, home, profileName: name, sources: secretSources(config) });
+      ensureSandboxHome(childEnv, { home, profileName: name });
+      secrets.push(...Object.keys(resolved.secrets ?? {}).map(key => childEnv[key]).filter(Boolean));
+      const launcher = resolveCodexLauncher(childEnv, process.platform, profile.path ?? null);
+      const r = await runListing({ executable: launcher.executable, args: [...launcher.args, 'debug', 'models'] }, { env: childEnv, timeoutMs });
+      if (r.timedOut) result = fallback(`${Math.round(timeoutMs / 100) / 10} 秒没有响应，已停止`);
+      else if (r.error) result = fallback(`无法运行 codex：${r.error.message}`);
+      else if (r.status !== 0) result = fallback(`codex debug models 失败（退出码 ${r.status}）`);
+      else {
+        const details = parseCodexModels(r.stdout);
+        result = !details ? fallback('codex 返回的不是模型列表') : details.length ? found('program', details) : fallback('codex 返回的列表里没有可选的模型');
+      }
+    } else if (profile.adapter === 'codex') {
+      // OpenAI 兼容接口（经 Codex）：<接口地址>/models，Bearer。
+      const base = String(profile.provider.baseUrl ?? '').trim().replace(/\/+$/, '');
+      if (!/^https?:\/\/[^/\s]+/i.test(base)) result = fallback('接口地址不是有效的 http(s) 地址');
+      else if (!entry) result = fallback('这个执行者没有可查询的接口');
+      else {
+        const key = secretFor(entry[1]);
+        result = key === null ? fallback(`没有设置密钥环境变量 ${entry[1]}`) : await viaApi([`${base}/models`], { Authorization: `Bearer ${key}` });
+      }
+    } else if (profile.adapter === 'claude-code') {
+      const baseUrl = String(profile.env?.ANTHROPIC_BASE_URL ?? '').trim();
+      const oauth = entries.find(([key]) => key === 'CLAUDE_CODE_OAUTH_TOKEN');
+      const native = entries.find(([key]) => key === 'ANTHROPIC_API_KEY');
+      if (!baseUrl && oauth && !native) result = fallback('订阅令牌不能查询模型列表');
+      else if (!baseUrl && !native) result = fallback('这个执行者没有可查询的接口');
+      else if (!baseUrl) {
+        // Claude 官方 API Key：x-api-key + anthropic-version。
+        const key = secretFor(native[1]);
+        result = key === null ? fallback(`没有设置密钥环境变量 ${native[1]}`) : await viaApi([nativeUrl], { 'x-api-key': key, 'anthropic-version': '2023-06-01' });
+      } else if (!entry) result = fallback('这个执行者没有可查询的接口');
+      else {
+        const urls = listUrls(baseUrl);
+        const key = urls ? secretFor(entry[1]) : null;
+        result = !urls ? fallback('接口地址不是有效的 http(s) 地址')
+          : key === null ? fallback(`没有设置密钥环境变量 ${entry[1]}`) : await viaApi(urls, { Authorization: `Bearer ${key}` });
+      }
+    } else result = fallback('这个执行者没有可查询的接口');
+  } catch (error) {
+    result = fallback(redactPaths(String(error.message ?? error)).slice(0, 300));
+  }
+  // 返回前把所有密钥值换成 ***（接口可能在错误正文里回显请求头）。
+  const masked = maskSecrets(result, secrets);
+  return { result: masked, text: formatProbe(masked, { presetEfforts, programLabel }) };
 }
 
 // ---- ar agents detect / test --decl（自定义 CLI 表单用：只用声明，不读不写配置） ----
@@ -777,7 +907,14 @@ const parseMaxTurns = value => {
 };
 const parseTimeout = value => { const n = Number(value); if (!Number.isFinite(n) || n <= 0) throw new Error('--timeout 必须为正的秒数'); return n; };
 
-const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]（单独的声明必须加 --name）';
+const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> [--probe] | models --preset <预设> [--model <模型>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] [--probe] | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]（单独的声明必须加 --name）';
+
+// 不带 --probe 的 models 输出：预设的可选值或程序的列表。
+function modelsReply(r) {
+  const text = r.ok ? (r.models.length ? [r.source === 'cli' ? '模型（来自程序的列表）：' : '模型（预设的可选值）：', ...r.models.map(m => `  ${m}`)].join('\n') : '没有可选的模型列表')
+    : [`列出模型失败：${r.error}`, ...(r.models.length ? ['预设的可选值：', ...r.models.map(m => `  ${m}`)] : [])].join('\n');
+  return { result: r, text, code: r.ok ? 0 : 1 };
+}
 
 // --decl / --generic 的值：解析声明 JSON；不是 JSON 或不是对象时抛出带原因的错误。
 function parseDecl(text) {
@@ -846,10 +983,26 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath,
       return { result: { ok: true, name: r.name, profile: r.profile, ...(r.warnings ? { warnings: r.warnings } : {}) }, text: [`已更新执行者 ${r.name}`, ...(r.warnings ?? [])].join('\n') };
     }
     case 'models': {
-      const r = await listAgentModels(home, one(), { env });
-      const text = r.ok ? (r.models.length ? [r.source === 'cli' ? '模型（来自程序的列表）：' : '模型（预设的可选值）：', ...r.models.map(m => `  ${m}`)].join('\n') : '没有可选的模型列表')
-        : [`列出模型失败：${r.error}`, ...(r.models.length ? ['预设的可选值：', ...r.models.map(m => `  ${m}`)] : [])].join('\n');
-      return { result: r, text, code: r.ok ? 0 : 1 };
+      // 导入之前查：--preset 与 add --preset 同名同校验，按导入后会得到的执行者配置去查，不读不写执行者配置。
+      if (args.includes('--preset')) {
+        const { opts, positional } = parseOptions(['preset', 'model', 'base-url', 'secret-var', 'auth'], ['probe']);
+        if (positional.length || !opts.preset) throw new Error(`用法：${usageAgents}`);
+        const spec = { preset: opts.preset, model: opts.model, baseUrl: opts['base-url'], secretVar: opts['secret-var'], auth: opts.auth };
+        if (opts.probe) {
+          const probed = await probePresetModels(home, spec, { env });
+          return { result: probed.result, text: probed.text };
+        }
+        const r = await listPresetModels(home, spec, { env });
+        return modelsReply(r);
+      }
+      if (args.includes('--probe')) {
+        // 探针：查到或退回预设都是正常结果（退出码 0），原因在 reason 里。
+        const { opts, positional } = parseOptions([], ['probe']);
+        if (positional.length !== 1 || !positional[0] || !opts.probe) throw new Error(`用法：${usageAgents}`);
+        const probed = await probeAgentModels(home, positional[0], { env });
+        return { result: probed.result, text: probed.text };
+      }
+      return modelsReply(await listAgentModels(home, one(), { env }));
     }
     case 'detect': {
       // 只检测、不写配置：表单里的"程序"一栏用。

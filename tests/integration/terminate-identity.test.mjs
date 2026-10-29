@@ -42,7 +42,8 @@ test('句柄方式：创建时间一致才结束；不一致（PID 被复用的�
   const results = await terminateByIdentity([a, { pid: b.pid, created: b.created + 5000 }]);
   assert.equal(results.get(a.pid), 'killed');
   assert.equal(results.get(b.pid), 'reused');
-  await delay(300);
+  // 结束是异步的：负载高时 300 ms 后进程可能还没从系统里消失（verify 并行跑全量时出现过），等它退出再断言，最多 10 秒。
+  for (const deadline = Date.now() + 10000; pidAlive(a.pid) && Date.now() < deadline;) await delay(100);
   assert.equal(pidAlive(a.pid), false, 'a 已被结束');
   assert.equal(pidAlive(b.pid), true, 'b 没被结束（复用者不受影响）');
   const edge = await terminateByIdentity([{ pid: c.pid, created: c.created + 2 }]);
@@ -55,14 +56,23 @@ test('句柄方式：创建时间一致才结束；不一致（PID 被复用的�
   // 073：PID 复用是正常现象（全量负载下 600 ms 内 a 的 PID 就可能被别的进程占用），"已退出报 gone"按调用前后的快照精确判定：
   // 快照里 a.pid 属于创建时间不同的进程 → 必须是 reused，且那个进程调用后仍存活；否则必须是 gone。
   const occupant = rows => rows.find(p => p.pid === a.pid && !sameIdentity(p, a)) ?? null;
-  const beforeRows = await processList();
-  const again = await terminateByIdentity([a]);
-  const afterRows = await processList();
-  const occupantBefore = occupant(beforeRows), occupantAfter = occupant(afterRows);
-  const verdict = again.get(a.pid);
-  // 调用前后占用者都是同一个进程 → reused；前后都没有占用者 → gone；其余是调用期间发生了复用或占用者退出（时序竞争）。
-  const expected = occupantBefore && occupantAfter && sameIdentity(occupantBefore, occupantAfter) ? 'reused' : !occupantBefore && !occupantAfter ? 'gone' : 'changed';
-  t.diagnostic(`a.pid=${a.pid} 调用前占用者=${occupantBefore ? occupantBefore.created : '无'} 调用后占用者=${occupantAfter ? occupantAfter.created : '无'} 结果=${verdict}`);
+  // 前后快照都没有占用者、结果却是 reused：调用期间有进程短暂占用了这个 PID 又退出（快照看不到）。
+  // 这种情况不改产品行为，也不放宽断言，而是等占用者消失后重新取一轮（最多 15 秒）：短暂占用者很快退出，之后必须是 gone；
+  // 持续存在的占用者会被快照看到，走 reused 的分支。
+  let beforeRows, afterRows, occupantBefore, occupantAfter, verdict, expected;
+  for (const deadline = Date.now() + 15000; ;) {
+    beforeRows = await processList();
+    const again = await terminateByIdentity([a]);
+    afterRows = await processList();
+    occupantBefore = occupant(beforeRows);
+    occupantAfter = occupant(afterRows);
+    verdict = again.get(a.pid);
+    // 调用前后占用者都是同一个进程 → reused；前后都没有占用者 → gone；其余是调用期间发生了复用或占用者退出（时序竞争）。
+    expected = occupantBefore && occupantAfter && sameIdentity(occupantBefore, occupantAfter) ? 'reused' : !occupantBefore && !occupantAfter ? 'gone' : 'changed';
+    t.diagnostic(`a.pid=${a.pid} 调用前占用者=${occupantBefore ? occupantBefore.created : '无'} 调用后占用者=${occupantAfter ? occupantAfter.created : '无'} 结果=${verdict}`);
+    if (!(expected === 'gone' && verdict === 'reused') || Date.now() > deadline) break;
+    await delay(200);
+  }
   if (expected === 'reused') {
     assert.equal(verdict, 'reused', 'a 的 PID 已被创建时间不同的进程占用 → reused');
     assert.ok(identityAlive(afterRows, occupantBefore), '复用者调用后仍存活（快照里同一个身份还在，没被结束）');

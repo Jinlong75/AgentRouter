@@ -5,11 +5,17 @@ import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
 import { nativeTheme, type BrowserWindow } from 'electron';
-import { ag, gx } from '../shared/copy';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { ag, gx, ro } from '../shared/copy';
 import type { Harness } from './shots-input';
 import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
 import { fileDialogs } from './console.mjs';
+import { effects } from './effects';
+// 演示的执行者 B 与限流数据和 npm run demo 同源（tools/demo/data.mjs 的 demoExecutorB、demoLimits）。
+// @ts-ignore —— 演示数据是零依赖 .mjs，没有类型声明；打包时由 esbuild 一并打包。
+import { demoExecutorB, demoLimits } from '../../../tools/demo/data.mjs';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
@@ -18,6 +24,24 @@ const git = (cwd: string, args: string[]) => {
     assert.equal(r.status, 0, `git ${args.join(' ')}：${r.stderr}`);
     return String(r.stdout).trim();
 };
+
+// 探针用的假目录（Stage07c 144）：验收环境的假 Codex（AR_TEST_AGENT 指向的脚本）原来只认 --version / login status / exec，其余以 2 退出；
+// 这里在脚本最前面加一段"debug models 打印和真实输出同样结构的 JSON（模型是编造的）"，探针（ar agents models <名> --probe）就能查到：
+// test-pro 支持 low / medium / high / max（默认 medium），test-mini 只支持 low / medium（默认 low），test-hidden 不是 list 可见，探针要去掉。
+// 返回恢复函数（写回原脚本）。不联网、不用真实 Codex。
+export async function fakeCodexModels(home: string) {
+    const script = path.join(home, 'fake-codex.cjs');
+    assert.ok(path.relative(home, script) === 'fake-codex.cjs', '假 Codex 必须在隔离目录里');
+    const original = await readFile(script, 'utf8');
+    const level = (effort: string) => ({ effort, description: effort });
+    const output = { models: [
+        { slug: 'test-pro', display_name: 'Test Pro', visibility: 'list', default_reasoning_level: 'medium', supported_reasoning_levels: ['low', 'medium', 'high', 'max'].map(level) },
+        { slug: 'test-mini', display_name: 'Test Mini', visibility: 'list', default_reasoning_level: 'low', supported_reasoning_levels: ['low', 'medium'].map(level) },
+        { slug: 'test-hidden', display_name: 'Test Hidden', visibility: 'hide', default_reasoning_level: 'low', supported_reasoning_levels: [level('low')] },
+    ] };
+    await writeFile(script, `if(process.argv.slice(2).join(' ')==='debug models'){process.stdout.write(${JSON.stringify(JSON.stringify(output))});process.exit(0);}\n${original}`);
+    return async () => { await writeFile(script, original); };
+}
 
 // UI28 导入向导扩展与模型、推理强度（Stage07 T8 之二）：自定义 CLI 表单与"测试并预览"、校验、Claude 类的推理强度与"升级到"、
 // OpenAI 兼容接口、Qoder 默认模型与推理强度、导出与"从文件导入"、截图。全部用真实输入（press / key / type），读 config.json 断言功能真的生效。
@@ -31,6 +55,8 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
     const config = path.join(home, 'config.json');
     const configBefore = await readFile(config, 'utf8').catch(() => null), secretsBefore = await readFile(secretsFile, 'utf8').catch(() => null);
     const original = { size: win.getContentSize(), theme: nativeTheme.themeSource };
+    // 限流标记（limits.json）：测试里会写一条，结束时恢复原样。
+    const limitsFile = path.join(home, 'limits.json'), limitsBefore = await readFile(limitsFile, 'utf8').catch(() => null);
     const readConfig = async () => JSON.parse(await readFile(config, 'utf8'));
     const work = path.join(home, 'shots-agents');
     await mkdir(work, { recursive: true });
@@ -53,6 +79,8 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
     const menuVisible = `(() => { const m = document.querySelector('.optmenu'); if (!m) return false; const s = getComputedStyle(m), r = m.getBoundingClientRect(); const x = r.left + r.width / 2, y = r.top + r.height / 2; const hit = document.elementFromPoint(x, y); return s.opacity === '1' && (s.transform === 'none' || s.transform === 'matrix(1, 0, 0, 1, 0, 0)') && s.visibility === 'visible' && r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 && r.right <= innerWidth && r.bottom <= innerHeight && !!hit && m.contains(hit); })()`;
     const assertMenuVisible = async (what: string) => assert.equal(await evaluate(menuVisible), true, `${what}：下拉菜单打开后看不见（透明、缩放或超出窗口）`);
     const pick = async (selector: string, label: string) => { await press(selector); await wait('!!document.querySelector(".optmenu")'); await assertMenuVisible(selector); await press(await option(label)); await wait('!document.querySelector(".optmenu")'); };
+    // 探针说明里的时间每次不同：把文案里的 00:00 换成 \d\d:\d\d 得到匹配用的正则。
+    const timeRegex = (text: string) => new RegExp('^' + text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('00:00', '\\d\\d:\\d\\d') + '$');
     const text = (selector: string) => evaluate(`document.querySelector(${jsonStr(selector)})?.textContent ?? null`);
     const agentsPage = async () => { await press('[data-page=tasks]'); await press('[data-page=connect]'); await wait('!!document.querySelector("[data-agents]") && !!document.querySelector(".page-h [data-import-agent]")'); };
     const openWizard = async () => { await press('.page-h [data-import-agent]'); await wait('!!document.querySelector(".sheet .preset.on")'); };
@@ -75,7 +103,7 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         sonnet: { adapter: 'claude-code', label: 'Sonnet 测试', enabled: true, path: path.join(home, 'fake-claude.cjs'), env: { ANTHROPIC_MODEL: 'claude-sonnet-5-5' }, auth: 'token', secrets: { CLAUDE_CODE_OAUTH_TOKEN: 'CLAUDE_CODE_OAUTH_TOKEN' }, maxTurns: null },
     } }));
     await writeFile(secretsFile, jsonStr({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ui28-subscription-0001' }));
-    fileDialogs.stub = true; fileDialogs.open.length = 0; fileDialogs.save.length = 0;
+    fileDialogs.stub = true; fileDialogs.open.length = 0; fileDialogs.save.length = 0; fileDialogs.openRequests.length = 0; fileDialogs.saveRequests.length = 0;
     try {
         await agentsPage();
 
@@ -85,10 +113,10 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         // 改写（112）：原断言 names 里同时有 qoder-cn 和 qoder → 新断言只有 qoder-cn（Qoder 合并成一张，默认预设 qoder-cn），qoder 不再单独成卡；原因：同一服务只放一张卡片。
         const presetList: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
         const presetOf = (name: string) => presetList.find(x => x.name === name);
-        await check('UI28 第 1 步：9 张卡片（顺序按 order），Xiaomi MiMo / Claude Code / Qoder 各合并成一张，data-card 与 data-preset（组里默认预设）正确，标题与说明逐字等于 presets --json 的 card', `(() => {
+        await check('UI28 第 1 步：10 张卡片（顺序按 order），Xiaomi MiMo / Claude Code / Qoder 各合并成一张，data-card 与 data-preset（组里默认预设）正确，标题与说明逐字等于 presets --json 的 card', `(() => {
             const cards = [...document.querySelectorAll('.sheet .preset')], names = cards.map(c => c.dataset.preset);
             const merged = (name, c) => { const el = cards.find(x => x.dataset.preset === name); return !!el && el.dataset.card === c.id && el.querySelector('b').textContent === c.title && el.querySelector('.pk > span').textContent === c.description; };
-            return names.length === 9 && names.join() === 'deepseek,mimo,claude-native,compat,codex,qoder-cn,openai-compat,@custom,@file'
+            return names.length === 10 && names.join() === 'deepseek,mimo,claude-native,compat,codex,qoder-cn,deepseek-harness,openai-compat,@custom,@file'
                 && cards.filter(c => c.dataset.card).map(c => c.dataset.card).join() === 'mimo,claude-code,qoder'
                 && merged('mimo', ${jsonStr(presetOf('mimo').card)}) && merged('claude-native', ${jsonStr(presetOf('claude-native').card)}) && merged('qoder-cn', ${jsonStr(presetOf('qoder-cn').card)})
                 && !names.includes('mimo-payg') && !names.includes('claude-subscription') && !names.includes('qoder')
@@ -133,6 +161,35 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await press('[data-w-variant=qoder-cn]'); await wait(`document.querySelector('[data-w=secretVar]')?.value === ${jsonStr(Object.values(cnPreset.secrets)[0])}`);
         await check('UI28 Qoder 切回国内版：名称、令牌说明（qoder.cn）、默认模型 DeepSeek-Flash 与推理强度 ultracode 都回到国内版的', `(() => { const name = document.querySelector('[data-w=name]').value; return name.startsWith('qoder-cn') && document.querySelector('.sheet').textContent.includes(${jsonStr(gx.qoderTokenHelp('qoder.cn', 'QODERCN_PERSONAL_ACCESS_TOKEN'))}) && document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode' && document.querySelector('.sheet .segm button.on').textContent === ${jsonStr(cnPreset.variant.option)}; })()`);
         await shots('wizard-2-variant-qoder');
+        // ---- 181：模型查询还没回来就切换版本，旧查询回来不能把表单改回旧版本（D101 全量 shots 发现）----
+        // 做法：先保存国内版的密钥（假值），触发一次被拖慢 1.5 秒的模型查询；查询进行中把 secrets:status 也拖慢，点"国际版"，
+        // 让旧查询恰好落在切换后"重新检测密钥"的等待里。等一切结束后，名称、显示名、密钥变量都应是国际版的，再切回国内版同样。
+        const versionValues = `(() => { const name = document.querySelector('[data-w=name]').value, on = document.querySelector('.sheet .segm button.on').textContent; return JSON.stringify([name, document.querySelector('[data-w=label]').value, document.querySelector('[data-w=secretVar]').value, on]); })()`;
+        effects.consoleDelay['agents:models'] = 1500;
+        try {
+            await type('[data-w=secret]', 'sk-ui181-fake-0001'); await press('[data-w-act=save-secret]');
+            await wait(`document.querySelector('[data-w-status]')?.textContent === ${jsonStr(ag.keySet)} && document.querySelector('.sheet [data-probe-refresh]')?.disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshingList)}`, 'UI28 181 国内版模型查询进行中');
+            effects.consoleDelay['secrets:status'] = 6000;
+            await press('[data-w-variant=qoder]');
+            // 等过 secrets:status 的延迟（6 秒）：旧查询（最多还剩 1.5 秒加核心耗时）和重新检测密钥都已结束。
+            await pause(8000);
+            delete effects.consoleDelay['secrets:status'];
+            const intlValues = await evaluate(versionValues) as string;
+            await check('UI28 181 模型查询进行中点"国际版"：等旧查询回来后，名称（qoder 系）、显示名、密钥变量都是国际版的，分段按钮是国际版', `(() => { const [name, label, secretVar, on] = JSON.parse(${jsonStr(intlValues)}); return name.startsWith('qoder') && !name.startsWith('qoder-cn') && label === ${jsonStr(intlPreset.label)} && secretVar === ${jsonStr(Object.values(intlPreset.secrets)[0])} && on === ${jsonStr(intlPreset.variant.option)}; })()`);
+            await press('[data-w-variant=qoder-cn]');
+            await wait(`document.querySelector('[data-w-status]')?.textContent === ${jsonStr(ag.keySet)} && !document.querySelector('.sheet [data-probe-refresh]').disabled`, 'UI28 181 切回国内版后查询结束', 30000);
+            const cnValues = await evaluate(versionValues) as string;
+            await check('UI28 181 再切回国内版：名称（qoder-cn）、显示名、密钥变量都是国内版的，分段按钮是国内版', `(() => { const [name, label, secretVar, on] = JSON.parse(${jsonStr(cnValues)}); return name.startsWith('qoder-cn') && label === ${jsonStr(cnPreset.label)} && secretVar === ${jsonStr(Object.values(cnPreset.secrets)[0])} && on === ${jsonStr(cnPreset.variant.option)}; })()`);
+            // ---- 189：下拉菜单打开期间模型查询返回、向导重画把下拉按钮换成新元素，Esc 后焦点要落在页面上现在的下拉按钮上 ----
+            await press('.sheet [data-probe-refresh]');
+            await wait(`document.querySelector('.sheet [data-probe-refresh]')?.disabled`, 'UI28 189 查询进行中');
+            await press('[data-sel=model]'); await wait('!!document.querySelector(".optmenu")');
+            const oldModelButton = `window.__ui189Old = document.querySelector('[data-sel=model]'), true`;
+            await evaluate(oldModelButton);
+            await wait(`!document.querySelector('.sheet [data-probe-refresh]')?.disabled && document.querySelector('[data-sel=model]') !== window.__ui189Old`, 'UI28 189 查询返回、下拉按钮被重画换掉', 30000);
+            await key('Escape');
+            await check('UI28 189 下拉菜单打开期间查询返回重画后按 Esc：菜单关了、模态框还在，焦点在页面上现在的模型下拉按钮上（不是已被换掉的旧按钮，也不是 body）', `!document.querySelector('.optmenu') && !!document.querySelector('.sheet') && !window.__ui189Old.isConnected && document.activeElement === document.querySelector('[data-sel=model]') && document.activeElement !== document.body`);
+        } finally { delete effects.consoleDelay['agents:models']; delete effects.consoleDelay['secrets:status']; }
 
         // ---- Xiaomi MiMo（112）：套餐分段按钮；接口地址在两个套餐之间变化（取模板值），用键盘 Tab 到按钮、空格切换 ----
         const mimoPlan = presetOf('mimo'), mimoPayg = presetOf('mimo-payg');
@@ -290,6 +347,22 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await key('Backspace');
         await check('UI28 示例：退格删掉只读参数的小方块，回到空状态', `document.querySelectorAll('.sheet .argbox')[1].querySelectorAll('.argchip').length === 0 && document.querySelector('[data-tag-in=readOnly]').value === ''`);
         await wait('!document.querySelector("[data-c-act=save]").disabled', 'UI28 示例检查完成后重新校验通过');
+        // 事件映射的框（155 W5）：新加一行空行，两个框空着时按 → 填入灰色示例（占位文字），再按不变，退格清空后又为空；检查完删掉这一行。
+        await press('[data-map-add]'); await wait('document.querySelectorAll(".map-row").length === 3');
+        await press('[data-m=when][data-i="2"]');
+        await check('UI28 示例：事件映射新行的两个框都是空的，占位文字是示例', `(() => { const w = document.querySelector('[data-m=when][data-i="2"]'), f = document.querySelector('[data-m=fields][data-i="2"]'); return w.value === '' && f.value === '' && w.placeholder === 'type = message' && f.placeholder === 'text ← content'; })()`);
+        await check('UI28 示例：事件映射一节的说明末尾也是「 · 」加 gx.exampleHint', `document.querySelector('[data-m=when][data-i="2"]').closest('.fld').querySelector('.fl span').textContent === ${jsonStr(`${gx.mappingHelp} · ${gx.exampleHint}`)}`);
+        await key('Right');
+        await check('UI28 示例：事件映射空的「条件」框按 → 填入 type = message，光标在末尾，焦点还在这个框，并触发更新（保存暂时禁用等重新校验）', `(() => { const i = document.querySelector('[data-m=when][data-i="2"]'); return i.value === 'type = message' && i.value === i.placeholder && i.selectionStart === i.value.length && i.selectionEnd === i.value.length && document.activeElement === i && document.querySelector('[data-c-act=save]').disabled; })()`);
+        await key('Right');
+        await check('UI28 示例：事件映射的框不为空时再按 → 不再改变', `document.querySelector('[data-m=when][data-i="2"]').value === 'type = message'`);
+        await press('[data-m=fields][data-i="2"]');
+        await key('Right');
+        await check('UI28 示例：事件映射空的「字段」框按 → 填入 text ← content，光标在末尾', `(() => { const i = document.querySelector('[data-m=fields][data-i="2"]'); return i.value === 'text ← content' && i.selectionStart === i.value.length && document.activeElement === i; })()`);
+        for (let i = 0; i < 'text ← content'.length; i++) await key('Backspace');
+        await check('UI28 示例：退格清空事件映射的字段框后又为空', `document.querySelector('[data-m=fields][data-i="2"]').value === ''`);
+        await press('[data-map-del="2"]'); await wait('document.querySelectorAll(".map-row").length === 2');
+        await wait('!document.querySelector("[data-c-act=save]").disabled', 'UI28 事件映射示例检查完成后重新校验通过');
         await shots('custom-form');
         // 2. 校验：参数模板里的 {bogus}。
         await type('[data-tag-in=args]', '{bogus}'); await key('Enter');
@@ -377,7 +450,13 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await openWizard();
         // 改写（112）：原操作直接点 [data-preset=claude-subscription] 卡片 → 先点合并的 Claude Code 卡片，下一步后在第 2 步点"订阅令牌"；原因：两张 Claude Code 卡片合并。
         await press('[data-preset=claude-native]'); await press('[data-w-act=next]'); await wait('!!document.querySelector(".sheet [data-w-variant]")');
+        // 探针（144）：第 2 步密钥还没设置时不查，模型下面写 probeFallback('还没有设置密钥')。
+        // 改写（168，D102）：原断言"没有'刷新列表'（导入前没有可查询的执行者）" → 新断言"有'刷新列表'但禁用（密钥未设置不查询）" → 原因：导入前就能按预设查（ar agents models --preset … --probe）。
+        await check('UI28 导入第 2 步（Claude Code · API Key，密钥未设置）：不查询，模型说明是 probeFallback("还没有设置密钥")，"刷新列表"禁用', `document.querySelector('[data-w-status]').textContent === '未设置' && document.querySelector('.sheet [data-probe-note]').textContent === ${jsonStr(ag.probeFallback('还没有设置密钥'))} && document.querySelector('.sheet [data-probe-refresh]')?.disabled === true`);
         await press('[data-w-variant=claude-subscription]'); await wait('document.querySelector("[data-w=secretVar]")?.value === "CLAUDE_CODE_OAUTH_TOKEN"');
+        // 改写（168，D102）：原断言"还没有可查询的执行者，模型说明沿用常用值的说明（gx.modelHelpPreset），没有'刷新列表'" → 新断言"进入第 2 步就查了：订阅令牌不能查询，说明是 probeFallback(订阅令牌不能查询模型列表)，'刷新列表'可点" → 原因：同上。
+        await wait(`document.querySelector('.sheet [data-probe-note]')?.textContent === ${jsonStr(ag.probeFallback('订阅令牌不能查询模型列表'))}`, 'UI28 导入第 2 步（订阅令牌）：导入前的查询结果');
+        await check('UI28 导入第 2 步（订阅令牌，密钥已设置、还没导入）：已按预设查过，说明是 probeFallback(订阅令牌不能查询模型列表)，"刷新列表"可点', `!document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)}`);
         await wait('!!document.querySelector(".sheet [data-sel=effort]")');
         await check('UI28 Claude 订阅预设第 2 步：模型没有预设可选值时是输入框，推理强度是下拉、默认选中"默认"', `document.querySelector('[data-w=model]') !== null && document.querySelector('[data-sel=effort]').textContent.trim() === ${jsonStr(gx.effortDefault)} && document.querySelector('[data-w=secretVar]').value === 'CLAUDE_CODE_OAUTH_TOKEN' && document.querySelector('[data-w-status]').textContent === '已设置'`);
         await type('[data-w=model]', 'claude-sonnet-5-5');
@@ -402,6 +481,17 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
 
         // ---- 3b. 升级到 ----
         await press('[data-more-agent=sonnet]'); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-sel=escalate]")');
+        // 探针（144）：这个 Claude 类执行者用订阅令牌，核心查不了模型列表：说明是 probeFallback(原因)，模型仍是输入框（值不动），"刷新列表"可点。
+        await wait('document.querySelector(".sheet [data-probe-note]").textContent !== "" && !document.querySelector(".sheet [data-probe-refresh]").disabled', 'UI28 Claude 编辑：探针查完');
+        await check('UI28 编辑 Claude 类执行者（订阅令牌）：说明是 probeFallback(订阅令牌不能查询模型列表)，模型输入框里是 claude-sonnet-5-5，右边有"刷新列表"', `document.querySelector('.sheet [data-probe-note]').textContent === ${jsonStr(ag.probeFallback('订阅令牌不能查询模型列表'))} && document.querySelector('.sheet [data-e=model]').value === 'claude-sonnet-5-5' && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)}`);
+        effects.consoleDelay['agents:models'] = 1500;
+        try {
+            await press('.sheet [data-probe-refresh]');
+            await check('UI28 编辑里点"刷新列表"：查询中按钮禁用并显示"正在查询…"，输入框里的值不丢', `document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshingList)} && document.querySelector('.sheet [data-e=model]').value === 'claude-sonnet-5-5'`);
+            await wait('!document.querySelector(".sheet [data-probe-refresh]").disabled', 'UI28 刷新列表查完', 30000);
+        } finally { delete effects.consoleDelay['agents:models']; }
+        await check('UI28 刷新完成：按钮恢复"刷新列表"，说明仍是 probeFallback，焦点回到按钮', `document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)} && document.querySelector('.sheet [data-probe-note]').textContent === ${jsonStr(ag.probeFallback('订阅令牌不能查询模型列表'))} && document.activeElement === document.querySelector('.sheet [data-probe-refresh]')`);
+        await shots('edit-claude-probe');
         await press('[data-sel=escalate]'); await wait('!!document.querySelector(".optmenu")');
         await assertMenuVisible('UI28 升级到下拉');
         await check('UI28 升级到下拉：不升级加其他已启用的执行者，不含自己，没有自定义…', `(() => { const labels = [...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return labels[0] === ${jsonStr(gx.escalateNone)} && labels.includes('Fake Ok') && labels.includes('UI28 CLI') && !labels.includes('Sonnet 测试') && !labels.includes(${jsonStr(gx.modelCustom)}); })()`);
@@ -450,7 +540,8 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await agentsPage(); await wait('!!document.querySelector("[data-agent=qoder-cn]")', 'UI28 Qoder 执行者行出现');
         await press('[data-more-agent=qoder-cn]'); await press(await ctxItem('编辑'));
         await wait('!!document.querySelector(".sheet [data-sel=model]") && !document.querySelector(".sheet [data-sel=model]").disabled', 'UI28 模型列表读完', 60000);
-        await check('UI28 编辑通用适配器执行者（Qoder）：显示名、模型、推理强度、升级到四项，没有接口地址和密钥项；当前值选中', `[...document.querySelectorAll('.sheet .fl b')].map(b => b.textContent.replace('*', '')).join() === ${jsonStr(['显示名', '模型', '推理强度', '升级到'].join())} && document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode'`);
+        // 改写（150，T4）：原断言 表单行逐项等于 显示名、模型、推理强度、升级到 → 新断言 逐项等于 显示名、模型、推理强度、可担任、可能用到的模型范围、升级到（原来的四项顺序不变，中间多两项）；原因：编辑里新增"可担任"和"可能用到的模型范围"。
+        await check('UI28 编辑通用适配器执行者（Qoder）：显示名、模型、推理强度、可担任、可能用到的模型范围、升级到六项，没有接口地址和密钥项；当前值选中', `[...document.querySelectorAll('.sheet .fl b')].map(b => b.textContent.replace('*', '')).join() === ${jsonStr(['显示名', '模型', '推理强度', ag.canDo, ag.modelRange, '升级到'].join())} && document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode'`);
         await pick('[data-sel=model]', gx.modelCustom);
         await check('UI28 编辑：模型选"自定义…"后变成输入框并取得焦点', 'document.activeElement===document.querySelector("[data-e=model]") && document.querySelector("[data-e=model]").value==="DeepSeek-Flash"');
         await type('[data-e=model]', '-x');
@@ -458,26 +549,43 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
         await verify('UI28 编辑 Qoder：model、effort 写进执行者配置，声明不动', async () => { const c = await readConfig(); assert.equal(c.profiles['qoder-cn'].model, 'DeepSeek-Flash-x'); assert.equal(c.profiles['qoder-cn'].effort, 'high'); assert.equal(c.generics['qoder-cn'].executable, 'qoderclicn'); });
 
-        // ---- 4b. Codex 的编辑里也有"升级到"（假 Codex 由验收环境的 AR_TEST_AGENT 提供；检查完把这个执行者去掉）----
+        // ---- 4b. Codex 的编辑（表单式，Stage07c T3）里也有"升级到"（假 Codex 由验收环境的 AR_TEST_AGENT 提供，探针用假目录 fakeCodexModels；检查完把这个执行者去掉）----
+        // 改写（144，T3）：原来选完"升级到"马上写进 config.json（设置式，底栏"完成"）→ 现在选完还没点"保存"时 config.json 不变，点"保存"才写入；原因：Codex 的编辑改成表单式。
+        const restoreModels = await fakeCodexModels(home);
         const withCodex = await readConfig();
         withCodex.profiles.codex = { adapter: 'codex', label: 'Codex 测试', enabled: true, auth: 'login' };
         await writeFile(config, jsonStr(withCodex));
         await agentsPage(); await wait('!!document.querySelector("[data-agent=codex]")', 'UI28 Codex 执行者行出现');
-        const codexEdit = async () => { await press('[data-more-agent=codex]'); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-setting=model]") && !!document.querySelector(".sheet [data-sel=escalate]")'); };
+        const codexEdit = async () => { await press('[data-more-agent=codex]'); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-e=label]") && !!document.querySelector(".sheet [data-sel=escalate]")'); };
         await codexEdit();
-        await check('UI28 编辑 Codex：设置项之外有"升级到"，默认是不升级', `document.querySelector('.sheet [data-sel=escalate]').textContent.trim() === ${jsonStr(gx.escalateNone)} && document.querySelector('.sheet').textContent.includes(${jsonStr(gx.escalateHelp)})`);
+        await check('UI28 编辑 Codex：表单里有"升级到"，默认是不升级；底栏是取消 / 保存', `document.querySelector('.sheet [data-sel=escalate]').textContent.trim() === ${jsonStr(gx.escalateNone)} && document.querySelector('.sheet').textContent.includes(${jsonStr(gx.escalateHelp)}) && [...document.querySelectorAll('.sheet-btns .btn')].map(b => b.textContent.trim()).join() === ${jsonStr(['取消', '保存'].join())}`);
         await press('[data-sel=escalate]'); await wait('!!document.querySelector(".optmenu")');
         await assertMenuVisible('UI28 Codex 升级到下拉');
         await check('UI28 Codex 的升级到下拉：不升级加其他已启用的执行者，不含自己', `(() => { const labels = [...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return labels[0] === ${jsonStr(gx.escalateNone)} && labels.includes('Fake Ok') && !labels.includes('Codex 测试'); })()`);
         await press(await option('Fake Ok')); await wait('!document.querySelector(".optmenu")');
-        await verify('UI28 Codex 升级到选另一个执行者：马上写进 config.json', async () => { for (let i = 0; i < 40 && (await readConfig()).profiles.codex.escalate !== 'ok'; i++) await pause(100); assert.equal((await readConfig()).profiles.codex.escalate, 'ok'); });
         await check('UI28 Codex 升级到选中后下拉显示所选执行者，焦点回到下拉', `document.querySelector('[data-sel=escalate]').textContent.trim() === 'Fake Ok' && document.activeElement === document.querySelector('[data-sel=escalate]')`);
+        await verify('UI28 Codex 升级到选完还没点保存：config.json 的 codex 没有 escalate', async () => { assert.ok(!('escalate' in (await readConfig()).profiles.codex)); });
         await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+        await verify('UI28 Codex 点保存：escalate 写进 config.json', async () => { assert.equal((await readConfig()).profiles.codex.escalate, 'ok'); });
         await agentsPage(); await codexEdit();
         await check('UI28 再次编辑 Codex：升级到显示上次选的执行者', 'document.querySelector("[data-sel=escalate]").textContent.trim()==="Fake Ok"');
         await pick('[data-sel=escalate]', gx.escalateNone);
-        await verify('UI28 Codex 改回"不升级"：escalate 消失', async () => { for (let i = 0; i < 40 && 'escalate' in (await readConfig()).profiles.codex; i++) await pause(100); assert.ok(!('escalate' in (await readConfig()).profiles.codex)); });
+        await verify('UI28 Codex 改回"不升级"、还没点保存：escalate 仍在 config.json 里', async () => { assert.equal((await readConfig()).profiles.codex.escalate, 'ok'); });
         await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+        await verify('UI28 Codex 点保存后 escalate 消失', async () => { assert.ok(!('escalate' in (await readConfig()).profiles.codex)); });
+        // 探针（假目录）：模型下拉里是假目录的 test-pro / test-mini，说明来自程序；换模型推理强度的选项跟着变；"刷新列表"重新查。
+        await agentsPage(); await codexEdit();
+        await wait('!document.querySelector(".sheet [data-probe-refresh]").disabled && document.querySelector(".sheet [data-probe-note]").textContent !== ""', 'UI28 Codex 编辑：探针查完');
+        await check('UI28 Codex 编辑：说明是 probeFrom("program", HH:MM)，模型下拉带"刷新列表"', `${timeRegex(ag.probeFrom('program', '00:00'))}.test(document.querySelector('.sheet [data-probe-note]').textContent) && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)}`);
+        await press('[data-sel=model]'); await wait('!!document.querySelector(".optmenu")');
+        await check('UI28 Codex 模型下拉：假目录里 visibility 为 list 的两个模型，test-hidden 被去掉', `(() => { const labels = [...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return labels.includes('test-pro') && labels.includes('test-mini') && !labels.includes('test-hidden') && labels.at(-1) === ${jsonStr(gx.modelCustom)}; })()`);
+        await press(await option('test-mini')); await wait('!document.querySelector(".optmenu")');
+        await check('UI28 选 test-mini：推理强度说明是 effortSupported(low / medium，默认 low)', `document.querySelector('.sheet').textContent.includes(${jsonStr(ag.effortSupported('low / medium', 'low'))})`);
+        await pick('[data-sel=model]', 'test-pro');
+        await check('UI28 换成 test-pro：推理强度说明换成 effortSupported(low / medium / high / max，默认 medium)', `document.querySelector('.sheet').textContent.includes(${jsonStr(ag.effortSupported('low / medium / high / max', 'medium'))}) && !document.querySelector('.sheet').textContent.includes(${jsonStr(ag.effortSupported('low / medium', 'low'))})`);
+        await shots('edit-codex');
+        await press('.sheet-btns .btn:first-child'); await wait('!document.querySelector(".sheet")');
+        await restoreModels();
         const withoutCodex = await readConfig(); delete withoutCodex.profiles.codex;
         await writeFile(config, jsonStr(withoutCodex));
         await agentsPage(); await wait('!document.querySelector("[data-agent=codex]")');
@@ -516,8 +624,255 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await verify('UI28 取消与坏文件都不改 config.json', async () => { assert.equal(await readFile(config, 'utf8'), before); });
         await closeSheet();
         await verify('UI28 文件对话框桩被用到：打开 4 次（浏览程序、导入成功、取消、坏文件）、保存 1 次（导出）', () => { assert.equal(fileDialogs.openRequests.length, 4); assert.equal(fileDialogs.saveRequests.length, 1); });
+        // ---- 5b. 导入向导第 2 步导入之前就查模型列表（168，D102）----
+        // 假接口在本机（127.0.0.1，随机端口，测完关闭）：/fake/models 返回两个模型（预设里的 deepseek-v4-pro 带推理强度 low / high，另一个是预设里没有的），别的路径 404。
+        // 查询走 agents:models（payload 带 preset 与 probe: true）→ ar agents models --preset deepseek --base-url … --probe；不访问任何真实接口。
+        const asked: { url: string; auth: string }[] = [];
+        const fakeApi = http.createServer((request, response) => {
+            asked.push({ url: request.url ?? '', auth: String(request.headers.authorization ?? '') });
+            if ((request.url ?? '').startsWith('/fake/models')) {
+                response.setHeader('content-type', 'application/json');
+                response.end(JSON.stringify({ data: [{ id: 'deepseek-v4-pro', display_name: 'Fake Pro', effort: { supported_levels: ['low', 'high'], default_level: 'low' } }, { id: 'deepseek-fake-b' }] }));
+            } else { response.statusCode = 404; response.end('{}'); }
+        });
+        await new Promise<void>(resolve => fakeApi.listen(0, '127.0.0.1', resolve));
+        try {
+            const fakeBase = `http://127.0.0.1:${(fakeApi.address() as AddressInfo).port}/fake`, fakeKey = 'sk-ui168-fake-0001';
+            const dsPreset = presetOf('deepseek');
+            assert.ok(dsPreset.modelOptions?.length >= 2, 'deepseek 预设要有模型可选值');
+            // 当前打开的下拉里的选项（去掉最后一项"自定义…"），看完按 Esc 关掉。
+            const menuLabels = async (selector: string) => {
+                await press(selector); await wait('!!document.querySelector(".optmenu")');
+                const labels: string[] = await evaluate(`[...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim())`);
+                await key('Escape'); await wait('!document.querySelector(".optmenu")');
+                return labels.filter(label => label !== gx.modelCustom);
+            };
+            // 把输入框里的内容换成别的：点进去、移到末尾、删光，再敲新的。
+            const retype = async (selector: string, value: string) => {
+                await press(selector); await key('End');
+                const length = Number(await evaluate(`document.querySelector(${jsonStr(selector)}).value.length`));
+                for (let i = 0; i < length; i++) await key('Backspace');
+                await type(selector, value);
+            };
+            await agentsPage(); await openWizard();
+            await press('[data-preset=deepseek]'); await press('[data-w-act=next]'); await wait('!!document.querySelector(".sheet [data-w=baseUrl]")');
+            await check('UI28 导入第 2 步（DeepSeek，密钥未设置）：不查询，说明是 probeFallback("还没有设置密钥")，"刷新列表"在模型下拉右边但禁用，下拉是预设的可选值', `document.querySelector('[data-w-status]').textContent === '未设置' && document.querySelector('.sheet [data-probe-note]').textContent === ${jsonStr(ag.probeFallback('还没有设置密钥'))} && document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').previousElementSibling === document.querySelector('.sheet [data-sel=model]').closest('.selw')`);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), dsPreset.modelOptions);
+            // 接口地址改成假接口，设置密钥：保存密钥后查一次，下拉换成假接口给的，说明是"列表来自接口 · HH:MM 更新"。
+            await retype('[data-w=baseUrl]', fakeBase);
+            await type('[data-w=secret]', fakeKey); await press('[data-w-act=save-secret]');
+            await wait(`${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]')?.textContent ?? '')`, 'UI28 导入第 2 步：假接口查到的说明', 30000);
+            await check('UI28 导入第 2 步：说明是 probeFrom("api", HH:MM)，"刷新列表"可点，密码框已清空', `${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]').textContent) && !document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)} && document.querySelector('[data-w=secret]').value === ''`);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-pro', 'deepseek-fake-b']);
+            await verify('UI28 假接口收到了请求：地址 /fake/models，带导入向导里保存的密钥（Bearer）', () => { assert.ok(asked.some(r => r.url === '/fake/models' && r.auth === `Bearer ${fakeKey}`), `假接口收到的请求：${asked.map(r => r.url).join()}`); });
+            await verify('UI28 导入之前查不写配置：config.json 里还没有 deepseek 执行者', async () => { assert.ok(!Object.keys((await readConfig()).profiles).some(name => name.startsWith('deepseek'))); });
+            const found = asked.length;
+            // 当前模型（预设的 deepseek-v4-pro）在接口给的列表里，推理强度的说明与下拉换成接口给的这个模型支持的。
+            const effortText = `[...document.querySelectorAll('.sheet .fld')].find(f => f.querySelector('.fl b')?.textContent === ${jsonStr(gx.effort)}).querySelector('.fl span').textContent`;
+            await check('UI28 查到后：推理强度说明是 effortSupported("low / high", "low")（来自接口）', `${effortText} === ${jsonStr(ag.effortSupported('low / high', 'low'))}`);
+            const effortFound = await menuLabels('.sheet [data-sel=effort]');
+            assert.ok(effortFound.includes('high') && !effortFound.includes('medium'), `推理强度下拉：${effortFound.join()}`);
+            // 改接口地址（写完离开输入框）：旧结果作废，下拉退回预设值，说明提示点"刷新列表"重查，没有自动再查。
+            await retype('[data-w=baseUrl]', `${fakeBase}-other`); await key('Tab');
+            await wait(`!${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]')?.textContent ?? '')`, 'UI28 改接口地址后说明变化');
+            await check('UI28 改接口地址后：说明提示点"刷新列表"重查（不再是 probeFrom），"刷新列表"可点', `document.querySelector('.sheet [data-probe-note]').textContent.includes(${jsonStr(ag.refreshList)}) && !document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)}`);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), dsPreset.modelOptions);
+            assert.ok((await menuLabels('.sheet [data-sel=effort]')).includes('medium'), '推理强度下拉退回预设的可选值');
+            assert.equal(asked.length, found, '改地址不会自动重查（假接口没有收到新请求）');
+            // 再改回假接口，点"刷新列表"：又是查到的结果。
+            await retype('[data-w=baseUrl]', fakeBase);
+            await press('.sheet [data-probe-refresh]');
+            await wait(`${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]')?.textContent ?? '') && !document.querySelector('.sheet [data-probe-refresh]').disabled`, 'UI28 点"刷新列表"后又是查到的结果', 30000);
+            await check('UI28 点"刷新列表"：说明又是 probeFrom("api", HH:MM)，焦点回到按钮，输入过的地址还在', `document.activeElement === document.querySelector('.sheet [data-probe-refresh]') && document.querySelector('[data-w=baseUrl]').value === ${jsonStr(fakeBase)}`);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-pro', 'deepseek-fake-b']);
+            await verify('UI28 点"刷新列表"重查了一次：假接口又收到 /fake/models', () => { assert.ok(asked.length > found && asked.at(-1)!.url === '/fake/models'); });
+            await shots('wizard-2-probe');
+            // 退出向导（输入过的内容丢弃）。
+            await key('Escape'); await wait('!!document.querySelector(".confirm-actions .danger")'); await press('.confirm-actions .danger'); await wait('!document.querySelector(".sheet")');
+            await verify('UI28 退出向导后 config.json 没有变化（导入前的查询不写配置）', async () => { assert.ok(!Object.keys((await readConfig()).profiles).some(name => name.startsWith('deepseek'))); });
+
+            // 不支持推理强度的预设（DeepSeek Harness，supportsEffort: false，D87）：第 2 步没有"推理强度"这一行。
+            await openWizard();
+            await press('[data-preset=deepseek-harness]'); await press('[data-w-act=next]'); await wait('!!document.querySelector(".sheet [data-w=secretVar]")');
+            await check('UI28 导入第 2 步（DeepSeek Harness，不支持推理强度）：没有"推理强度"这一行，也没有"已忽略"', `![...document.querySelectorAll('.sheet .fl b')].some(b => b.textContent.includes(${jsonStr(gx.effort)})) && !document.querySelector('.sheet [data-sel=effort]') && !document.querySelector('.sheet [data-effort-ignored]') && [...document.querySelectorAll('.sheet .fl b')].some(b => b.textContent.includes(${jsonStr(ag.model)}))`);
+            await closeSheet();
+            // 编辑里同样：导入一个，没写推理强度时整行隐藏；配置里已经写了的，原位置显示"这个执行者不支持推理强度，已忽略"，保存不动它。
+            const added = await coreRun(['agents', 'add', '--preset', 'deepseek-harness', '--name', 'deepseek-harness'], { timeoutMs: 60000 });
+            assert.equal(added.code, 0, added.stderr || added.json?.error);
+            await agentsPage(); await wait('!!document.querySelector("[data-agent=deepseek-harness]")', 'UI28 dsh 行出现');
+            await press('[data-more-agent=deepseek-harness]'); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-role]")', 'UI28 编辑 dsh');
+            await check('UI28 编辑 DeepSeek Harness（不支持推理强度，没写）：没有"推理强度"这一行', `![...document.querySelectorAll('.sheet .fl b')].some(b => b.textContent.includes(${jsonStr(gx.effort)})) && !document.querySelector('.sheet [data-sel=effort]') && !document.querySelector('.sheet [data-effort-ignored]')`);
+            await closeSheet();
+            const withEffort = await readConfig(); withEffort.profiles['deepseek-harness'].effort = 'high';
+            await writeFile(config, jsonStr(withEffort));
+            await agentsPage(); await wait('!!document.querySelector("[data-agent=deepseek-harness]")', 'UI28 dsh 行出现（写了推理强度）');
+            await press('[data-more-agent=deepseek-harness]'); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-role]")', 'UI28 编辑 dsh（写了推理强度）');
+            await check('UI28 编辑 DeepSeek Harness（配置里已写 effort）：原位置是 effortUnsupported，没有推理强度下拉', `(() => { const f = [...document.querySelectorAll('.sheet .fld')].find(x => x.querySelector('.fl b')?.textContent === ${jsonStr(gx.effort)}); return !!f && f.querySelector('[data-effort-ignored]').textContent === ${jsonStr(ro.effortUnsupported)} && !document.querySelector('.sheet [data-sel=effort]'); })()`);
+            await press('.sheet [data-role=reviewer]'); await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+            await verify('UI28 保存后推理强度原样保留（界面没有动它），roles 写进去了', async () => { const p = (await readConfig()).profiles['deepseek-harness']; assert.equal(p.effort, 'high'); assert.deepEqual(p.roles, ['executor']); });
+            const withoutDsh = await readConfig(); delete withoutDsh.profiles['deepseek-harness']; if (withoutDsh.generics) delete withoutDsh.generics['deepseek-harness'];
+            await writeFile(config, jsonStr(withoutDsh));
+            await agentsPage(); await wait('!document.querySelector("[data-agent=deepseek-harness]")');
+        } finally { await new Promise<void>(resolve => fakeApi.close(() => resolve())); }
+
+        // ---- 6. 可担任 · 模型家族 · 限流标记（Stage07c 150，T4 / T7，D85、D83）----
+        // 行里的数据来自 ar roles --json（可担任、家族）与 ar route config --json（限流，原文由核心给，D104）；
+        // 编辑里改的"可担任""模型范围"点"保存"才写入（ar roles set）；"已恢复"走 ar route limits clear。限流标记是在隔离目录的 limits.json 里写一条。
+        const clockOf = (ms: number) => { const d = new Date(ms), t = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }); return d.toDateString() === new Date().toDateString() ? t : `${d.getMonth() + 1}月${d.getDate()}日 ${t}`; };
+        const until = Date.now() + 20 * 60000, evidence = 'rate_limit_event status rejected';
+        const rolesNow = async () => { const r = await coreRun(['roles'], { timeoutMs: 60000 }); assert.equal(r.code, 0, r.stderr || r.json?.error); return r.json as { families: string[]; lead: { profiles: string[]; families: string[]; source: string }; profiles: { name: string; roles: string[]; modelFamilies: string[]; families: string[]; familiesUnknown: boolean; familiesSource: string }[] }; };
+        const both = ['executor', 'reviewer'].map(r => ag.roleNames[r]).join(' · ');
+        const pageShots = async (name: string) => {
+            for (const [w, ht, tag] of [[1160, 720, 'default'], [960, 600, 'min']] as const) for (const theme of ['dark', 'light'] as const) {
+                win.setContentSize(w, ht); nativeTheme.themeSource = theme; await pause(350);
+                await check(`UI28 ${name}（${theme}，${w}×${ht}）页面没有横向溢出，每个执行者行完整显示在窗口里`, `document.scrollingElement.scrollWidth <= innerWidth && [...document.querySelectorAll('.xrow')].every(r => r.getBoundingClientRect().right <= innerWidth)`);
+                await save(`agents-${name}-${theme}-${tag}`);
+            }
+            win.setContentSize(original.size[0], original.size[1]); nativeTheme.themeSource = 'dark'; await pause(350);
+        };
+        const withDs = await readConfig();
+        withDs.profiles.ds = { adapter: 'claude-code', label: 'DS 测试', enabled: true, path: path.join(home, 'fake-claude.cjs'), env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_MODEL: 'deepseek-v4-pro' }, auth: 'token', secrets: { CLAUDE_CODE_OAUTH_TOKEN: 'CLAUDE_CODE_OAUTH_TOKEN' }, maxTurns: null };
+        await writeFile(config, jsonStr(withDs));
+        await writeFile(limitsFile, jsonStr({ v: 1, profiles: { ds: { kind: 'limit', until, since: Date.now(), evidence } } }));
+        await agentsPage(); await wait('!!document.querySelector("[data-agent=ds] [data-limited]")', 'UI28 被限流的执行者行出现限流标签');
+        await check('UI28 每个已启用的执行者行第二行末尾都有"可担任 …"和"家族 …"（家族未知时写 familyUnknown）', `(() => { const rows = [...document.querySelectorAll('[data-agent]')].filter(r => !r.querySelector('.x1').textContent.includes(${jsonStr(ag.disabled)})); return rows.length >= 4 && rows.every(r => { const x2 = r.querySelector('.x2'), a = r.querySelector('[data-roles]'), f = r.querySelector('[data-family-row]'); return a && f && x2.lastElementChild === f && x2.contains(a) && a.textContent.startsWith(${jsonStr(ag.canDoRow(''))}) && (f.textContent === ${jsonStr(ag.familyUnknown)} || f.textContent.startsWith(${jsonStr(ag.familyRow(''))})); }); })()`);
+        await check('UI28 行里的值与核心一致：sonnet 可担任 执行者 · 审查者、家族 claude；ds 家族 deepseek；fake 执行者家族未知', `(() => { const t = (n, s) => document.querySelector('[data-agent=' + n + '] ' + s).textContent; return t('sonnet', '[data-roles]') === ${jsonStr(ag.canDoRow(both))} && t('sonnet', '[data-family-row]') === ${jsonStr(ag.familyRow('claude'))} && t('ds', '[data-family-row]') === ${jsonStr(ag.familyRow('deepseek'))} && t('ok', '[data-family-row]') === ${jsonStr(ag.familyUnknown)}; })()`);
+        await verify('UI28 行里的家族和 ar roles --json 一致（界面不自己判断）', async () => { const view = await rolesNow(); const sonnet = view.profiles.find(x => x.name === 'sonnet')!, ds = view.profiles.find(x => x.name === 'ds')!; assert.deepEqual(sonnet.families, ['claude']); assert.deepEqual(ds.families, ['deepseek']); assert.equal(view.profiles.find(x => x.name === 'ok')!.familiesUnknown, true); });
+        await check('UI28 被限流的执行者：info 标签带 time-line 图标，文字是 limitedUntil(恢复时间)，悬停提示是 limitedEvidence(原文)；只有这一个执行者有', `(() => { const tags = [...document.querySelectorAll('[data-limited]')], t = document.querySelector('[data-agent=ds] [data-limited]'); return tags.length === 1 && t.classList.contains('tag') && t.classList.contains('info') && !!t.querySelector('.ri-time-line') && t.textContent === ${jsonStr(ag.limitedUntil(clockOf(until)))} && t.getAttribute('title') === ${jsonStr(ag.limitedEvidence(evidence))} && t.closest('.x1') === document.querySelector('[data-agent=ds] .x1'); })()`);
+        await check('UI28 限流标签旁有次按钮"已恢复"，悬停提示是 limitedClearHelp', `(() => { const b = document.querySelector('[data-agent=ds] [data-limited-clear=ds]'); return !!b && b.classList.contains('quiet') && b.textContent === ${jsonStr(ag.limitedClear)} && b.getAttribute('title') === ${jsonStr(ag.limitedClearHelp)} && document.querySelectorAll('[data-limited-clear]').length === 1; })()`);
+        // 截图前把被限流的行滚到可见（真实滚动位置）。
+        await evaluate('document.querySelector("[data-agent=ds]").scrollIntoView({ block: "end" }); true');
+        await pageShots('roles-limited');
+        // 点"已恢复"失败：配置读不了时核心拒绝，标签保留，横幅写 limitedClearFail(原因)。
+        const goodConfig = await readFile(config, 'utf8');
+        await writeFile(config, '{');
+        try {
+            await press('[data-limited-clear=ds]');
+            await wait(`!![...document.querySelectorAll('[data-agents] .banner.fail')].find(b => b.textContent.includes(${jsonStr(ag.limitedClearFail(''))}))`, 'UI28 "已恢复"失败后的横幅');
+            await check('UI28 "已恢复"失败：标签和按钮都还在，按钮可以再点', `!!document.querySelector('[data-agent=ds] [data-limited]') && !!document.querySelector('[data-limited-clear=ds]') && !document.querySelector('[data-limited-clear=ds]').disabled`);
+        } finally { await writeFile(config, goodConfig); }
+        await verify('UI28 "已恢复"失败：limits.json 里还有 ds', async () => { assert.ok((JSON.parse(await readFile(limitsFile, 'utf8')) as any).profiles.ds); });
+        await agentsPage(); await wait('!!document.querySelector("[data-agent=ds] [data-limited]") && ![...document.querySelectorAll("[data-agents] .banner.fail")].length', 'UI28 配置恢复后重新进入页面');
+        await press('[data-limited-clear=ds]');
+        await wait('!document.querySelector("[data-limited]") && !document.querySelector("[data-limited-clear]")', 'UI28 点"已恢复"后标签消失');
+        await verify('UI28 "已恢复"：limits.json 里没有 ds（ar route limits clear 清掉了）', async () => { assert.ok(!('ds' in (JSON.parse(await readFile(limitsFile, 'utf8')) as any).profiles)); });
+        await check('UI28 "已恢复"成功后没有错误横幅，ds 行还在', '!document.querySelector("[data-agents] .banner.fail") && !!document.querySelector("[data-agent=ds]")');
+        // 188（D125，原断言：185 的演示限流在 Codex 行；新断言：在"演示执行者 B"行，Codex 行没有；原因：演示里 Codex 要保持可用，新建任务走默认路由不能被限流跳过）：
+        // npm run demo 写进公共目录的 config.json / limits.json（demoExecutorB、demoLimits）：演示执行者 B 行显示"额度到 HH:MM 恢复"，悬停是限流原文，旁边有"已恢复"；Codex 行没有。
+        {
+            const demoLimit = demoLimits(Date.now()), demoEntry = demoLimit.profiles[demoExecutorB.name] as { until: number; evidence: string };
+            const configNow = await readFile(config, 'utf8'), withDemo = JSON.parse(configNow);
+            withDemo.profiles.codex = { adapter: 'codex', label: 'Codex 测试', enabled: true, auth: 'login' };
+            withDemo.profiles[demoExecutorB.name] = demoExecutorB.profile;
+            try {
+                await writeFile(config, jsonStr(withDemo));
+                await writeFile(limitsFile, jsonStr(demoLimit));
+                await agentsPage(); await wait(`!!document.querySelector("[data-agent=${demoExecutorB.name}] [data-limited]")`, 'UI188 演示的限流标签出现在演示执行者 B 行');
+                await check('UI188 演示数据的限流：演示执行者 B 行的 info 标签写 limitedUntil(恢复时间)、悬停是 limitedEvidence(限流原文)，旁边有"已恢复"；Codex 行存在、没有限流标签；只有这一个执行者被限流', `(() => { const row = document.querySelector('[data-agent=${demoExecutorB.name}]'), t = row.querySelector('[data-limited]'); const codex = document.querySelector('[data-agent=codex]'); return row.textContent.includes(${jsonStr(demoExecutorB.profile.label)}) && document.querySelectorAll('[data-limited]').length === 1 && t.classList.contains('info') && t.textContent === ${jsonStr(ag.limitedUntil(clockOf(demoEntry.until)))} && t.getAttribute('title') === ${jsonStr(ag.limitedEvidence(demoEntry.evidence))} && !!row.querySelector('[data-limited-clear=${demoExecutorB.name}]') && !!codex && !codex.querySelector('[data-limited]') && !codex.querySelector('[data-limited-clear]'); })()`);
+                // 截图前把被限流的行滚到可见（同上面 ds 那一次）。
+                await evaluate(`document.querySelector("[data-agent=${demoExecutorB.name}]").scrollIntoView({ block: "end" }); true`);
+                await save('agents-demo-limited-dark');
+            } finally { await writeFile(config, configNow); }
+            await agentsPage(); await wait(`!document.querySelector("[data-agent=codex]") && !document.querySelector("[data-agent=${demoExecutorB.name}]") && !!document.querySelector("[data-agent=ds]")`, 'UI188 配置恢复后 Codex 与演示执行者 B 行消失');
+        }
+        if (limitsBefore === null) await rm(limitsFile, { force: true }); else await writeFile(limitsFile, limitsBefore);
+
+        // 编辑 Claude 类执行者：可担任（三个切换按钮，至少保留一个）、可能用到的模型范围（自动识别结果 + "修改…"展开家族多选）。
+        const editOf = async (name: string) => { await press(`[data-more-agent=${name}]`); await press(await ctxItem('编辑')); await wait('!!document.querySelector(".sheet [data-role]") && !!document.querySelector(".sheet [data-family-open]")', `UI28 编辑 ${name}`); };
+        const saveSheet = async () => { await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")'); };
+        await editOf('sonnet');
+        // 改写（D128）：原断言 可担任是两个切换按钮"执行者 / 审查者"（都按下）→ 新断言 三个切换按钮"主导 / 执行者 / 审查者"（主导没按下，执行者与审查者按下）；原因：角色由用户决定，可担任加"主导"。
+        await check('UI28 编辑 Claude 类：可担任是三个切换按钮"主导 / 执行者 / 审查者"（主导没按下，执行者与审查者按下），说明是 canDoHelp；模型范围显示 modelRangeAutoBy(claude, adapter)（没有模型名也没有接口地址：按适配器默认，走查 U5），"修改…"按钮没展开',`(() => { const roles = [...document.querySelectorAll('.sheet [data-role]')]; const labels = [...document.querySelectorAll('.sheet .fl b')].map(b => b.textContent); const help = [...document.querySelectorAll('.sheet .fl')].find(l => l.querySelector('b').textContent === ${jsonStr(ag.canDo)}).querySelector('span').textContent; return roles.map(b => b.textContent).join() === ${jsonStr([ag.roleNames.lead, ag.roleNames.executor, ag.roleNames.reviewer].join())} && roles.map(b => b.getAttribute('aria-pressed')).join() === 'false,true,true' && !roles[0].classList.contains('on') && roles.slice(1).every(b => b.classList.contains('on')) && help === ${jsonStr(ag.canDoHelp)} && labels.includes(${jsonStr(ag.modelRange)}) && document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.modelRangeAutoBy('claude', 'adapter'))} && document.querySelector('.sheet [data-family-open]').getAttribute('aria-expanded') === 'false' && document.querySelector('.sheet [data-family-open]').textContent === ${jsonStr(ag.modelRangeChange)} && !document.querySelector('.sheet [data-family]'); })()`);
+        await press('.sheet [data-role=executor]');
+        await check('UI28 点"执行者"：它不再按下，焦点还在它上面，"保存"可用', `(() => { const b = document.querySelector('.sheet [data-role=executor]'); return b.getAttribute('aria-pressed') === 'false' && !b.classList.contains('on') && document.activeElement === b && !document.querySelector('.sheet-btns .btn:last-child').disabled; })()`);
+        await verify('UI28 还没点保存：config.json 的 sonnet 没有 roles', async () => { assert.ok(!('roles' in (await readConfig()).profiles.sonnet)); });
+        await saveSheet();
+        await verify('UI28 取消"执行者"后保存：config.json 的 roles 是 ["reviewer"]，ar roles --json 与它一致', async () => { assert.deepEqual((await readConfig()).profiles.sonnet.roles, ['reviewer']); const p = (await rolesNow()).profiles.find(x => x.name === 'sonnet')!; assert.deepEqual(p.roles, ['reviewer']); });
+        await wait(`document.querySelector('[data-agent=sonnet] [data-roles]').textContent === ${jsonStr(ag.canDoRow(ag.roleNames.reviewer))}`, 'UI28 保存后行里的可担任更新');
+        await editOf('sonnet');
+        await check('UI28 再次编辑：只有"审查者"按下', `(() => { const [a, b, c] = [...document.querySelectorAll('.sheet [data-role]')]; return a.getAttribute('aria-pressed') === 'false' && b.getAttribute('aria-pressed') === 'false' && c.getAttribute('aria-pressed') === 'true'; })()`);
+        await press('.sheet [data-role=reviewer]');
+        await check('UI28 三个都取消：保存禁用，帮助行换成说明（role=alert），切换按钮仍可点', `(() => { const save = document.querySelector('.sheet-btns .btn:last-child'); const hint = document.querySelector('.sheet [data-roles-hint]'); return save.disabled && !!hint && hint.getAttribute('role') === 'alert' && hint.textContent === ${jsonStr(ag.canDoNeedOne)} && [...document.querySelectorAll('.sheet [data-role]')].every(b => b.getAttribute('aria-pressed') === 'false' && !b.disabled); })()`);
+        await verify('UI28 三个都取消时点不了保存：config.json 不变', async () => { assert.deepEqual((await readConfig()).profiles.sonnet.roles, ['reviewer']); });
+        await press('.sheet [data-role=reviewer]'); await press('.sheet [data-role=executor]');
+        await check('UI28 再选回执行者与审查者：保存可用，说明消失', `!document.querySelector('.sheet-btns .btn:last-child').disabled && !document.querySelector('.sheet [data-roles-hint]')`);
+        // D128（191）：把 Claude 类设为可担任"主导"后保存，ar roles --json 的 lead.source 是 set；再取消，回到 default。
+        await press('.sheet [data-role=lead]');
+        await check('UI28 点"主导"：它按下，焦点还在它上面，"保存"可用，说明仍是 canDoHelp', `(() => { const b = document.querySelector('.sheet [data-role=lead]'); return b.getAttribute('aria-pressed') === 'true' && b.classList.contains('on') && document.activeElement === b && !document.querySelector('.sheet-btns .btn:last-child').disabled && !document.querySelector('.sheet [data-roles-hint]'); })()`);
+        await saveSheet();
+        await verify('UI28 保存"主导"：roles 含 lead，ar roles --json 的主导是 sonnet、source 为 set、家族 claude', async () => {
+            const p = (await readConfig()).profiles.sonnet;
+            assert.ok(p.roles.includes('lead')); assert.ok(p.roles.includes('executor') && p.roles.includes('reviewer'));
+            const view = await rolesNow(), me = view.profiles.find(x => x.name === 'sonnet')!;
+            assert.ok(me.roles.includes('lead')); assert.deepEqual(view.lead, { profiles: ['sonnet'], families: ['claude'], source: 'set' });
+        });
+        await wait(`document.querySelector('[data-agent=sonnet] [data-roles]').textContent === ${jsonStr(ag.canDoRow(['executor', 'reviewer', 'lead'].map(r => ag.roleNames[r]).join(' · ')))}`, 'UI28 行里的可担任含"主导"');
+        await editOf('sonnet');
+        await check('UI28 再次编辑：三个都按下', `[...document.querySelectorAll('.sheet [data-role]')].every(b => b.getAttribute('aria-pressed') === 'true' && b.classList.contains('on'))`);
+        await press('.sheet [data-role=lead]');
+        await saveSheet();
+        await verify('UI28 取消"主导"后保存：roles 回到 [executor, reviewer]，ar roles --json 的 lead.source 回到 default（按 Claude Code）', async () => {
+            assert.deepEqual((await readConfig()).profiles.sonnet.roles, ['executor', 'reviewer']);
+            const view = await rolesNow();
+            assert.deepEqual(view.lead, { profiles: [], families: ['claude'], source: 'default' });
+        });
+        await editOf('sonnet');
+        await press('.sheet [data-family-open]');
+        await check('UI28 点"修改…"：展开家族多选，选项和 ar roles --json 的 families 一致，按钮 aria-expanded 为 true，焦点还在按钮上', `(() => { const b = document.querySelector('.sheet [data-family-open]'); return b.getAttribute('aria-expanded') === 'true' && document.activeElement === b && [...document.querySelectorAll('.sheet [data-family]')].map(x => x.dataset.family).join() === ${jsonStr((await rolesNow()).families.join())} && [...document.querySelectorAll('.sheet [data-family]')].every(x => x.getAttribute('aria-pressed') === 'false'); })()`);
+        await press('.sheet [data-family=gpt]'); await press('.sheet [data-family=qwen]');
+        await check('UI28 选 gpt、qwen：两个按下，模型范围一行显示所选家族', `document.querySelector('.sheet [data-family=gpt]').getAttribute('aria-pressed') === 'true' && document.querySelector('.sheet [data-family=qwen]').getAttribute('aria-pressed') === 'true' && document.querySelector('.sheet [data-model-range]').textContent === 'gpt、qwen'`);
+        await shots('edit-roles');
+        await saveSheet();
+        await verify('UI28 保存：roles 是 [executor, reviewer]，modelFamilies 是 [gpt, qwen]，ar roles --json 一致，其余字段不变', async () => {
+            const p = (await readConfig()).profiles.sonnet;
+            assert.deepEqual(p.roles, ['executor', 'reviewer']); assert.deepEqual(p.modelFamilies, ['gpt', 'qwen']); assert.equal(p.env.ANTHROPIC_MODEL, 'claude-sonnet-5-5');
+            const r = (await rolesNow()).profiles.find(x => x.name === 'sonnet')!; assert.deepEqual(r.roles, ['executor', 'reviewer']); assert.deepEqual(r.modelFamilies, ['gpt', 'qwen']);
+        });
+        await editOf('sonnet');
+        await check('UI28 再次编辑：模型范围显示已声明的 gpt、qwen（不再是自动识别的写法）', `document.querySelector('.sheet [data-model-range]').textContent === 'gpt、qwen'`);
+        await press('.sheet [data-family-open]'); await press('.sheet [data-family=gpt]'); await press('.sheet [data-family=qwen]');
+        await check('UI28 声明的家族全部取消：回到自动识别的结果', `document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.familyUnknown)} || document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.modelRangeAutoBy('claude', 'adapter'))}`);
+        await saveSheet();
+        await verify('UI28 声明清空后保存：modelFamilies 从 config.json 里消失', async () => { assert.ok(!('modelFamilies' in (await readConfig()).profiles.sonnet)); assert.deepEqual((await rolesNow()).profiles.find(x => x.name === 'sonnet')!.modelFamilies, []); });
+        // 走查 U5：自动识别写明实际依据——只有接口地址认得出家族（没有模型名）时写"按接口地址自动识别"，与 ar roles 的 familiesSource 一致。
+        const withHost = await readConfig();
+        withHost.profiles.hostonly = { adapter: 'claude-code', label: '只有地址', enabled: true, path: path.join(home, 'fake-claude.cjs'), env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic' }, auth: 'token', secrets: { CLAUDE_CODE_OAUTH_TOKEN: 'CLAUDE_CODE_OAUTH_TOKEN' }, maxTurns: null };
+        await writeFile(config, jsonStr(withHost));
+        await agentsPage(); await wait('!!document.querySelector("[data-agent=hostonly]")', 'UI28 hostonly 行出现');
+        await editOf('hostonly');
+        await check('UI28 编辑只有接口地址的执行者：模型范围是 modelRangeAutoBy("deepseek", "host")，即"deepseek（按接口地址自动识别）"', `document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.modelRangeAutoBy('deepseek', 'host'))} && document.querySelector('.sheet [data-model-range]').textContent === 'deepseek（按接口地址自动识别）'`);
+        await verify('UI28 核心的 familiesSource 是 host，家族 deepseek', async () => { const p = (await rolesNow()).profiles.find(x => x.name === 'hostonly')!; assert.equal(p.familiesSource, 'host'); assert.deepEqual(p.families, ['deepseek']); });
+        await closeSheet();
+        const withoutHost = await readConfig(); delete withoutHost.profiles.hostonly;
+        await writeFile(config, jsonStr(withoutHost));
+        await agentsPage(); await wait('!document.querySelector("[data-agent=hostonly]")');
+        // 通用适配器（自定义 CLI）的编辑里也有这两项。
+        await editOf('custom');
+        // 改写（D128）：原断言 可担任是 2 个切换按钮 → 新断言 3 个（主导 / 执行者 / 审查者）；原因：角色由用户决定。
+        await check('UI28 编辑通用适配器执行者：也有可担任（三个按钮）和模型范围（认不出家族：familyUnknown）', `document.querySelectorAll('.sheet [data-role]').length === 3 && [...document.querySelectorAll('.sheet [data-role]')].map(b => b.textContent).join() === ${jsonStr([ag.roleNames.lead, ag.roleNames.executor, ag.roleNames.reviewer].join())} && document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.familyUnknown)}`);
+        await press('.sheet [data-role=executor]'); await press('.sheet [data-family-open]'); await press('.sheet [data-family=qwen]');
+        await saveSheet();
+        await verify('UI28 通用适配器的编辑保存：roles [reviewer]、modelFamilies [qwen]，声明不动', async () => { const c = await readConfig(); assert.deepEqual(c.profiles.custom.roles, ['reviewer']); assert.deepEqual(c.profiles.custom.modelFamilies, ['qwen']); assert.equal(c.generics.custom.output.map.length, 2); });
+        await wait(`document.querySelector('[data-agent=custom] [data-family-row]').textContent === ${jsonStr(ag.familyRow('qwen'))}`, 'UI28 行里的家族变成 qwen');
+        // Codex 的编辑（表单式，144）里也有。
+        const withCodex6 = await readConfig();
+        withCodex6.profiles.codex = { adapter: 'codex', label: 'Codex 测试', enabled: true, auth: 'login' };
+        await writeFile(config, jsonStr(withCodex6));
+        await agentsPage(); await wait('!!document.querySelector("[data-agent=codex]")', 'UI28 Codex 执行者行出现（角色）');
+        await check('UI28 Codex 行也有"可担任"和"家族 gpt"', `document.querySelector('[data-agent=codex] [data-roles]').textContent === ${jsonStr(ag.canDoRow(both))} && document.querySelector('[data-agent=codex] [data-family-row]').textContent === ${jsonStr(ag.familyRow('gpt'))}`);
+        await press('[data-more-agent=codex]'); await press(await ctxItem('编辑'));
+        await wait('!!document.querySelector(".sheet [data-e=label]") && !!document.querySelector(".sheet [data-role]")', 'UI28 编辑 Codex（角色）');
+        await check('UI28 编辑 Codex：可担任在"位置"之后、"升级到"之前，模型范围显示 modelRangeAutoBy(gpt, adapter)',`(() => { const labels = [...document.querySelectorAll('.sheet .fl b')].map(b => b.textContent.replace('*', '')); const at = n => labels.indexOf(n); return at(${jsonStr(ag.canDo)}) > at(${jsonStr(ag.location)}) && at(${jsonStr(ag.canDo)}) < at(${jsonStr(gx.escalate)}) && at(${jsonStr(ag.modelRange)}) === at(${jsonStr(ag.canDo)}) + 1 && document.querySelector('.sheet [data-model-range]').textContent === ${jsonStr(ag.modelRangeAutoBy('gpt', 'adapter'))}; })()`);
+        await press('.sheet [data-role=reviewer]');
+        await verify('UI28 Codex 编辑：还没点保存时 config.json 不变', async () => { assert.ok(!('roles' in (await readConfig()).profiles.codex)); });
+        await saveSheet();
+        await verify('UI28 Codex 取消"审查者"后保存：roles 是 ["executor"]，ar roles --json 一致', async () => { assert.deepEqual((await readConfig()).profiles.codex.roles, ['executor']); assert.deepEqual((await rolesNow()).profiles.find(x => x.name === 'codex')!.roles, ['executor']); });
+        const withoutCodex6 = await readConfig(); delete withoutCodex6.profiles.codex;
+        await writeFile(config, jsonStr(withoutCodex6));
+        await agentsPage(); await wait('!document.querySelector("[data-agent=codex]")');
         await check('UI28 页面上没有任何密钥值', '!document.body.innerHTML.includes("sk-ui28")');
     } finally {
+        if (limitsBefore === null) await rm(limitsFile, { force: true }); else await writeFile(limitsFile, limitsBefore);
         fileDialogs.stub = false;
         win.setContentSize(original.size[0], original.size[1]); nativeTheme.themeSource = original.theme;
         if (configBefore === null) await rm(config, { force: true }); else await writeFile(config, configBefore);

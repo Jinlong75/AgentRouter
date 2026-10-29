@@ -27,11 +27,20 @@ test('预设：每个预设的下拉说明字段形状正确；Qoder 两个版�
     for (const key of ['modelOptions', 'effortOptions', 'listModels', 'types', 'baseUrlOptions']) {
       if (profile[key] !== undefined) assert.ok(Array.isArray(profile[key]) && profile[key].every(item => typeof item === 'string' && item), `${name}.${key}`);
     }
-    assert.ok(Array.isArray(profile.effortOptions) && profile.effortOptions.length > 0, `${name} 有 effortOptions`);
+    // 推理强度（154、D87）：预设要么有非空的 effortOptions，要么声明 supportsEffort === false（并且没有 effortOptions）
+    if (profile.supportsEffort === false) assert.equal(profile.effortOptions, undefined, `${name} 声明不支持推理强度，就不写 effortOptions`);
+    else assert.ok(Array.isArray(profile.effortOptions) && profile.effortOptions.length > 0, `${name} 有 effortOptions 或声明 supportsEffort: false`);
   }
   const cn = loadPreset('qoder-cn').profile, intl = loadPreset('qoder').profile;
   const strip = p => ({ ...p, label: '', title: '', description: '', secrets: {}, model: null, effort: null, variant: { ...p.variant, option: '', help: '' }, generic: { ...p.generic, label: '', executable: '', failureHints: [] } });
   assert.deepEqual(strip(cn), strip(intl));
   assert.equal(intl.generic.executable, 'qodercli');
   assert.deepEqual(Object.values(intl.secrets), ['QODER_PERSONAL_ACCESS_TOKEN']);
+});
+
+test('预设：每个预设都不带默认每日上限', () => {
+  for (const { name, profile } of presetObjects()) {
+    const limits = profile.limits;
+    assert.ok(limits === undefined || limits === null || (typeof limits === 'object' && Object.keys(limits).length === 0), `预设不带默认每日上限（D60）：${name}`);
+  }
 });

@@ -1,10 +1,12 @@
-// ar 子命令：dispatch · redispatch · retry · wait · stop · accept · reject · push · pull · revert · diff · status · report · gc · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs，accept/reject 见 accept.mjs，diff 见 diff.mjs，status 见 status.mjs，report 见 report.mjs，gc 见 gc.mjs）。
+// ar 子命令：dispatch · redispatch · retry · wait · stop · accept · reject · push · pull · revert · diff · status · overlaps · report · gc · config · agents · secrets · version（init/projects 见 project.mjs，agents/secrets 见 agents.mjs，accept/reject 见 accept.mjs，diff 见 diff.mjs，status 见 status.mjs，report 见 report.mjs，gc 见 gc.mjs）。
 // 所有面向软件的命令支持 --json：标准输出只有一个 JSON 对象；出错时 { ok:false, error } 且退出码非 0。
 import { trace, tracing } from './trace.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { run, readProjectConfig } from './run.mjs';
 import { route, routeConfigCommand } from './router.mjs';
+import { rolesCommand } from './roles.mjs';
+import { reviewCommand } from './review.mjs';
 import { parseSpec, validateSpec, SPEC_TYPES } from './spec.mjs';
 import { adapters } from '../adapters/index.mjs';
 import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from './compat.mjs';
@@ -20,6 +22,7 @@ import { diffTask } from './diff.mjs';
 import { buildReport, reportLines, setBlame } from './report.mjs';
 import { gc, gcLines } from './gc.mjs';
 import { statusLines, taskStatus } from './status.mjs';
+import { overlapGroups } from './schedule.mjs';
 import { agentsCommand, secretsCommand, listAgents } from './agents.mjs';
 import { unsetUserSecret } from './secrets.mjs';
 import { initCommand, projectsCommand } from './project.mjs';
@@ -29,41 +32,141 @@ import { readJson } from './json.mjs';
 import { withProxy } from './env.mjs';
 import { proxyText, readSystemProxy, resolveProxy } from './proxy.mjs';
 
-export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'push', 'pull', 'revert', 'diff', 'status', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'route', 'proxy', 'version', 'help', '--run-request'];
+export const commands = ['dispatch', 'redispatch', 'retry', 'wait', 'stop', 'accept', 'reject', 'push', 'pull', 'revert', 'diff', 'status', 'overlaps', 'report', 'gc', 'config', 'init', 'projects', 'agents', 'secrets', 'spec', 'route', 'roles', 'review', 'proxy', 'version', 'help', '--run-request'];
 const helpWords = ['help', '--help', '-h'];
 export { listAgents };
 const legacy = { '--wait': 'wait', '--stop': 'stop', '--config': 'config' };
 export const usage = [
-  '用法：',
-  '  ar dispatch <任务说明 | "任务文字"> [补充说明] [--profile <名>] [--role <角色>] [--name <记录名>] [--host claude-code|agentrouter] [--sandbox …] [--watch-window …] [--detach] [--no-worktree]',
-  '  ar redispatch <记录名> [--detach] [--host claude-code|agentrouter]（按记录里保存的参数再派发一次，记录名自动去重）',
-  '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]（同一工作区手动重试下一次尝试，协议 14.3；--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：在原 worktree 合并主分支后重跑门禁，协议 15.8）',
-  '  ar accept <记录名> [--squash] [--push|--no-push] [--by human]　　ar reject <记录名> --reason "<原因>" [--keep-branch] [--by human]　　ar diff <记录名>（worktree 任务的验收合并、驳回与改动，协议 15.6～15.9；--push 合并后接着推送主分支）',
-  '  ar revert <记录名> [--by human]（撤销已合并任务的合并：git revert，只追加一个反向提交，不改历史、不推送）',
-  '  ar push <项目路径> [--by human|lead|cli] [--dry-run] [--no-fetch]（把主分支普通推送到项目配置的远程，不强制、不推标签；--dry-run 只报告领先落后）　　ar pull <项目路径> [--by human|lead|cli]（只快进，分叉时不拉取）',
-  '  ar status <记录名>（任务当前状态，不等待，协议 15.11）　　ar gc [--dry-run]（清理孤立的 worktree、并发名额与过期的执行者会话记录，协议 15.10）',
-  '  ar report <记录名> [--blame <n>=spec|worker|environment]（任务结束后的链路报告与评分：执行者、主导各一组指标；--blame 把第 n 次门禁失败归因到任务说明、执行者或环境，协议第 16 节）',
-  '  ar wait [记录名]　　ar stop <记录名>　　ar config [键=值 … | init]',
-  '  ar init [项目路径] [--dry-run]　　ar init --upgrade [项目路径] [--dry-run] [--replace-role <角色,…>] [--add-field <键,…>]　　ar projects list [--registry-only]|add <路径> [--allow-non-git]|remove <路径>|purge <路径> [--dry-run] [--worktrees]|clear|show [路径]|config <路径> [键=值 …]|git-init <路径>|commit-init <路径> [--with-existing]|changes <路径>|commit <路径> [--message <说明> --files <路径…>]（表单也可从标准输入读 JSON）|git-identity <路径> --name <用户名> --email <邮箱> [--global]　　ar version',
-  '  ar agents list [--detect]|presets|add --preset <预设> [--name <名>] [--label …] [--model …] [--effort …] [--base-url …] [--secret-var …] [--auth login|token]|add --generic <声明JSON> --name <名> [--label …]|update <名> […|--effort <级别>|""|--max-turns <正整数>|-|--escalate <名>|""]|default <名>|remove <名>|enable <名>|disable <名>|test <名> [--timeout <秒>]',
-  '  ar agents models <名>（可选的模型）|validate <文件>（校验声明或导出文件，只读）|export <名> [--out <文件>] [--force]|import <文件> [--name <名>] [--force]（单独的声明必须加 --name）',
-  '  ar agents validate --decl <声明JSON>|detect --decl <声明JSON>|test --decl <声明JSON> [--timeout <秒>]（只用声明，不读不写配置；软件的自定义 CLI 表单用）',
-  '  ar secrets status [变量名 …]|set <变量名>（值从标准输入读入，不回显）|unset <变量名>（删除 Windows 用户环境变量）',
-  '  ar spec list <项目路径> [--include-archived]|archive <项目路径> <相对路径…> [--commit]（把顶层任务说明 git mv 到 archive/，不删除）|read <项目路径> <相对路径>|new <项目路径> [--dry-run] [--commit]（表单从标准输入读入）|commit <项目路径> <相对路径>|check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]（允许路径会匹配到哪些现有文件，只读）',
-  '  ar route [--spec <任务说明>] [--type <类型>] [--project <路径>] [--profile <名>] [--explain]（只计算会派给谁和为什么，不派发、不写文件）',
-  '  ar route config　　ar route rules set \'<JSON 数组>\'　　ar route fallback set <名>|clear　　ar route reviewer set \'<JSON>\'　　ar route limit set <名> [--tasks <n>|""] [--tokens <n>|""]（路由配置的读取与写入）',
-  '  ar proxy resolve（这一刻的网络代理：config.json 的 proxy 模式、读到的地址与要给执行者设置的变量，只读）',
-  '  加 --json 时只输出一个 JSON 对象（供软件调用）',
+  '用法：ar <子命令> [参数]（加 --json 时只输出一个 JSON 对象，供软件调用）',
+  '',
+  '【派发与查看】',
+  '  ar dispatch <任务说明 | "任务文字"> [补充说明] [--profile <名>] [--role <角色>|none] [--name <记录名>]',
+  '      [--host claude-code|agentrouter] [--sandbox …] [--watch-window …] [--detach]',
+  '      [--model <模型>] [--effort <级别>] [--tier <档位>] [--base <分支>] [--no-worktree]',
+  '      派发一个任务给执行者',
+  '  ar redispatch <记录名> [--detach] [--host claude-code|agentrouter]',
+  '      按记录里保存的参数再派发一次，记录名自动去重',
+  '  ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach]',
+  '      [--host claude-code|agentrouter]',
+  '      同一工作区手动重试下一次尝试（协议 14.3）；--rebase 用于合并冲突、门禁失败或已中断的 worktree 任务：',
+  '      在原 worktree 合并主分支后重跑门禁（协议 15.8）',
+  '  ar wait [记录名]',
+  '      等任务结束并输出结果',
+  '  ar stop <记录名>',
+  '      停止任务',
+  '  ar status <记录名>',
+  '      任务当前状态，不等待（协议 15.11）',
+  '  ar report <记录名> [--blame <n>=spec|worker|environment]',
+  '      任务结束后的链路报告与评分；--blame 把第 n 次门禁失败归因到任务说明、执行者或环境（协议第 16 节）',
+  '  ar overlaps [--project <路径>]',
+  '      同项目里改动范围互相重叠的待验收任务分组与建议的批准顺序，只读',
+  '  ar gc [--dry-run]',
+  '      清理孤立的 worktree、并发名额与过期的执行者会话记录（协议 15.10）',
+  '',
+  '【验收与 git】',
+  '  ar accept <记录名> [--squash] [--push|--no-push] [--by human]',
+  '      验收 worktree 任务并合并（协议 15.6～15.9）；--push 合并后接着推送主分支',
+  '  ar reject <记录名> --reason "<原因>" [--keep-branch] [--by human]',
+  '      驳回 worktree 任务',
+  '  ar diff <记录名>',
+  '      看 worktree 任务的改动',
+  '  ar revert <记录名> [--by human]',
+  '      撤销已合并任务的合并：git revert，只追加一个反向提交，不改历史、不推送',
+  '  ar push <项目路径> [--by human|lead|cli] [--dry-run] [--no-fetch]',
+  '      把主分支普通推送到项目配置的远程，不强制、不推标签；--dry-run 只报告领先落后',
+  '  ar pull <项目路径> [--by human|lead|cli]',
+  '      只快进，分叉时不拉取',
+  '',
+  '【执行者与路由】',
+  '  ar agents list [--detect] | presets | default <名> | remove <名> | enable <名> | disable <名>',
+  '      查看、设默认、删除、启用、停用执行者',
+  '  ar agents add --preset <预设> [--name <名>] [--label …] [--model …] [--effort …] [--base-url …]',
+  '      [--secret-var …] [--auth login|token]',
+  '  ar agents add --generic <声明JSON> --name <名> [--label …]',
+  '      添加执行者（预设或自定义命令行声明）',
+  '  ar agents update <名> […|--effort <级别>|""|--max-turns <正整数>|-|--escalate <名>|""]',
+  '      修改执行者的设置',
+  '  ar agents test <名> [--timeout <秒>]',
+  '      试运行一次执行者',
+  '  ar agents models <名> [--probe]',
+  '      可选的模型',
+  '  ar agents models --preset <预设> [--base-url …] [--secret-var …] [--auth login|token] [--model …]',
+  '      导入之前查（按导入后会得到的配置，不读不写已有的执行者）；可加 --probe',
+  '  ar agents validate <文件> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]',
+  '      校验、导出、导入执行者声明（单独的声明导入时必须加 --name）；validate 只读',
+  '  ar agents validate --decl <声明JSON> | detect --decl <声明JSON> | test --decl <声明JSON> [--timeout <秒>]',
+  '      只用声明，不读不写配置；软件的自定义 CLI 表单用',
+  '  ar secrets status [变量名 …] | set <变量名> | unset <变量名>',
+  '      密钥环境变量：set 的值从标准输入读入，不回显；unset 删除 Windows 用户环境变量',
+  '  ar route [--spec <任务说明>] [--type <类型>] [--project <路径>] [--profile <名>] [--explain]',
+  '      只计算会派给谁和为什么，不派发、不写文件',
+  '  ar route config | ar route rules set \'<JSON 数组>\' | ar route fallback set <名>|clear',
+  '  ar route strong set <名>|clear | ar route reviewer set \'<JSON>\' | ar route limits clear <名>',
+  '  ar route limit set <名> [--tasks <n>|""] [--tokens <n>|""]',
+  '      路由配置的读取与写入；limits clear 手动清除限流标记',
+  '      reviewer set 的 JSON 可写三个开关：mustDiffer、differFamily、differFromLead',
+  '  ar route suggest [--json]',
+  '      按你的执行者生成建议规则，只显示不写入',
+  '  ar roles [--review-for <执行者名> [--model <模型>]]',
+  '  ar roles set <执行者名> [roles=executor,reviewer,lead] [modelFamilies=<家族,…>]',
+  '      每个执行者可担任的角色（含主导）与模型家族；审查者的三个约束与主导见 ar roles 输出',
+  '  ar roles family set <模型名前缀> <家族> | clear <模型名前缀> | list [--json]',
+  '      补充或覆盖模型到家族的对应，存在 config.json 的 familyRules',
+  '',
+  '【审查】',
+  '  ar review <记录名> [--profile <审查者>]',
+  '      对待验收的 worktree 任务再审一次，不改任务状态',
+  '  ar review confirm <记录名> <问题编号> valid|invalid [--note "<说明>"] [--by human|lead]',
+  '      确认审查问题成立与否',
+  '  ar review show <记录名> | stats',
+  '      看审查结论；stats 是每个审查者的准确率',
+  '  ar review config [set [default=true|false] [block=none|high] [maxReworks=<0～5>]]',
+  '      全局的审查设置：是否默认审查、是否拦截、最多返工几次',
+  '',
+  '【项目与任务说明】',
+  '  ar init [项目路径] [--dry-run]',
+  '  ar init --upgrade [项目路径] [--dry-run] [--replace-role <角色,…>] [--add-field <键,…>]',
+  '      初始化或升级项目的 .agent-router 配置',
+  '  ar projects list [--registry-only] | add <路径> [--allow-non-git] | remove <路径> | clear | show [路径]',
+  '      查看、登记、移除项目',
+  '  ar projects purge <路径> [--dry-run] [--worktrees] | config <路径> [键=值 …] | git-init <路径>',
+  '  ar projects commit-init <路径> [--with-existing] | changes <路径>',
+  '  ar projects git-identity <路径> --name <用户名> --email <邮箱> [--global]',
+  '  ar projects commit <路径> [--message <说明> --files <路径…>]',
+  '      项目的清理、配置、git 初始化与提交（commit 的表单也可从标准输入读 JSON）',
+  '  ar spec list <项目路径> [--include-archived] | read <项目路径> <相对路径>',
+  '      列出、读取任务说明',
+  '  ar spec archive <项目路径> <相对路径…> [--commit]',
+  '      把顶层任务说明 git mv 到 archive/，不删除；已归档的跳过',
+  '  ar spec new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径>',
+  '      新建任务说明（表单从标准输入读入）、提交任务说明',
+  '  ar spec check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]',
+  '      允许路径会匹配到哪些现有文件，只读',
+  '',
+  '【其他】',
+  '  ar config [键=值 … | init]',
+  '      查看或修改全局配置',
+  '  ar proxy resolve',
+  '      这一刻的网络代理：config.json 的 proxy 模式、读到的地址与要给执行者设置的变量，只读',
+  '  ar version | ar help',
+  '      版本号、本帮助',
 ].join('\n');
 
 // 旧写法转成子命令：ar <任务> → dispatch；--wait/--stop/--config → wait/stop/config。--json 可出现在任意位置。
-export function normalizeArgs(argv) {
+// 第一个参数长得像子命令（小写字母开头，只含小写字母、数字、连字符）、不是已知子命令、也不是存在的文件时，
+// 多半是敲错或不存在的子命令：不派发，command 为 'unknown'，rest 只有这个词。
+const commandLike = /^[a-z][a-z0-9-]*$/;
+const isFile = (cwd, word) => { try { return statSync(resolvePath(cwd, word)).isFile(); } catch { return false; } };
+export function normalizeArgs(argv, cwd = process.cwd()) {
   const json = argv.includes('--json');
   let args = argv.filter(a => a !== '--json');
   // 第一个参数正好是 help / --help / -h 才算帮助（后面的参数不管）；任务文字里含 help 不受影响。
   if (helpWords.includes(args[0])) args = ['help'];
   else if (legacy[args[0]]) args = [legacy[args[0]], ...args.slice(1)];
-  else if (!args.length || !commands.includes(args[0])) args = ['dispatch', ...args];
+  else if (!args.length || !commands.includes(args[0])) {
+    if (args.length && commandLike.test(args[0]) && !isFile(cwd, args[0])) return { command: 'unknown', rest: [args[0]], json };
+    args = ['dispatch', ...args];
+  }
   return { command: args[0], rest: args.slice(1), json };
 }
 
@@ -110,7 +213,14 @@ function assertSafeHome(env) {
 }
 
 export async function main(argv, { scriptPath, env = process.env, cwd = process.cwd(), out = console.log, readSecret = readSecretValue, setSecret, unsetSecret = unsetUserSecret, readForm = readSpecForm } = {}) {
-  const { command, rest, json } = normalizeArgs(argv);
+  const { command, rest, json } = normalizeArgs(argv, cwd);
+  // 不认识的子命令：只提示，不碰任何文件、不派发。
+  if (command === 'unknown') {
+    const text = `不认识的子命令：${rest[0]}。可用的子命令见 ar help；要把这段文字当任务派发，写成 ar dispatch "${rest[0]}"`;
+    if (!json) throw new Error(text);
+    out(JSON.stringify({ ok: false, code: 'UNKNOWN_COMMAND', error: text, command: rest[0] }));
+    return 2;
+  }
   const homes = [homeDirectory(env), legacyHomeDirectory(env)];
   const lines = [];
   // --json 时收集普通输出，最后只打印一个 JSON 对象。
@@ -122,6 +232,12 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
     if (!json) return action();
     const original = console.log;
     console.log = (...parts) => log(parts.join(' '));
+    try { return await action(); } finally { console.log = original; }
+  };
+  // 安排合并后的自动重跑门禁时 run() 会打印"记录名 / 进度"，这些不属于 accept 的输出，吞掉。
+  const silenced = async action => {
+    const original = console.log;
+    console.log = () => {};
     try { return await action(); } finally { console.log = original; }
   };
   // 任务最后一次尝试汇报里的"需要越界"（协议 14.5）：从清单的 end 事件读，托管、前台、脱离派发都走这一条路径；
@@ -181,7 +297,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           if (!saved) throw new Error('这个任务是旧版本派发的，没有保存派发参数，不能再派一次');
           inheritRoute = saved.route ?? null;
           runArgs = [saved.task, ...(saved.extra ? [saved.extra] : []), '--name', saved.name, '--profile', saved.profile,
-            ...(saved.role ? ['--role', saved.role] : []), ...optionArgs(saved.options), ...(saved.noWorktree ? ['--no-worktree'] : []), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
+            ...(saved.role && !saved.roleDefault ? ['--role', saved.role] : []), ...optionArgs(saved.options), ...(typeof saved.baseBranch === 'string' && saved.baseBranch ? ['--base', saved.baseBranch] : []), ...(saved.noWorktree ? ['--no-worktree'] : []), ...(detachFlag ? ['--detach'] : []), ...(host ? ['--host', host] : [])];
         } else runArgs = command === 'dispatch' ? rest : ['--run-request', ...rest];
         const code = await capture(() => run({ scriptPath, env, root: cwd, args: runArgs, inheritRoute, onDetach: id => { detach = id; }, onGate: value => { gate = value; } }));
         const name = lines.find(l => l.startsWith('记录名：'))?.slice(4), progress = lines.find(l => l.startsWith('进度：'))?.slice(3);
@@ -235,12 +351,23 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
           }
           return 4;
         }
-        if (json) emit({ ok: true, merge: result.merge, mode: result.mode, cleanup: result.cleanup, ...(result.push ? { push: result.push } : {}) });
+        // 合并后与它改动范围重叠、仍待验收的任务：脱离进程自动按新基线重跑门禁（Stage07c 154，D86），accept 不等它们，也不受它们影响。
+        const rebased = [], failed = [];
+        for (const target of result.rerun?.targets ?? []) {
+          try {
+            await silenced(() => run({ scriptPath, env, root: cwd, retry: { name: target.name, rebase: true, detach: true, host: null, afterMerge: result.rerun.after } }));
+            rebased.push(target);
+          } catch (error) { failed.push({ ...target, error: error.message }); }
+        }
+        if (json) emit({ ok: true, merge: result.merge, mode: result.mode, cleanup: result.cleanup, ...(result.push ? { push: result.push } : {}), ...(rebased.length ? { rebased: rebased.map(item => item.id) } : {}) });
         else {
           if (result.mode === 'confirm') out(`已确认：${name}（没有改动，worktree 已删除）`);
           else out(`已合并：${name}（${result.mode === 'squash' ? '压成一个提交' : '合并提交'} ${result.merge.slice(0, 7)}）`);
           if (!result.cleanup) out('worktree 或分支没能清理干净，合并结果不受影响；稍后用 ar gc 清理');
-          if (result.push) out(result.push.ok ? (result.push.pushed === false ? '没有需要推送的提交' : '已推送到远程') : `已合并，推送失败：${result.push.error}（合并结果不受影响，可以稍后用 ar push 重试）`);
+          if (result.push?.skipped) out(`已合并，没有推送：${result.push.reason}`);
+          else if (result.push) out(result.push.ok ? (result.push.pushed === false ? '没有需要推送的提交' : '已推送到远程') : `已合并，推送失败：${result.push.error}（合并结果不受影响，可以稍后用 ar push 重试）`);
+          if (rebased.length) out(`已安排重跑门禁：${rebased.map(item => item.name).join('、')}（与 ${name} 的改动范围重叠，按合并后的新基线重跑，不启动执行者）`);
+          for (const item of failed) out(`没能安排重跑门禁：${item.name}（${item.error}）`);
         }
         return 0;
       }
@@ -324,6 +451,24 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         if (json) emit(result); else for (const line of statusLines(result)) out(line);
         return 0;
       }
+      // 互相重叠的待验收任务组与建议的批准顺序（Stage07c 154，D86）：只读。
+      case 'overlaps': {
+        const overlapsUsage = '用法：ar overlaps [--project <路径>] [--json]';
+        let project = '.';
+        for (let i = 0; i < rest.length; i++) {
+          if (rest[i] !== '--project' || rest[i + 1] === undefined || rest[i + 1].startsWith('--')) throw new Error(overlapsUsage);
+          project = rest[++i];
+        }
+        const groups = overlapGroups({ homes: [...new Set(homes)], root: resolvePath(cwd, project) });
+        if (json) { emit({ ok: true, groups }); return 0; }
+        if (!groups.length) out('没有互相重叠的待验收任务');
+        for (const group of groups) {
+          out(`重叠的待验收任务：${group.tasks.map(task => task.name).join('、')}`);
+          for (const task of group.tasks) out(`  ${task.name}：${task.paths.join('、')}`);
+          out(`  ${group.why}`);
+        }
+        return 0;
+      }
       // 链路报告：只读；--blame 先写归因标记，再按新归因出报告。记录名允许中文、空格等。
       case 'report': {
         const reportUsage = '用法：ar report <记录名> [--blame <n>=spec|worker|environment] [--json]';
@@ -383,7 +528,7 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
       // 路由试算（Stage07 T4）：只计算，不派发、不写任何文件。
       case 'route': {
         // 路由配置的读写：ar route config / rules set / fallback set|clear / reviewer set / limit set。
-        if (['config', 'rules', 'fallback', 'reviewer', 'limit'].includes(rest[0])) {
+        if (['config', 'rules', 'fallback', 'reviewer', 'limit', 'limits', 'suggest', 'strong'].includes(rest[0])) {
           const { result, text } = routeConfigCommand(rest, { home: homes[0] });
           if (json) emit({ ok: true, ...result }); else out(text);
           return 0;
@@ -423,6 +568,18 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         out(`将派给 ${label}（${result.trace.at(-1)}）`);
         if (explain) { out('路由过程：'); for (const line of result.trace) out(`  ${line}`); }
         return 0;
+      }
+      // 角色设置（Stage07c T4）：每个执行者可担任的角色、模型家族、按家族挑审查者；set 子命令写 config.json。
+      case 'roles': {
+        const { result, text } = rolesCommand(rest, { home: homes[0] });
+        if (json) emit({ ok: true, ...result }); else out(text);
+        return 0;
+      }
+      // 审查（Stage08 T3、T4）：再审、确认问题、查看、统计准确率、全局审查设置。
+      case 'review': {
+        const { result, text, code = 0 } = await reviewCommand(rest, { homes, root: cwd, env });
+        if (json) emit(result); else out(text);
+        return code;
       }
       case 'version': {
         arity(rest, 0, 'ar version');

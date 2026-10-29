@@ -466,6 +466,26 @@ export async function captureProjects(h: Harness) {
     await check('UI15 分叉：说明 pj.remoteDiverged(1, 1)，这一行没有任何按钮（既不能推送也不能拉取）', `${remoteLine} === ${JSON.stringify(pj.remoteDiverged(1, 1))} && ${remoteButtons}.length === 0 && !document.querySelector('[data-pj=remote-push], [data-pj=remote-pull]')`);
     await verify('UI15 分叉时刷新只读取：本机 main 与裸仓库 main 都没变', () => { assert.equal(localMain(), localDiverged); assert.equal(bareMain(), bareDiverged); });
     await shot('projects-remote-diverged');
+    // 155 B8：分叉时说明下面给出做法——一句说明、rebase 与 merge 两行命令（各带说明和"复制命令"），复制的是带项目路径的完整命令；软件仍不合并。
+    await check('UI15 155 B8 分叉：说明下面是 pj.remoteDivergedHow 和两行命令（rebase、merge），各带说明与"复制命令"按钮，在远程那组行的下面', `(() => { const box = document.querySelector('.pj-body .dv-how'), rows = [...box.querySelectorAll('[data-pj-diverged-cmd]')], rowsBox = document.querySelector('.rows.remote'); const want = [[${JSON.stringify(pj.remoteDivergedRebase)}, ${JSON.stringify(pj.remoteDivergedRebaseHelp)}], [${JSON.stringify(pj.remoteDivergedMerge)}, ${JSON.stringify(pj.remoteDivergedMergeHelp)}]]; return box.firstElementChild.textContent === ${JSON.stringify(pj.remoteDivergedHow)} && rows.length === 2 && rows.every((r, i) => r.querySelector('.v.mono').textContent === want[i][0] && r.querySelector('.v.muted').textContent === want[i][1] && r.querySelector('[data-pj=remote-copy]').textContent.trim() === ${JSON.stringify(pj.pushCopyCommand)}) && !!(rowsBox.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
+    for (const [index, command] of [[2, 'pull --rebase'], [3, 'pull --no-rebase']] as const) {
+        const copies = effects.copyLog.length;
+        await press(`.dv-how .r:nth-child(${index}) [data-pj=remote-copy]`);
+        await h.happened(`UI15 155 B8 复制 ${command} 写入剪贴板`, () => effects.copyLog.length > copies, 3000);
+        await verify(`UI15 155 B8 复制的是带项目路径的完整命令 git -C "<项目路径>" ${command}`, () => { assert.equal(norm(effects.copyLog.at(-1)!.text), norm(`git -C "${dir.initialized}" ${command}`)); });
+    }
+    await verify('UI15 155 B8 复制只写剪贴板：本机 main 与裸仓库 main 都没变', () => { assert.equal(localMain(), localDiverged); assert.equal(bareMain(), bareDiverged); });
+    await check('UI15 155 B8 复制后这一节没有推送 / 拉取按钮', `!document.querySelector('[data-pj=remote-push], [data-pj=remote-pull]')`);
+    {
+        const divWin = BrowserWindow.getAllWindows()[0], [divW, divH] = divWin.getContentSize();
+        divWin.setContentSize(960, 600);
+        try {
+            await pause(500);
+            await check('UI15 155 B8 最小窗口 960×600：分叉的做法不溢出（没有横向滚动，每一行和它的子元素右边都在滚动区内）', `(() => { const scroller = document.querySelector('[data-pj-detail] .scroll'); const right = scroller.getBoundingClientRect().right; return innerWidth <= 960 && scroller.scrollWidth <= scroller.clientWidth + 1 && [...document.querySelectorAll('.dv-how, .dv-how .r, .dv-how .r > *')].every(e => e.getBoundingClientRect().right <= right + 1); })()`);
+            await shot('projects-remote-diverged-960x600');
+        }
+        finally { divWin.setContentSize(divW, divH); await pause(300); }
+    }
     // 在“终端”里合并后，本机领先远程：回到有推送按钮的状态，给下面的失败场景用。
     git(dir.initialized, ['-c', 'user.name=AgentRouter Shots', '-c', 'user.email=shots@example.invalid', '-c', 'commit.gpgsign=false', 'merge', '--no-edit', 'refs/remotes/origin/main']);
     await press('[data-pj=remote-refresh]');
@@ -515,8 +535,31 @@ export async function captureProjects(h: Harness) {
         await new Promise<void>(resolve => server.close(() => resolve()));
     }
 
-    // 编辑配置的推送三项：填远程名、勾选“批准合并后自动推送”，保存后 project.json 里有 push，且只写改过的键。
     git(dir.initialized, ['remote', 'set-url', 'origin', bare]);
+
+    // 155 W2：GitHub 的邮箱隐私拒绝。裸仓库里放一个 pre-receive 钩子，输出 GH007 那行并拒绝（本机的裸仓库，绝不连真实远程）：
+    // 失败横幅是 pj.pushEmailPrivacy(要推送的提交里第一个作者邮箱)，右边按钮打开"设置 git 提交身份"弹窗；什么都没改，用完删掉钩子。
+    const hook = path.join(bare, 'hooks', 'pre-receive');
+    await mkdir(path.dirname(hook), { recursive: true });
+    await writeFile(hook, '#!/bin/sh\necho "remote: error: GH007: Your push would publish a private email address." >&2\nexit 1\n');
+    try {
+        const refsBeforeGh = { local: localMain(), bare: bareMain(), tracking: trackingMain() };
+        const rejectedEmail = git(dir.initialized, ['log', 'refs/remotes/origin/main..refs/heads/main', '--format=%ae']).split('\n').filter(Boolean)[0];
+        assert.ok(rejectedEmail && rejectedEmail.includes('@'), `测试前提：本机有领先的提交，作者邮箱 ${rejectedEmail}`);
+        await press('[data-pj=remote-push]');
+        await wait(`!!${bannerFail} && document.querySelector('[data-pj=remote-refresh]')?.disabled === false`, '邮箱隐私拒绝的横幅', 60000);
+        await check('UI15 155 W2 GH007：横幅标题 pj.pushFailedTitle，正文 pj.pushEmailPrivacy(作者邮箱)，右边按钮 pj.pushEmailPrivacyAction（不是"复制命令"），推送按钮变成"重试"', `(() => { const b = ${bannerFail}; return b.querySelector('.rt b').textContent === ${JSON.stringify(pj.pushFailedTitle)} && b.querySelector('.rt span').textContent === ${JSON.stringify(pj.pushEmailPrivacy(rejectedEmail))} && b.querySelector('[data-pj=identity]').textContent.trim() === ${JSON.stringify(pj.pushEmailPrivacyAction)} && !b.querySelector('[data-pj=remote-copy]') && ${remoteButtons}.join() === ${JSON.stringify(pj.pushRetry)}; })()`);
+        await verify('UI15 155 W2 被拒绝的推送什么都没改：本机 main、裸仓库 main、远程跟踪分支都和失败前一样，作者没被改写', () => { assert.deepEqual({ local: localMain(), bare: bareMain(), tracking: trackingMain() }, refsBeforeGh); });
+        await shot('projects-remote-emailprivacy');
+        await press(`.pj-body .banner.fail [data-pj=identity]`);
+        await wait(`!!document.querySelector('.sheet [data-id-f=name]')`, 'GH007 横幅的按钮打开提交身份弹窗');
+        await check('UI15 155 W2 点横幅按钮：打开的是"设置 git 提交身份"弹窗 pj.identityEditTitle', `document.querySelector('.sheet-h > b').textContent === ${JSON.stringify(pj.identityEditTitle)}`);
+        await key('Escape');
+        await wait(`!document.querySelector('.sheet')`, '关闭提交身份弹窗');
+    }
+    finally { await rm(hook, { force: true }); }
+
+    // 编辑配置的推送三项：填远程名、勾选“批准合并后自动推送”，保存后 project.json 里有 push，且只写改过的键。
     await press('[data-pj=edit]');
     await wait('!!document.querySelector(".sheet [data-pj-f=\\"push.remote\\"]")', '编辑配置打开');
     await typeIn('[data-pj-f="push.remote"]', 'origin');
@@ -731,8 +774,15 @@ export async function captureProjects(h: Harness) {
     await verify('UI15 说明为空时不产生提交', () => { assert.equal(git(dirA, ['rev-parse', 'HEAD']), headA); });
     await type('[data-cm-message]', 'add a and c');
     await check('UI15 开始输入说明后，字段下的提示消失', `document.querySelector('[data-cm-error]').textContent === ''`);
+    // 155 W1：提交过程中按钮（禁用、转圈）的文字也必须是勾选数。MutationObserver 记下按钮每一次变化后的文字与禁用状态。
+    await evaluate(`(() => { const b = document.querySelector('.sheet [data-sheet-btn="1"]'), rec = window.__cmBtn = []; const note = () => rec.push({ text: b.textContent.trim(), disabled: b.disabled }); note(); new MutationObserver(note).observe(b, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['disabled'] }); })()`);
     await press('.sheet [data-sheet-btn="1"]');
     await wait(`!document.querySelector('.sheet') && document.querySelector('.dh-2').textContent.includes(${JSON.stringify(pj.dirty(1))})`, '提交成功：弹窗关闭、状态行只剩 1 个未提交', 30000);
+    await verify('UI15 155 W1 取消勾选一个后提交：提交过程中（按钮禁用时）文字仍是"提交 2 个文件"，记录里没有出现过别的数字', async () => {
+        const rec = await evaluate(`window.__cmBtn`) as { text: string; disabled: boolean }[];
+        assert.ok(rec.some(x => x.disabled), `没有记到按钮禁用（忙碌）的状态：${JSON.stringify(rec)}`);
+        assert.deepEqual([...new Set(rec.map(x => x.text))], [pj.commitDo(2)], `按钮文字变化记录：${JSON.stringify(rec)}`);
+    });
     await verify('UI15 提交 2 个文件：提交只含 a.txt 和 c.txt，说明是输入原文，git status 只剩 b.txt', () => {
         assert.notEqual(git(dirA, ['rev-parse', 'HEAD']), headA);
         assert.deepEqual(git(dirA, ['show', '--name-only', '--pretty=format:', 'HEAD']).split('\n').filter(Boolean).sort(), ['a.txt', 'c.txt']);
@@ -740,6 +790,15 @@ export async function captureProjects(h: Harness) {
         assert.equal(git(dirA, ['status', '--porcelain']), '?? b.txt');
     });
     await check('UI15 提交成功后右下角提示"已提交 <哈希>（2 个文件）"', `document.querySelector('.notice')?.textContent === ${JSON.stringify(pj.commitDone(git(dirA, ['rev-parse', '--short', 'HEAD']), 2))}`);
+    // 155 W3：提示放在底栏（.actbar，60px）上方：底边离窗口底至少 76px；背景不透明（--surface 垫底，computed 是 rgb 而不是 rgba）。验收页上与 .actbar 按钮不相交的检查在 shots-accept.ts。
+    // 缩放下 innerHeight 是取整的，差值可能小 1px 以内，所以下限写 75。
+    await verify('UI15 155 W3 提交提示离窗口底边至少 76px（在底栏上方），背景色不透明', async () => {
+        const m = await evaluate(`(() => { const n = document.querySelector('.notice'), r = n.getBoundingClientRect(), p = document.createElement('i'); p.style.backgroundColor = 'var(--surface)'; document.body.append(p); const surface = getComputedStyle(p).backgroundColor; p.remove(); return { gap: innerHeight - r.bottom, bottom: getComputedStyle(n).bottom, background: getComputedStyle(n).backgroundColor, surface }; })()`) as { gap: number; bottom: string; background: string; surface: string };
+        assert.ok(m.gap >= 75, `提示离窗口底边 ${m.gap}px：${JSON.stringify(m)}`);
+        assert.match(m.surface, /^rgb\(/, JSON.stringify(m));
+        assert.equal(m.background, m.surface, JSON.stringify(m));
+    });
+    await shot('projects-commit-toast');
 
     // (b) 本机和项目都没有提交身份：提交 → 先弹身份弹窗（默认全局）→ 保存 → 回到提交弹窗，说明与勾选还在 → 提交成功。
     await writeFile(globalConfig, '');

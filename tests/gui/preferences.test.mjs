@@ -159,16 +159,38 @@ test('字标字体 Space Grotesk 缺失或校验不符时构建继续、移除�
   assert.equal(brandFontHash,'acad6de1fc93436f5c0f1f4137751ef04f1aea3063e7036535970ffcfbd79f72');
 });
 
-test('同时运行的任务（concurrency）：只收 1～4 的整数，写入 config.json 并保留其余字段；手写的越界值原样显示，保留天数默认 14',async t=>{
+test('同时运行的任务（concurrency）：收 1～8 的整数与 "auto"，concurrencyMax 收 1～8，写入 config.json 并保留其余字段；手写的越界值原样显示，保留天数默认 14',async t=>{
   const {home,service}=await fixture(t),file=path.join(home,'config.json');
   await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,future:'keep'}},managed:true,extension:{keep:true}}));
   assert.equal((await service.run('settings')).concurrency,2);assert.equal((await service.run('settings')).retentionDays,14);
-  for(const value of [0,5,1.5,'3','2',null,undefined,NaN,-1,[3]]) await assert.rejects(service.run('save',{key:'concurrency',value}),/Invalid value/,String(value));
+  for(const value of [0,9,1.5,'3','2',null,undefined,NaN,-1,[3],'x','AUTO']) await assert.rejects(service.run('save',{key:'concurrency',value}),/Invalid value/,String(value));
   assert.equal(JSON.parse(await readFile(file,'utf8')).concurrency,undefined,'被拒绝的值不写文件');
-  for(const value of [1,2,3,4]) {
+  for(const value of [1,2,3,4,5,8,'auto']) {
     assert.equal((await service.run('save',{key:'concurrency',value})).concurrency,value);
     const disk=JSON.parse(await readFile(file,'utf8'));
     assert.equal(disk.concurrency,value);assert.equal(disk.managed,true);assert.deepEqual(disk.extension,{keep:true});assert.equal(disk.profiles.codex.future,'keep');
+  }
+  // 自动档：settings 带核心给的估算信息；concurrencyMax 默认 8，只收 1～8 的整数，被拒绝的值不写文件，写入保留其余字段。
+  const auto=await service.run('settings');
+  assert.equal(auto.concurrency,'auto');assert.equal(auto.concurrencyMax,8);
+  assert.ok(Number.isInteger(auto.parallel.estimate)&&auto.parallel.estimate>=1&&auto.parallel.estimate<=8);assert.ok(auto.parallel.cores>=1);assert.match(auto.parallel.freeGb,/^\d+\.\d$/);assert.equal(typeof auto.parallel.busy,'boolean');
+  for(const value of [0,9,1.5,'4','auto',null,undefined,NaN,-1,[4]]) await assert.rejects(service.run('save',{key:'concurrencyMax',value}),/Invalid value/,String(value));
+  assert.equal(JSON.parse(await readFile(file,'utf8')).concurrencyMax,undefined,'被拒绝的值不写文件');
+  for(const value of [1,4,8]) {
+    assert.equal((await service.run('save',{key:'concurrencyMax',value})).concurrencyMax,value);
+    const disk=JSON.parse(await readFile(file,'utf8'));
+    assert.equal(disk.concurrencyMax,value);assert.equal(disk.concurrency,'auto');assert.equal(disk.managed,true);assert.deepEqual(disk.extension,{keep:true});assert.equal(disk.profiles.codex.future,'keep');
+  }
+  assert.ok((await service.run('settings')).parallel.estimate<=8);
+  // 182：memLowPercent 默认 5，只收 1～50 的整数，被拒绝的值不写文件，写入保留其余字段；parallel.memLowGb 是按当前比例算出的阈值（一位小数）。
+  assert.equal(auto.memLowPercent,5);assert.match(auto.parallel.memLowGb,/^\d+\.\d$/);
+  for(const value of [0,51,2.5,'10',null,undefined,NaN,-1,[10]]) await assert.rejects(service.run('save',{key:'memLowPercent',value}),/Invalid value/,String(value));
+  assert.equal(JSON.parse(await readFile(file,'utf8')).memLowPercent,undefined,'被拒绝的值不写文件');
+  for(const value of [3,10,20]) {
+    const saved=await service.run('save',{key:'memLowPercent',value});assert.equal(saved.memLowPercent,value);
+    assert.ok(Number(saved.parallel.memLowGb)>=1.5);
+    const disk=JSON.parse(await readFile(file,'utf8'));
+    assert.equal(disk.memLowPercent,value);assert.equal(disk.concurrency,'auto');assert.equal(disk.managed,true);assert.deepEqual(disk.extension,{keep:true});assert.equal(disk.profiles.codex.future,'keep');
   }
   await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',enabled:true}},concurrency:7,sessionRetentionDays:30}));
   const settings=await service.run('settings');assert.equal(settings.concurrency,7);assert.equal(settings.retentionDays,30);
@@ -250,4 +272,63 @@ test('演示夹具里的假 Codex 认得 exec --json：ar agents test codex 通�
   assert.equal(direct.code,0);assert.ok(direct.out.split('\n').filter(Boolean).every(l=>JSON.parse(l).type));
   assert.equal((await run(env.AR_TEST_AGENT,['unknown-sub'])).code,2);
   assert.equal((await run(env.AR_TEST_AGENT,['exec'])).code,2);
+});
+
+// Stage07c 144：Codex 的编辑是表单式，点"保存"时模型、推理强度、服务档位、沙箱、位置一次写入（key: 'codex'）。
+test('Codex 表单式保存：多项一次写入，null 表示跟随，不写入的不动；无效值整体拒绝、不改文件',async t=>{
+  const {home,service}=await fixture(t),file=path.join(home,'config.json');
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,model:null,effort:null,tier:null,sandbox:'workspace-write',keep:'me'}}}));
+  const abs=path.join(home,'codex.cmd');
+  const result=await service.run('save',{key:'codex',value:{model:'test-pro',effort:'max',tier:'flex',sandbox:'read-only',path:abs}});
+  assert.equal(result.values.model,'test-pro');assert.equal(result.values.effort,'max');assert.equal(result.values.path,abs);
+  let disk=JSON.parse(await readFile(file,'utf8'));
+  assert.deepEqual([disk.profiles.codex.model,disk.profiles.codex.effort,disk.profiles.codex.tier,disk.profiles.codex.sandbox,disk.profiles.codex.path],['test-pro','max','flex','read-only',abs]);
+  assert.equal(disk.profiles.codex.keep,'me');
+  await service.run('save',{key:'codex',value:{model:null,path:null}});
+  disk=JSON.parse(await readFile(file,'utf8'));
+  assert.equal(disk.profiles.codex.model,null);assert.equal(disk.profiles.codex.path,null);assert.equal(disk.profiles.codex.effort,'max');
+  const before=await readFile(file,'utf8');
+  for(const value of [{},null,[],{tier:'turbo'},{sandbox:'danger'},{model:3},{unknown:'x'},{model:'ok',path:'relative/codex'}]) {
+    await assert.rejects(service.run('save',{key:'codex',value}));assert.equal(await readFile(file,'utf8'),before);
+  }
+  await writeFile(file,'invalid');
+  await assert.rejects(service.run('save',{key:'codex',value:{model:'x'}}));assert.equal(await readFile(file,'utf8'),'invalid');
+});
+// 166：改过名的 Codex 执行者（codex-pro）的编辑读写自己的配置：save 带 profile 写到对应执行者，profile 不合法时拒绝。
+test('Codex 表单式保存带 profile：写到对应执行者，codex 不变；settings 给每个 Codex 执行者各自的值；profile 不合法整体拒绝、不改文件',async t=>{
+  const {home,service}=await fixture(t),file=path.join(home,'config.json');
+  const other={adapter:'claude-code',label:'别的',enabled:true,env:{ANTHROPIC_MODEL:'m'}};
+  await writeFile(file,JSON.stringify({v:2,defaultProfile:'codex',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true,model:'base',sandbox:'workspace-write'},'codex-pro':{adapter:'codex',label:'Codex Pro',enabled:true,model:'pro',effort:'high',tier:'flex',sandbox:'read-only'},other}}));
+  const read=async()=>JSON.parse(await readFile(file,'utf8'));
+  let state=await service.run('settings');
+  assert.deepEqual(Object.keys(state.codexProfiles).sort(),['codex','codex-pro']);
+  assert.deepEqual(state.codexProfiles['codex-pro'],{model:'pro',effort:'high',tier:'flex',sandbox:'read-only',path:null});
+  assert.equal(state.codexProfiles.codex.model,'base');assert.equal(state.values.model,'base','设置页 Codex 一节仍读 codex');
+  state=await service.run('save',{key:'codex',value:{model:'pro-2',sandbox:'workspace-write'},profile:'codex-pro'});
+  let disk=await read();
+  assert.equal(disk.profiles['codex-pro'].model,'pro-2');assert.equal(disk.profiles['codex-pro'].sandbox,'workspace-write');assert.equal(disk.profiles['codex-pro'].effort,'high');
+  assert.deepEqual(disk.profiles.codex,{adapter:'codex',label:'Codex',enabled:true,model:'base',sandbox:'workspace-write'},'codex 不变');
+  assert.deepEqual(disk.profiles.other,other);
+  assert.equal(state.codexProfiles['codex-pro'].model,'pro-2');assert.equal(state.values.model,'base');
+  const before=await readFile(file,'utf8');
+  for(const profile of ['nope','other','','a b','x'.repeat(41),3,null,['codex-pro'],'__proto__']) {
+    await assert.rejects(service.run('save',{key:'codex',value:{model:'bad'},profile}),`profile ${JSON.stringify(profile)}`);assert.equal(await readFile(file,'utf8'),before);
+  }
+  // 不带 profile：和以前一样写 codex
+  await service.run('save',{key:'codex',value:{model:'base-2'}});
+  disk=await read();assert.equal(disk.profiles.codex.model,'base-2');assert.equal(disk.profiles['codex-pro'].model,'pro-2');
+});
+
+// 166：并行一节"机器正忙"按原因写——注入 { busy, cpu } 是 CPU；再加 memLow / freeMemGb 是可用内存不够。
+test('并行一节的机器正忙带原因：CPU 与可用内存分开，不忙时没有原因',async t=>{
+  const {home,env}=await fixture(t),load=path.join(home,'test-load.json');
+  await writeFile(path.join(home,'config.json'),JSON.stringify({v:2,defaultProfile:'codex',concurrency:'auto',profiles:{codex:{adapter:'codex',label:'Codex',enabled:true}}}));
+  const service=await createPreferences(root,path.join(home,'monitor'),{...env,AR_TEST_LOAD_FILE:load});
+  const parallel=async()=>(await service.run('settings')).parallel;
+  await writeFile(load,JSON.stringify({busy:true,cpu:92}));
+  let info=await parallel();assert.equal(info.busy,true);assert.equal(info.busyReason,'cpu');assert.equal(info.cpu,92);
+  await writeFile(load,JSON.stringify({busy:true,cpu:17,memLow:true,freeMemGb:0.94}));
+  info=await parallel();assert.equal(info.busy,true);assert.equal(info.busyReason,'memory');assert.equal(info.busyFreeGb,'0.9');
+  await writeFile(load,JSON.stringify({busy:false,cpu:10,memLow:true}));
+  info=await parallel();assert.equal(info.busy,false);assert.equal(info.busyReason,null);assert.equal(info.busyFreeGb,null);
 });

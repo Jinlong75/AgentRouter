@@ -237,7 +237,7 @@ export async function captureSearch(h: Harness, registry: Registry, win: Browser
 
     // ---------------- 侧栏底部 ----------------
     await goTasks();
-    const config = () => jsonOf<{ concurrency?: number; managed?: boolean; profiles?: Record<string, { adapter?: string; label?: string; enabled?: boolean }> }>(configFile);
+    const config = () => jsonOf<{ concurrency?: number | 'auto'; concurrencyMax?: number; memLowPercent?: number; managed?: boolean; profiles?: Record<string, { adapter?: string; label?: string; enabled?: boolean }> }>(configFile);
     // 期望的侧栏行：配置里每个启用的执行者，显示名 + 正在运行（运行、门禁、准备，不含排队）的任务数/上限。
     const sidebarRows = async (limit: number) => {
         const rows: { text: string; tip: string }[] = [];
@@ -249,7 +249,7 @@ export async function captureSearch(h: Harness, registry: Registry, win: Browser
         }
         return rows;
     };
-    const limit0 = (await config()).concurrency ?? 2;
+    const limit0 = (await config()).concurrency as number ?? 2;
     const rows0 = await sidebarRows(limit0);
     assert.ok(rows0.some(r => r.text === `Codex${s6.loadRow(2, limit0)}`), `侧栏应有 Codex 一行，两个进行中的演示任务：${rows0.map(r => r.text).join('、')}`);
     await check('UI15 侧栏底部：每个启用的执行者一行，文字精确等于“显示名 + 运行数/上限”', `JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.textContent)) === ${jsonStr(jsonStr(rows0.map(r => r.text)))}`);
@@ -268,31 +268,127 @@ export async function captureSearch(h: Harness, registry: Registry, win: Browser
     await check('UI07 关掉托管后侧栏最后一行是“托管未开启”，圆点不是绿色', `(() => { const mg = document.querySelector('.nav-foot').lastElementChild; return mg.textContent.trim() === ${jsonStr(c.managedOff)} && !mg.querySelector('.dot').classList.contains('ok'); })()`);
     if (wasManaged) { await press('[data-pref=managed]'); await wait(`document.querySelector('.nav-foot .mg').textContent.trim() === ${jsonStr(c.managedOn)}`, '恢复托管开启'); }
 
-    // ---------------- UI07 设置页：并行 ----------------
-    await check('UI07 设置页“托管”后面是“并行”一节：标题、说明、“同时运行的任务”与 1～4 分段控件', `(() => { const secs = [...document.querySelectorAll('.doc-in .sect')], i = secs.findIndex(s => s.querySelector('h2')?.textContent === ${jsonStr(s6.parallelSec)}); const sec = secs[i]; return i > 0 && secs[i - 1].parentElement.id === 'managed-section' && sec.querySelector('p')?.textContent === ${jsonStr(s6.parallelLead)} && sec.querySelector('.l')?.firstChild.textContent === ${jsonStr(s6.concurrency)} && [...sec.querySelectorAll('[data-segment=concurrency]')].map(b => b.dataset.value).join() === '1,2,3,4'; })()`);
-    await check(`UI07 并行：当前值 ${limit0} 被选中，其余不选`, `[...document.querySelectorAll('[data-segment=concurrency]')].filter(b => b.classList.contains('on')).map(b => b.dataset.value).join() === ${jsonStr(String(limit0))}`);
-    await press('[data-segment=concurrency][data-value="3"]');
-    await verify('UI07 点“3”后 config.json 的 concurrency 为 3，其余字段保留', async () => {
-        assert.ok((await pollUntil(async () => (await config()).concurrency === 3, 8000, 100)).ok, 'concurrency 应为 3');
+    // ---------------- UI07 设置页：并行（自动 / 固定） ----------------
+    const loadFile = appEnv.AR_TEST_LOAD_FILE!;
+    const nowText = `(document.querySelector('[data-parallel-now]')?.textContent ?? '')`;
+    const pickText = (key: string) => `document.querySelector('[data-pick=${key}] span')?.textContent`;
+    await check('UI07 设置页“托管”后面是“并行”一节：标题、说明、“同时运行的任务”与“自动 / 固定”分段', `(() => { const secs = [...document.querySelectorAll('.doc-in .sect')], i = secs.findIndex(s => s.querySelector('h2')?.textContent === ${jsonStr(s6.parallelSec)}); const sec = secs[i]; return i > 0 && secs[i - 1].parentElement.id === 'managed-section' && sec.querySelector('p')?.textContent === ${jsonStr(s6.parallelLead)} && sec.querySelector('.l')?.firstChild.textContent === ${jsonStr(s6.concurrency)} && [...sec.querySelectorAll('[data-segment=concurrencyMode]')].map(b => b.dataset.value + ':' + b.textContent).join() === ${jsonStr(`auto:${s6.concurrencyModes.auto},fixed:${s6.concurrencyModes.fixed}`)} && !sec.querySelector('[data-segment=concurrency]'); })()`);
+    await check(`UI07 并行：配置里是数字 ${limit0} → “固定”被选中，下拉显示 ${limit0}，没有估算行`, `[...document.querySelectorAll('[data-segment=concurrencyMode].on')].map(b => b.dataset.value).join() === 'fixed' && ${pickText('concurrency')} === ${jsonStr(String(limit0))} && !document.querySelector('[data-parallel-now]') && !document.querySelector('[data-pick=concurrencyMax]') && document.querySelector('[data-pick=concurrency]').closest('.set-r').querySelector('.l span').textContent === ${jsonStr(s6.concurrencyFixedHelp)}`);
+    // 文案定稿（144）：这一行的标题原来是占位【文案待定：固定数量】，现在是 s6.concurrencyFixed。新增检查，原有断言不变。
+    await check('UI07 并行：固定档数量这一行的标题是 s6.concurrencyFixed（不是文案占位）', `document.querySelector('[data-pick=concurrency]').closest('.set-r').querySelector('.l').firstChild.textContent === ${jsonStr(s6.concurrencyFixed)} && !document.querySelector('.doc-in').textContent.includes('文案待定')`);
+    // 点“自动”：写入 "auto"，出现估算行（数字来自核心）与“自动时最多”下拉（默认 8）。
+    // 173：估算行只在机器不忙时出现，而“忙不忙”读的是这台电脑当时真实的可用内存；先把负载固定成“不忙”（与下面“机器正忙”同一注入文件，后面会改写并移走）。
+    // 注入文件到整段并行检查结束才删（finally），中途不删，免得回到读真实可用内存。
+    try {
+    // 182：另带 totalMemGb 固定总内存（设置页算“内存不够时暂停”的阈值用，不读这台电脑的真实总内存）。
+    await writeFile(loadFile, JSON.stringify({ busy: false, totalMemGb: 32 }));
+    await press('[data-segment=concurrencyMode][data-value="auto"]');
+    await verify('UI07 点“自动”后 config.json 的 concurrency 为 "auto"，其余字段保留', async () => {
+        assert.ok((await pollUntil(async () => (await config()).concurrency === 'auto', 8000, 100)).ok, 'concurrency 应为 auto');
         const after = await config();
         assert.ok(after.profiles && Object.keys(after.profiles).length >= 1, '执行者配置不能丢');
     });
+    await wait('!!document.querySelector("[data-parallel-now]")', 'UI07 自动档出现估算行');
+    const estimateRe = /^现在估算 (\d+) 个（(\d+) 核、可用内存 (\d+\.\d) GB）$/;
+    const estimateNow = String(await evaluate(nowText)), estimated = estimateRe.exec(estimateNow);
+    assert.ok(estimated, `估算行应是 concurrencyAutoNow 的格式：${estimateNow}`);
+    const estimate = Number(estimated![1]);
+    assert.equal(estimateNow, s6.concurrencyAutoNow(estimate, Number(estimated![2]), estimated![3]), '估算行文字与文案函数一致');
+    assert.ok(estimate >= 1 && estimate <= 8, `估算值应在 1～8：${estimate}`);
+    await check('UI07 自动：“自动”被选中；估算行是 mono 文字，下面是“自动时最多”下拉，默认 8；没有固定数量下拉', `[...document.querySelectorAll('[data-segment=concurrencyMode].on')].map(b => b.dataset.value).join() === 'auto' && document.querySelector('[data-parallel-now]').classList.contains('mono') && !document.querySelector('[data-pick=concurrency]') && ${pickText('concurrencyMax')} === '8' && document.querySelector('[data-pick=concurrencyMax]').closest('.set-r').querySelector('.l').firstChild.textContent === ${jsonStr(s6.concurrencyMax)} && document.querySelector('[data-pick=concurrencyMax]').closest('.set-r').querySelector('.l span').textContent === ${jsonStr(s6.concurrencyMaxHelp)}`);
+    // 文案定稿（144）：自动估算这一行的标题与说明原来是占位【文案待定：自动估算】与空串，现在是 s6.concurrencyAuto 与 s6.concurrencyAutoHelp。新增检查，原有断言不变。
+    await check('UI07 并行：自动估算这一行的标题是 s6.concurrencyAuto、说明是 s6.concurrencyAutoHelp（不是文案占位）', `document.querySelector('[data-parallel-now]').closest('.set-r').querySelector('.l').firstChild.textContent === ${jsonStr(s6.concurrencyAuto)} && document.querySelector('[data-parallel-now]').closest('.set-r').querySelector('.l span').textContent === ${jsonStr(s6.concurrencyAutoHelp)} && !document.querySelector('.doc-in').textContent.includes('文案待定')`);
+    await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].length > 0 && [...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/${estimate}'))`, 'UI07 自动档侧栏上限是估算值', 15000);
+    await save('ui07-parallel-auto-dark');
+    // 打开“自动时最多”下拉，选 4。
+    await press('[data-pick=concurrencyMax]');
+    await wait('!!document.querySelector(".ctx[role=listbox]")', 'UI07 “自动时最多”下拉打开');
+    await check('UI07 “自动时最多”下拉：1～8 八个选项', `[...document.querySelectorAll('.ctx[role=listbox] [role=option]')].map(o => o.textContent).join() === '1,2,3,4,5,6,7,8'`);
+    await press('.ctx[role=listbox] [data-option="3"]');
+    await verify('UI07 选“4”后 config.json 的 concurrencyMax 为 4，concurrency 仍是 "auto"', async () => {
+        assert.ok((await pollUntil(async () => (await config()).concurrencyMax === 4, 8000, 100)).ok, 'concurrencyMax 应为 4');
+        assert.equal((await config()).concurrency, 'auto');
+    });
+    await check('UI07 选“4”后：下拉显示 4，下拉菜单关闭', `${pickText('concurrencyMax')} === '4' && !document.querySelector('.ctx')`);
+    // 182（D114）：“自动时最多”下面是“内存不够时暂停”一行（比例下拉，默认 5%）。注入文件固定总内存 32 GB：5% = 1.6 GB，10% = 3.2 GB。
+    const memRow = `document.querySelector('[data-pick=memLowPercent]').closest('.set-r')`;
+    const memLabel = `${memRow}.querySelector('.l').firstChild.textContent`;
+    await check('UI182 自动档：“自动时最多”下面是“内存不够时暂停”一行，标签、说明（阈值 1.6 GB）、下拉显示“低于 5%”', `(() => { const rows = [...document.querySelectorAll('.doc-in .sect .set-r')], i = rows.indexOf(document.querySelector('[data-pick=concurrencyMax]').closest('.set-r')); return rows[i + 1] === ${memRow} && ${memLabel} === ${jsonStr(s6.memLowPercent)} && ${memRow}.querySelector('.l span').textContent === ${jsonStr(s6.memLowPercentHelp('1.6'))} && ${pickText('memLowPercent')} === ${jsonStr(s6.memLowPercentOption(5))}; })()`);
+    await press('[data-pick=memLowPercent]');
+    await wait('!!document.querySelector(".ctx[role=listbox]")', 'UI182 “内存不够时暂停”下拉打开');
+    await check('UI182 “内存不够时暂停”下拉：五个选项（低于 3% / 5% / 10% / 15% / 20%）', `[...document.querySelectorAll('.ctx[role=listbox] [role=option]')].map(o => o.textContent).join() === ${jsonStr([3, 5, 10, 15, 20].map(n => s6.memLowPercentOption(n)).join())}`);
+    await press('.ctx[role=listbox] [data-option="2"]');
+    await verify('UI182 选“低于 10%”后 config.json 的 memLowPercent 为 10，concurrency 与 concurrencyMax 保留', async () => {
+        assert.ok((await pollUntil(async () => (await config()).memLowPercent === 10, 8000, 100)).ok, 'memLowPercent 应为 10');
+        assert.equal((await config()).concurrency, 'auto');
+        assert.equal((await config()).concurrencyMax, 4);
+    });
+    await check('UI182 选“低于 10%”后：下拉显示“低于 10%”，说明里的阈值变成 3.2 GB，菜单关闭', `${pickText('memLowPercent')} === ${jsonStr(s6.memLowPercentOption(10))} && ${memRow}.querySelector('.l span').textContent === ${jsonStr(s6.memLowPercentHelp('3.2'))} && !document.querySelector('.ctx')`);
+    await press('[data-pick=memLowPercent]');
+    await wait('!!document.querySelector(".ctx[role=listbox]")', 'UI182 改回 5%：下拉打开');
+    await press('.ctx[role=listbox] [data-option="1"]');
+    await verify('UI182 改回“低于 5%”后 config.json 的 memLowPercent 为 5', async () => {
+        assert.ok((await pollUntil(async () => (await config()).memLowPercent === 5, 8000, 100)).ok, 'memLowPercent 应为 5');
+    });
+    await check('UI182 改回“低于 5%”后：下拉显示“低于 5%”，阈值回到 1.6 GB', `${pickText('memLowPercent')} === ${jsonStr(s6.memLowPercentOption(5))} && ${memRow}.querySelector('.l span').textContent === ${jsonStr(s6.memLowPercentHelp('1.6'))}`);
+    // 机器正忙（注入：写 tools/shots.mjs 经环境给的 AR_TEST_LOAD_FILE，与核心排队时的注入同一格式）：估算行换成暂停说明；不切页面，等 10 秒的定时刷新。
+    // 先给配置文件路径那一行（shots 已替换过文字）和整个“并行”一节的节点做记号，刷新后核对它们没有被重建。
+    await evaluate(`(() => { const path = [...document.querySelectorAll('.doc-in .sect span.mono')].find(e => /config\\.json$/.test(e.textContent)); window.__keepPath = path; window.__keepPathText = path?.textContent; window.__keepNow = document.querySelector('[data-parallel-now]'); window.__keepSets = [...document.querySelectorAll('.doc-in .set')]; })()`);
+    await check('UI07 记号：找到配置文件路径行', `!!window.__keepPath && !!window.__keepNow && window.__keepSets.length > 3`);
+    await writeFile(loadFile, JSON.stringify({ busy: true, cpu: 92 }));
+    await wait(`${nowText} === ${jsonStr(s6.concurrencyAutoBusy(92))}`, 'UI07 机器正忙：估算行换成 concurrencyAutoBusy（定时刷新）', 20000);
+    await check('UI07 定时刷新只原地改估算行：路径行与各设置块仍是原来的节点，路径文字没变，估算行节点没被重建', `window.__keepPath.isConnected && window.__keepPath === [...document.querySelectorAll('.doc-in .sect span.mono')].find(e => /config\\.json$/.test(e.textContent)) && window.__keepPath.textContent === window.__keepPathText && window.__keepNow === document.querySelector('[data-parallel-now]') && window.__keepSets.every((e, i) => e === document.querySelectorAll('.doc-in .set')[i])`);
+    await check('UI07 机器正忙：估算行是 info 标签，文字 = concurrencyAutoBusy(92)', `document.querySelector('[data-parallel-now]').classList.contains('tag') && document.querySelector('[data-parallel-now]').classList.contains('info') && ${nowText} === ${jsonStr(s6.concurrencyAutoBusy(92))}`);
+    await save('ui07-parallel-busy-dark');
+    nativeTheme.themeSource = 'light'; await pause(350); await save('ui07-parallel-busy-light'); nativeTheme.themeSource = 'dark'; await pause(350);
+    // 机器恢复：注入文件改回“不忙”，离开再回到设置页（打开时读一次）→ 估算行恢复。
+    await writeFile(loadFile, JSON.stringify({ busy: false }));
+    await press('[data-page=tasks]');
+    await press('[data-page=settings]');
+    await wait(`${nowText}.startsWith('现在估算')`, 'UI07 恢复后估算行回到估算值');
+    nativeTheme.themeSource = 'light'; await pause(350); await save('ui07-parallel-auto-light'); nativeTheme.themeSource = 'dark'; await pause(350);
+    // 点“固定”：默认选当前估算值；再从下拉选 3。
+    await press('[data-segment=concurrencyMode][data-value="fixed"]');
+    await verify('UI07 点“固定”后 config.json 的 concurrency 是当前估算值（数字）', async () => {
+        assert.ok((await pollUntil(async () => typeof (await config()).concurrency === 'number', 8000, 100)).ok, 'concurrency 应为数字');
+        const value = (await config()).concurrency as unknown as number;
+        assert.ok(value >= 1 && value <= 8 && Math.abs(value - estimate) <= 1, `固定值应是估算值（${estimate}）：${value}`);
+    });
+    await wait('!!document.querySelector("[data-pick=concurrency]")', 'UI07 固定档出现下拉');
+    await press('[data-pick=concurrency]');
+    await wait('!!document.querySelector(".ctx[role=listbox]")', 'UI07 固定数量下拉打开');
+    await press('.ctx[role=listbox] [data-option="2"]');
+    await verify('UI07 选“3”后 config.json 的 concurrency 为 3，其余字段保留', async () => {
+        assert.ok((await pollUntil(async () => (await config()).concurrency === 3, 8000, 100)).ok, 'concurrency 应为 3');
+        const after = await config();
+        assert.ok(after.profiles && Object.keys(after.profiles).length >= 1, '执行者配置不能丢');
+        assert.equal(after.concurrencyMax, 4, '自动档的上限保留');
+    });
     await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].length > 0 && [...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/3'))`, 'UI07 侧栏底部上限立刻变成 /3', 8000);
-    await check('UI07 改成 3 后：分段控件选中“3”，侧栏每行都是“n/3”', `document.querySelector('[data-segment=concurrency].on')?.dataset.value === '3' && JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.textContent)) === ${jsonStr(jsonStr((await sidebarRows(3)).map(r => r.text)))}`);
-    await save('ui07-parallel-dark');
-    // 手写的越界值：分段控件不选任何一项，显示当前值；侧栏上限跟着配置。
+    await check('UI07 改成 3 后：“固定”被选中，下拉显示 3，侧栏每行都是“n/3”', `[...document.querySelectorAll('[data-segment=concurrencyMode].on')].map(b => b.dataset.value).join() === 'fixed' && ${pickText('concurrency')} === '3' && JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.textContent)) === ${jsonStr(jsonStr((await sidebarRows(3)).map(r => r.text)))}`);
+    await save('ui07-parallel-fixed-dark');
+    nativeTheme.themeSource = 'light'; await pause(350); await save('ui07-parallel-fixed-light'); nativeTheme.themeSource = 'dark'; await pause(350);
+    // 手写的越界值：下拉不选任何一项，显示当前值；侧栏上限跟着配置。
     await press('[data-page=tasks]');
     const handwritten = await config();
-    await writeFile(configFile, JSON.stringify({ ...handwritten, concurrency: 7 }, null, 2) + '\n');
+    await writeFile(configFile, JSON.stringify({ ...handwritten, concurrency: 12 }, null, 2) + '\n');
     await press('[data-page=settings]');
     await wait('!!document.querySelector("[data-concurrency-value]")', 'UI07 越界值显示在控件前面');
-    await check('UI07 配置里手写的 concurrency: 7（超出 1～4）：分段控件不选任何一项，并显示当前值 7', `document.querySelectorAll('[data-segment=concurrency].on').length === 0 && document.querySelector('[data-concurrency-value]').textContent === '7' && [...document.querySelectorAll('[data-segment=concurrency]')].every(b => b.getAttribute('aria-pressed') === 'false')`);
-    await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/7'))`, 'UI07 侧栏上限跟着手写的值变成 /7', 15000);
-    await press(`[data-segment=concurrency][data-value="${limit0}"]`);
+    await check('UI07 配置里手写的 concurrency: 12（超出 1～8）：“固定”被选中，下拉不选任何一项，并显示当前值 12', `[...document.querySelectorAll('[data-segment=concurrencyMode].on')].map(b => b.dataset.value).join() === 'fixed' && document.querySelector('[data-concurrency-value]').textContent === '12' && document.querySelector('[data-pick=concurrency] span').classList.contains('ph')`);
+    await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/12'))`, 'UI07 侧栏上限跟着手写的值变成 /12', 15000);
+    await press('[data-pick=concurrency]');
+    await wait('!!document.querySelector(".ctx[role=listbox]")', 'UI07 恢复原值：下拉打开');
+    await press(`.ctx[role=listbox] [data-option="${limit0 - 1}"]`);
     await verify(`UI07 恢复原值 ${limit0}`, async () => { assert.ok((await pollUntil(async () => (await config()).concurrency === limit0, 8000, 100)).ok); });
-    await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/${limit0}'))`, 'UI07 侧栏上限恢复', 8000);
-    await check('UI07 恢复后越界值的提示消失，原值被选中', `!document.querySelector('[data-concurrency-value]') && document.querySelector('[data-segment=concurrency].on')?.dataset.value === ${jsonStr(String(limit0))}`);
-
+    const restored = await config() as Record<string, unknown>;
+    delete restored.concurrencyMax;
+    delete restored.memLowPercent;
+    await writeFile(configFile, JSON.stringify(restored, null, 2) + '\n');
+    await wait(`[...document.querySelectorAll('.nav-foot .load-l .mono:last-child')].every(e => e.textContent.endsWith('/${limit0}'))`, 'UI07 侧栏上限恢复', 15000);
+    await check('UI07 恢复后越界值的提示消失，原值显示在下拉里', `!document.querySelector('[data-concurrency-value]') && ${pickText('concurrency')} === ${jsonStr(String(limit0))}`);
+    } finally {
+      await rm(loadFile, { force: true });
+    }
     // ---------------- UI07 设置页：清理（ar gc） ----------------
     const fixtureRoot = path.join(home, 'shots-search'), repo = path.join(fixtureRoot, 'gc-repo');
     const acceptedDir = path.join(worktreeRoot, 'a1b2c3-gc-accepted'), awaitingDir = path.join(worktreeRoot, 'd4e5f6-gc-awaiting');

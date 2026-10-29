@@ -270,8 +270,9 @@ test('5 任务名额：concurrency 1 的两个 --detach 任务，第二个排队
   const f = fixture(t, { concurrency: 1 });
   const release = path.join(f.base, '放行.flag');
   f.setProfile({ releaseFile: release, releaseTimeoutMs: 60000 });
-  const first = f.spec('docs/specs/006-第一个.md');
-  const second = f.spec('docs/specs/007-第二个.md');
+  // 两个任务同时运行：改动范围不重叠（重叠会按 140 排队等对方，不是这里要测的名额排队）。
+  const first = f.spec('docs/specs/006-第一个.md', { allowed: ['first/**'] });
+  const second = f.spec('docs/specs/007-第二个.md', { allowed: ['second/**'] });
 
   let result = await f.ar(['dispatch', first, '--name', '第一个', '--detach', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);
@@ -302,8 +303,8 @@ test('6 排队中 ar stop 第二个：interrupted、没有 preparing、没有 wo
   const f = fixture(t, { concurrency: 1 });
   const release = path.join(f.base, '放行.flag');
   f.setProfile({ releaseFile: release, releaseTimeoutMs: 60000 });
-  const first = f.spec('docs/specs/008-第一个.md');
-  const second = f.spec('docs/specs/009-第二个.md');
+  const first = f.spec('docs/specs/008-第一个.md', { allowed: ['first/**'] });
+  const second = f.spec('docs/specs/009-第二个.md', { allowed: ['second/**'] });
 
   let result = await f.ar(['dispatch', first, '--name', '第一个', '--detach', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);

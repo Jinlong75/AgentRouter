@@ -8,7 +8,9 @@ import { app, nativeTheme } from 'electron';
 import type { Harness } from './shots-input';
 import { effects } from './effects';
 import { appEnvironment } from './app-env.mjs';
-import { px, s6, sc } from '../shared/copy';
+import { fakeCodexModels } from './shots-agents';
+import { fileDialogs } from './console.mjs';
+import { ag, c, gx, p, px, ro, s6, sc } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读（演示与截图把隔离覆盖放在 AR_ISOLATED_ENV 里，主进程 process.env 是用户原样）。
 const appEnv = appEnvironment(process.env);
@@ -84,10 +86,10 @@ export async function captureWizard(h: Harness) {
     // 112：同一服务只放一张卡片；选 Xiaomi MiMo 后表单第一行是"套餐"分段按钮，切换等于改选另一个预设。
     const wizardPresets: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
     const byName = (name: string) => wizardPresets.find(x => x.name === name);
-    await check('UI09 第 3 步的预设卡片按服务合并：7 张（DeepSeek、Xiaomi MiMo、Claude Code、兼容后端、Codex、Qoder、OpenAI 兼容接口），合并卡片的标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
+    await check('UI09 第 3 步的预设卡片按服务合并：8 张（DeepSeek、Xiaomi MiMo、Claude Code、兼容后端、Codex、Qoder、DeepSeek Harness、OpenAI 兼容接口），合并卡片的标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
         const cards = [...document.querySelectorAll(".presets .preset")], names = cards.map(c => c.dataset.wizardPreset);
         const merged = (name, c) => { const el = cards.find(x => x.dataset.wizardPreset === name); return el.dataset.card === c.id && el.querySelector("b").textContent === c.title && el.querySelector(".pk > span").textContent === c.description; };
-        return names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,openai-compat"
+        return names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,deepseek-harness,openai-compat"
             && merged("mimo", ${JSON.stringify(byName('mimo').card)}) && merged("claude-native", ${JSON.stringify(byName('claude-native').card)}) && merged("qoder-cn", ${JSON.stringify(byName('qoder-cn').card)})
             && document.querySelectorAll(".presets .preset .tag.brand").length === 1 && !!cards[0].querySelector(".tag.brand");
     })()`);
@@ -108,6 +110,31 @@ export async function captureWizard(h: Harness) {
             && first.querySelector(".fl span").textContent === ${JSON.stringify(byName('mimo-payg').variant.help)}
             && ${JSON.stringify(byName('mimo-payg').env.ANTHROPIC_BASE_URL)} !== ${JSON.stringify(byName('mimo').env.ANTHROPIC_BASE_URL)} && document.querySelector(".preset.on").dataset.wizardPreset === "mimo";
     })()`);
+    // 172：切换预设后，读密钥状态的结果回来时界面会重画（chooseWizardPreset 的第二次 render）；真实用户这时可能已经点进密钥框开始输入。
+    // 让 secrets:status 慢 1.5 秒，把"点中并输入"稳稳放进这个窗口，断言结果回来之后焦点仍在密钥框、已输入的字还在。
+    // A：结果回来时内容没变（状态仍是"未设置"）——不重画；B：结果回来时内容变了（状态变成"已设置"）——重画，但焦点、输入、光标都保住。
+    const mimoSecret = Object.values(byName('mimo-payg').secrets ?? {})[0] as string;
+    const secretsBefore = await readFile(secretsFile, 'utf8').catch(() => null);
+    effects.consoleDelay['secrets:status'] = 1500;
+    try {
+        for (const [label, variant, draft, changes] of [['A 内容没变', 'mimo', 'sk-draft-a', false], ['B 内容变了', 'mimo-payg', 'sk-draft-b', true]] as const) {
+            const statusFrom = ipcSeq();
+            await press(`[data-wizard-variant=${variant}]`);
+            await wait(`document.querySelector("[data-wizard-variant=${variant}]")?.classList.contains("on")`);
+            await type('[data-wizard-secret]', draft);
+            if (changes) await writeFile(secretsFile, JSON.stringify({ ...(secretsBefore ? JSON.parse(secretsBefore) : {}), [mimoSecret]: 'sk-shots-regress-172' }));
+            await waitIpcReturn(`UI09 172 ${label}：secrets:status`, 'console', 'secrets:status', statusFrom, 15000);
+            if (changes) await wait('document.querySelector("[data-wizard-secret-state]")?.textContent==="已设置"', '界面按新状态重画', 15000);
+            else await wait('!!document.querySelector("[data-wizard-secret-state]")');
+            await check(`UI09 172 ${label}：读密钥状态的结果回来、界面重画（或判定无需重画）之后，焦点仍在密钥框，已输入的字还在`, `document.activeElement === document.querySelector("[data-wizard-secret]") && document.querySelector("[data-wizard-secret]").value === ${JSON.stringify(draft)}`);
+            await key('Backspace');
+            await check(`UI09 172 ${label}：重画之后继续输入仍然生效（光标在末尾）`, `document.querySelector("[data-wizard-secret]").value === ${JSON.stringify(draft.slice(0, -1))}`);
+            await evaluate('document.querySelector("[data-wizard-secret]").value = ""');
+        }
+    } finally {
+        delete effects.consoleDelay['secrets:status'];
+        if (secretsBefore === null) await rm(secretsFile, { force: true }); else await writeFile(secretsFile, secretsBefore);
+    }
     // 回到推荐的 DeepSeek，后面按原流程导入。
     await press('[data-wizard-preset=deepseek]');
     await wait('document.querySelector(".preset.on")?.dataset.wizardPreset==="deepseek" && !document.querySelector("[data-wizard-variant]")');
@@ -125,6 +152,8 @@ export async function captureWizard(h: Harness) {
     await press('[data-pref=wizard-agent]');
     await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试连接成功', 90000);
     await check('UI09 第 3 步导入后自动测试连接并显示成功', 'document.querySelector("[data-wizard-result=ok]").textContent.includes("连接成功")');
+    // Stage07c 151（T5）：连接成功的说明下面多一行"可以按你的执行者生成建议规则（路由页）"（点了跳到路由页并打开建议弹窗，见 UI08 的第三次引导）。
+    await check('UI09 第 3 步连接成功的说明下面有一行 ro.suggestHint（次按钮、带路由图标），在每日上限问题之前', `(() => { const b = document.querySelector('[data-pref=wizard-suggest]'), ok = document.querySelector('[data-wizard-result=ok]'), limit = document.querySelector('[data-wizard-limit]'); return !!b && b.textContent.trim() === ${JSON.stringify(ro.suggestHint)} && !!b.querySelector('i.ri-route-line') && !b.classList.contains('primary') && !!(ok.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(b.compareDocumentPosition(limit) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
     await verify('UI09 config.json 新增执行者（预设、适配器、密钥变量名），没有密钥值', async () => {
         const config = await readConfig();
         const added = Object.entries(config.profiles).find(([, profile]: [string, any]) => Object.values(profile.secrets ?? {}).includes('DEEPSEEK_API_KEY'));
@@ -137,7 +166,34 @@ export async function captureWizard(h: Harness) {
     await save('wizard-3-light');
     nativeTheme.themeSource = 'dark';
     await audit('首次引导第 3 步', async () => { await wait('!!document.querySelector("[data-wizard-result=ok]")'); });
+    await check('UI09 已有多个执行者：强执行者是下拉，默认不设，没有只说明一句', `!!document.querySelector('[data-pref=wizard-strong]') && document.querySelector('[data-pref=wizard-strong] span').textContent === ${JSON.stringify(p.wizardStrongNone)} && !document.querySelector('[data-wizard-strong-only]')`);
+    await press('[data-pref=wizard-strong]'); await wait('!!document.querySelector(".ctx")');
+    const strongLabels = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.ctx button')].map(b => b.textContent.trim()))`)) as string[];
+    assert.equal(strongLabels[0], p.wizardStrongNone); assert.ok(strongLabels.length >= 3, `选项：${strongLabels.join()}`);
+    await press('.ctx button:nth-child(2)'); await wait('!document.querySelector(".ctx")');
+    await check('UI09 选了第一个执行者：下拉显示它', `document.querySelector('[data-pref=wizard-strong] span').textContent === ${JSON.stringify(strongLabels[1])}`);
+    await save('wizard-3-strong-dark'); nativeTheme.themeSource = 'light'; await save('wizard-3-strong-light'); nativeTheme.themeSource = 'dark';
+
+    // 137（D73）：测试成功后可选填"每天最多几个任务"；空着跳过、填 0 报错、填 2 才写 limits.maxTasksPerDay。
+    const limitedProfile = async () => Object.entries((await readConfig()).profiles).find(([, profile]: [string, any]) => Object.values(profile.secrets ?? {}).includes('DEEPSEEK_API_KEY'))![1] as any;
+    await check('UI09 第 3 步测试成功后出现"每天最多几个任务"：输入框默认空、占位"不限"，单位"个任务"', `(() => {
+        const input = document.querySelector("[data-wizard-limit]");
+        return !!input && input.value === "" && input.placeholder === "不限" && input.closest(".statusline").textContent.includes("每天最多") && input.closest(".statusline").textContent.includes("个任务")
+            && document.querySelector("[data-wizard-limit-error]").textContent === "" && !input.classList.contains("bad");
+    })()`);
+    await type('[data-wizard-limit]', '0');
     await press('[data-pref=next]');
+    await wait('document.querySelector("[data-wizard-limit-error]")?.textContent.length > 0', '填 0 后出现提示');
+    await check('UI09 填 0 点"下一步"：显示"填 1 以上的整数…"，输入框标红，仍在第 3 步', `document.querySelector("[data-wizard-limit-error]").textContent === "填 1 以上的整数，或者空着（不限）" && document.querySelector("[data-wizard-limit]").classList.contains("bad") && !document.querySelector("[data-wizard-folder]") && document.querySelector("[data-wizard-limit]").value === "0"`);
+    await verify('UI09 填 0 不写配置：这个执行者没有 limits', async () => { assert.equal((await limitedProfile()).limits, undefined); });
+    await press('[data-wizard-limit]');
+    await key('Backspace');
+    await check('UI09 改动输入框后提示立即消失', 'document.querySelector("[data-wizard-limit]").value === "" && document.querySelector("[data-wizard-limit-error]").textContent === ""');
+    await type('[data-wizard-limit]', '2');
+    await press('[data-pref=next]');
+    await wait('!!document.querySelector("[data-wizard-folder]")', '填 2 后进入第 4 步');
+    await verify('UI09 填 2 点"下一步"：进第 4 步，config.json 里 limits.maxTasksPerDay === 2', async () => { assert.equal((await limitedProfile()).limits.maxTasksPerDay, 2); });
+    await verify('UI09 点下一步：routing.strongExecutor 是所选执行者（已有的名字）', async () => { const c = await readConfig(); assert.ok(c.routing?.strongExecutor && c.profiles[c.routing.strongExecutor], JSON.stringify(c.routing)); });
 
     // 第 4 步：选择并登记第一个项目，不往仓库里写任何文件。
     await wait('!!document.querySelector("[data-wizard-folder]")', '第 4 步项目选择');
@@ -192,8 +248,18 @@ export async function capturePreferences(h: Harness) {
     const settings = async () => { await press('[data-page=tasks]'); await press('[data-page=settings]'); await wait('!!document.querySelector("[data-pref=notifications]")'); };
     // Codex 的派发参数从 Stage03 起在 Agent 页"编辑执行者 · Codex"里（任务 004）。
     const agentsPage = async (name = 'codex') => { await press('[data-page=tasks]'); await press('[data-page=connect]'); await wait(`!!document.querySelector('[data-agent="${name}"]')`); };
-    const codexEdit = async () => { await agentsPage(); await press('[data-more-agent=codex]'); await press('.ctx button:nth-child(1)'); await wait('!!document.querySelector(".sheet [data-setting=model]")'); };
-    const closeSheet = async () => { await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")'); };
+    // 改写（144，T3：Codex 编辑改为表单式）：原来等 `.sheet [data-setting=model]`（设置式控件）→ 现在等表单里的显示名输入框与模型下拉。
+    const codexEdit = async () => { await agentsPage(); await press('[data-more-agent=codex]'); await press('.ctx button:nth-child(1)'); await wait('!!document.querySelector(".sheet [data-e=label]") && !!document.querySelector(".sheet [data-sel=model]")'); };
+    // 表单式的底栏是"取消 / 保存"：closeSheet 关掉框（点"取消"，没有改动时不会弹放弃确认）。
+    const closeSheet = async () => { await press('.sheet-btns .btn:first-child'); await wait('!document.querySelector(".sheet")'); };
+    // 下拉菜单（.optmenu）里按文字选一项：先点开下拉，再点那一项，都是真实点击。
+    const optionSelector = async (label: string) => {
+        const index = await evaluate(`(() => { const items = [...document.querySelectorAll('.optmenu button')]; items.forEach((b, i) => b.setAttribute('data-pick', String(i))); return items.findIndex(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp'))?.textContent.trim() === ${JSON.stringify(label)}); })()`);
+        assert.ok(index >= 0, `下拉里没有「${label}」`);
+        return `.optmenu button[data-pick="${index}"]`;
+    };
+    const pickOption = async (selector: string, label: string) => { await press(selector); await wait('!!document.querySelector(".optmenu")'); await press(await optionSelector(label)); await wait('!document.querySelector(".optmenu")'); };
+    const menuLabels = (): Promise<string[]> => evaluate(`[...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim())`);
     nativeTheme.themeSource = 'dark';
     // 037 第 4 项（来源核实见任务汇报）：claude-code 行的版本在验收里走 AR_TEST_AGENT 的假脚本（那份脚本是为 codex 写的），
     // 会串成 codex-cli；真实安装没有这个问题（detect 跑的是真 claude --version）。这里把向导创建的 deepseek 指向假 Claude Code
@@ -275,24 +341,134 @@ export async function capturePreferences(h: Harness) {
 
     // UI07 设置：每一项写入 config.json，失败恢复，环境变量覆盖说明。
     await rm(config, { force: true }); await settings(); await save('settings-unconfigured-dark');
-    await codexEdit(); await save('connect-codex-edit-dark'); nativeTheme.themeSource = 'light'; await save('connect-codex-edit-light'); nativeTheme.themeSource = 'dark';
-    await press('[data-setting=model]'); await press('.ctx button:nth-child(2)');
-    await wait('!!document.querySelector(".model-input")');
-    await type('.model-input', 'gpt-x-large'); await key('Enter');
-    await wait('document.querySelector("[data-setting=model]")?.textContent.includes("gpt-x-large")');
-    await verify('UI07 自定义模型（编辑执行者）：键盘输入后回车写入 config.json', async () => { assert.equal((await readConfig()).profiles.codex.model, 'gpt-x-large'); });
-    await check('UI07 自定义模型隐藏跟随配置说明', '!document.querySelector("[data-setting=model]").closest(".set-r").textContent.includes("括号里")');
-    await press('[data-setting=effort]'); await press('.ctx button:nth-child(5)');
-    await verify('UI07 推理强度写入 config.json', async () => { assert.equal((await readConfig()).profiles.codex.effort, 'high'); });
-    await press('[data-setting=tier]'); await press('.ctx button:nth-child(2)');
-    await verify('UI07 服务档位写入 config.json', async () => { assert.equal((await readConfig()).profiles.codex.tier, 'default'); });
-    await check('UI07 环境变量覆盖在对应行说明', 'document.querySelector("[data-setting=tier]").closest(".set-r").textContent.includes("环境变量 CODEX_TIER 正在覆盖这一项（priority）")');
-    await press('[data-segment=sandbox][data-value=read-only]');
-    await verify('UI07 沙箱分段写入 config.json', async () => { assert.equal((await readConfig()).profiles.codex.sandbox, 'read-only'); });
-    await press('[data-segment=sandbox][data-value=workspace-write]');
-    await closeSheet();
+    // 改写（144，T3：Codex 编辑改为表单式）：原来的设置式检查（每改一项立即写进 config.json、底栏"完成"）整段换成表单式：
+    // 改动只在点"保存"时一次写入，点"取消"、Esc 放弃都不写；模型与推理强度的下拉来自探针（验收环境的假 Codex 给假目录，见 fakeCodexModels）。
+    const restoreModels = await fakeCodexModels(home);
+    const fieldOf = (label: string) => `[...document.querySelectorAll('.sheet .fld')].find(f => f.querySelector('.fl b').textContent.replace('*', '') === ${JSON.stringify(label)})`;
+    const timeText = (text: string) => new RegExp('^' + text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('00:00', '\\d\\d:\\d\\d') + '$');
+    await codexEdit();
+    await check('UI07 编辑 Codex 是表单式：字段顺序是显示名、模型、推理强度、服务档位、沙箱、位置、可担任、可能用到的模型范围、升级到，底栏是"取消 / 保存"，没有"完成"', `[...document.querySelectorAll('.sheet .fl b')].map(b => b.textContent.replace('*', '')).join() === ${JSON.stringify([ag.label, c.model, c.effort, p.tier, c.sandbox, ag.location, ag.canDo, ag.modelRange, gx.escalate].join())} && [...document.querySelectorAll('.sheet-btns .btn')].map(b => b.textContent).join() === ${JSON.stringify([c.cancel, ag.save].join())}`);
+    await wait('!!document.querySelector(".sheet [data-probe-refresh]") && !document.querySelector(".sheet [data-probe-refresh]").disabled && document.querySelector(".sheet [data-probe-note]").textContent !== ""', 'UI07 Codex 编辑：探针查完（"刷新列表"可点、说明有内容）');
+    await check('UI07 Codex 编辑：模型下面写"列表来自程序 · HH:MM 更新"（探针 source 为 program），"刷新列表"在下拉右边', `${timeText(ag.probeFrom('program', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]').textContent) && document.querySelector('.sheet [data-probe-refresh]').textContent === ${JSON.stringify(ag.refreshList)} && document.querySelector('.sheet [data-probe-refresh]').previousElementSibling === document.querySelector('.sheet [data-sel=model]').closest('.selw')`);
+    await save('connect-codex-edit-dark'); nativeTheme.themeSource = 'light'; await save('connect-codex-edit-light'); nativeTheme.themeSource = 'dark';
+    await check('UI07 环境变量覆盖在对应行说明（服务档位）', `${fieldOf(p.tier)}.querySelector('.override')?.textContent.includes("环境变量 CODEX_TIER 正在覆盖这一项（priority）")`);
+    await press('[data-sel=model]'); await wait('!!document.querySelector(".optmenu")');
+    await verify('UI07 Codex 模型下拉：第一项"跟随 Codex（gpt-x）"，然后是探针的可选模型（不含 visibility 不是 list 的），最后是"自定义…"', async () => { assert.deepEqual(await menuLabels(), [p.follow('gpt-x'), 'test-pro', 'test-mini', gx.modelCustom]); });
+    await key('Escape'); await wait('!document.querySelector(".optmenu")');
+    // 换一个模型：推理强度的选项与说明跟着变（两个模型给不同的强度列表）。
+    await pickOption('[data-sel=model]', 'test-pro');
+    await press('[data-sel=effort]'); await wait('!!document.querySelector(".optmenu")');
+    await verify('UI07 选 test-pro：推理强度下拉是探针给的 low / medium / high / max（第一项跟随 Codex，最后是自定义…）', async () => { assert.deepEqual(await menuLabels(), [p.follow('medium'), 'low', 'medium', 'high', 'max', gx.modelCustom]); });
+    await check('UI07 选 test-pro：推理强度的说明是 effortSupported（这个模型支持的强度与默认值）', `document.querySelector('.sheet').textContent.includes(${JSON.stringify(ag.effortSupported('low / medium / high / max', 'medium'))})`);
+    await key('Escape'); await wait('!document.querySelector(".optmenu")');
+    await pickOption('[data-sel=effort]', 'max');
+    await pickOption('[data-sel=model]', 'test-mini');
+    await check('UI07 换成 test-mini：说明变成它支持的 low / medium；当前值 max 不在新选项里，原样保留并显示成输入框（不悄悄改掉）', `document.querySelector('.sheet [data-e=effort]')?.value === 'max' && document.querySelector('.sheet').textContent.includes(${JSON.stringify(ag.effortSupported('low / medium', 'low'))})`);
+    await pickOption('[data-sel=model]', 'test-pro');
+    await check('UI07 换回 test-pro：max 又在选项里，显示成下拉', 'document.querySelector(\'.sheet [data-sel=effort]\')?.textContent.trim() === "max" && !document.querySelector(\'.sheet [data-e=effort]\')');
+    // 点"刷新列表"：真实点击，查询中按钮禁用并写"正在查询…"，查完恢复并重新显示结果。
+    effects.consoleDelay['agents:models'] = 1500;
+    try {
+        await press('.sheet [data-probe-refresh]');
+        await check('UI07 点"刷新列表"：查询中按钮禁用并显示"正在查询…"', `document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${JSON.stringify(ag.refreshingList)}`);
+        await wait('!document.querySelector(".sheet [data-probe-refresh]").disabled', 'UI07 刷新列表查完', 30000);
+    } finally { delete effects.consoleDelay['agents:models']; }
+    await check('UI07 刷新完成：按钮恢复"刷新列表"，说明仍是"列表来自程序"，已选的模型、推理强度不变', `document.querySelector('.sheet [data-probe-refresh]').textContent === ${JSON.stringify(ag.refreshList)} && ${timeText(ag.probeFrom('program', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]').textContent) && document.querySelector('.sheet [data-sel=model]').textContent.trim() === 'test-pro' && document.querySelector('.sheet [data-sel=effort]').textContent.trim() === 'max'`);
+    await pickOption('[data-sel=tier]', 'flex');
+    await press('[data-e-seg=sandbox][data-value=read-only]');
+    await type('[data-e=label]', ' 2');
+    await check('UI07 改了沙箱：只读按钮按下状态为真', `document.querySelector('.sheet [data-e-seg=sandbox][data-value=read-only]').getAttribute('aria-pressed') === 'true'`);
+    await verify('UI07 改完还没点保存：config.json 没有被创建（改动只在表单里）', async () => { assert.equal(await exists(config), false, `config.json 不该存在：${await readFile(config, 'utf8').catch(() => '')}`); });
+    // Esc：改过字段，先确认放弃；选"取消"回到表单，值还在。
+    await key('Escape'); await wait('!!document.querySelector(".confirm-actions")');
+    await check('UI07 改过字段后按 Esc：先确认放弃', 'document.querySelector(".confirm-card h2").textContent==="放弃未保存的改动？"');
+    await press('.confirm-actions .btn');
+    await check('UI07 在确认框里选"取消"：回到表单，填的值还在', 'document.querySelector(".sheet [data-e=label]").value === "Codex 2" && document.querySelector(".sheet [data-sel=model]").textContent.trim() === "test-pro" && document.querySelector(".sheet [data-sel=tier]").textContent.trim() === "flex"');
+    await press('.sheet-btns .btn:first-child'); await wait('!document.querySelector(".sheet")');
+    await verify('UI07 点"取消"：什么都没写（config.json 仍不存在）', async () => { assert.equal(await exists(config), false); });
+    // 再打开，改完点"保存"：一次写入所有改动（显示名走 agents:update，其余走设置通道一次写入）。
+    await codexEdit();
+    await check('UI07 再次打开：回到没改过的样子（模型是"跟随 Codex"、沙箱是可写工作区、显示名 Codex）', `document.querySelector('.sheet [data-sel=model]').textContent.trim() === ${JSON.stringify(p.follow('gpt-x'))} && document.querySelector('.sheet [data-e=label]').value === "Codex" && document.querySelector('.sheet [data-e-seg=sandbox][data-value=workspace-write]').getAttribute('aria-pressed') === 'true'`);
+    await wait('!document.querySelector(".sheet [data-probe-refresh]").disabled && document.querySelector(".sheet [data-probe-note]").textContent !== ""', 'UI07 再次打开：探针查完');
+    await pickOption('[data-sel=model]', 'test-pro');
+    await pickOption('[data-sel=effort]', 'max');
+    await pickOption('[data-sel=tier]', 'flex');
+    await press('[data-e-seg=sandbox][data-value=read-only]');
+    await type('[data-e=label]', ' 2');
+    await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+    await verify('UI07 点"保存"：config.json 的 codex 执行者里模型、推理强度、服务档位、沙箱、显示名都对', async () => {
+        const profile = (await readConfig()).profiles.codex;
+        assert.deepEqual([profile.model, profile.effort, profile.tier, profile.sandbox, profile.label], ['test-pro', 'max', 'flex', 'read-only', 'Codex 2']);
+    });
+    await wait('!!document.querySelector("[data-agent=codex]") && document.querySelector("[data-agent=codex] .x1 b")?.textContent === "Codex 2"', 'UI07 保存后列表显示新的显示名');
+    // 手写的模型原样保留：选"自定义…"后在输入框里改，保存；再打开仍显示成输入框。
+    await codexEdit();
+    // 探针（假目录）查完才会出现模型下拉的值：codexEdit 只等到 [data-sel=model]（探针没回来时那是输入框旁的小箭头按钮），先等探针说明出现。
+    await wait('!document.querySelector(".sheet [data-probe-refresh]")?.disabled && document.querySelector(".sheet [data-probe-note]")?.textContent !== ""', 'UI07 再次打开：探针查完');
+    await check('UI07 再次打开：保存过的值预填（test-pro、max、flex、只读、Codex 2）', `document.querySelector('.sheet [data-sel=model]').textContent.trim() === 'test-pro' && document.querySelector('.sheet [data-sel=effort]').textContent.trim() === 'max' && document.querySelector('.sheet [data-sel=tier]').textContent.trim() === 'flex' && document.querySelector('.sheet [data-e-seg=sandbox][data-value=read-only]').getAttribute('aria-pressed') === 'true' && document.querySelector('.sheet [data-e=label]').value === 'Codex 2'`);
+    await pickOption('[data-sel=model]', gx.modelCustom);
+    await check('UI07 模型选"自定义…"：变成输入框并取得焦点，里面是原来的模型名', 'document.activeElement === document.querySelector(".sheet [data-e=model]") && document.querySelector(".sheet [data-e=model]").value === "test-pro"');
+    await type('[data-e=model]', '-x');
+    // 位置：点"指定位置…"选程序（文件对话框用桩），只记在表单里，点"保存"才写；"改回自动查找"取消这次选择。这里不保存位置（保存了会改变后面检查的 Codex 检测）。
+    const fakeProgram = path.join(home, 'fake-codex.cjs');
+    fileDialogs.stub = true; fileDialogs.open.length = 0; fileDialogs.open.push(fakeProgram);
+    try { await press('[data-loc=choose]'); await wait(`document.querySelector(".sheet [data-loc=reset]") !== null`, 'UI07 选了位置'); } finally { fileDialogs.stub = false; }
+    await check('UI07 位置：选了程序后表单里显示这个路径与"改回自动查找"；模型输入框里手写的值还在', `document.querySelector('.sheet .statusline .mono.muted').textContent === ${JSON.stringify(fakeProgram)} && document.querySelector('.sheet [data-loc=reset]').textContent === ${JSON.stringify(p.reset)} && document.querySelector('.sheet [data-e=model]').value === 'test-pro-x'`);
+    await verify('UI07 位置：选了程序但还没点保存，config.json 里没有 path', async () => { assert.ok(!(await readConfig()).profiles.codex.path); });
+    await press('[data-loc=reset]');
+    await check('UI07 位置：点"改回自动查找"后显示"自动查找"，没有重置按钮', `document.querySelector('.sheet .statusline .mono.muted').textContent === ${JSON.stringify(p.auto)} && !document.querySelector('.sheet [data-loc=reset]')`);
+    await press('[data-e-seg=sandbox][data-value=workspace-write]');
+    await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+    await verify('UI07 手写的模型保存进 config.json，其余没改的项不变', async () => {
+        const profile = (await readConfig()).profiles.codex;
+        assert.deepEqual([profile.model, profile.effort, profile.tier, profile.sandbox], ['test-pro-x', 'max', 'flex', 'workspace-write']);
+    });
+    await codexEdit();
+    await check('UI07 手写的模型再打开仍原样显示成输入框；推理强度 max 不在预设里也原样保留', 'document.querySelector(".sheet [data-e=model]")?.value === "test-pro-x" && document.querySelector(".sheet [data-e=effort]")?.value === "max"');
+    await key('Escape'); await wait('!document.querySelector(".sheet")');
+    await check('UI07 没有改动时按 Esc 直接关闭，不弹放弃确认', '!document.querySelector(".confirm-actions")');
+    // 改回显示名与"跟随"：选"跟随 Codex"保存后对应项写成 null（config.json 里是 null，不是空串）。
+    await codexEdit();
+    await pickOption('[data-sel=model]', p.follow('gpt-x'));
+    await press('.sheet [data-e=label]'); await key('End'); await key('Backspace'); await key('Backspace');
+    await pickOption('[data-sel=tier]', p.follow('default'));
+    await pickOption('[data-sel=effort]', p.follow('medium'));
+    await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")');
+    await verify('UI07 选"跟随 Codex"保存：model、tier、effort 写成 null，显示名改回 Codex', async () => {
+        const profile = (await readConfig()).profiles.codex;
+        assert.deepEqual([profile.model, profile.effort, profile.tier, profile.label], [null, null, null, 'Codex']);
+    });
     // 关闭模态框后放回焦点是异步收尾（关闭动画、列表可能随配置写入重建），标准：1 秒内回到原按钮；超时会打印当前焦点。
     await within('UI07 关闭"编辑执行者"后焦点回到触发它的更多按钮', 'document.activeElement===document.querySelector("[data-more-agent=codex]")', 1000);
+    // 166：改过名的 Codex 执行者（codex-pro）的编辑读写自己的配置。隔离配置里再加一个 Codex 执行者 codex-pro（模型、强度、档位、沙箱都与 codex 不同）→
+    // 打开它的编辑：预填的是它自己的值 → 改模型、点"保存" → config.json 里 codex-pro 的模型变了，codex 的一个字节都没变。结束后把配置还原成这一段之前的样子。
+    const beforePro = await readFile(config, 'utf8'), beforeProConfig = JSON.parse(beforePro);
+    await writeFile(config, JSON.stringify({ ...beforeProConfig, profiles: { ...beforeProConfig.profiles, 'codex-pro': { adapter: 'codex', label: 'Codex Pro', enabled: true, model: 'test-mini', effort: 'low', tier: 'flex', sandbox: 'read-only' } } }));
+    await agentsPage('codex-pro');
+    await press('[data-more-agent=codex-pro]'); await press('.ctx button:nth-child(1)');
+    await wait('!!document.querySelector(".sheet [data-e=label]") && !!document.querySelector(".sheet [data-sel=model]")', 'UI07 打开 codex-pro 的编辑');
+    await wait('!document.querySelector(".sheet [data-probe-refresh]")?.disabled && document.querySelector(".sheet [data-probe-note]")?.textContent !== ""', 'UI07 codex-pro 编辑：探针查完');
+    await check('UI07 codex-pro 的编辑：模型、推理强度、服务档位、沙箱、显示名预填的是它自己的值（test-mini / low / flex / 只读 / Codex Pro），不是 codex 的', `document.querySelector('.sheet [data-sel=model]').textContent.trim() === 'test-mini' && document.querySelector('.sheet [data-sel=effort]').textContent.trim() === 'low' && document.querySelector('.sheet [data-sel=tier]').textContent.trim() === 'flex' && document.querySelector('.sheet [data-e-seg=sandbox][data-value=read-only]').getAttribute('aria-pressed') === 'true' && document.querySelector('.sheet [data-e=label]').value === 'Codex Pro'`);
+    await pickOption('[data-sel=model]', 'test-pro');
+    await press('.sheet-btns .btn:last-child'); await wait('!document.querySelector(".sheet")', 'UI07 codex-pro 保存后关闭');
+    await verify('UI07 codex-pro 点"保存"：config.json 里 codex-pro 的模型变成 test-pro（其余项不变），codex 执行者与别的执行者都没变', async () => {
+        const after = await readConfig(), pro = after.profiles['codex-pro'];
+        assert.deepEqual([pro.model, pro.effort, pro.tier, pro.sandbox, pro.label], ['test-pro', 'low', 'flex', 'read-only', 'Codex Pro']);
+        for (const name of Object.keys(beforeProConfig.profiles)) assert.deepEqual(after.profiles[name], beforeProConfig.profiles[name], `${name} 不该被改`);
+    });
+    await writeFile(config, beforePro);
+    // 166：设置页并行一节的"机器正忙"按原因写——注入可用内存不够（经 tools/shots.mjs 给的 AR_TEST_LOAD_FILE，另认可选的 memLow 与 freeMemGb）时写内存那一句，不写 CPU。
+    const loadFile = appEnv.AR_TEST_LOAD_FILE!;
+    await writeFile(config, JSON.stringify({ ...beforeProConfig, concurrency: 'auto' }));
+    // 173：先把负载固定成“不忙”，估算行才不取决于这台电脑当时的可用内存；下面改写成“内存不够”，finally 里移走。
+    await writeFile(loadFile, JSON.stringify({ busy: false }));
+    await settings();
+    await wait('!!document.querySelector("[data-parallel-now]")', 'UI07 自动档出现估算行');
+    await writeFile(loadFile, JSON.stringify({ busy: true, cpu: 17, memLow: true, freeMemGb: 0.9 }));
+    try {
+        await wait(`document.querySelector('[data-parallel-now]').textContent === ${JSON.stringify(s6.concurrencyAutoBusyMem('0.9'))}`, 'UI07 内存不够：估算行换成 concurrencyAutoBusyMem（定时刷新）', 20000);
+        await check('UI07 机器正忙因为可用内存不够：写内存那一句（concurrencyAutoBusyMem），不是 CPU 那一句', `document.querySelector('[data-parallel-now]').classList.contains('tag') && document.querySelector('[data-parallel-now]').classList.contains('info') && document.querySelector('[data-parallel-now]').textContent === ${JSON.stringify(s6.concurrencyAutoBusyMem('0.9'))} && !document.querySelector('[data-parallel-now]').textContent.includes('CPU')`);
+    } finally { await rm(loadFile, { force: true }); await writeFile(config, beforePro); }
     await settings();
     await press('[data-segment=watchWindow][data-value=never]');
     await verify('UI07 进度窗口分段写入 config.json', async () => { assert.equal((await readConfig()).watchWindow, 'never'); });
@@ -334,14 +510,19 @@ export async function capturePreferences(h: Harness) {
     await check('UI07 没有 codex 执行者时执行者区没有 Codex 行', '!document.querySelector("[data-agent=codex]") && !!document.querySelector("[data-agent=example]")');
     await save('connect-no-codex-dark');
     await writeFile(config, configured);
-    // 打开控件之后文件被外部破坏：写入必须失败并恢复界面原值（编辑执行者里）。
+    // 打开表单之后文件被外部破坏：点"保存"必须失败，留在框里显示原因（编辑执行者里）。
+    // 改写（144，T3）：原断言"写入失败恢复原值（下拉退回改之前的服务档位 default）" → 新断言"写入失败保持用户填的值（服务档位仍是刚选的 flex）、不关弹窗、显示原因"；
+    // 原因：表单式下改动是用户一次填好再点保存的，失败时把填好的值清掉用户得重填；不关弹窗才能改了再试。
     await codexEdit();
-    // 074：先等这次输入触发的 preferences:save 返回（上限 5000 ms），再断言界面已恢复；原来不等，写入偶尔还没返回时检查就先跑了（072）。
+    await writeFile(config, 'invalid');
+    await pickOption('[data-sel=tier]', 'flex');
+    // 074：先等这次点击触发的 preferences:save 返回（上限 5000 ms），再断言界面；原来不等，写入偶尔还没返回时检查就先跑了（072）。
     const saveFrom = ipcSeq();
-    await writeFile(config, 'invalid'); await press('[data-setting=tier]'); await press('.ctx button:nth-child(3)');
+    await press('.sheet-btns .btn:last-child');
     const saveMs = await waitIpcReturn('UI07 写入失败这次 preferences:save', 'preferences', 'save', saveFrom, 5000);
     console.log(`用时 UI07 写入失败这次 preferences:save：${saveMs} ms（上限 5000 ms）`);
-    await check('UI07 写入失败恢复原值并显示原因（编辑执行者）', 'document.querySelector(".sheet [data-setting=tier]").textContent.trim()==="default" && !!document.querySelector(".sheet .banner.fail")');
+    await wait('!!document.querySelector(".sheet .banner.fail") && !document.querySelector(".sheet-btns .btn:last-child").disabled', 'UI07 写入失败后弹窗显示原因、按钮恢复');
+    await check('UI07 写入失败保持用户填的值并显示原因、不关弹窗（编辑执行者）', 'document.querySelector(".sheet [data-sel=tier]").textContent.trim()==="flex" && !!document.querySelector(".sheet .banner.fail") && document.querySelector(".sheet .banner.fail").textContent.trim().length > 0');
     await verify('UI07 写入失败不篡改文件', async () => { assert.equal(await readFile(config, 'utf8'), 'invalid'); });
     await closeSheet();
     await settings(); await save('settings-invalid-top-dark');
@@ -349,8 +530,10 @@ export async function capturePreferences(h: Harness) {
     await save('settings-invalid-dark');
     await check('UI07 无效配置禁用进度窗口控件并说明原因', '[...document.querySelectorAll("[data-segment=watchWindow]")].every(b=>b.disabled) && document.querySelector(".doc-in").textContent.includes("修好或删掉")');
     await codexEdit();
-    await check('UI07 无效配置时"编辑执行者 · Codex"的派发参数控件禁用并说明原因', '[...document.querySelectorAll(".sheet [data-setting], .sheet [data-segment=sandbox]")].every(b=>b.disabled) && document.querySelector(".sheet").textContent.includes("修好或删掉")');
+    // 改写（144，T3）：原断言 `.sheet [data-setting], .sheet [data-segment=sandbox]` 全部禁用 → 新断言表单里的下拉、输入框、沙箱分段、位置按钮全部禁用（至少各有一个，不是空集），"保存"也禁用；原因：控件换成了表单式的。
+    await check('UI07 无效配置时"编辑执行者 · Codex"的表单控件禁用并说明原因，"保存"不可点', '(() => { const ctl = [...document.querySelectorAll(".sheet [data-sel], .sheet [data-e-seg=sandbox], .sheet [data-loc], .sheet .inp")]; return ctl.length >= 6 && ctl.every(b=>b.disabled) && document.querySelector(".sheet").textContent.includes("修好或删掉") && document.querySelector(".sheet-btns .btn:last-child").disabled && !document.querySelector(".sheet [data-probe-refresh]"); })()');
     await closeSheet();
+    await restoreModels();
     await rm(config); await settings();
     await h.wheel('.doc.scroll', 10000);
     // 018 加了"列表"一节后设置页更高：滚到底再点靠上的开关时，命中测试里的
@@ -387,9 +570,68 @@ export async function capturePreferences(h: Harness) {
     await press('[data-pref=wizard]');
     await wait('!!document.querySelector(".wiz")');
     await check('UI08 "重新运行首次引导"打开引导第 1 步', '!!document.querySelector(".wiz") && [...document.querySelectorAll("[data-page]")].every(b=>b.disabled)');
+    // 137：空着"不限"再走一遍第 3 步（UI08 重新运行首次引导 → 第 2 步 → 第 3 步导入 DeepSeek 并测试）。
+    // 空着点"下一步"不写 limits，已有的上限也不被清掉。此处 config.json 可能还不存在（UI07 之前重置过），所以读不到按"没有执行者"算；
+    // 导入成功后用 route:limit 给这个执行者预先设上限 5（与填 2 那条路径互不相干），空着进第 4 步后它必须还是 5。
+    {
+        const readAll = async () => (await readFile(config, 'utf8').then(JSON.parse, () => ({ profiles: {} }))).profiles ?? {};
+        const existed = await exists(config);
+        const profilesBefore = Object.keys(await readAll());
+        await wait('!document.querySelector("[data-pref=next]").disabled', '第 1 步检测完成', 30000);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-choice]")', '第 2 步');
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector(".presets .preset.on")', '第 3 步预设加载完成', 30000);
+        await press('[data-pref=wizard-agent]');
+        await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试成功', 90000);
+        await check('UI08 重新走到第 3 步：每日上限输入框默认空（不沿用上一次填的 2）', 'document.querySelector("[data-wizard-limit]")?.value === ""');
+        const added = Object.keys(await readAll()).filter(name => !profilesBefore.includes(name))[0];
+        assert.ok(added, '导入后配置里有新执行者');
+        await evaluate(`window.dock.console('route:limit', { name: ${JSON.stringify(added)}, tasks: 5 })`);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', '空着点下一步进第 4 步');
+        await verify('UI08 空着点"下一步"不写 limits：预先设的上限 5 没被清掉，也没有多出别的执行者的上限', async () => {
+            const after = await readAll();
+            assert.equal(after[added].limits.maxTasksPerDay, 5);
+            for (const [name, profile] of Object.entries(after) as [string, any][]) if (name !== added) assert.equal(profile.limits, undefined);
+        });
+        await evaluate(`window.dock.console('agents:remove', { name: ${JSON.stringify(added)} })`);
+        if (!existed) await rm(config, { force: true });
+    }
     await press('[data-pref=skip]');
     await wait('!document.querySelector(".wiz")');
     await check('UI08 跳过引导回到软件，侧栏恢复可用', '[...document.querySelectorAll("[data-page]")].every(b=>!b.disabled)');
+    // Stage07c 151（T5）：第三次走到第 3 步，点"可以按你的执行者生成建议规则"：引导结束，跳到路由页并打开建议弹窗（内容与核心的建议一致）。
+    {
+        const readAll = async () => (await readFile(config, 'utf8').then(JSON.parse, () => ({ profiles: {} }))).profiles ?? {};
+        const existed = await exists(config);
+        const profilesBefore = Object.keys(await readAll());
+        await press('[data-pref=wizard]');
+        await wait('!!document.querySelector(".wiz")', 'UI08 再次打开引导');
+        await wait('!document.querySelector("[data-pref=next]").disabled', '第 1 步检测完成', 30000);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-choice]")', '第 2 步');
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector(".presets .preset.on")', '第 3 步预设加载完成', 30000);
+        await press('[data-pref=wizard-agent]');
+        await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试成功', 90000);
+        await press('[data-pref=wizard-suggest]');
+        await wait('!document.querySelector(".wiz") && document.querySelector("[data-page=routing]")?.getAttribute("aria-current") === "page" && !!document.querySelector(".sheet [data-ro-sug]")', 'UI08 点建议提示后：引导结束、到路由页、建议弹窗打开', 30000);
+        await check('UI08 点"可以按你的执行者生成建议规则"：引导结束（侧栏可用）、停在路由页、弹出标题为 ro.suggestTitle 的建议弹窗', `[...document.querySelectorAll("[data-page]")].every(b=>!b.disabled) && document.querySelector("[data-page=routing]").getAttribute("aria-current") === "page" && document.querySelector(".sheet").getAttribute("aria-label") === ${JSON.stringify(ro.suggestTitle)}`);
+        await verify('UI08 建议弹窗里的条数等于核心 ar route suggest 的结果（至少有刚导入的 DeepSeek 一条），默认全选', async () => {
+            const suggested = await evaluate(`window.dock.console('route:suggest')`);
+            const shown = await evaluate(`[...document.querySelectorAll('.sheet [data-ro-sug]')].map(b => b.getAttribute('aria-checked')).join()`);
+            assert.ok(suggested.rules.length >= 1, JSON.stringify(suggested));
+            assert.equal(shown, suggested.rules.map(() => 'true').join());
+        });
+        await press('.sheet [data-sheet-btn="0"]');
+        await wait('!document.querySelector(".sheet")', 'UI08 取消关闭建议弹窗');
+        const added = Object.keys(await readAll()).filter(name => !profilesBefore.includes(name))[0];
+        assert.ok(added, '导入后配置里有新执行者');
+        await evaluate(`window.dock.console('agents:remove', { name: ${JSON.stringify(added)} })`);
+        if (!existed) await rm(config, { force: true });
+        await press('[data-page=about]');
+    }
     const fontExists = await stat(path.join(__dirname, 'fonts/MiSansVF.ttf')).then(() => true, () => false);
     if (fontExists) await check('UI08 已加载随包 MiSans', 'document.fonts.check(\'13px "AgentRouter MiSans"\') && [...document.fonts].some(f=>f.family.includes("AgentRouter MiSans") && f.status==="loaded")');
     if (await exists(path.join(__dirname, 'fonts/SpaceGrotesk.ttf'))) await check('UI08 字标已加载随包 Space Grotesk', 'document.fonts.check(\'700 13px "AgentRouter Space Grotesk"\') && [...document.fonts].some(f=>f.family.includes("AgentRouter Space Grotesk") && f.status==="loaded")');
@@ -487,7 +729,9 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
     await writeFile(secretsFile, JSON.stringify({ EXAMPLE_TEST_KEY: 'sk-shots-example-0000' }));
     try {
         await press('[data-page=tasks]'); await press('[data-page=connect]'); await wait('!!document.querySelector("[data-agent=bad]")');
-        await check('UI06 执行者区每行：标签、默认、认证状态（隔离密钥文件）', 'document.querySelector("[data-agent=ok] .x1").textContent.includes("默认") && document.querySelector("[data-agent=example] .xtag").textContent==="EX" && document.querySelector("[data-agent=example] .x2").textContent.includes("已设置") && document.querySelector("[data-agent=codex] .x1").textContent.includes("只在指定时使用")');
+        await check('UI06 执行者区每行：标签、默认、认证状态（隔离密钥文件）', 'document.querySelector("[data-agent=ok] .x1").textContent.includes("默认") && document.querySelector("[data-agent=example] .xtag").textContent==="EX" && document.querySelector("[data-agent=example] .x2").textContent.includes("已设置") && !document.querySelector("[data-agent=codex] .x1").textContent.includes("只在指定时使用")');
+        // 180（D111）：执行者区说明改成按路由分配，Codex 行不再有"只在指定时使用"标签。
+        await check('UI06 执行者区说明文字是按路由分配的新文案', '[...document.querySelectorAll(".sect h2")].some(h => h.textContent === "执行者" && h.nextElementSibling.textContent === "实际执行任务的 Agent。任务按路由页的规则分配给它们；没有规则命中时派给\\"默认\\"那一个。")');
         // 037 第 4 项：claude-code 执行者（example）行版本是 Claude Code 风格、不含 codex-cli；codex 行含 codex-cli。
         await check('UI06 claude-code 执行者（example）行的版本不含 codex-cli，codex 行含', 'document.querySelector("[data-agent=example]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=example]").textContent.includes("codex-cli") && document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
         await save('connect-executors-dark'); nativeTheme.themeSource = 'light'; await save('connect-executors-light'); nativeTheme.themeSource = 'dark';
@@ -591,13 +835,13 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
         await press('.page-h [data-import-agent]'); await wait('!!document.querySelector(".sheet .preset.on")');
         const presetList: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
         const cardOf = (name: string) => presetList.find(x => x.name === name).card;
-        await check('UI13 第 1 步显示 9 张卡片（7 张预设加自定义 CLI、从文件导入），MiMo、Claude Code、Qoder 各合并成一张，标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
+        await check('UI13 第 1 步显示 10 张卡片（8 张预设加自定义 CLI、从文件导入），MiMo、Claude Code、Qoder 各合并成一张，标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
             const cards = [...document.querySelectorAll(".sheet .preset")];
             const names = cards.map(c => c.dataset.preset);
             const card = name => cards.find(c => c.dataset.preset === name);
             const brand = [...document.querySelectorAll(".sheet .preset .tag.brand")];
             const merged = (name, id, c) => card(name).dataset.card === id && card(name).querySelector("b").textContent === c.title && card(name).querySelector(".pk > span").textContent === c.description;
-            return names.length === 9 && names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,openai-compat,@custom,@file"
+            return names.length === 10 && names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,deepseek-harness,openai-compat,@custom,@file"
                 && cards.filter(c => c.dataset.card).map(c => c.dataset.card).join() === "mimo,claude-code,qoder"
                 && merged("mimo", "mimo", ${JSON.stringify(cardOf('mimo'))}) && merged("claude-native", "claude-code", ${JSON.stringify(cardOf('claude-native'))}) && merged("qoder-cn", "qoder", ${JSON.stringify(cardOf('qoder-cn'))})
                 && !card("mimo-payg") && !card("claude-subscription") && !card("qoder")

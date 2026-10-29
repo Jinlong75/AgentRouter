@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { nativeTheme } from 'electron';
 import { clock, pollUntil, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, type Harness } from './shots-input';
 import { coreRun } from './core';
-import { nt, ro } from '../shared/copy';
+import { gx, nt, ro } from '../shared/copy';
 import { appEnvironment } from './app-env.mjs';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
@@ -28,7 +28,7 @@ const core = async (args: string[], cwd?: string) => {
 };
 
 // 在隔离公共目录里准备新建任务页用的临时仓库：已初始化、有一个任务说明、项目配置里有允许路径与验收命令。
-async function fixtures() {
+export async function fixtures() {
     const home = appEnv.AGENT_ROUTER_HOME!;
     assert.ok(home && path.isAbsolute(home), '截图验收必须在隔离公共目录里运行');
     const repo = path.join(home, 'shots-newtask', 'sample'), specs = path.join(repo, 'docs', 'specs');
@@ -293,7 +293,7 @@ export async function captureNewtask(h: Harness) {
         await goto('text');
         await check('UI16 直接写文字时隐藏"先提交任务说明"', `!document.querySelector('[data-nt-commit]') && !!document.querySelector('[data-nt-f=text]')`);
         await type('[data-nt-f=text]', 'Update the README title only.');
-        await check('UI16 直接写文字时说明栏只写文字与执行者', `document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify('直接把这段文字派给 假执行者')}`);
+        await check('UI16 直接写文字时说明栏写文字与执行者，并说明直接改、不跑门禁、不进验收页', `document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify('直接把这段文字派给 假执行者：在项目里直接改，不跑门禁，也不进验收页')}`);
         await shot('newtask-text');
         await press('[data-nt-dispatch]');
         await wait('document.querySelector("[data-page=tasks]")?.getAttribute("aria-current") === "page" && !!document.querySelector(".trow.on")', '直接写文字派发后切回任务页并选中', 20000);
@@ -544,6 +544,105 @@ export async function captureNewtask(h: Harness) {
             await writeFile(configFile, fakeText);
             await rm(researchFile, { force: true });
             // 回到没有规则的状态：重新进入页面，后面的通用检查与以前一样。
+            await reenter('existing').catch(() => { });
+        }
+
+        // ---- UI16（Stage07c 151，T6）：新建任务说明里的推理强度 ----
+        // 配置 = 假执行者 + 由核心 ar agents add 按预设加入的 Claude（订阅令牌）和 DeepSeek Harness（预设声明不支持推理强度）；不派发，
+        // 生成的任务说明用"预览"看（和派发时同一份 ar spec new 的结果）。结束时配置还原。
+        const effortSpecRel = (src: string) => /^effort: (.+)$/m.exec(src)?.[1] ?? null;
+        const previewSource = async () => {
+            await press('[data-nt-preview]');
+            await wait('!!document.querySelector(".sheet.wide .mdsrc.selectable")', 'UI16c 预览模态框', 15000);
+            const src = String(await evaluate(`document.querySelector('.sheet.wide .mdsrc').textContent`));
+            await press('.sheet.wide [data-sheet-btn="0"]');
+            await wait('!document.querySelector(".sheet")', 'UI16c 关闭预览');
+            return src;
+        };
+        const effortMenu = async () => JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.ctx button')].map(b => b.textContent.trim()))`)) as string[];
+        const chooseWorker = async (label: string) => {
+            await press('[data-nt-worker]');
+            await wait('!!document.querySelector(".ctx")', `UI16c 执行者下拉（选 ${label}）`);
+            await press(await menuItem(label));
+            await wait('!document.querySelector(".ctx")', `UI16c 选了 ${label}`);
+        };
+        const chooseEffort = async (label: string) => {
+            await press('[data-nt-effort]');
+            await wait('!!document.querySelector(".ctx")', `UI16c 推理强度下拉（选 ${label}）`);
+            await press(await menuItem(label));
+            await wait('!document.querySelector(".ctx")', `UI16c 选了 ${label}`);
+        };
+        await writeFile(configFile, fakeText);
+        await core(['agents', 'add', '--preset', 'claude-subscription', '--label', 'Claude 测试']);
+        await core(['agents', 'add', '--preset', 'deepseek-harness', '--label', 'Harness 测试']);
+        const presetEfforts: string[] = (await core(['agents', 'presets'])).presets.find((x: any) => x.name === 'claude-subscription').effortOptions;
+        assert.ok(presetEfforts.length >= 2 && !(await core(['agents', 'presets'])).presets.find((x: any) => x.name === 'deepseek-harness').supportsEffort, '预设：Claude 有推理强度选项，DeepSeek Harness 不支持');
+        const effortFixtureConfig = await readFile(configFile, 'utf8');
+        try {
+            await reenter('new');
+            // 标题和目标是预览的前提；本段自己填的，结束时清掉（不影响后面的检查）。
+            const filled: string[] = [];
+            for (const [field, text] of [['title', 'Effort notes'], ['goal', 'Check the effort field.']]) {
+                if (await evaluate(`document.querySelector("[data-nt-f=${field}]").value`)) continue;
+                await type(`[data-nt-f=${field}]`, text);
+                filled.push(field);
+            }
+            await wait('!!document.querySelector("[data-nt-effort]")', 'UI16c 推理强度一行出现');
+            await check('UI16c 新建任务说明：执行者下面多一行推理强度（标签 gx.effort，默认"默认"），说明文案是占位', `(() => { const box = document.querySelector('[data-nt-effort-box]'), b = box.querySelector('[data-nt-effort]'); return box.previousElementSibling.querySelector('[data-nt-worker]') !== null && box.querySelector('.fl b').textContent === ${JSON.stringify(gx.effort)} && b.textContent.trim() === ${JSON.stringify(gx.effortDefault)} && b.getAttribute('aria-label') === ${JSON.stringify(gx.effort)} && box.querySelector('.fl span').textContent.length > 0; })()`);
+            await verify('UI16c 默认执行者（假执行者，没有推理强度的选项）：推理强度下拉只有"默认"', async () => {
+                await press('[data-nt-effort]');
+                await wait('!!document.querySelector(".ctx")', 'UI16c 推理强度下拉');
+                assert.deepEqual(await effortMenu(), [gx.effortDefault]);
+                await key('Escape');
+            });
+            await chooseWorker('Claude 测试');
+            await press('[data-nt-effort]');
+            await wait('!!document.querySelector(".ctx")', 'UI16c Claude 的推理强度下拉');
+            await verify('UI16c 选了 Claude 测试：推理强度下拉第一项"默认"，其余是它预设的选项', async () => { assert.deepEqual(await effortMenu(), [gx.effortDefault, ...presetEfforts]); });
+            await key('Escape');
+            await chooseEffort('high');
+            await check('UI16c 选了 high：下拉显示 high', `document.querySelector('[data-nt-effort] span').textContent === 'high'`);
+            await evaluate('document.querySelector("[data-nt-effort-box]").scrollIntoView({ block: "center" })');
+            await pause(300);
+            await shot('newtask-effort');
+            await verify('UI16c 预览：生成的任务说明 frontmatter 有 effort: high，worker 是 claude-subscription', async () => {
+                const src = await previewSource();
+                assert.equal(effortSpecRel(src), 'high', src);
+                assert.match(src, /^worker: claude-subscription$/m);
+            });
+            await chooseEffort(gx.effortDefault);
+            await verify('UI16c 选"默认"：生成的任务说明没有 effort 行', async () => { const src = await previewSource(); assert.equal(effortSpecRel(src), null, src); });
+            // 换执行者：当前强度不在新执行者的选项里时换成"默认"并提示一句。
+            await chooseEffort('high');
+            await chooseWorker('假执行者');
+            await check('UI16c 换成假执行者（没有 high 这个选项）：推理强度换成"默认"，出现提示（含 high）', `(() => { const n = document.querySelector('[data-nt-effort-note]'); return document.querySelector('[data-nt-effort] span').textContent === ${JSON.stringify(gx.effortDefault)} && !!n && n.textContent.includes('high'); })()`);
+            await verify('UI16c 换成假执行者后生成的任务说明没有 effort 行', async () => { const src = await previewSource(); assert.equal(effortSpecRel(src), null, src); });
+            // 不支持推理强度的执行者：这一行隐藏；已选了强度再换成它时，原位置显示一句"已忽略"，生成的任务说明不写 effort。
+            await chooseWorker('Harness 测试');
+            await check('UI16c 选了不支持推理强度的 Harness 测试：推理强度一行隐藏（不是禁用）', `!!document.querySelector('[data-nt-effort-box]') && document.querySelector('[data-nt-effort-box]').children.length === 0 && !document.querySelector('[data-nt-effort]')`);
+            await chooseWorker('Claude 测试');
+            await chooseEffort('high');
+            await chooseWorker('Harness 测试');
+            await check('UI16c 已选 high 再换成 Harness 测试：原位置显示 ro.effortUnsupported，没有下拉', `(() => { const t = document.querySelector('[data-nt-effort-ignored]'); return !!t && t.textContent === ${JSON.stringify(ro.effortUnsupported)} && !document.querySelector('[data-nt-effort]') && t.closest('.fld').querySelector('.fl b').textContent === ${JSON.stringify(gx.effort)}; })()`);
+            await shot('newtask-effort-ignored');
+            await verify('UI16c 不支持的执行者：生成的任务说明不写 effort', async () => { const src = await previewSource(); assert.equal(effortSpecRel(src), null, src); assert.match(src, /^worker: deepseek-harness$/m); });
+            // 执行者选"自动"且按路由规则时，选项来自路由结果的执行者。
+            await writeFile(configFile, JSON.stringify({ ...JSON.parse(effortFixtureConfig), routing: { rules: [{ types: ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review'], profile: 'claude-subscription' }], fallback: null, reviewer: null } }, null, 2) + '\n');
+            await reenter('new');
+            await chooseWorker(ro.autoByRule);
+            await wait('!!document.querySelector("[data-nt-route]")', 'UI16c 路由提示');
+            await waitHint('claude-subscription', 'UI16c 自动按规则派给 Claude 测试');
+            await check('UI16c 执行者是"自动（按路由规则）"，推理强度一行仍在', `document.querySelector('[data-nt-worker] span').textContent === ${JSON.stringify(ro.autoByRule)} && !!document.querySelector('[data-nt-effort]')`);
+            await press('[data-nt-effort]');
+            await wait('!!document.querySelector(".ctx")', 'UI16c 自动时的推理强度下拉');
+            await verify('UI16c 自动：推理强度的选项来自路由结果的执行者（Claude 测试）', async () => { assert.deepEqual(await effortMenu(), [gx.effortDefault, ...presetEfforts]); });
+            await key('Escape');
+            // 后面的检查不带强度、不带标题和目标：选回"默认"，清掉本段填的字段。
+            await chooseEffort(gx.effortDefault);
+            for (const field of filled) { await focusField(`[data-nt-f=${field}]`); await key('a', ['control']); await key('Backspace'); }
+        }
+        finally {
+            await writeFile(configFile, fakeText);
             await reenter('existing').catch(() => { });
         }
 

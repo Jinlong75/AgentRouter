@@ -9,7 +9,7 @@ import { isAbsolute, join } from 'node:path';
 import { launcherFor, findOnPath } from '../lib/launcher.mjs';
 import { limitOutput } from '../lib/output.mjs';
 import { getPath, placeholdersIn } from '../lib/generic-schema.mjs';
-import { createMapper as createStreamMapper, relPath } from './claude-code.mjs';
+import { createMapper as createStreamMapper, finalResultOf, relPath } from './claude-code.mjs';
 
 // 参数总长上限（Windows 命令行上限 32767 字符，留出程序路径与引号的余量）。
 const MAX_ARG_CHARS = 28000;
@@ -144,6 +144,8 @@ export function makeGeneric(decl, { name = null } = {}) {
   const label = decl.label;
   const format = decl.output?.format ?? 'text';
   const report = decl.report ?? (format === 'text' ? 'stdout' : 'lastSay');
+  const hasReadOnlyEnv = decl.readOnlyEnv !== null && typeof decl.readOnlyEnv === 'object' && Object.keys(decl.readOnlyEnv).length > 0;
+  const supportsReadOnly = Array.isArray(decl.readOnlyArgs) || hasReadOnlyEnv;
   const pick = (a, b) => unset(a) ? (unset(b) ? null : b) : a;
   return {
     id: 'generic',
@@ -153,9 +155,11 @@ export function makeGeneric(decl, { name = null } = {}) {
     keepStdout: report === 'stdout',
     // 托管 / 脱离派发的请求带上声明（见 run.mjs 的 profileConfig），执行者进程不再读配置。
     snapshotKeys: ['generic', 'genericDecl', 'genericError'],
-    capabilities: { readOnly: Array.isArray(decl.readOnlyArgs), usage: format !== 'text', cost: false, reportFile: report === 'file' },
+    capabilities: { readOnly: supportsReadOnly, usage: format !== 'text', cost: false, reportFile: report === 'file' },
     declaration: decl,
     declarationName: name,
+    // 声明里写了 kind（limit / unavailable）的失败提示：命中就按限流 / 服务不可用处理（Stage07c T7，见 limits-state.mjs 的 classifyFailure）。
+    limitHints: (decl.failureHints ?? []).filter(hint => hint.kind === 'limit' || hint.kind === 'unavailable'),
     detect({ env = process.env } = {}) {
       try {
         const launcher = resolveLauncher(decl, env);
@@ -172,8 +176,16 @@ export function makeGeneric(decl, { name = null } = {}) {
     command({ root, report: reportPath, prompt, settings = {}, detection, env = process.env, profile = {}, readOnly = false }) {
       let template = decl.args;
       if (readOnly) {
-        if (!Array.isArray(decl.readOnlyArgs)) throw new Error(`${label} 不支持只读任务`);
-        template = decl.readOnlyArgs;
+        if (!supportsReadOnly) throw new Error(`${label} 不支持只读任务`);
+        if (Array.isArray(decl.readOnlyArgs)) template = decl.readOnlyArgs;
+        // 只读靠环境变量切换（如 dsh 的 DSH_PERMISSION_MODE）：env 已由公共层并入，这里再叠加 readOnlyEnv。
+        // runner 把同一个对象交给 spawn，所以直接写入；不动 process.env。
+        if (hasReadOnlyEnv && env !== process.env) {
+          for (const [key, value] of Object.entries(decl.readOnlyEnv)) {
+            for (const existing of Object.keys(env)) if (existing.toLowerCase() === key.toLowerCase()) delete env[existing];
+            env[key] = String(value);
+          }
+        }
       }
       const model = pick(settings.model, profile.model), effort = pick(settings.effort, profile.effort);
       const argTemplate = dropUnset(template, { model, effort });
@@ -200,6 +212,8 @@ export function makeGeneric(decl, { name = null } = {}) {
       };
     },
     createMapper: () => createMapper_(decl.output ?? { format: 'text' }),
+    // 执行者不自行退出的兜底：声明里还没有"结束条件"，只有 stream-json（复用 Claude Code 的解析）有明确的结果事件；text / jsonl 不启用。
+    ...(format === 'stream-json' ? { finalResult: finalResultOf } : {}),
     mapLine: (line, ctx) => createMapper_(decl.output ?? { format: 'text' })(line, ctx),
     finish({ lastSay, result, stdoutText } = {}) {
       if (report === 'stdout') return stdoutText ? stdoutText : null;

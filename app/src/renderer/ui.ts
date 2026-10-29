@@ -128,7 +128,7 @@ export function openSheet(options: {
     background.forEach(({ e }) => e.inert = true);
     document.body.append(overlay);
     const focusables = () => [...root.querySelectorAll<HTMLElement>('button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])')].filter(el => !(el as HTMLButtonElement).disabled && !el.closest('[inert],[hidden]') && el.getClientRects().length > 0);
-    const primaryLabel = btnsEl.querySelector<HTMLButtonElement>('button:last-of-type')?.innerHTML ?? '';
+    let idleLabel = '';
     let closed = false;
     // 触发按钮可能在模态框打开期间随页面重建被替换：按它的 data-* 属性找到新的同一个按钮再放回焦点。
     const triggerNow = () => { if (options.trigger.isConnected) return options.trigger; const attrs = [...options.trigger.attributes].filter(a => a.name.startsWith('data-')); return attrs.length ? document.querySelector<HTMLElement>(attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join('')) : null; };
@@ -138,7 +138,17 @@ export function openSheet(options: {
         root,
         setBody(html) { bodyEl.replaceChildren(...nodes(html)); },
         setFoot(html) { btnsEl.innerHTML = html; bind(); },
-        busy(on) { for (const b of btnsEl.querySelectorAll<HTMLButtonElement>('button')) b.disabled = on; const p = btnsEl.querySelector<HTMLButtonElement>('button:last-of-type'); if (p) p.innerHTML = on ? `<span class="mk run">${icon('loader-4-line')}</span>${primaryLabel}` : primaryLabel; if (!on && !root.contains(document.activeElement)) p?.focus({ preventScroll: true }); },
+        busy(on) {
+            for (const b of btnsEl.querySelectorAll<HTMLButtonElement>('button')) b.disabled = on;
+            const p = btnsEl.querySelector<HTMLButtonElement>('button:last-of-type');
+            // 主按钮原来的内容在进入忙碌时才记下（按钮文字里可能带数字，调用方会在打开之后改它，不能用打开时的那份）。
+            if (p) {
+                const spinning = p.firstElementChild?.matches('.mk.run') ?? false;
+                if (on) { if (!spinning) idleLabel = p.innerHTML; p.innerHTML = `<span class="mk run">${icon('loader-4-line')}</span>${idleLabel}`; }
+                else if (spinning) p.innerHTML = idleLabel;
+            }
+            if (!on && !root.contains(document.activeElement)) p?.focus({ preventScroll: true });
+        },
         fail(text) { bodyEl.querySelector('.sheet-fail')?.remove(); if (!text) return; const b = document.createElement('div'); b.className = 'banner fail sheet-fail'; b.setAttribute('role', 'alert'); b.innerHTML = `<span class="mk fail">${icon('close-circle-line')}</span><span>${esc(text)}</span>`; bodyEl.prepend(b); },
         close,
     };

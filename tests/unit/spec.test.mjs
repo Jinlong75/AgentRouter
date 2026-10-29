@@ -325,6 +325,59 @@ test('core/templates/spec.md 能被解析与校验', () => {
   assert.match(text, /\n## 受影响的已有测试\n/);
 });
 
+test('effort / model（Stage07c T6）：认识的字段，不再有"不认识的字段"警告；没写是 undefined', () => {
+  const { parsed, spec } = read('---\nid: 1\neffort: high\nmodel: deepseek-v4-flash   # 行尾注释\n---\n');
+  assert.deepEqual(parsed.warnings, []);
+  assert.equal(spec.effort, 'high');
+  assert.equal(spec.model, 'deepseek-v4-flash');
+  assert.equal(read('---\nid: 1\neffort: "  max  "\n---\n').spec.effort, 'max', '首尾空白去掉');
+  const none = read('---\nid: 1\n---\n').spec;
+  assert.equal(none.effort, undefined);
+  assert.equal(none.model, undefined);
+});
+
+test('effort / model：必须是非空字符串，写了别的类型报错并带行号', () => {
+  fails('---\nid: 1\neffort: true\n---\n', { line: 3, match: /effort 必须是字符串（当前：true）/, validate: true });
+  fails('---\nid: 1\nmodel: false\n---\n', { line: 3, match: /model 必须是字符串（当前：false）/, validate: true });
+  fails('---\nid: 1\neffort:\n---\n', { line: 3, match: /effort 必须是字符串/, validate: true });
+  fails('---\nid: 1\neffort: []\n---\n', { line: 3, match: /effort 必须是字符串/, validate: true });
+  fails('---\nid: 1\nmodel: "   "\n---\n', { line: 3, match: /model 不能为空/, validate: true });
+  fails('---\nid: 1\neffort: ""\n---\n', { line: 3, match: /effort 不能为空/, validate: true });
+});
+
+test('core/templates/spec.md 的 effort / model 示例是注释，复制出来不会带上占位值', () => {
+  const text = readFileSync(fileURLToPath(new URL('../../core/templates/spec.md', import.meta.url)), 'utf8');
+  assert.match(text, /\n# effort: high .*可选/);
+  assert.match(text, /\n# model: .*可选/);
+  const { spec, parsed } = read(text, 'spec.md');
+  assert.equal(spec.effort, undefined);
+  assert.equal(spec.model, undefined);
+  assert.deepEqual(parsed.warnings, []);
+});
+
 test('SPEC_TYPES 是协议里的七种类型', () => {
   assert.deepEqual(SPEC_TYPES, ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review']);
+});
+
+test('reviewer / review_block（Stage08 T3）：认识的字段，没有"不认识的字段"警告；没写是 undefined', () => {
+  const { parsed, spec } = read('---\nid: 1\nreview: true\nreviewer: kimi-k3-reviewer   # 行尾注释\nreview_block: high\n---\n');
+  assert.deepEqual(parsed.warnings, []);
+  assert.equal(spec.review, true);
+  assert.equal(spec.reviewer, 'kimi-k3-reviewer');
+  assert.equal(spec.review_block, 'high');
+  assert.equal(read('---\nid: 1\nreviewer: "  rev  "\nreview_block: none\n---\n').spec.reviewer, 'rev', '首尾空白去掉');
+  assert.equal(read('---\nid: 1\nreview_block: none\n---\n').spec.review_block, 'none');
+  const none = read('---\nid: 1\n---\n').spec;
+  assert.equal(none.reviewer, undefined);
+  assert.equal(none.review_block, undefined);
+});
+
+test('reviewer / review_block：类型不对报错并带行号', () => {
+  fails('---\nid: 1\nreviewer: true\n---\n', { line: 3, match: /reviewer 必须是字符串（当前：true）/, validate: true });
+  fails('---\nid: 1\nreviewer: []\n---\n', { line: 3, match: /reviewer 必须是字符串/, validate: true });
+  fails('---\nid: 1\nreviewer: "   "\n---\n', { line: 3, match: /reviewer 不能为空/, validate: true });
+  fails('---\nid: 1\nreview_block: true\n---\n', { line: 3, match: /review_block 只能是 none 或 high（当前：true）/, validate: true });
+  fails('---\nid: 1\nreview_block: all\n---\n', { line: 3, match: /review_block 只能是 none 或 high（当前：all）/, validate: true });
+  fails('---\nid: 1\nreview_block: HIGH\n---\n', { line: 3, match: /review_block 只能是 none 或 high/, validate: true });
+  fails('---\nid: 1\nreview: yes\n---\n', { line: 3, match: /review 必须是 true 或 false/, validate: true });
 });

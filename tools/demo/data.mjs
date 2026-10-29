@@ -262,4 +262,43 @@ const wtReport = [
   '2. 多个成就同时解锁时按解锁顺序排队，不合并成一条。',
 ].join('\n');
 
-export { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, reportRich, wtReport, wtMerged };
+// Stage08 158（D92）：待验收演示任务 t32 的审查结果（形状照界面稿 preview.js 的 REVIEW.t22）：Codex 交叉审查，结论 concerns，三条问题，
+// 其中 R1-2 已被人确认"成立"、R1-3 已确认"不成立"。review 是顶层 review.json 的内容（at 与 base / head 由生成器按任务时间补），
+// events 是对应的清单事件（reviewing → review，再加每条确认的 review-confirm），时刻是相对任务结束的毫秒。
+// 185（D117）：生成器 tools/demo/index.mjs 读这份数据——给 t32 的任务目录写 review.json，并在它的 worktree 事件里补 reviewing、review（end 之前）；
+// review-confirm（end 之后）只由 npm run demo 写（demo({ confirmations: true })）：界面验收的夹具不写，路由页准确率（UI31）才从"还没有确认"开始。
+// 所以 t32 的验收页与任务详情"审查"标签可用，评分标签多"审查者"一组（核心按 review.json 与 review 事件算）。
+const reviews = {
+  t32: {
+    review: {
+      v: 1, attempt: 1, reviewer: 'codex', crossed: true, verdict: 'concerns', ms: 108000,
+      summary: '功能完成；同时解锁多个成就时队列没有上限，收起动画结束前切页会留下空容器',
+      reviewed: ['src/ui/Toast.ts', 'src/achievements/store.ts', 'tests/achievements.test.ts'],
+      issues: [
+        { id: 'R1-1', severity: 'medium', file: 'src/achievements/store.ts', line: 18, title: '排队没有上限', detail: '一次解锁几十个成就时会连续弹很久。建议最多排 5 个，其余合并成"还有 N 个成就"。', confirmation: null },
+        { id: 'R1-2', severity: 'medium', file: 'src/ui/Toast.ts', line: 42, title: '切页时动画回调还在', detail: '收起动画结束前离开页面，回调里移除的节点已经不在，会留下空容器。离开页面时取消动画。', confirmation: { result: 'valid', by: 'human', note: null } },
+        { id: 'R1-3', severity: 'low', file: 'tests/achievements.test.ts', line: 7, title: '测试名与内容不符', detail: '"自动收起"用例只断言了出现，没有断言收起。', confirmation: { result: 'invalid', by: 'human', note: null } },
+      ],
+      warnings: [], tries: [{ reviewer: 'codex', ok: true, ms: 108000 }], usage: { input: 12400, output: 900 }, raw: null,
+    },
+    events: [
+      { event: 'reviewing', after: -108000 },
+      { event: 'review', after: -1000, reviewer: 'codex', crossed: true, verdict: 'concerns', issues: 3, high: 0 },
+      { event: 'review-confirm', after: 600000, issue: 'R1-2', severity: 'medium', result: 'valid', by: 'human', reviewer: 'codex' },
+      { event: 'review-confirm', after: 620000, issue: 'R1-3', severity: 'low', result: 'invalid', by: 'human', reviewer: 'codex' },
+    ],
+  },
+};
+
+// 188（D125）：npm run demo 里另加一个演示用执行者"演示执行者 B"（假执行者适配器，不需要真的能跑），限流标记放在它身上，Codex 保持可用
+// （演示里新建任务走默认路由，默认执行者仍是 Codex）。config.json 与 limits.json 由 npm run demo（run.mjs）写；界面验收的演示数据不带这两份，
+// 免得路由跳过默认执行者；shots-agents.ts 的演示限流检查自己把它们写进隔离目录。
+const demoExecutorB = { name: 'demo-b', profile: { adapter: 'fake', label: '演示执行者 B', enabled: true } };
+// 限流（公共目录的 limits.json，协议见 core/lib/limits-state.mjs）："额度到 HH:MM 恢复"，恢复时间按演示启动时现算（现在 + 95 分钟），所以每次启动显示的钟点不同。
+// 限流原文是 Codex 报错的写法（已掩码、不含密钥）。
+const demoLimits = (now = Date.now()) => ({
+  v: 1,
+  profiles: { [demoExecutorB.name]: { kind: 'limit', until: now + 95 * 60000, since: now - 4 * 60000, evidence: "You've hit your usage limit. Upgrade your plan or try again later." } },
+});
+
+export { tasks, gates, attemptSets, plan1, ev1, ev5, ev6, files3, reportRich, wtReport, wtMerged, reviews, demoExecutorB, demoLimits };

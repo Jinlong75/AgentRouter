@@ -603,3 +603,182 @@ test('ar config 显示 reportWeights、prices、leadUsage，非法值给出警�
   assert.ok(lines.some(entry => /^leadUsage\s+true\s+config\.json$/.test(entry)));
   assert.equal(lines.filter(entry => entry.includes('reportWeights.toolError.points 必须为正数')).length, 1);
 });
+
+// ---- 159：审查者一组（D93）----
+// 一次审查：event 是清单里的 review 事件，file 是 attempts/<n>/review[-<run>].json 的内容，top 为 true 时同时写顶层 review.json。
+const issue = (id, severity, result = null) => ({ id, severity, file: 'src/a.js', line: 1, title: `问题 ${id}`, detail: '', confirmation: result ? { result, by: 'human', note: null, at: T0 } : null });
+const reviewScene = (t, reviews, options = {}) => {
+  const f = scene(t, {
+    attempts: [{ n: 1, gate: true }], worktree: true, ...options,
+    extra: [...(options.extra ?? []), ...reviews.map(({ event }) => ({ event: 'review', attempt: 1, ...event }))],
+  });
+  reviews.forEach(({ event, file, top }, index) => {
+    const run = event.run ?? 1;
+    const body = { v: 1, attempt: 1, at: T0 + index, reviewer: event.reviewer, crossed: event.crossed ?? true, verdict: 'concerns', summary: '', reviewed: [], issues: [], warnings: [], tries: [], ms: 0, usage: { input: null, output: null }, ...file, ...(run > 1 ? { run } : {}) };
+    put(path.join(f.record, 'attempts', '1', run > 1 ? `review-${run}.json` : 'review.json'), JSON.stringify(body));
+    if (top ?? index === reviews.length - 1) put(path.join(f.record, 'review.json'), JSON.stringify(body));
+  });
+  return f;
+};
+const ok = (reviewer, ms = 1000) => ({ reviewer, ok: true, ms });
+const failed = (reviewer, kind, ms = 1000) => ({ reviewer, ok: false, kind, why: kind, ms });
+
+test('审查者一组：没有 review 事件，或最近一次没有可用的审查者，就没有 reviewer 键', t => {
+  assert.equal('reviewer' in scene(t, { attempts: [{ n: 1, gate: true }] }).report(), false);
+  const none = reviewScene(t, [{ event: { reviewer: null, crossed: false, verdict: 'unknown' }, file: { reviewer: null, summary: '没有可用的审查者' } }]).report();
+  assert.equal('reviewer' in none, false);
+  assert.equal('reviewer' in none.weights, false, '没有这一组时 weights 也不多键');
+  // 先有审查者审过、后来一次没有可用的审查者：按最近一次算，没有这一组。
+  const later = reviewScene(t, [
+    { event: { reviewer: 'codex', verdict: 'pass' }, file: { verdict: 'pass', tries: [ok('codex')] } },
+    { event: { reviewer: null, crossed: false, verdict: 'unknown', run: 2 }, file: { reviewer: null }, top: false },
+  ]).report();
+  assert.equal('reviewer' in later, false);
+});
+
+test('审查者一组：各扣分项的计数与扣分（改了文件 −30、没按格式给结论 −10、不成立的中低 −5、不成立的高 −10）', t => {
+  const report = reviewScene(t, [{
+    event: { reviewer: 'codex', verdict: 'concerns', issues: 4, high: 1 },
+    file: {
+      tries: [failed('codex', 'invalid'), failed('codex', 'parse'), failed('codex', 'timeout'), failed('codex', 'start'), ok('codex')],
+      issues: [issue('R1-1', 'high', 'invalid'), issue('R1-2', 'medium', 'invalid'), issue('R1-3', 'low', 'invalid'), issue('R1-4', 'low', 'valid'), issue('R1-5', 'high')],
+    },
+  }]).report();
+  const group = report.reviewer;
+  assert.deepEqual(group.items.map(entry => entry.key), ['reviewInvalid', 'reviewFormat', 'reviewFalse', 'reviewFalseHigh']);
+  assert.deepEqual(brief(group), [['reviewInvalid', 1, -30], ['reviewFormat', 2, -20], ['reviewFalse', 2, -10], ['reviewFalseHigh', 1, -10]]);
+  assert.equal(group.score, 30);
+  assert.equal(item(group, 'reviewFalse').detail, '中 1 · 低 1');
+  assert.equal(item(group, 'reviewInvalid').detail, 'codex');
+  assert.equal(group.profile, 'codex');
+  assert.equal(group.crossed, true);
+  assert.deepEqual(report.weights.reviewer, { reviewInvalid: { points: 30, max: 60 }, reviewFormat: { points: 10, max: 30 }, reviewFalse: { points: 5, max: 30 }, reviewFalseHigh: { points: 10, max: 40 } });
+  // 另外两组不受影响。
+  assert.equal(report.executor.score, 100);
+  assert.equal(report.lead.score, 100);
+});
+
+test('审查者一组：没确认的问题不扣分也不算成立；性能只列出：问题数与严重度、成立 / 已确认、用时、token', t => {
+  const report = reviewScene(t, [{
+    event: { reviewer: 'codex', crossed: false, verdict: 'concerns' },
+    file: {
+      ms: 108000, usage: { input: 12400, output: 900 }, tries: [ok('codex', 108000)],
+      issues: [issue('R1-1', 'high'), issue('R1-2', 'medium', 'valid'), issue('R1-3', 'medium'), issue('R1-4', 'low', 'invalid')],
+    },
+  }]).report();
+  const group = report.reviewer;
+  assert.deepEqual(brief(group), [['reviewInvalid', 0, 0], ['reviewFormat', 0, 0], ['reviewFalse', 1, -5], ['reviewFalseHigh', 0, 0]]);
+  assert.equal(item(group, 'reviewFalse').detail, '低');
+  assert.equal(group.score, 95);
+  assert.deepEqual(group.perf, { issues: { total: 4, high: 1, medium: 2, low: 1 }, confirmed: 2, valid: 1, ms: 108000, usage: { input: 12400, output: 900 } });
+  assert.equal(group.crossed, false);
+  const empty = reviewScene(t, [{ event: { reviewer: 'codex', verdict: 'pass' }, file: { verdict: 'pass', reviewed: ['src/a.js'], tries: [ok('codex')] } }]).report().reviewer;
+  assert.deepEqual(empty.perf, { issues: { total: 0, high: 0, medium: 0, low: 0 }, confirmed: 0, valid: 0, ms: 0, usage: null });
+  assert.equal(empty.score, 100);
+});
+
+test('审查者一组：每项有上限（改了文件最多 −60、没按格式最多 −30、不成立的中低最多 −30、高最多 −40）', t => {
+  const many = (n, make) => Array.from({ length: n }, (_, i) => make(i));
+  const group = reviewScene(t, [{
+    event: { reviewer: 'codex' },
+    file: {
+      tries: [...many(5, () => failed('codex', 'invalid')), ...many(6, () => failed('codex', 'exit'))],
+      issues: [...many(9, i => issue(`R1-${i + 1}`, 'low', 'invalid')), ...many(6, i => issue(`R1-${i + 10}`, 'high', 'invalid'))],
+    },
+  }]).report().reviewer;
+  assert.deepEqual(brief(group), [['reviewInvalid', 5, -60], ['reviewFormat', 6, -30], ['reviewFalse', 9, -30], ['reviewFalseHigh', 6, -40]]);
+  assert.equal(group.score, 0, '合计 −160，最低 0');
+});
+
+test('审查者一组：config.json 的 reportWeights 可以覆盖四项；非法值忽略并提示，不再提示"不是已知的扣分项"', t => {
+  const f = reviewScene(t, [{
+    event: { reviewer: 'codex' },
+    file: { tries: [failed('codex', 'invalid'), failed('codex', 'invalid'), failed('codex', 'parse')], issues: [issue('R1-1', 'low', 'invalid'), issue('R1-2', 'high', 'invalid')] },
+  }], { config: { reportWeights: {
+    reviewInvalid: { points: 7, max: 10 }, reviewFormat: { points: 0 }, reviewFalse: { points: 2 }, reviewFalseHigh: { max: 3 },
+  } } });
+  const report = f.report();
+  assert.deepEqual(brief(report.reviewer), [['reviewInvalid', 2, -10], ['reviewFormat', 1, -10], ['reviewFalse', 1, -2], ['reviewFalseHigh', 1, -3]]);
+  assert.deepEqual(report.weights.reviewer.reviewInvalid, { points: 7, max: 10 });
+  assert.deepEqual(report.weights.reviewer.reviewFalseHigh, { points: 10, max: 3 });
+  assert.deepEqual(report.warnings, ['配置：reportWeights.reviewFormat.points 必须为正数，已按默认处理']);
+  // 不影响执行者、主导的扣分表。
+  assert.deepEqual(report.weights.executor.attemptGate, { points: 15, max: null });
+  const plain = reviewScene(t, [{ event: { reviewer: 'codex' }, file: {} }], { config: { reportWeights: { reviewInvalid: { points: 7 } } } }).report();
+  assert.equal(plain.warnings, undefined);
+});
+
+test('审查者一组：换过审查者时只出一组，标题是最近一次的审查者，扣分都算进来，失败的审查者列在说明里', t => {
+  const report = reviewScene(t, [{
+    event: { reviewer: 'deepseek', verdict: 'pass', crossed: false },
+    file: { crossed: false, tries: [failed('deepseek', 'invalid'), failed('mimo', 'exit'), ok('deepseek')], ms: 4000, usage: { input: 100, output: 10 } },
+  }, {
+    event: { reviewer: 'codex', verdict: 'concerns', run: 2, crossed: true },
+    file: { tries: [failed('mimo', 'parse'), ok('codex')], ms: 2000, usage: { input: 50, output: 5 }, issues: [issue('R1.2-1', 'medium', 'invalid')] },
+  }]).report();
+  const group = report.reviewer;
+  assert.equal(group.profile, 'codex');
+  assert.equal(group.crossed, true);
+  assert.deepEqual(brief(group), [['reviewInvalid', 1, -30], ['reviewFormat', 2, -20], ['reviewFalse', 1, -5], ['reviewFalseHigh', 0, 0]]);
+  assert.equal(item(group, 'reviewInvalid').detail, 'deepseek', '改了文件的是第一次的 deepseek');
+  assert.equal(item(group, 'reviewFormat').detail, 'mimo', '两次失败都是 mimo');
+  assert.equal(group.score, 45);
+  assert.equal(group.perf.ms, 6000);
+  assert.deepEqual(group.perf.usage, { input: 150, output: 15 });
+  assert.equal(report.executor.score, 100, '审查者的失败不算执行者的');
+});
+
+test('审查者一组：标题取给出结论的审查者（顶层 review.json）；后来手动再审解析失败，只在扣分里出现（167）', t => {
+  const report = reviewScene(t, [{
+    event: { reviewer: 'codex', verdict: 'concerns', crossed: false },
+    file: { crossed: false, tries: [ok('codex')], ms: 3000, issues: [issue('R1-1', 'high', 'valid'), issue('R1-2', 'low', 'valid')] },
+    top: true,
+  }, {
+    event: { reviewer: 'mimo', verdict: 'unknown', run: 2, crossed: true },
+    file: { crossed: true, verdict: 'unknown', tries: [failed('mimo', 'parse', 500)], ms: 500 },
+    top: false,
+  }]).report();
+  const group = report.reviewer;
+  assert.equal(group.profile, 'codex', '标题是给出结论的 codex，不是最后一次失败的 mimo');
+  assert.equal(group.crossed, false, 'crossed 也取 codex 的');
+  assert.deepEqual(group.perf.issues, { total: 2, high: 1, medium: 0, low: 1 });
+  assert.deepEqual(brief(group), [['reviewInvalid', 0, 0], ['reviewFormat', 1, -10], ['reviewFalse', 0, 0], ['reviewFalseHigh', 0, 0]]);
+  assert.equal(item(group, 'reviewFormat').detail, 'mimo', '失败的审查仍记在 mimo 名下');
+  assert.equal(group.perf.ms, 3500, '用时仍是所有审查的合计');
+  // 只有一次审查：与以前相同。
+  const single = reviewScene(t, [{ event: { reviewer: 'codex', crossed: true }, file: { tries: [ok('codex')] } }]).report().reviewer;
+  assert.equal(single.profile, 'codex');
+  assert.equal(single.crossed, true);
+  // 第 2 次审查成功、顶层换成它：标题是它。
+  const swapped = reviewScene(t, [
+    { event: { reviewer: 'codex', crossed: false }, file: { crossed: false, tries: [ok('codex')] } },
+    { event: { reviewer: 'mimo', run: 2, crossed: true }, file: { crossed: true, tries: [ok('mimo')] } },
+  ]).report().reviewer;
+  assert.equal(swapped.profile, 'mimo');
+  assert.equal(swapped.crossed, true);
+});
+
+test('审查者一组：顶层 review.json 读不到时用最近一次审查自己的文件；review 事件有、文件都读不到也不报错', t => {
+  const f = reviewScene(t, [{ event: { reviewer: 'codex' }, file: { tries: [failed('codex', 'parse')], issues: [issue('R1-1', 'low', 'invalid')] }, top: false }]);
+  const group = f.report().reviewer;
+  assert.deepEqual(brief(group), [['reviewInvalid', 0, 0], ['reviewFormat', 1, -10], ['reviewFalse', 1, -5], ['reviewFalseHigh', 0, 0]]);
+  rmSync(path.join(f.record, 'attempts'), { recursive: true, force: true });
+  const missing = f.report().reviewer;
+  assert.equal(missing.score, 100);
+  assert.equal(missing.profile, 'codex', '文件读不到时审查者取事件里的');
+});
+
+test('审查者一组：文字输出多一段"审查者"，没有审查时文字输出不变', t => {
+  const plain = reportLines(scene(t, { attempts: [{ n: 1, gate: true }] }).report());
+  assert.equal(plain.some(entry => entry.startsWith('审查者')), false);
+  const lines = reportLines(reviewScene(t, [{
+    event: { reviewer: 'codex', crossed: true },
+    file: { ms: 108000, usage: { input: 12400, output: 900 }, tries: [ok('codex')], issues: [issue('R1-1', 'high'), issue('R1-2', 'low', 'invalid'), issue('R1-3', 'medium', 'valid')] },
+  }]).report());
+  const at = lines.indexOf('审查者 95/100');
+  assert.ok(at > lines.indexOf('主导 100/100'), lines.join('\n'));
+  assert.deepEqual(lines.slice(at + 1, at + 6), [
+    '  改了文件（审查无效）：0 次（0）', '  没按格式给结论：0 次（0）', '  被标为"不成立"的问题：1 个：低（−5）', '  被标为"不成立"的高严重度问题：0 个（0）',
+    '  性能：审查者 codex（交叉）；问题 3 个（高 1 · 中 1 · 低 1）；成立 1 / 已确认 2；用时 1.8 分钟；token 输入 12400、输出 900',
+  ]);
+});

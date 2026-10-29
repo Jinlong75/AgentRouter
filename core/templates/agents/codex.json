@@ -8,5 +8,6 @@
   "description": "用 ChatGPT 登录或 OpenAI API Key",
   "recommended": false,
   "effortOptions": ["minimal", "low", "medium", "high", "xhigh"],
+  "types": ["code", "fix", "refactor"],
   "order": 7
 }

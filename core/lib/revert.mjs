@@ -7,6 +7,7 @@ import { git, uncommittedFiles } from './git.mjs';
 import { readJson } from './json.mjs';
 import { requireGitIdentity } from './project.mjs';
 import { registryWriter } from './records.mjs';
+import { taskBaseBranch } from './status.mjs';
 import { locateStart, reverseRows, worktreeOutcome } from './wait.mjs';
 import { unmergedFiles } from './worktree.mjs';
 
@@ -52,7 +53,8 @@ export function revertMerge({ homes, root, name, by = null, env = process.env } 
   if (!accepted || typeof accepted.merge !== 'string' || !fullSha.test(accepted.merge)) throw new Error(`这是一次确认，没有合并提交，不能撤销：${start.name}`);
   if (reverted) throw new Error(`已经撤销过：${start.name}（反向提交 ${String(reverted.commit).slice(0, 7)}）`);
 
-  const baseBranch = baseBranchOf(root);
+  // 这个任务的基线分支：派发时用 --base 指定的，否则项目配置的 baseBranch（136）。
+  const baseBranch = taskBaseBranch(start, baseBranchOf(root));
   if (!baseBranch) throw new Error('项目配置没有写 baseBranch，不知道该在哪个分支上撤销');
   // 检查 1：主工作区当前分支是 baseBranch。
   const current = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']);

@@ -2,7 +2,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, freemem, totalmem } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 export function loginState(result) {
@@ -28,9 +28,9 @@ export function hostActions(skills, backup) {
 export const defaultChecked = state => state === 'missing' || state === 'update';
 export async function createPreferences(root, data, env = process.env) {
   const module = file => import(pathToFileURL(join(root, file)).href);
-  const [install, config, adapter, codexConfig, json, proxy] = await Promise.all([
+  const [install, config, adapter, codexConfig, json, proxy, schedule] = await Promise.all([
     module('installer/lib/install.mjs'), module('core/lib/config.mjs'),
-    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs'), module('core/lib/json.mjs'), module('core/lib/proxy.mjs')]);
+    module('core/adapters/codex.mjs'), module('installer/lib/codex-config.mjs'), module('core/lib/json.mjs'), module('core/lib/proxy.mjs'), module('core/lib/schedule.mjs')]);
   const home = config.homeDirectory(env), ownFile = join(data, 'preferences.json');
   let own = { notifications: true, theme: 'system', wizardDone: false, closeAction: 'ask', trayHintShown: false };
   try { own = { ...own, ...json.parseJson(readFileSync(ownFile, 'utf8')) }; } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -55,6 +55,26 @@ export async function createPreferences(root, data, env = process.env) {
       return value && typeof value.home === 'string' ? value : null;
     } catch { return null; }
   };
+  // 并行一节的估算信息全部取自核心（slotLimits 的估算值、schedule 的核数与忙闲判断），界面不自己算。
+  // 机器正忙：真实采样只在可用内存不够时才算（CPU 要连续 1 分钟超过 85% 才暂停，瞬时值判断不了）；
+  // 测试用 AR_TEST_LOAD_FILE（与核心排队时的注入同一格式 { busy, cpu }，这里另认可选的 memLow: true 与 freeMemGb，模拟"可用内存不够"）：由测试工具在启动前经隔离环境设置，产品代码不自己造路径。
+  // 返回忙的原因：memory（可用内存不够，带可用内存 GB 一位小数）或 cpu；不忙时 reason 为 null。
+  const loadFile = env.AR_TEST_LOAD_FILE || '';
+  const gb = bytes => (bytes / 1024 ** 3).toFixed(1);
+  const machineLoad = percent => {
+    if (loadFile) try {
+      const injected = json.parseJson(readFileSync(loadFile, 'utf8')), busy = injected.busy === true, memory = busy && injected.memLow === true;
+      return { busy, cpu: Number.isFinite(injected.cpu) ? injected.cpu : null, reason: memory ? 'memory' : busy ? 'cpu' : null, freeGb: memory && Number.isFinite(injected.freeMemGb) ? injected.freeMemGb.toFixed(1) : gb(freemem()) };
+    } catch { /* 没有注入文件就按真实采样。 */ }
+    const load = schedule.currentLoad({ memLowPercent: percent });
+    return { busy: load.memLow, cpu: load.cpu, reason: load.memLow ? 'memory' : null, freeGb: gb(load.freeMemBytes) };
+  };
+  // "内存不够时暂停"的阈值（GB，一位小数）：与核心排队时同一个函数 memLowThreshold；
+  // 测试注入文件可另带 totalMemGb（固定总内存，免得读这台电脑的真实内存）。
+  const totalMemory = () => {
+    if (loadFile) try { const injected = json.parseJson(readFileSync(loadFile, 'utf8')); if (Number.isFinite(injected.totalMemGb) && injected.totalMemGb > 0) return injected.totalMemGb * 1024 ** 3; } catch { /* 没有注入文件就读真实总内存。 */ }
+    return totalmem();
+  };
   function settings() {
     let state;
     try { state = config.loadConfig(home, {}, {}); }
@@ -73,7 +93,20 @@ export async function createPreferences(root, data, env = process.env) {
     // 网络代理（099）：config.json 的 proxy（没写按 off）；system 模式再读一次系统代理，界面据此说明"这一刻读到了什么"。
     const saved = state.config?.proxy, mode = proxy.PROXY_MODES.includes(saved?.mode) ? saved.mode : 'off';
     const networkProxy = { mode, url: typeof saved?.url === 'string' ? saved.url : '', system: mode === 'system' && !state.reason ? proxy.readSystemProxy({ env }) : null };
-    return { managed: state.config?.managed === true, leadUsage: state.config?.leadUsage === true, proxy: networkProxy, concurrency: config.slotLimits(state.config).limits.concurrency, retentionDays: config.sessionRetention(state.config).days,
+    // concurrency：auto 原样给 'auto'；写了正整数的（含手写的越界值）原样给；其余按核心的口径取生效值。
+    const slots = config.slotLimits(state.config), raw = state.config?.concurrency;
+    const concurrency = raw === 'auto' ? 'auto' : Number.isSafeInteger(raw) && raw > 0 ? raw : slots.limits.concurrency;
+    const load = slots.mode === 'auto' ? machineLoad(slots.memLowPercent) : { busy: false, cpu: null, reason: null, freeGb: null };
+    // busyReason / busyFreeGb：机器正忙的原因（memory = 可用内存不够，cpu）与忙时的可用内存（GB，一位小数）；不忙时为 null。
+    const parallel = { estimate: slots.estimate, cores: schedule.machineCores(), freeGb: (freemem() / 1024 ** 3).toFixed(1), cpu: load.cpu, busy: load.busy, busyReason: load.busy ? load.reason : null, busyFreeGb: load.busy ? load.freeGb : null,
+      memLowGb: gb(schedule.memLowThreshold(totalMemory(), slots.memLowPercent)) };
+    // codexProfiles：每个 Codex 适配器的执行者（含改过名的，如 codex-pro）各自的值，给 Codex 编辑预填用；解析与上面的 resolveSettings(…, '<名>') 相同。
+    const codexProfiles = {};
+    if (!state.reason && state.config?.v === 2) for (const [name, profile] of Object.entries(state.config.profiles ?? {})) {
+      if (profile?.adapter !== 'codex') continue;
+      try { const { model, effort, tier, sandbox, path } = config.resolveSettings(state.config, {}, {}, name).settings; codexProfiles[name] = { model, effort, tier, sandbox, path }; } catch { /* 这一个读不了就让界面回退到 values。 */ }
+    }
+    return { codexProfiles, managed: state.config?.managed === true, leadUsage: state.config?.leadUsage === true, proxy: networkProxy, concurrency, concurrencyMax: slots.max, memLowPercent: slots.memLowPercent, parallel, retentionDays: config.sessionRetention(state.config).days,
       values: state.settings, profiles, exists: state.exists, reason: state.reason, file: shorten(state.file),
       home, leftover: leftover(),
       current: { model: current.model, effort: current.model_reasoning_effort, tier: current.service_tier }, overrides, own };
@@ -110,8 +143,13 @@ export async function createPreferences(root, data, env = process.env) {
       if (action === 'detect') return detect();
       if (action === 'save') {
         if (payload.key === 'managed') { if (typeof payload.value !== 'boolean') throw Error('Invalid value'); config.writeConfig(home, { managed: payload.value }); return settings(); }
-        // 同时运行的任务数：config.json 的 concurrency，界面只让选 1～4；writeConfig 不认这个键，走 updateConfig（保留其余字段）。
-        if (payload.key === 'concurrency') { if (!Number.isInteger(payload.value) || payload.value < 1 || payload.value > 4) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.concurrency = payload.value; }); return settings(); }
+        // 同时运行的任务数：config.json 的 concurrency，收 1～8 的整数或 "auto"（D59）；自动档的上限 concurrencyMax 收 1～8 的整数。
+        // writeConfig 不认这两个键，走 updateConfig（保留其余字段）；被拒绝的值不写文件。
+        const slotValue = value => Number.isInteger(value) && value >= 1 && value <= schedule.concurrencyCap;
+        if (payload.key === 'concurrency') { if (payload.value !== 'auto' && !slotValue(payload.value)) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.concurrency = payload.value; }); return settings(); }
+        if (payload.key === 'concurrencyMax') { if (!slotValue(payload.value)) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.concurrencyMax = payload.value; }); return settings(); }
+        // 内存不够时暂停的比例（D114，182）：config.json 的 memLowPercent，只收 1～50 的整数；被拒绝的值不写文件。
+        if (payload.key === 'memLowPercent') { if (!schedule.validMemLowPercent(payload.value)) throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.memLowPercent = payload.value; }); return settings(); }
         // 统计主导的 token 与用时：config.json 的 leadUsage，只认布尔值；走 updateConfig 保留其余字段。
         if (payload.key === 'leadUsage') { if (typeof payload.value !== 'boolean') throw Error('Invalid value'); config.updateConfig(home, cfg => { cfg.leadUsage = payload.value; }); return settings(); }
         // 网络代理：{ mode, url? }。manual 先用核心的 validateProxyUrl 校验，不合法抛出错误码（PROXY_EMPTY / PROXY_FORMAT / PROXY_CREDENTIALS，
@@ -127,9 +165,27 @@ export async function createPreferences(root, data, env = process.env) {
           } else config.updateConfig(home, cfg => { cfg.proxy = { ...(typeof cfg.proxy?.url === 'string' && cfg.proxy.url && proxy.validateProxyUrl(cfg.proxy.url).ok ? { url: cfg.proxy.url } : {}), mode: value.mode }; });
           return settings();
         }
+        const choices = { effort: ['minimal','low','medium','high','xhigh'], tier: ['default','priority','flex'], sandbox: ['workspace-write','read-only'], watchWindow: ['auto','always','never'] };
+        // Codex 的编辑是表单式（144）：点"保存"时模型、推理强度、服务档位、沙箱、位置一次写入（同一次 writeConfig，要么全写要么都不写）。
+        // value 是 { model?, effort?, tier?, sandbox?, path? }，值为字符串或 null（null = 跟随 Codex / 自动查找）。
+        // 推理强度不再限定那五个值：探针查到的可选值可能更多（如 max），原样写入、不替用户改。
+        if (payload.key === 'codex') {
+          const value = payload.value;
+          if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Invalid value');
+          const changes = {};
+          for (const [key, item] of Object.entries(value)) {
+            if (!['model', 'effort', 'tier', 'sandbox', 'path'].includes(key)) throw Error('Invalid setting');
+            if (item !== null && typeof item !== 'string') throw Error('Invalid value');
+            if (item !== null && key !== 'effort' && choices[key] && !choices[key].includes(item)) throw Error('Invalid value');
+            changes[key] = item;
+          }
+          if (!Object.keys(changes).length) throw Error('Invalid value');
+          // profile（可选）：改过名的 Codex 执行者的名字；不给时写 codex，和以前一样。是否存在、是否 Codex 适配器由 writeConfig 校验。
+          if (payload.profile !== undefined && !(typeof payload.profile === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(payload.profile))) throw Error('Invalid value');
+          config.writeConfig(home, changes, payload.profile === undefined ? {} : { profile: payload.profile }); return settings();
+        }
         if (!['model', 'effort', 'tier', 'sandbox', 'watchWindow', 'path'].includes(payload.key)) throw Error('Invalid setting');
         if (payload.value !== null && typeof payload.value !== 'string') throw Error('Invalid value');
-        const choices = { effort: ['minimal','low','medium','high','xhigh'], tier: ['default','priority','flex'], sandbox: ['workspace-write','read-only'], watchWindow: ['auto','always','never'] };
         if (payload.value !== null && choices[payload.key] && !choices[payload.key].includes(payload.value)) throw Error('Invalid value');
         config.writeConfig(home, { [payload.key]: payload.value }); return settings();
       }

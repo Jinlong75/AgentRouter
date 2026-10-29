@@ -111,11 +111,12 @@ function fixture(t) {
     child.on('error', error => { clearTimeout(timer); reject(error); });
     child.on('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
-  f.task = async (name, profile = {}) => {
+  // gate: false 的任务不启用门禁（任务说明没有 verify、allowed_paths 和 expect_commit）：批准别的重叠任务后不会自动重跑，批准它自己时才发现冲突。
+  f.task = async (name, profile = {}, { gate = true } = {}) => {
     f.setProfile(profile);
     f.count += 1;
     const rel = `docs/specs/${920 + f.count}-conflict.md`;
-    write(path.join(repo, rel), ['---', 'id: 920', 'title: 冲突测试', 'type: code', 'expect_commit: false', 'allowed_paths:', '  - src/**', 'verify:', '  - node -e "process.exit(0)"', '---', '', '正文。', ''].join('\n'));
+    write(path.join(repo, rel), ['---', 'id: 920', 'title: 冲突测试', 'type: code', 'expect_commit: false', ...(gate ? ['allowed_paths:', '  - src/**', 'verify:', '  - node -e "process.exit(0)"'] : []), '---', '', '正文。', ''].join('\n'));
     commitAll(repo, `任务说明 ${name}`);
     const result = await f.ar(['dispatch', rel, '--name', name, '--json']);
     assert.equal(result.code, 0, result.stderr + result.stdout);
@@ -125,12 +126,20 @@ function fixture(t) {
   };
   f.events = id => rows(home).filter(row => row.id === id);
   // 两个任务改同一行；先 accept 第一个，第二个留在待验收。
-  f.conflictPair = async suffix => {
+  f.conflictPair = async (suffix, { gate = true } = {}) => {
     const x = await f.task(`冲突X${suffix}`, { writes: [{ path: 'src/a.js', content: 'one\nTWO-X\nthree\n' }], commit: 'X 改第二行' });
-    const y = await f.task(`冲突Y${suffix}`, { writes: [{ path: 'src/a.js', content: 'one\nTWO-Y\nthree\n' }], commit: 'Y 改第二行' });
+    const y = await f.task(`冲突Y${suffix}`, { writes: [{ path: 'src/a.js', content: 'one\nTWO-Y\nthree\n' }], commit: 'Y 改第二行' }, { gate });
     const accepted = await f.ar(['accept', x.name, '--json']);
     assert.equal(accepted.code, 0, accepted.stderr + accepted.stdout);
     return { x, y };
+  };
+  // 批准 X 之后，启用了门禁的 Y 自动按新基线重跑门禁（154，D86）：合并有冲突 → 撤销合并，Y 进入冲突状态。等到这个状态并断言。
+  f.awaitConflict = async y => {
+    await until(() => f.events(y.id).some(row => row.event === 'conflict'), `${y.name} 的自动重跑冲突`);
+    const status = await f.ar(['status', y.name, '--json']);
+    assert.equal(status.code, 0, status.stderr + status.stdout);
+    assert.equal(JSON.parse(status.stdout).state, 'conflict', `${y.name} 已在冲突状态`);
+    assert.deepEqual(JSON.parse(status.stdout).conflict, { files: ['src/a.js'] });
   };
   // 主分支的指纹：HEAD、文件字节、暂存区、git status，以及没有合并进行中的痕迹。
   f.mainState = () => ({
@@ -151,11 +160,10 @@ test('1 冲突：accept 退出码 4、conflict 事件、主分支字节不变；
   const mainBefore = f.mainState();
   assert.equal(mainBefore.status, '');
 
-  // --no-ff 冲突：merge --abort 后主分支恢复原样。
-  let result = await f.ar(['accept', y.name, '--json']);
-  assert.equal(result.code, 4, result.stderr + result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { ok: false, conflict: true, files: ['src/a.js'] });
-  assert.deepEqual(f.mainState(), mainBefore, 'merge --abort 后主分支字节不变');
+  // 批准 X 后 Y 自动按新基线重跑门禁，有冲突：撤销合并，Y 已在冲突状态（批准时才发现冲突的路径见用例 1b、1c）。
+  await f.awaitConflict(y);
+  let result;
+  assert.deepEqual(f.mainState(), mainBefore, '自动重跑后主分支字节不变');
   assert.equal(readFileSync(path.join(f.repo, 'src/a.js'), 'utf8'), 'one\nTWO-X\nthree\n', '没有冲突标记留在主工作区');
 
   const conflicts = f.events(y.id).filter(row => row.event === 'conflict');
@@ -171,6 +179,7 @@ test('1 冲突：accept 退出码 4、conflict 事件、主分支字节不变；
   assert.deepEqual(JSON.parse(result.stdout), { ok: false, error: `任务不在待验收状态：${y.name}` });
 
   // 不带 --rebase 的 retry 被拒绝并提示。
+  const resumesBefore = f.events(y.id).filter(row => row.event === 'resume').length;
   for (const args of [[], ['--note', '直接再试']]) {
     result = await f.ar(['retry', y.name, ...args, '--json']);
     assert.equal(result.code, 2, result.stdout);
@@ -178,7 +187,7 @@ test('1 冲突：accept 退出码 4、conflict 事件、主分支字节不变；
     assert.match(error, /合并冲突/);
     assert.ok(error.includes('--rebase'), error);
   }
-  assert.ok(!f.events(y.id).some(row => row.event === 'resume'), '被拒绝的 retry 没写任何事件');
+  assert.equal(f.events(y.id).filter(row => row.event === 'resume').length, resumesBefore, '被拒绝的 retry 没写任何事件（只有自动重跑的那一次 resume）');
 
   // --rebase：在原 worktree 里合并主分支 → 有冲突 → 派执行者（冲突解决者）一次 → 门禁 → 待验收。
   const newBase = git(f.repo, ['rev-parse', 'main']);
@@ -221,7 +230,7 @@ test('1 冲突：accept 退出码 4、conflict 事件、主分支字节不变；
 
 test('1b --squash 冲突：退出码 4、reset --merge 后主分支字节不变、没有 SQUASH_MSG 残留；不带 --json 时标准输出写明冲突文件', async t => {
   const f = fixture(t);
-  const { y } = await f.conflictPair('一乙');
+  const { y } = await f.conflictPair('一乙', { gate: false });   // Y 不启用门禁：不会自动重跑，批准时才发现冲突
   const mainBefore = f.mainState();
   const result = await f.ar(['accept', y.name, '--squash']);
   assert.equal(result.code, 4, result.stderr + result.stdout);
@@ -234,11 +243,27 @@ test('1b --squash 冲突：退出码 4、reset --merge 后主分支字节不变�
   assert.ok(!f.events(y.id).some(row => row.event === 'accepted'));
 });
 
+test('1c --no-ff 冲突（Y 不启用门禁，批准时才发现）：退出码 4、JSON 带冲突文件、merge --abort 后主分支字节不变、conflict 事件只有一条', async t => {
+  const f = fixture(t);
+  const { y } = await f.conflictPair('一丙', { gate: false });
+  const mainBefore = f.mainState();
+  assert.equal(f.events(y.id).some(row => row.event === 'conflict'), false, '没有自动重跑，批准前没有 conflict 事件');
+  const result = await f.ar(['accept', y.name, '--json']);
+  assert.equal(result.code, 4, result.stderr + result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout), { ok: false, conflict: true, files: ['src/a.js'] });
+  assert.deepEqual(f.mainState(), mainBefore, 'merge --abort 后主分支字节不变');
+  assert.equal(readFileSync(path.join(f.repo, 'src/a.js'), 'utf8'), 'one\nTWO-X\nthree\n', '没有冲突标记留在主工作区');
+  const conflicts = f.events(y.id).filter(row => row.event === 'conflict');
+  assert.equal(conflicts.length, 1);
+  assert.deepEqual(conflicts[0].files, ['src/a.js']);
+  assert.ok(!f.events(y.id).some(row => row.event === 'accepted'));
+});
+
 test('2 --rebase 没有冲突：不启动执行者，只跑门禁（reason rebase），之后待验收并能 accept；--detach 同样', async t => {
   const f = fixture(t);
   const { y } = await f.conflictPair('二');
-  let result = await f.ar(['accept', y.name, '--json']);
-  assert.equal(result.code, 4);
+  await f.awaitConflict(y);
+  let result;
   // 主分支上来了一个不冲突的新提交：改动和 Y 的完全一样（两边同样的改动合并起来没有冲突），再加一个无关文件。
   write(path.join(f.repo, 'src/a.js'), 'one\nTWO-Y\nthree\n');
   write(path.join(f.repo, 'src/other.js'), '无关的新文件\n');
@@ -285,8 +310,8 @@ test('2 --rebase 没有冲突：不启动执行者，只跑门禁（reason rebas
 test('3b --rebase 合并本身没能进行（worktree 里有会被覆盖的未提交改动）：任务以失败结束，仍是冲突状态，清掉改动后可以再 --rebase', async t => {
   const f = fixture(t);
   const { y } = await f.conflictPair('四');
-  let result = await f.ar(['accept', y.name, '--json']);
-  assert.equal(result.code, 4);
+  await f.awaitConflict(y);
+  let result;
   // 主分支上改了 README；Y 的 worktree 里 README 有未提交的改动，合并会覆盖它，git 拒绝合并（不是冲突）。
   write(path.join(f.repo, 'README.md'), '# 说明（主分支改过）\n');
   commitAll(f.repo, '主分支改 README');
@@ -325,13 +350,12 @@ test('3 --rebase 只用于冲突的任务；冲突的任务可以驳回：删除
   let result = await f.ar(['retry', pending.name, '--rebase', '--json']);
   assert.equal(result.code, 2);
   assert.deepEqual(JSON.parse(result.stdout), { ok: false, error: `任务不在冲突状态，不能用 --rebase：${pending.name}` });
+  await f.awaitConflict(y);
   // 已合并的任务同样不是冲突状态。
   result = await f.ar(['retry', x.name, '--rebase', '--json']);
   assert.equal(result.code, 2);
   assert.match(JSON.parse(result.stdout).error, /不能用 --rebase/);
 
-  result = await f.ar(['accept', y.name, '--json']);
-  assert.equal(result.code, 4);
   const mainBefore = f.mainState();
   result = await f.ar(['reject', y.name, '--reason', '两个方案冲突，放弃这个', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);

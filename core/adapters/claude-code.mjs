@@ -55,6 +55,9 @@ export function createMapper() {
     let e;
     try { e = JSON.parse(line); } catch { return line.trim() ? [{ kind: 'text', text: line }] : []; }
     if (!e || typeof e !== 'object' || Array.isArray(e)) return [];
+    // 限流信息（Stage07c T7）：不产生统一事件，只记下最后一条，派发流程在尝试失败后读它（见 limits-state.mjs 的 classifyFailure）。
+    // 绝大多数是 status: "allowed"（只是用量提示），不是 allowed / allowed_warning 才算被限流。
+    if (e.type === 'rate_limit_event' && e.rate_limit_info && typeof e.rate_limit_info === 'object') { mapper.rateLimit = e.rate_limit_info; return []; }
     const out = [];
     if (e.type === 'system' && e.subtype === 'init') out.push({ kind: 'tool', name: 'init', detail: String(e.model ?? '') });
     if (e.type === 'assistant') for (const c of e.message?.content ?? []) {
@@ -94,8 +97,13 @@ export function createMapper() {
     return out;
   };
   mapper.lastResult = null;
+  mapper.rateLimit = null;
   return mapper;
 }
+
+// 最后的结果事件（执行者不自行退出的兜底，runner.mjs）：一行输出映射出的事件里有 turn（只有 result 行会产生）就是结果，
+// 同一行里还有 error（is_error / error_*）则结果是错误。不是结果返回 null。
+export const finalResultOf = batch => (batch.some(e => e.kind === 'turn') ? { ok: !batch.some(e => e.kind === 'error') } : null);
 
 // 结果出错又没有说明文字时，按 subtype 给中文说明，括号里保留原值。
 const explain = subtype => ({ error_max_turns: '达到最大轮数仍未完成', error_during_execution: '执行过程中出错', error_max_budget_usd: '达到费用上限' }[subtype] ?? 'Claude Code 报告失败') + (subtype ? `（${subtype}）` : '');
@@ -163,6 +171,7 @@ export const claudeCode = {
   // 显示用的模型名：Claude Code 从 ANTHROPIC_MODEL 读模型（这是 Claude Code 的约定，不是某个服务商的）。
   modelName({ profile } = {}) { return profile?.env?.ANTHROPIC_MODEL ?? null; },
   createMapper,
+  finalResult: finalResultOf,
   mapLine: (line, ctx) => createMapper()(line, ctx),
   finish({ lastSay, result }) { return result ?? lastSay ?? null; },
   failureHint,

@@ -224,7 +224,7 @@ test('ar route config --json：规则、兜底、审查者、默认执行者、�
   assert.equal(r.json.ok, true);
   assert.deepEqual(r.json.rules, cfg.routing.rules);
   assert.equal(r.json.fallback, 'scribe');
-  assert.deepEqual(r.json.reviewer, { profiles: ['reader', 'fake'], mustDiffer: false });
+  assert.deepEqual(r.json.reviewer, { profiles: ['reader', 'fake'], mustDiffer: false, differFamily: false, differFromLead: true });
   assert.equal(r.json.defaultProfile, 'fake');
   assert.deepEqual(r.json.profiles.map(p => p.name), ['fake', 'reader', 'scribe', 'plain']);
   const byName = Object.fromEntries(r.json.profiles.map(p => [p.name, p]));
@@ -248,16 +248,16 @@ test('ar route config：没有 routing / reviewer 为 null 按空处理；旧的
   delete cfg.routing;
   const f = fixture(t, cfg);
   const empty = f.json(['route', 'config']).json;
-  assert.deepEqual([empty.rules, empty.fallback, empty.reviewer, empty.projectRules], [[], null, { profiles: [], mustDiffer: true }, []]);
+  assert.deepEqual([empty.rules, empty.fallback, empty.reviewer, empty.projectRules], [[], null, { profiles: [], mustDiffer: true, differFamily: true, differFromLead: true }, []]);
   const write = routing => writeFileSync(path.join(f.home, 'config.json'), JSON.stringify(config({ routing })));
   write({ rules: [], fallback: null, reviewer: null });
-  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: [], mustDiffer: true });
+  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: [], mustDiffer: true, differFamily: true, differFromLead: true });
   write({ rules: [], fallback: null, reviewer: { profile: 'reader' } });
-  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: true }, '旧写法 { profile } 读成 profiles');
+  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: true, differFamily: true, differFromLead: true }, '旧写法 { profile } 读成 profiles');
   write({ rules: [], fallback: null, reviewer: 'reader' });
-  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: true }, '旧的字符串写法也能读');
+  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: true, differFamily: true, differFromLead: true }, '旧的字符串写法也能读');
   write({ rules: [], fallback: null, reviewer: { profiles: ['reader'], mustDiffer: false } });
-  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: false });
+  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['reader'], mustDiffer: false, differFamily: false, differFromLead: true });
   // 只有一个启用的执行者又没有 defaultProfile 时，默认执行者就是它（与路由器的兜底一致）。
   writeFileSync(path.join(f.home, 'config.json'), JSON.stringify({ v: 2, profiles: { solo: { adapter: 'fake', enabled: true }, off: { adapter: 'fake', enabled: false } } }));
   assert.equal(f.json(['route', 'config']).json.defaultProfile, 'solo');
@@ -344,7 +344,7 @@ test('ar route reviewer set：写 { profiles, mustDiffer }；旧的 { profile } 
   const before = readConfig(f);
   const set = f.json(['route', 'reviewer', 'set', JSON.stringify({ profiles: ['reader', 'fake'], mustDiffer: false })]);
   assert.equal(set.status, 0, JSON.stringify(set.json));
-  assert.deepEqual(set.json.reviewer, { profiles: ['reader', 'fake'], mustDiffer: false });
+  assert.deepEqual(set.json.reviewer, { profiles: ['reader', 'fake'], mustDiffer: false, differFamily: false, differFromLead: true });
   assert.deepEqual(readConfig(f).routing.reviewer, { profiles: ['reader', 'fake'], mustDiffer: false });
   assert.deepEqual(rest(readConfig(f)), rest(before));
   assert.deepEqual(readConfig(f).routing.rules, before.routing.rules);
@@ -354,10 +354,17 @@ test('ar route reviewer set：写 { profiles, mustDiffer }；旧的 { profile } 
   assert.deepEqual(readConfig(f).routing.reviewer, { profiles: ['scribe'], mustDiffer: true });
   assert.equal(f.json(['route', 'reviewer', 'set', JSON.stringify({ profiles: [] })]).status, 0, '清空候选是允许的');
   assert.deepEqual(readConfig(f).routing.reviewer, { profiles: [], mustDiffer: true });
+  // differFamily（190 D128）：可以单独写；这次没写时保留已有的值。
+  const familyOff = f.json(['route', 'reviewer', 'set', JSON.stringify({ profiles: ['scribe'], mustDiffer: true, differFamily: false })]);
+  assert.equal(familyOff.status, 0, JSON.stringify(familyOff.json));
+  assert.deepEqual(readConfig(f).routing.reviewer, { profiles: ['scribe'], mustDiffer: true, differFamily: false });
+  assert.deepEqual(f.json(['route', 'config']).json.reviewer, { profiles: ['scribe'], mustDiffer: true, differFamily: false, differFromLead: true });
+  assert.equal(f.json(['route', 'reviewer', 'set', JSON.stringify({ profiles: ['scribe'] })]).status, 0);
+  assert.deepEqual(readConfig(f).routing.reviewer, { profiles: ['scribe'], mustDiffer: true, differFamily: false }, '没写 differFamily 时保留已有的值');
   const file = path.join(f.home, 'config.json'), original = readFileSync(file, 'utf8');
   for (const [value, pattern] of [
     ['不是 JSON', /不是有效的 JSON/], [[], /审查者设置必须是对象/], [{}, /要写 profiles/], [{ profiles: 'reader' }, /profiles 必须是数组/],
-    [{ profiles: ['ghost'] }, /审查者候选里的执行者不存在：ghost/], [{ profile: 'ghost' }, /不存在：ghost/], [{ profiles: ['reader'], mustDiffer: 'yes' }, /mustDiffer 必须是布尔值/], [{ profiles: ['reader'], extra: 1 }, /不能有这些字段：extra/],
+    [{ profiles: ['ghost'] }, /审查者候选里的执行者不存在：ghost/], [{ profile: 'ghost' }, /不存在：ghost/], [{ profiles: ['reader'], mustDiffer: 'yes' }, /mustDiffer 必须是布尔值/], [{ profiles: ['reader'], differFamily: 'yes' }, /differFamily 必须是布尔值/], [{ profiles: ['reader'], extra: 1 }, /不能有这些字段：extra/],
   ]) {
     const r = f.json(['route', 'reviewer', 'set', typeof value === 'string' ? value : JSON.stringify(value)]);
     assert.equal(r.status, 2, JSON.stringify(value));

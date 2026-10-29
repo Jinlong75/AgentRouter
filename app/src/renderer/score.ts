@@ -119,7 +119,22 @@ export class ScoreView {
         const cap = exec.cap ? `<div class="sc-cap" data-sc-cap>${esc(exec.cap === 'failed' ? sc.capFailed : sc.capRejected)}</div>` : '';
         const who = exec.perf.profiles.map(name => this.profileName(t, name)).join(' → ');
         return this.card('executor', sc.executor, 'robot-2-line', who, exec.score, exec.items.map(i => this.row(i, 'executor', escalated)).join('') + cap, execPerf)
-            + this.card('lead', sc.lead, 'user-line', this.host.leadName(t), lead.score, lead.items.map(i => this.row(i, 'lead', escalated)).join(''), leadPerf);
+            + this.card('lead', sc.lead, 'user-line', this.host.leadName(t), lead.score, lead.items.map(i => this.row(i, 'lead', escalated)).join(''), leadPerf)
+            + this.reviewerCard(t, report);
+    }
+    // 有审查的任务多一张"审查者"卡片（没有审查时核心不给 reviewer，界面不变）。
+    private reviewerCard(t: Task, report: Report) {
+        const review = report.reviewer;
+        if (!review)
+            return '';
+        const { issues } = review.perf;
+        const perf: [string, string, string][] = [
+            ['error-warning-line', sc.reviewPerfIssues, sc.reviewPerfIssuesValue(issues.total, issues.high, issues.medium, issues.low)],
+            ['check-double-line', sc.reviewPerfValid, sc.reviewPerfValidValue(review.perf.valid, review.perf.confirmed)],
+            ['time-line', sc.perfTime, minutes(review.perf.ms)],
+            ['coin-line', sc.perfToken, review.perf.usage ? usageText(review.perf.usage) : sc.noTokens],
+        ];
+        return this.card('reviewer', sc.reviewer, 'shield-check-line', sc.reviewerCrossed(this.profileName(t, review.profile), review.crossed), review.score, review.items.map(i => this.row(i, 'reviewer', 0)).join(''), perf);
     }
     private card(role: string, title: string, iconName: string, who: string, score: number, rows: string, perf: [string, string, string][]) {
         const tone = band(score);
@@ -128,14 +143,20 @@ export class ScoreView {
             + `<div class="sc-perf">${perf.map(([i, k, v]) => `<span>${icon(i)}<em>${esc(k)}</em>${esc(v)}</span>`).join('')}</div></div>`;
     }
     // 一项扣分：名称、明细、扣分；没扣分的行用次级色。
-    private row(item: ReportItem, role: 'executor' | 'lead', escalated: number) {
+    private row(item: ReportItem, role: 'executor' | 'lead' | 'reviewer', escalated: number) {
         const name = role === 'lead' && item.key === 'needsScope' ? sc.leadNeedsScope : sc.items[item.key] ?? item.key;
         const detail = this.detail(item, role, escalated);
         const points = item.points ? `−${Math.abs(item.points)}` : '0';
         return `<div class="sc-r ${item.points ? '' : 'zero'}" data-sc-item="${role}:${esc(item.key)}"><span class="k">${esc(name)}</span><span class="v ${detail.includes('/') ? 'mono' : ''}" title="${esc(detail)}">${esc(detail)}</span><span class="p mono">${points}</span></div>`;
     }
-    private detail(item: ReportItem, role: 'executor' | 'lead', escalated: number) {
+    private detail(item: ReportItem, role: 'executor' | 'lead' | 'reviewer', escalated: number) {
         const { key, count } = item;
+        // 审查者一组：次数或个数；核心的 detail 是失败的审查者名 / 被标"不成立"的严重度，放在括号里。
+        if (key === 'reviewInvalid' || key === 'reviewFormat' || key === 'reviewFalse' || key === 'reviewFalseHigh') {
+            if (!count)
+                return sc.none;
+            return (key === 'reviewInvalid' || key === 'reviewFormat' ? sc.count(count) : sc.files(count)) + (item.detail ? `（${item.detail}）` : '');
+        }
         if (key === 'rejected' || key === 'conflict') {
             // 不用 worktree 的任务没有验收，还没验收的任务不扣分（核心把原因写在 detail 里）。
             if (item.detail === sc.noAcceptance) return sc.noAcceptance;

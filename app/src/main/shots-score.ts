@@ -13,6 +13,8 @@ import { appEnvironment } from './app-env.mjs';
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
 const SCORE_ID = 't27';
+// 185：自带演示审查结果的待验收任务（tools/demo/data.mjs 的 reviews.t32）。
+const DEMO_REVIEW_ID = 't32';
 const jsonStr = JSON.stringify;
 
 // UI26 任务详情"评分"标签与设置页"统计主导的 token 与用时"（Stage06 T9b）。
@@ -36,6 +38,15 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
         const { saved, hidden } = await keysOf();
         const rest = hidden.filter(entry => !entry.startsWith(SCORE_ID + ':'));
         await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: keep ? [...rest, ...originalHidden] : rest }) + '\n');
+        await registry.reloadHidden();
+    };
+    // 另一个默认隐藏的演示任务（185 的 t32）：第一次调用时记下它原来的隐藏项，keep 为 true 时放回。
+    const originalHiddenOf = new Map<string, string[]>();
+    const setHiddenOf = async (id: string, keep: boolean) => {
+        const { saved, hidden } = await keysOf();
+        if (!originalHiddenOf.has(id)) originalHiddenOf.set(id, hidden.filter(entry => entry.startsWith(id + ':')));
+        const rest = hidden.filter(entry => !entry.startsWith(id + ':'));
+        await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: keep ? [...rest, ...originalHiddenOf.get(id)!] : rest }) + '\n');
         await registry.reloadHidden();
     };
     const pair = async (name: string) => {
@@ -193,13 +204,16 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
         await wait(`document.querySelector('[data-sc-fail="1"] [role=radio][aria-checked=true]')?.dataset.blameWho === 'environment'`, 'UI26 方向键再到环境');
         await wait(`document.querySelector('[data-sc-card=lead] [data-sc-item="lead:envBlame"] .v')?.textContent === ${jsonStr(sc.count(1) + sc.envFree)}`, 'UI26 两张卡片出现"环境原因 1 次（不扣分）"');
         const envReport = await reportNow();
+        // 148：归因到环境的尝试不计工具报错。演示数据 t27 第 1 次有 2 个工具报错，按 reportWeights 默认每个 1 分，所以执行者多 2 分。
+        const envToolErrorPoints = 2 * 1;
         await verify('UI26 归因到环境：执行者比"执行者"归因时高出这一次的扣分（+15）、主导分数不变；两张卡片的"环境原因"都是"1 次（不扣分）"、扣分 0；marks.json 这一键是 environment', async () => {
             assert.deepEqual(JSON.parse(await readFile(marks, 'utf8')), { v: 1, blame: { 1: 'environment' } });
             assert.equal(envReport.attempts.find(a => a.n === 1)!.blame, 'environment');
             const cards = await dom();
-            assert.equal(Number(cards[0].score), base.executor.score + 15);
+            assert.equal(Number(cards[0].score), base.executor.score + 15 + envToolErrorPoints);
             assert.equal(Number(cards[1].score), base.lead.score);
-            assert.equal(envReport.executor.score, base.executor.score + 15);
+            assert.equal(envReport.executor.score, base.executor.score + 15 + envToolErrorPoints);
+            assert.equal(cards[0].rows.find(r => r[0] === 'executor:toolError')![2], sc.files(1), '归因到环境后执行者的工具报错只剩 1 个');
             assert.equal(envReport.lead.score, base.lead.score);
             for (const [i, role] of ['executor', 'lead'].entries()) {
                 const row = cards[i].rows.find(r => r[0] === `${role}:envBlame`)!;
@@ -269,6 +283,126 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
         await check('UI26 点击展开后的说明文字同样精确等于 sc.howText', `document.querySelector('[data-sc-how] p').textContent === ${jsonStr(sc.howText)}`);
         await press('[data-sc-how] summary');
 
+        // ---- 检查 3b（Stage08 T6b）：有审查的任务多一张"审查者"卡片；没有审查的任务仍是两张 ----
+        // 演示数据里没有带审查的任务：往 t27 的任务目录写 review.json、往清单追加一条 review 事件（带标记，检查完只删这一行），检查完恢复。
+        await check('UI159 没有审查的任务（t27）评分标签仍是两张卡片：执行者、主导，核心的报告里没有 reviewer', `[...document.querySelectorAll('[data-sc-card]')].map(c => c.dataset.scCard).join() === 'executor,lead'`);
+        await verify('UI159 核心 ar report --json 在没有审查时没有 reviewer 键', async () => { assert.equal('reviewer' in await reportNow(), false); });
+        const runsFile = path.join(home, 'runs.jsonl'), reviewFile = path.join(dir, 'review.json'), marker = 'selfTest159';
+        const reviewIssue = (id: string, severity: string, result: string | null) => ({ id, severity, file: 'src/input/conflict.ts', line: 1, title: `问题 ${id}`, detail: '', confirmation: result ? { result, by: 'human', note: null, at: Date.now() } : null });
+        const dropReviewRow = async () => {
+            const text = await readFile(runsFile, 'utf8').catch(() => '');
+            if (text.includes(marker)) await writeFile(runsFile, text.split('\n').filter(line => !line.includes(marker)).join('\n'));
+            await rm(reviewFile, { force: true });
+        };
+        const reviewerDom = async () => JSON.parse(await evaluate(`JSON.stringify((() => { const card = document.querySelector('[data-sc-card="reviewer"]'); return {
+            title: card.querySelector('.card-h b').textContent, who: card.querySelector('.card-h .muted').textContent, score: card.querySelector('[data-sc-score]').textContent, label: card.querySelector('[data-sc-score]').getAttribute('aria-label'),
+            outOf: card.querySelector('.aside > span:last-child').textContent, bar: card.querySelector('.sc-bar span').style.width, tone: [...card.querySelector('[data-sc-score]').classList].find(c => ['ok', 'mid', 'bad'].includes(c)),
+            rows: [...card.querySelectorAll('[data-sc-item]')].map(r => [r.dataset.scItem, r.querySelector('.k').textContent, r.querySelector('.v').textContent, r.querySelector('.p').textContent, r.classList.contains('zero')]),
+            perf: [...card.querySelectorAll('.sc-perf > span')].map(s => s.textContent) }; })())`)) as { title: string; who: string; score: string; label: string; outOf: string; bar: string; tone: string; rows: [string, string, string, string, boolean][]; perf: string[] };
+        try {
+            await writeFile(reviewFile, JSON.stringify({
+                v: 1, attempt: 3, at: Date.now(), reviewer: 'codex', crossed: true, base: null, head: null, verdict: 'concerns', summary: '', reviewed: [],
+                issues: [reviewIssue('R3-1', 'high', 'invalid'), reviewIssue('R3-2', 'medium', 'valid'), reviewIssue('R3-3', 'low', 'invalid'), reviewIssue('R3-4', 'low', null)], warnings: [],
+                tries: [{ reviewer: 'deepseek', ok: false, why: '没有结论', kind: 'parse', ms: 500 }, { reviewer: 'codex', ok: true, ms: 107500 }], ms: 108000, usage: { input: 12400, output: 900 }, raw: null,
+            }, null, 2) + '\n');
+            await writeFile(runsFile, (await readFile(runsFile, 'utf8')).replace(/\n*$/, '\n') + JSON.stringify({ v: 1, event: 'review', id: SCORE_ID, attempt: 3, reviewer: 'codex', crossed: true, verdict: 'concerns', issues: 4, high: 1, at: Date.now(), [marker]: true }) + '\n');
+            await press('[data-task=t3]');
+            await press(`[data-task="${SCORE_ID}"]`);
+            await press('[data-tab=score]');
+            await wait('!!document.querySelector("[data-sc-card=reviewer]")', 'UI159 有审查的任务出现"审查者"卡片');
+            const reviewed = await reportNow();
+            await verify('UI159 核心的报告多 reviewer：审查者 codex（交叉）75 分——没按格式 −10、不成立的低 −5、不成立的高 −10；问题 4 个（高 1 · 中 1 · 低 2）、成立 1 / 已确认 3、用时 108 秒、token 12400 / 900；执行者、主导不变', () => {
+                const group = reviewed.reviewer!;
+                assert.equal(group.score, 75);
+                assert.equal(group.profile, 'codex');
+                assert.equal(group.crossed, true);
+                assert.deepEqual(group.items.map(i => [i.key, i.count, i.points]), [['reviewInvalid', 0, 0], ['reviewFormat', 1, -10], ['reviewFalse', 1, -5], ['reviewFalseHigh', 1, -10]]);
+                assert.deepEqual(group.perf, { issues: { total: 4, high: 1, medium: 1, low: 2 }, confirmed: 3, valid: 1, ms: 108000, usage: { input: 12400, output: 900 } });
+                assert.equal(reviewed.executor.score, base.executor.score);
+                assert.equal(reviewed.lead.score, base.lead.score);
+            });
+            const reviewerChecks = async (report: Report) => {
+                const card = await reviewerDom(), group = report.reviewer!;
+                assert.equal(card.title, sc.reviewer);
+                assert.ok(card.who.toLowerCase().includes('codex') && card.who.endsWith('（交叉）'), `卡片头的审查者：${card.who}`);
+                assert.equal(card.score, String(group.score), '审查者分数');
+                assert.equal(card.label, sc.scoreLabel(group.score));
+                assert.equal(card.outOf, sc.outOf);
+                assert.equal(card.bar, `${group.score}%`);
+                assert.equal(card.tone, toneOf(group.score));
+                assert.deepEqual(card.rows.map(r => [r[0], r[1], r[3], r[4]]), group.items.map(item => [`reviewer:${item.key}`, sc.items[item.key], pointsOf(item), item.points === 0]), '审查者每项扣分');
+                assert.deepEqual(card.rows.map(r => r[2]), [sc.none, sc.count(1) + '（deepseek）', sc.files(1) + '（低）', sc.files(1)], '审查者每项明细');
+                const kilo = (n: number) => `${(n / 1000).toFixed(1)}k`;
+                assert.deepEqual(card.perf, [
+                    `${sc.reviewPerfIssues}${sc.reviewPerfIssuesValue(4, 1, 1, 2)}`, `${sc.reviewPerfValid}${sc.reviewPerfValidValue(1, 3)}`,
+                    `${sc.perfTime}${(group.perf.ms / 60000).toFixed(1)} 分钟`, `${sc.perfToken}${sc.tokens(kilo(12400), kilo(900))}`,
+                ]);
+            };
+            await verify('UI159 第三张卡片"审查者"：标题、审查者名带"（交叉）"、分数 / aria-label / 进度条 / 档位、每项名称明细扣分、性能四项（问题、成立、用时、token），全部与核心一致', async () => { await reviewerChecks(reviewed); });
+            await check('UI159 三张卡片的顺序是执行者、主导、审查者，宽度相同、上下排；其余两张的分数仍与核心一致', `(() => { const cards = [...document.querySelectorAll('[data-sc-card]')]; const r = cards.map(c => c.getBoundingClientRect()); return cards.map(c => c.dataset.scCard).join() === 'executor,lead,reviewer' && r[0].bottom <= r[1].top && r[1].bottom <= r[2].top && Math.abs(r[0].width - r[2].width) < 1 && r[0].left === r[2].left; })()`);
+            await verify('UI159 执行者、主导两张卡片与核心一致（有审查时它们不变）', async () => { compare(await dom(), reviewed); });
+            await pair('ui159-score-reviewer');
+            // 用鼠标把第 1 次归因切到"任务说明"：重画后审查者卡片还在、内容不变，执行者 +15 / 主导 −15；再切回。
+            await press('[data-sc-fail="1"] [data-blame-who=spec]');
+            await wait(`document.querySelector('[data-sc-card=executor] [data-sc-score]').textContent === ${jsonStr(String(base.executor.score + 15))}`, 'UI159 归因切换后执行者分数 +15');
+            await verify('UI159 切换归因后重画：审查者卡片仍在，分数与每项不变，且与核心一致', async () => {
+                const again = await reportNow();
+                assert.equal(again.reviewer!.score, 75);
+                compare(await dom(), again);
+                await reviewerChecks(again);
+            });
+            await press('[data-sc-fail="1"] [data-blame-who=worker]');
+            await wait(`document.querySelector('[data-sc-card=executor] [data-sc-score]').textContent === ${jsonStr(String(base.executor.score))}`, 'UI159 归因切回执行者');
+        }
+        finally { await dropReviewRow(); }
+        await press('[data-task=t3]');
+        await press(`[data-task="${SCORE_ID}"]`);
+        await press('[data-tab=score]');
+        await wait(`!!document.querySelector("[data-sc-card=executor]") && !document.querySelector("[data-sc-card=reviewer]")`, 'UI159 去掉审查记录后审查者卡片消失');
+        await check('UI159 去掉审查记录后回到两张卡片，核心的报告里没有 reviewer', `[...document.querySelectorAll('[data-sc-card]')].map(c => c.dataset.scCard).join() === 'executor,lead'`);
+        await verify('UI159 恢复后核心没有 reviewer，两张卡片与核心一致', async () => { const again = await reportNow(); assert.equal('reviewer' in again, false); compare(await dom(), again); });
+
+        // ---- 检查 3c（185，D117 演示数据补审查）：演示任务 t32（待验收）自带审查结果，评分标签直接有"审查者"一组 ----
+        // t32 默认隐藏（worktree 演示任务）：临时显示、检查完恢复。期望值全部来自 data.mjs 的 reviews.t32：Codex 交叉审查，三个问题（中 2 · 低 1），R1-2 成立、R1-3 不成立（低，扣 5 分），用时 108 秒，token 12400 / 900。
+        await setHiddenOf(DEMO_REVIEW_ID, false);
+        await press('[data-page=tasks]');
+        await wait('!!document.querySelector("[data-task]")');
+        await press('[data-filter=all]');
+        await press('[data-project]');
+        await press('.ctx button');
+        await wait(`!!document.querySelector('[data-task="${DEMO_REVIEW_ID}"]')`, 'UI185 显示带审查的演示任务 t32', 20000);
+        const t32 = registry.tasks.find(t => t.id === DEMO_REVIEW_ID)!;
+        await press(`[data-task="${DEMO_REVIEW_ID}"]`);
+        await wait('!!document.querySelector("[data-tab=score]")', 'UI185 t32 出现评分标签');
+        await press('[data-tab=score]');
+        await wait('!!document.querySelector("[data-sc-card=reviewer]")', 'UI185 t32 的评分标签有"审查者"卡片');
+        const demoReport = await core(['report', t32.name, '--json'], t32.repo);
+        await verify('UI185 演示任务 t32 的评分：核心报告有审查者一组——codex（交叉）95 分，只扣"不成立的低"一个 −5；问题 3 个（中 2 · 低 1）、成立 1 / 已确认 2、用时 108 秒、token 12400 / 900', () => {
+            const group = demoReport.reviewer!;
+            assert.equal(group.score, 95);
+            assert.equal(group.profile, 'codex');
+            assert.equal(group.crossed, true);
+            assert.deepEqual(group.items.map(i => [i.key, i.count, i.points]), [['reviewInvalid', 0, 0], ['reviewFormat', 0, 0], ['reviewFalse', 1, -5], ['reviewFalseHigh', 0, 0]]);
+            assert.deepEqual(group.perf, { issues: { total: 3, high: 0, medium: 2, low: 1 }, confirmed: 2, valid: 1, ms: 108000, usage: { input: 12400, output: 900 } });
+        });
+        await verify('UI185 t32 评分标签三张卡片（执行者、主导、审查者）与核心一致，审查者卡片的标题、审查者名带"（交叉）"、分数、每项名称明细扣分、性能四项都对得上', async () => {
+            const cards = await dom(), card = await reviewerDom(), group = demoReport.reviewer!, kilo = (n: number) => `${(n / 1000).toFixed(1)}k`;
+            assert.equal(await evaluate(`[...document.querySelectorAll('[data-sc-card]')].map(c => c.dataset.scCard).join()`), 'executor,lead,reviewer');
+            compare(cards, demoReport);
+            assert.equal(card.title, sc.reviewer);
+            assert.ok(card.who.toLowerCase().includes('codex') && card.who.endsWith('（交叉）'), `卡片头的审查者：${card.who}`);
+            assert.equal(card.score, String(group.score));
+            assert.equal(card.label, sc.scoreLabel(group.score));
+            assert.equal(card.bar, `${group.score}%`);
+            assert.equal(card.tone, toneOf(group.score));
+            assert.deepEqual(card.rows.map(r => [r[0], r[1], r[3], r[4]]), group.items.map(item => [`reviewer:${item.key}`, sc.items[item.key], pointsOf(item), item.points === 0]));
+            assert.deepEqual(card.rows.map(r => r[2]), [sc.none, sc.none, sc.files(1) + '（低）', sc.none]);
+            assert.deepEqual(card.perf, [`${sc.reviewPerfIssues}${sc.reviewPerfIssuesValue(3, 0, 2, 1)}`, `${sc.reviewPerfValid}${sc.reviewPerfValidValue(1, 2)}`, `${sc.perfTime}${(group.perf.ms / 60000).toFixed(1)} 分钟`, `${sc.perfToken}${sc.tokens(kilo(12400), kilo(900))}`]);
+        });
+        await pair('ui185-score-reviewer-demo');
+        await setHiddenOf(DEMO_REVIEW_ID, true);
+        await openTab();
+
         // ---- 最小窗口 ----
         win.setContentSize(960, 600);
         await pause(500);
@@ -329,7 +463,10 @@ export async function captureScore(h: Harness, registry: Registry, win: BrowserW
         if (originalConfig === null) await rm(configFile, { force: true }).catch(() => { });
         else await writeFile(configFile, originalConfig).catch(() => { });
         await rm(path.join(dir || path.join(home, 'none'), 'marks.json'), { recursive: true, force: true }).catch(() => { });
+        await rm(path.join(dir || path.join(home, 'none'), 'review.json'), { force: true }).catch(() => { });
+        await readFile(path.join(home, 'runs.jsonl'), 'utf8').then(text => text.includes('selfTest159') ? writeFile(path.join(home, 'runs.jsonl'), text.split('\n').filter(line => !line.includes('selfTest159')).join('\n')) : undefined).catch(() => { });
         await setHidden(true).catch(() => { });
+        await setHiddenOf(DEMO_REVIEW_ID, true).catch(() => { });
         win.setContentSize(original.size[0], original.size[1]);
         nativeTheme.themeSource = original.theme;
     }

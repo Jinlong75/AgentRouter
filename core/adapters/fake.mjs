@@ -63,6 +63,10 @@ export function mapLine(line) {
   return e && typeof e === 'object' && !Array.isArray(e) && kinds.includes(e.kind) ? [e] : [];
 }
 
+// 最后的结果事件（执行者不自行退出的兜底，runner.mjs）：一条 turn 事件；同一行里不会再有 error，所以总是成功结果。
+// 回放中出错的假执行者用 exit 表示失败，不靠这个字段。
+const finalResult = batch => (batch.some(e => e.kind === 'turn') ? { ok: true } : null);
+
 export const fake = {
   id: 'fake',
   label: '假执行者',
@@ -85,4 +89,5 @@ export const fake = {
     return { executable: process.execPath, args: ['-e', runner, JSON.stringify(playback), report], stdin: prompt };
   },
   mapLine,
+  finalResult,
 };

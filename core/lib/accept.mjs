@@ -1,12 +1,14 @@
 // 验收合并与驳回（协议 15.6、15.7）：ar accept / ar reject。零依赖。
 // 只写清单事件（accepted / conflict / rejected / cleanup），不碰任务的记录目录；git 一律参数数组、shell: false（git.mjs）。
-import { existsSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { git, uncommittedFiles } from './git.mjs';
 import { readJson } from './json.mjs';
 import { pushBranch } from './push.mjs';
-import { registryWriter } from './records.mjs';
+import { registryWriter, taskPaths } from './records.mjs';
 import { parseSpec, validateSpec } from './spec.mjs';
+import { awaitingTasks, pathsOverlap, taskScope } from './schedule.mjs';
+import { taskBaseBranch } from './status.mjs';
 import { findTerminal, latestEvent, locateStart, reverseRows, worktreeOutcome } from './wait.mjs';
 import { branchExists, removeWorktree, unmergedFiles } from './worktree.mjs';
 
@@ -75,7 +77,8 @@ export function accept({ homes, root, name, squash = false, push = null, by = nu
   // 任务分支相对基线没有新提交（调研 / 审查类任务）：没有东西可合并，改为确认（Stage07 105）。
   if (noNewCommits({ root, file, start, worktree })) return confirm({ root, registry, id, worktree, by, env });
   const config = projectConfig(root);
-  const baseBranch = config.baseBranch;
+  // 这个任务的基线分支：派发时用 --base 指定的，否则项目配置的 baseBranch（136）。
+  const baseBranch = taskBaseBranch(start, config.baseBranch);
   if (typeof baseBranch !== 'string' || baseBranch.trim() === '') throw new Error('项目配置没有写 baseBranch，不知道该合并到哪个分支');
   // 检查 2：主工作区当前分支是 baseBranch。
   const current = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -123,10 +126,32 @@ export function accept({ homes, root, name, squash = false, push = null, by = nu
   registry({ event: 'accepted', id, merge, mode, by: actor({ by, env }), at: Date.now() });
   const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: mode === 'squash' });
   // 合并后推送（Stage07b 128）：--push，或没写 --push / --no-push 且项目配置 push.afterAccept 为 true。没有推送时结果里不出现 push 键。
-  const pushed = push === true || (push === null && config.push?.afterAccept === true)
-    ? pushAfterMerge({ root, home: homes[0], registry, id, by: actor({ by, env }), env })
-    : null;
-  return { ok: true, merge, mode, cleanup, ...(pushed ? { push: pushed } : {}) };
+  // 推送只认项目配置的 baseBranch：这次派发指定了别的基线分支时不推送（包括显式的 --push），合并照常完成（136）。
+  const wantPush = push === true || (push === null && config.push?.afterAccept === true);
+  const pushed = !wantPush ? null
+    : baseBranch !== config.baseBranch ? skipPush({ root, name: start.name, baseBranch, projectBranch: config.baseBranch })
+      : pushAfterMerge({ root, home: homes[0], registry, id, by: actor({ by, env }), env });
+  // 合并后要自动按新基线重跑门禁的任务（Stage07c 154，D86）：由调用方（cli.mjs）去启动，这里只算出名单。
+  const targets = rerunTargets({ home, root, start, baseBranch, projectBaseBranch: config.baseBranch });
+  return { ok: true, merge, mode, cleanup, ...(pushed ? { push: pushed } : {}), ...(targets.length ? { rerun: { after: { id, name: start.name }, targets } } : {}) };
+}
+
+// 同项目、同一基线分支、仍是待验收、用 worktree 且启用了门禁（只读任务没有改动，不需要）、改动范围和刚合并的 X 重叠的任务：[{ id, name }]。
+// 不重叠的、已经是冲突 / 失败 / 进行中的任务都不动。
+function rerunTargets({ home, root, start, baseBranch, projectBaseBranch }) {
+  const mine = taskScope(start.dir ?? '').patterns;
+  return awaitingTasks({ home, root })
+    .filter(task => task.id !== start.id && task.scope.gate && !task.scope.readOnly
+      && taskBaseBranch(task.start, projectBaseBranch) === baseBranch && pathsOverlap(task.scope.patterns, mine))
+    .map(task => ({ id: task.id, name: task.name }));
+}
+
+// 基线分支不是项目主分支时跳过推送：结果里写原因，任务的进度日志另记一行（记录目录不会被清理动掉）。
+function skipPush({ root, name, baseBranch, projectBranch }) {
+  const reason = `这次派发的基线是 ${baseBranch}，不是项目主分支 ${projectBranch}，不自动推送`;
+  try { appendFileSync(taskPaths(root, name).progress, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 批准后没有推送：${reason}\n`); }
+  catch { /* 进度日志写不了不影响合并结果。 */ }
+  return { skipped: true, reason };
 }
 
 // 合并成功后接着推送 baseBranch。推送失败不影响合并结果：返回 { ok, pushed?, code?, error? }，并在任务记录追加一条 push 事件。

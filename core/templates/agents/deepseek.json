@@ -16,5 +16,6 @@
   "recommended": true,
   "modelOptions": ["deepseek-v4-pro", "deepseek-v4-flash"],
   "effortOptions": ["low", "medium", "high", "xhigh", "max"],
+  "types": ["test", "docs"],
   "order": 1
 }

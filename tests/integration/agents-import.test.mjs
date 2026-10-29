@@ -86,14 +86,15 @@ test('presets --json：带 effortOptions / modelOptions / listModels / types；�
   const { call } = setup(t);
   const { json, code } = await call(['agents', 'presets', '--json']);
   assert.equal(code, 0);
-  assert.deepEqual(json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'openai-compat']);
+  assert.deepEqual(json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'deepseek-harness', 'openai-compat']);
   const by = name => json.presets.find(p => p.name === name);
   for (const name of ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat']) {
     assert.deepEqual(by(name).effortOptions, ['low', 'medium', 'high', 'xhigh', 'max'], name);
   }
   assert.deepEqual(by('codex').effortOptions, ['minimal', 'low', 'medium', 'high', 'xhigh']);
   assert.deepEqual(by('deepseek').modelOptions, ['deepseek-v4-pro', 'deepseek-v4-flash']);
-  assert.ok(!('listModels' in by('deepseek')) && !('types' in by('deepseek')), '没有的字段不输出');
+  assert.ok(!('listModels' in by('deepseek')), '没有的字段不输出');
+  assert.deepEqual(by('deepseek').types, ['test', 'docs']);
   const qoder = by('qoder-cn');
   assert.equal(qoder.adapter, 'generic'); assert.equal(qoder.auth, 'token'); assert.equal(qoder.title, 'Qoder（国内版）');
   assert.deepEqual(qoder.listModels, ['--list-models']);

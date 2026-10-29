@@ -160,6 +160,76 @@ test('默认创建时间：不传 created 时用 createdOf 查到的值（查不
   second();
 });
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+test('limit 是函数：每轮重读，第一轮 1、之后 2，第 2 个调用者下一轮拿到名额，onLimit(2, 1) 只调一次', async t => {
+  const home = setup(t);
+  const options = { home, kind: 'task', ...base, ...fakes({ alive: [100] }) };
+  const first = await acquireSlot({ ...options, id: 'a', limit: 1 });
+  let value = 1, calls = 0;
+  const changes = [];
+  let got = false;
+  const pending = acquireSlot({ ...options, id: 'b', limit: () => { calls++; return value; }, onLimit: (now, old) => changes.push([now, old]) })
+    .then(release => { got = true; return release; });
+  await sleep(100);
+  assert.equal(got, false);
+  assert.ok(calls >= 3, '每轮都调用');
+  assert.deepEqual(changes, []);
+  value = 2;
+  const release = await pending;
+  assert.deepEqual(changes, [[2, 1]]);
+  assert.equal(JSON.parse(readFileSync(slotFile(home, 'slot-2.json'), 'utf8')).id, 'b');
+  release(); first();
+});
+
+test('limit 函数抛错 / 返回 0 / 返回 "x"：沿用上一轮的值，不抛出也不放行；第一轮就失败按 1', async t => {
+  const home = setup(t);
+  const options = { home, kind: 'task', ...base, ...fakes({ alive: [100] }) };
+  const first = await acquireSlot({ ...options, id: 'a', limit: 1 });
+  for (const bad of [() => { throw new Error('半个文件'); }, () => 0, () => 'x', () => 1.5, () => undefined]) {
+    const controller = { stopped: false };
+    setTimeout(() => { controller.stopped = true; }, 80);
+    const changes = [];
+    await assert.rejects(acquireSlot({ ...options, id: 'b', limit: bad, signal: controller, onLimit: (...a) => changes.push(a) }), { stopped: true });
+    assert.deepEqual(changes, [], '第一轮失败按 1，不算变化');
+    assert.deepEqual(names(home), ['slot-1.json'], '没有多占');
+  }
+  // 中途失败：先返回 2（拿到 slot-2 之前被占满），之后坏值沿用 2，不退回 1 也不报变化。
+  const second = await acquireSlot({ ...options, id: 'c', limit: 2 });
+  let step = 0;
+  const changes = [];
+  const controller = { stopped: false };
+  setTimeout(() => { controller.stopped = true; }, 100);
+  await assert.rejects(acquireSlot({ ...options, id: 'd', signal: controller, onLimit: (...a) => changes.push(a),
+    limit: () => { step++; if (step === 1) return 2; throw new Error('读不了'); } }), { stopped: true });
+  assert.deepEqual(changes, []);
+  first(); second();
+});
+
+test('调小上限（2 → 1）：编号 2 已被占着的名额不被回收；新调用者要等占用数低于 1', async t => {
+  const home = setup(t);
+  const options = { home, kind: 'task', ...base, ...fakes({ alive: [100] }) };
+  const one = await acquireSlot({ ...options, id: 'a', limit: 2 });
+  const two = await acquireSlot({ ...options, id: 'b', limit: 2 });
+  assert.deepEqual(names(home), ['slot-1.json', 'slot-2.json']);
+  const changes = [];
+  let got = false;
+  const pending = acquireSlot({ ...options, id: 'c', limit: () => 1, onLimit: (...a) => changes.push(a) }).then(release => { got = true; return release; });
+  await sleep(100);
+  assert.equal(got, false);
+  assert.deepEqual(names(home), ['slot-1.json', 'slot-2.json'], 'slot-2 仍是 b 的');
+  assert.equal(JSON.parse(readFileSync(slotFile(home, 'slot-2.json'), 'utf8')).id, 'b');
+  // 上限改为 1 之后，释放编号 2 的名额也不放行新调用者（它只试 slot-1）；释放 slot-1 才放行。
+  two();
+  await sleep(100);
+  assert.equal(got, false, '占用数还是 1，不低于新上限');
+  one();
+  const release = await pending;
+  assert.deepEqual(names(home), ['slot-1.json']);
+  assert.deepEqual(changes, []);
+  release();
+});
+
 test('配置：默认值、合法值、非法值按默认处理并给出提示', () => {
   assert.deepEqual(slotDefaults, { concurrency: 2, gateConcurrency: 1 });
   const none = slotLimits({});

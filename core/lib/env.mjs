@@ -2,9 +2,9 @@
 // 再写入 profile.env、解析后的 secrets、隔离项（隔离项最后写，profile 不能改掉它）。
 // 其他变量（别的密钥、令牌、个人配置）一律不传；任何 profile 的密钥来源变量都不原样传下去。
 // 返回的对象只交给 spawn，调用方绝不打印或写盘。
-import { existsSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, parse } from 'node:path';
+import { dirname, join, parse, resolve as resolvePath } from 'node:path';
 import { resolveSecret } from './secrets.mjs';
 import { testAgent, testAgentEnv } from './compat.mjs';
 import { readConfig } from './config.mjs';
@@ -123,6 +123,7 @@ export function ensureSandboxHome(env, { home, profileName } = {}) {
   try { makeSandbox(env.USERPROFILE); return env.USERPROFILE; }
   catch {
     const dir = mkdtempSync(join(tmpdir(), `ar-sandbox-${String(profileName).replace(/[^\w.-]/g, '_')}-`));
+    registerOneShotSandbox(dir);
     // 缓存位置是核心按沙箱算出来的（不是调用方指定的）时，跟着换到一次性目录。
     const derived = env.PSModuleAnalysisCachePath === psCachePath(env.USERPROFILE);
     pointHome(env, dir);
@@ -130,6 +131,35 @@ export function ensureSandboxHome(env, { home, profileName } = {}) {
     makeSandbox(dir);
     return dir;
   }
+}
+
+// 一次性沙箱目录（上面的临时目录退回）：只有这里登记过的才会被删，公共目录下的正常沙箱一律不碰（D121）。
+// 执行者结束后由 runner.mjs 删（removeOneShotSandbox）；没走到那里的（检测、被停止等）在进程退出时兜底删。
+const oneShotSandboxes = new Set();
+let oneShotHookInstalled = false;
+const sameDir = (a, b) => resolvePath(a) === resolvePath(b);
+function registerOneShotSandbox(dir) {
+  oneShotSandboxes.add(resolvePath(dir));
+  if (oneShotHookInstalled) return;
+  oneShotHookInstalled = true;
+  process.on('exit', () => { for (const one of oneShotSandboxes) try { rmSync(one, { recursive: true, force: true }); } catch { /* 退出时删不掉就算了。 */ } });
+}
+
+// 环境的用户目录是登记过的一次性目录时删掉它（被子进程占用就重试几次，仍不行就忽略）；返回是否删了。
+export function removeOneShotSandbox(env) {
+  const dir = env?.USERPROFILE;
+  if (!dir || ![...oneShotSandboxes].some(one => sameDir(one, dir))) return false;
+  try { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  catch { return false; }
+  // 登记保留：同一个环境再启动时 reviveOneShotSandbox 要认得它，进程退出时的兜底对不存在的目录无害。
+  return true;
+}
+
+// 同一个环境再启动一次执行者（自动重试等）前：它的一次性目录已被上一次收尾删掉时重新建好。
+export function reviveOneShotSandbox(env) {
+  const dir = env?.USERPROFILE;
+  if (!dir || ![...oneShotSandboxes].some(one => sameDir(one, dir)) || existsSync(dir)) return;
+  try { makeSandbox(dir); } catch { /* 建不了就让执行者按原样启动。 */ }
 }
 
 // Windows 上查"本机应用数据 / 漫游应用数据"这类已知文件夹时，按注册表里的 %USERPROFILE%\AppData\… 展开；

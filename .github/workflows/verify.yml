@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       focus:
-        description: '只跑这一项（UI05、UI17-fail、newtask-load、core-spawn）；留空跑完整界面验收'
+        description: '只跑这一项（agents、preferences、score、routing、search、newtask-load、accept、focus-ring、core-spawn、UI17-fail、UI05、delete-one、process-unknown、UI20-lists）；留空跑完整界面验收'
         required: false
         default: ''
       repeat:

@@ -66,7 +66,7 @@ test('派发写入 dispatch.json：完整任务文字、补充说明、角色与
   assert.equal(value.detached, true);
 
   const saved = readJson(dispatchFile(f.repo, 'long-text'));
-  assert.deepEqual(saved, { v: 1, task, extra: '补充说明一二三', role: 'worker', spec: null, profile: 'fake', name: 'long-text' });
+  assert.deepEqual(saved, { v: 1, task, extra: '补充说明一二三', role: 'worker', spec: null, profile: 'fake', name: 'long-text', settingSources: { model: '内置默认', effort: '内置默认' } });
 
   // 请求文件在任务运行期间存在：先等它出现，再检查两份文件都没有密钥值或密钥来源。
   const managed = path.join(f.home, 'managed');

@@ -1,13 +1,14 @@
-import { c, wt as w } from '../shared/copy';
+import { c, rv, wt as w } from '../shared/copy';
 import type { GateResult, ProjectShow, Task } from '../shared/types';
 import { esc, markdown } from '../shared/markdown';
 import { executorLabel, executorTag } from '../shared/executor';
-import { confirmAction, field, icon, menu, notice, openSheet, type ConfirmOption } from './ui';
+import { confirmAction, field, icon, menu, notice, openSheet, toast, type ConfirmOption } from './ui';
 import { selectProjectNext } from './projects';
 import { gateBadge, gateEnabled, gateFile, gateTab } from './gate';
 import { attemptBadge, lastFailure, openRetrySheet } from './attempts';
 import { openCommitSheet } from './projects';
-import { baseBranchOf, bannerHtml, closeBlocked, loadRepoState, needsAccept, readdProject, repoBanner, sha7, waitedSince, writeBlocked, wtMark, wtStateLine, wtTrack } from './wt';
+import { reviewerLabel, reviewHint, ReviewView, reviewSumItem } from './review';
+import { baseBranchOf, bannerHtml, closeBlocked, loadRepoState, needsAccept, overlapLines, listMeta, readdProject, repoBanner, reviewBadge, sha7, waitedSince, writeBlocked, wtMark, wtStateLine, wtTrack } from './wt';
 
 // 验收页（Stage06，协议 15.6～15.9；界面稿 app/design/preview.js 的 acceptRow / diffView / acceptOverview / acceptPage）：
 // 左边是待验收与冲突的任务，右边是详情（概览 · 改动 · 门禁 · 审查）与底部操作栏（驳回 · 重试 · 批准并合并 / 解决冲突并重试）。
@@ -16,6 +17,8 @@ export interface AcceptHost {
     tasks(): Task[];
     // 点轨道上的"派发 / 执行"节点：回到任务页看这个任务的参数 / 进展。
     openTask(id: string, tab: string): void;
+    // 交叉审查的"审查"标签（Stage08 158）：验收页与任务详情共用一份。
+    reviews: ReviewView;
 }
 interface DiffFile { path: string; oldPath: string | null; status: string; additions: number; deletions: number; binary: boolean; patch?: string; truncated?: boolean }
 interface DiffData { base: string; head: string; files: DiffFile[]; totalBytes: number; truncated: boolean }
@@ -23,7 +26,9 @@ type DiffState = { loading: true } | { error: string } | { data: DiffData };
 interface Overview { allowed: string[] | null; verify: string[] | null; goal: string | null }
 // copy：不在主分支时给"复制命令"；commit：主工作区有未提交的改动（核心错误码 DIRTY_MAIN）时给"去提交"。
 type Banner = { title: string; text: string; copy?: string; commit?: boolean };
-type TabKey = 'overview' | 'diff' | 'gate';
+type TabKey = 'overview' | 'diff' | 'gate' | 'review';
+// ar overlaps --json 的一组（Stage07c 154、171）：互相重叠的待验收任务，order 是建议的批准顺序（任务 id），why 是核心给的一句话。
+interface OverlapGroup { tasks: { id: string; name: string }[]; order: string[]; why: string }
 
 const clock = (n: number) => new Date(n).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 const messageOf = (error: unknown) => String((error as { message?: unknown } | null)?.message ?? error);
@@ -69,6 +74,20 @@ export class AcceptView {
     private toastTimer?: ReturnType<typeof setTimeout>;
     private signature = '';
     private generation = 0;
+    // 每个项目里互相重叠的待验收任务组（tasks:overlaps，即 ar overlaps --json）：待验收的任务集合变了才重新问核心；读不到就当没有分组。
+    // groupsKey 是最近一次问核心用的待验收集合，loadedKey 是 groups 对应的集合（结果回来之后才更新）。
+    private groups = new Map<string, OverlapGroup[]>();
+    private groupsKey = '';
+    private loadedKey = '';
+    // 交叉审查（Stage08 158）："审查"标签、需人工处理横幅、批准确认框里的未确认提示；点"文件:行"切到改动并滚到这一行。
+    // ReviewView 由 index.ts 建一份、验收页与任务详情共用（点击监听也只挂一次）。
+    private get reviews() { return this.host.reviews; }
+    // 从别处（任务详情的"审查"标签）要求打开这个任务的改动并定位：验收页第一次画出详情后执行。
+    private pendingJump: { id: string; file: string; line: number | null } | null = null;
+    // 最近一次跳转标出的那一行：整页重画后补回标记与位置，直到用户切标签或选了别的任务。
+    private hit: { id: string; file: string; line: number | null } | null = null;
+    // 审查摘要（概览那一项与需人工处理横幅）上次画出来的样子：非"审查"标签下只在它变了才重画正文。
+    private reviewSig = '';
     constructor(private host: AcceptHost) { }
 
     // ---- 生命周期 ----
@@ -79,6 +98,13 @@ export class AcceptView {
         content.innerHTML = `<div class="page-h"><h1>${esc(w.pageTitle)}</h1><span class="lead">${esc(w.pageLead)}</span></div><div class="acc-page"><div class="acc-main"></div></div>`;
         content.onclick = e => void this.click(e);
         this.signature = '';
+        // 待验收集合变了而且有可能成组时，先等分组回来（最多 1.5 秒）再画列表，免得列表画出来之后又整体挪位置。
+        const list = this.list();
+        if (!this.groupsReady(list)) {
+            const gen = this.generation;
+            void Promise.race([this.loadGroups(list), new Promise(resolve => setTimeout(resolve, 1500))]).then(() => { if (gen === this.generation && this.signature === '') this.render(); });
+            return;
+        }
         this.render();
     }
     unmount() {
@@ -95,9 +121,10 @@ export class AcceptView {
     tasksChanged() {
         if (!this.root) return;
         const list = this.list();
+        void this.loadGroups(list);
         for (const id of [...this.gone]) if (!this.host.tasks().some(t => t.id === id && needsAccept(t))) this.gone.delete(id);
         const t = this.current(list);
-        const signature = JSON.stringify([list.map(x => x.id), t && [t.id, t.status, t.wt, t.commit, t.minutes, t.gateOk, t.gateSummary, t.attempts?.length]]);
+        const signature = JSON.stringify([list.map(x => x.id), t && [t.id, t.status, t.wt, t.commit, t.minutes, t.gateOk, t.gateSummary, t.attempts?.length, t.review, t.reviewing]]);
         if (signature === this.signature) return;
         this.render();
     }
@@ -119,8 +146,17 @@ export class AcceptView {
         this.renderBody();
         this.renderActions(now);
     };
+    // 审查数据变了（读到了、写了确认、再审中）：当前任务的"审查"标签重画；别的标签只在概览那一项或需人工处理横幅变了时重画正文。
+    reviewChanged(id: string) {
+        const t = this.current();
+        if (!t || t.id !== id || !this.root) return;
+        const signature = JSON.stringify([this.reviews.needsHuman(t), t.review, reviewerLabel(t.review?.reviewer ?? null)]);
+        if (this.tab !== 'review' && signature === this.reviewSig) return;
+        this.renderBody();
+    }
     private async load(t: Task) {
         loadRepoState(t, this.repoChanged);
+        void this.reviews.ensure(t);
         const gen = this.generation, id = t.id, key = this.key(t);
         if (!this.detailData.has(key)) {
             try {
@@ -169,25 +205,88 @@ export class AcceptView {
         }
     }
 
+    // 互相重叠的待验收任务组：同一项目里有两个以上待验收的任务才问核心；结果回来时待验收集合已变（又发了新的请求）就丢掉。
+    // 分组真的变了才重画列表（并保住焦点）。
+    private groupsKeyOf(list: Task[]) { return list.map(t => `${t.repo}|${t.id}`).join('\n'); }
+    // 分组对这个待验收集合是不是已经知道了（没有哪个项目有两个以上待验收的任务，就不用问）。
+    private groupsReady(list: Task[]) {
+        return !list.some(t => list.some(x => x !== t && x.repo === t.repo)) || this.groupsKeyOf(list) === this.loadedKey;
+    }
+    // 问核心：同一个待验收集合只问一次，再调用时返回还在路上的那次（挂载时等它）。
+    private pending: Promise<void> = Promise.resolve();
+    private loadGroups(list: Task[]): Promise<void> {
+        const key = this.groupsKeyOf(list);
+        if (key === this.groupsKey) return this.pending;
+        this.groupsKey = key;
+        this.pending = this.fetchGroups(list, key);
+        return this.pending;
+    }
+    private async fetchGroups(list: Task[], key: string) {
+        const gen = this.generation;
+        const counts = new Map<string, number>();
+        for (const t of list) counts.set(t.repo, (counts.get(t.repo) ?? 0) + 1);
+        const next = new Map<string, OverlapGroup[]>();
+        await Promise.all([...counts].filter(([, n]) => n > 1).map(async ([repo]) => {
+            try {
+                const result = await window.dock.console('tasks:overlaps', { project: repo }) as { groups?: OverlapGroup[] };
+                const groups = (Array.isArray(result.groups) ? result.groups : []).filter(g => Array.isArray(g?.tasks) && Array.isArray(g.order) && typeof g.why === 'string');
+                if (groups.length) next.set(repo, groups);
+            }
+            catch { /* 读不到就不分组，列表照旧。 */ }
+        }));
+        // 页面已经卸载 / 重新挂载：这次结果不要，下次再问；待验收集合又变了：另一次请求在路上，由它负责。
+        if (gen !== this.generation) { if (this.groupsKey === key) this.groupsKey = ''; return; }
+        if (key !== this.groupsKey) return;
+        this.loadedKey = key;
+        const before = JSON.stringify([...this.groups]);
+        this.groups = next;
+        if (before === JSON.stringify([...next])) return;
+        const focus = this.focusKey();
+        this.renderList(this.list());
+        this.restoreFocus(focus);
+    }
+    // 列表里要成组显示的任务：核心给的组里至少有两个现在还在列表里的任务；组里按建议的批准顺序排。
+    private overlapGroups(list: Task[]) {
+        const byId = new Map(list.map(t => [t.id, t]));
+        const found: { group: OverlapGroup; tasks: Task[] }[] = [];
+        const used = new Set<string>();
+        for (const [repo, groups] of this.groups) {
+            for (const group of groups) {
+                const tasks = group.order.map(id => byId.get(id)).filter((t): t is Task => !!t && t.repo === repo && !used.has(t.id));
+                if (tasks.length < 2) continue;
+                tasks.forEach(t => used.add(t.id));
+                found.push({ group, tasks });
+            }
+        }
+        return found;
+    }
+
     // ---- 渲染 ----
     private render() {
         const main = this.root?.querySelector<HTMLElement>('.acc-main');
         if (!main) return;
         const focus = this.focusKey();
+        // 整页重画会换掉"审查"标签里的说明框：先记下里面的文字与焦点，画完放回去。
+        const reviewFocus = this.reviews.capture(this.root);
         const list = this.list(), t = this.current(list);
         if (t) this.selected = t.id;
-        this.signature = JSON.stringify([list.map(x => x.id), t && [t.id, t.status, t.wt, t.commit, t.minutes, t.gateOk, t.gateSummary, t.attempts?.length]]);
+        if (t && this.tab === 'review' && !t.review) this.tab = 'overview';
+        this.signature = JSON.stringify([list.map(x => x.id), t && [t.id, t.status, t.wt, t.commit, t.minutes, t.gateOk, t.gateSummary, t.attempts?.length, t.review, t.reviewing]]);
         if (!t) {
             main.innerHTML = `<div class="empty">${icon('git-pull-request-line')}<b>${esc(w.emptyTitle)}</b><p>${esc(w.emptyHelp)}</p></div>`;
             return;
         }
         if (!main.querySelector('.split')) main.innerHTML = '<div class="split"><div class="edge"><div class="tlist scroll"></div></div><div class="detail acc"></div></div>';
         this.renderList(list);
+        void this.loadGroups(list);
         this.renderDetail(t);
         void this.load(t);
         // 改动提前读：改动为空的任务要据此换成“确认”流程；读失败的任务不在每次刷新时重读（切到改动标签才重试）。
         if (this.tab === 'diff' || !this.diffs.has(this.key(t))) void this.loadDiff(t);
         this.restoreFocus(focus);
+        this.reviews.restore(this.root, reviewFocus);
+        this.applyHit(t, true);
+        if (this.pendingJump?.id === t.id) { const jump = this.pendingJump; this.pendingJump = null; void this.jumpTo(t, jump.file, jump.line); }
     }
     private focusKey() {
         const el = document.activeElement;
@@ -210,9 +309,12 @@ export class AcceptView {
         const row = (t: Task) => {
             const s = t.wt, mark = wtMark(t.wt ? (t.wt.phase === 'conflict' ? 'conflict' : 'awaiting') : null)!;
             const sub = s?.phase === 'conflict' ? `<em class="attn">${esc(w.subConflict(s.conflictFiles?.length ?? 0))}</em>` : esc(w.rowWaited(waitedSince(t)));
-            return `<button class="trow ${t.id === this.selected ? 'on' : ''}" data-acc="${esc(t.id)}">${mark.html}<span class="tm"><b><span class="ttl">${esc(t.title)}</span></b><span><span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${attemptBadge(t)}${gateBadge(t)}${esc(t.repo.split(/[\\/]/).filter(Boolean).at(-1) ?? '')} · ${sub}</span></span><span class="ts"><span class="mono">${clock(t.started)}</span></span></button>`;
+            return `<button class="trow ${t.id === this.selected ? 'on' : ''}" data-acc="${esc(t.id)}">${mark.html}<span class="tm"><b><span class="ttl">${esc(t.title)}</span></b><span>${listMeta(`<span class="xtag mono" title="${esc(executorLabel(t))}" data-executor="${esc(executorTag(executorLabel(t)))}">${esc(executorTag(executorLabel(t)))}</span>${attemptBadge(t)}${gateBadge(t)}`, reviewBadge(t), `${esc(t.repo.split(/[\\/]/).filter(Boolean).at(-1) ?? '')} · ${sub}`)}</span></span><span class="ts"><span class="mono">${clock(t.started)}</span></span></button>`;
         };
-        box.innerHTML = `<div class="tgroup">${esc(w.listGroup)}<span class="mono">${list.length}</span></div>${list.map(row).join('')}`;
+        // 互相重叠的待验收任务放在一组（组上方：标题、建议的批准顺序、核心给的原因），不重叠的照旧排在后面。
+        const grouped = this.overlapGroups(list), inGroup = new Set(grouped.flatMap(g => g.tasks.map(t => t.id)));
+        const groupHtml = grouped.map(({ group, tasks }) => `<div class="ovgroup" data-ov-group><div class="ovg-h"><b data-ov-title>${esc(w.overlapGroupTitle)}</b><span data-ov-order>${esc(w.overlapOrder(group.tasks.map(x => x.name).join(' → ')))}</span><span class="why" data-ov-why>${esc(group.why)}</span></div>${tasks.map(row).join('')}</div>`).join('');
+        box.innerHTML = `<div class="tgroup">${esc(w.listGroup)}<span class="mono">${list.length}</span></div>${groupHtml}${list.filter(t => !inGroup.has(t.id)).map(row).join('')}`;
         box.scrollTop = scroll;
     }
     private tabItems(t: Task): [TabKey | 'review', string][] {
@@ -245,8 +347,9 @@ export class AcceptView {
         const bar = this.root?.querySelector<HTMLElement>('.detail.acc .dtabs');
         if (!t || !bar) return;
         const focused = document.activeElement instanceof HTMLElement && bar.contains(document.activeElement) ? document.activeElement.dataset.atab : undefined;
-        bar.innerHTML = `<div class="segm sm">${this.tabItems(t).map(([key, label]) => key === 'review'
-            ? `<button data-atab="review" disabled title="${esc(w.reviewLater)}">${label}</button>`
+        // "审查"标签：有审查结果的任务可点；没有审查的任务仍是灰的，悬停提示"这个任务没有审查"。
+        bar.innerHTML = `<div class="segm sm">${this.tabItems(t).map(([key, label]) => key === 'review' && !t.review
+            ? `<button data-atab="review" disabled title="${esc(rv.none)}">${label}</button>`
             : `<button data-atab="${key}" class="${key === this.tab ? 'on' : ''}" aria-pressed="${key === this.tab}">${label}</button>`).join('')}</div>`;
         if (focused) bar.querySelector<HTMLElement>(`[data-atab="${focused}"]`)?.focus({ preventScroll: true });
     }
@@ -260,9 +363,18 @@ export class AcceptView {
         const blockedButton = notice?.commit ? `<button class="btn sm" data-acc-commit>${icon('git-commit-line')}${esc(w.goCommit)}</button>` : notice?.copy ? `<button class="btn sm" data-acc-copy="${esc(notice.copy)}">${esc(w.copyCommand)}</button>` : '';
         const blocked = notice ? bannerHtml('fail', notice.title, notice.text, blockedButton) : '';
         const conflictBanner = conflict ? bannerHtml('fail', w.conflictTitle, w.conflictPageHelp(baseBranchOf(t), t.wt?.conflictFiles ?? [])) : '';
-        const content = this.tab === 'diff' ? this.diffView(t) : this.tab === 'gate' ? this.gateView(t) : this.overviewView(t);
+        if (this.tab === 'review' && !t.review) this.tab = 'overview';
+        const content = this.tab === 'diff' ? this.diffView(t) : this.tab === 'gate' ? this.gateView(t) : this.tab === 'review' ? this.reviews.html(t) : this.overviewView(t);
         const researchBanner = !conflict && this.research(t) ? bannerHtml('info', w.researchTitle, w.researchHelp) : '';
-        body.innerHTML = repoBanner(t) + blocked + conflictBanner + researchBanner + content;
+        // 拦截模式下返工次数用完仍有高严重度问题（Stage08 158）：各标签顶部都有横幅。
+        const needsHuman = this.reviews.needsHumanBanner(t);
+        this.reviewSig = JSON.stringify([this.reviews.needsHuman(t), t.review, reviewerLabel(t.review?.reviewer ?? null)]);
+        // 与别的待验收任务重叠的提示行（171）。
+        // "审查"标签里有说明输入框：整块替换前后保住里面的文字与焦点。
+        const focus = this.reviews.capture(body);
+        body.innerHTML = repoBanner(t) + blocked + conflictBanner + needsHuman + researchBanner + overlapLines(t, this.host.tasks()) + content;
+        this.reviews.restore(body, focus);
+        this.applyHit(t, false);
         scroller.scrollTop = top;
     }
     private gateView(t: Task) {
@@ -279,7 +391,7 @@ export class AcceptView {
         const spec = `<div class="specbox"><div class="sb-h">${icon('file-list-3-line')}<b>${esc(w.specBox)}</b><span class="mono muted">${esc(t.spec ?? c.direct)}</span><span class="sp"></span>${t.spec ? `<button class="btn sm quiet" data-acc-open="spec">${esc(c.open)}</button>` : ''}</div><p>${esc(goal)}</p><div class="sb-k"><span>${esc(w.specAllowed)}</span><span class="mono">${t.readOnly === true ? esc(w.specReadOnly) : list(overview?.allowed, overview?.allowed === null || !overview ? w.specNone : w.specAll)}</span></div><div class="sb-k"><span>${esc(w.specVerify)}</span><span class="mono">${list(overview?.verify, w.specNone)}</span></div></div>`;
         const file = gateFile(data?.gate ?? null);
         const commit = t.commit ?? sha7(file?.head ?? '');
-        const sum = `<div class="sum">${commit ? `<span>${icon('git-commit-line')}<em>${c.commit}</em><span class="mono">${esc(commit)}</span></span>` : ''}<span>${icon('time-line')}<em>${c.elapsed}</em>${t.minutes ?? '—'} ${c.minutes}</span><span>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span class="sp"></span><button class="btn icon quiet" data-acc-open="report" data-tip="${c.openReport}" aria-label="${c.openReport}">${icon('external-link-line')}</button></div>`;
+        const sum = `<div class="sum">${commit ? `<span>${icon('git-commit-line')}<em>${c.commit}</em><span class="mono">${esc(commit)}</span></span>` : ''}<span>${icon('time-line')}<em>${c.elapsed}</em>${t.minutes ?? '—'} ${c.minutes}</span><span>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span>${reviewSumItem(t)}<span class="sp"></span><button class="btn icon quiet" data-acc-open="report" data-tip="${c.openReport}" aria-label="${c.openReport}">${icon('external-link-line')}</button></div>`;
         const text = !data ? '' : report ? `<div class="md selectable">${markdown(report)}</div>` : `<div class="empty">${icon('file-text-line')}<b>${c.noReport}</b></div>`;
         return spec + sum + text;
     }
@@ -339,18 +451,28 @@ export class AcceptView {
         const b = (e.target as Element).closest<HTMLElement>('button');
         if (!b || !this.root?.contains(b)) return;
         const d = b.dataset, t = this.current();
-        if (d.acc !== undefined) { this.selected = d.acc; this.tab = 'overview'; this.render(); return; }
+        if (d.acc !== undefined) { this.selected = d.acc; this.tab = 'overview'; this.hit = null; this.render(); return; }
         // 推送失败提示上的"去项目页"：告诉项目页下次进入时选中这个项目，再按侧栏"项目"（与用户点它同一条路径）。
         if (d.accGoProject) {
             selectProjectNext(d.accGoProject);
             document.querySelector<HTMLElement>('[data-page=projects]')?.click();
             return;
         }
+        // 提示上的"撤销说明"：不依赖当前选中的任务。批准后与它重叠的任务会回到"门禁中"重跑，这时验收列表可能是空的（current 为空），点击不能被丢掉。
+        if (d.accUndo) { void window.dock.action(t?.id ?? d.accTask ?? '', 'copy-text', d.accUndo).catch(notice); return; }
         if (!t) return;
-        if (d.atab) { this.tab = d.atab as TabKey; this.renderTabs(); this.renderBody(); if (this.tab === 'diff') void this.loadDiff(t); return; }
-        // 轨道节点：门禁节点切到门禁标签；派发 / 执行 / 待验收 / 合并回到任务页对应的标签。
+        if (d.atab) {
+            if (d.atab === 'review' && !t.review) return;
+            this.hit = null;
+            this.tab = d.atab as TabKey; this.renderTabs(); this.renderBody();
+            if (this.tab === 'diff') void this.loadDiff(t);
+            if (this.tab === 'review') void this.reviews.ensure(t);
+            return;
+        }
+        // 轨道节点：门禁、审查节点切到对应标签；派发 / 执行 / 待验收 / 合并回到任务页对应的标签。
         if (b.classList.contains('node') && d.tab) {
             if (d.tab === 'gate') { this.tab = 'gate'; this.renderTabs(); this.renderBody(); }
+            else if (d.tab === 'review' && t.review) { this.tab = 'review'; this.renderTabs(); this.renderBody(); void this.reviews.ensure(t); }
             else this.host.openTask(t.id, d.tab);
             return;
         }
@@ -374,7 +496,6 @@ export class AcceptView {
         if (b.hasAttribute('data-acc-commit')) { void this.goCommit(t, b); return; }
         if (d.accOpen) { void this.action(t, d.accOpen); return; }
         if (d.accCopy) { void this.action(t, 'copy-text', d.accCopy); return; }
-        if (d.accUndo) { void this.action(t, 'copy-text', d.accUndo); return; }
         if (d.accApprove) void this.approve(t, b);
         else if (d.accConfirm) void this.confirm(t);
         else if (d.accReject) this.rejectSheet(t, b);
@@ -384,7 +505,55 @@ export class AcceptView {
     private action(t: Task, name: string, value?: string) {
         return window.dock.action(t.id, name, value).catch(notice);
     }
-    // 折叠 / 展开一个文件：只改这一个文件的 DOM，滚动位置与焦点都不动。
+    // ---- 审查：点"文件:行"跳到改动 ----
+    // 任务详情的"审查"标签要求来这里：选中这个任务（mount 已选）、切到改动并定位；详情还没画出来时等第一次 render 再做。
+    openDiffAt(id: string, file: string, line: number | null) {
+        const t = this.current();
+        if (this.root && t?.id === id && this.root.querySelector('.detail.acc')) void this.jumpTo(t, file, line);
+        else this.pendingJump = { id, file, line };
+    }
+    // 切到"改动"标签，等改动读到，展开这个文件，把这一行滚到视口中间并标出来。
+    // 改动里没有这一行（审查者指的行不在改动里、文件被截断）时滚到文件开头并提示一句；没有这个文件时停在改动开头并提示。
+    private async jumpTo(t: Task, file: string, line: number | null) {
+        if (!this.root) return;
+        const gen = this.generation, key = this.key(t);
+        this.tab = 'diff';
+        this.renderTabs();
+        this.renderBody();
+        void this.loadDiff(t);
+        for (let i = 0; i < 400; i++) {
+            const state = this.diffs.get(key);
+            if (state && !('loading' in state)) break;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            if (gen !== this.generation || this.current()?.id !== t.id) return;
+        }
+        const state = this.diffs.get(key);
+        if (!this.root || !state || !('data' in state) || this.current()?.id !== t.id) return;
+        const norm = (value: string) => value.replace(/\\/g, '/').replace(/^\.\//, '');
+        const index = state.data.files.findIndex(f => norm(f.path) === norm(file));
+        if (index < 0) { this.hit = null; toast(reviewHint); return; }
+        this.expandedOf(t, state.data).add(index);
+        this.tab = 'diff';
+        this.hit = { id: t.id, file, line };
+        this.renderTabs();
+        this.renderBody();
+        // 之后清单变了（别处写了确认等）整页重画时，render / renderBody 会按 this.hit 把标记与位置补回来。
+        if (!this.applyHit(t, true) && line !== null) toast(reviewHint);
+    }
+    // 把 this.hit 指的那一行标出来（rv-hit）；scroll 为真时滚到视口中间，行不在改动里（审查者指的行超出改动）时滚到文件开头。返回这一行有没有找到。
+    private applyHit(t: Task, scroll: boolean): boolean {
+        const hit = this.hit, state = this.diffs.get(this.key(t));
+        if (!hit || hit.id !== t.id || this.tab !== 'diff' || !this.root || !state || !('data' in state)) return false;
+        const norm = (value: string) => value.replace(/\\/g, '/').replace(/^\.\//, '');
+        const index = state.data.files.findIndex(f => norm(f.path) === norm(hit.file));
+        const box = index < 0 ? null : this.root.querySelector<HTMLElement>(`[data-df-box="${index}"]`);
+        if (!box) return false;
+        this.root.querySelectorAll('.dl.rv-hit').forEach(el => el.classList.remove('rv-hit'));
+        const row = hit.line === null ? undefined : [...box.querySelectorAll<HTMLElement>('.dl:not(.del):not(.hunk)')].find(el => el.querySelector('.no')?.textContent === String(hit.line));
+        row?.classList.add('rv-hit');
+        if (scroll) (row ?? box.querySelector<HTMLElement>('.df-h') ?? box).scrollIntoView({ block: row ? 'center' : 'start' });
+        return !!row;
+    }    // 折叠 / 展开一个文件：只改这一个文件的 DOM，滚动位置与焦点都不动。
     private toggleFile(t: Task, index: number) {
         const state = this.diffs.get(this.key(t));
         if (!state || !('data' in state)) return;
@@ -424,7 +593,11 @@ export class AcceptView {
         try {
             const choice = await this.pushChoice(t);
             if (choice) { remote = choice.remote; option = { label: w.approvePush(choice.remote), help: w.approvePushHelp, checked: choice.afterAccept }; }
-            if (!await confirmAction(w.approveTitle(t.title, base), w.approveBody(mode, t.wt?.branch ?? ''), w.approve, trigger, false, option)) return;
+            // 审查还有高 / 中问题没确认（Stage08 158）：确认框里多一句提示，不拦着批准。
+            const unconfirmed = t.review ? (await this.reviews.load(t), this.reviews.unconfirmed(t)) : [];
+            const asking = confirmAction(w.approveTitle(t.title, base), w.approveBody(mode, t.wt?.branch ?? ''), w.approve, trigger, false, option);
+            if (unconfirmed.length) document.querySelector('.confirm-card #confirm-body')?.insertAdjacentHTML('afterend', `<p class="note" data-rv-approve-note>${esc(rv.approveUnconfirmed(unconfirmed.length, unconfirmed.map(issue => issue.id).join('、')))}</p>`);
+            if (!await asking) return;
         }
         finally { this.approving = false; }
         this.blocked.delete(t.id);
@@ -494,7 +667,7 @@ export class AcceptView {
         host.querySelector('.toast')?.remove();
         clearTimeout(this.toastTimer);
         const undo = w.undoText(sha7(merge), mode), base = baseBranchOf(t);
-        const undoButton = `<button class="btn sm quiet" data-acc-undo="${esc(undo)}">${esc(w.undoHelp)}</button>`;
+        const undoButton = `<button class="btn sm quiet" data-acc-undo="${esc(undo)}" data-acc-task="${esc(t.id)}">${esc(w.undoHelp)}</button>`;
         if (push && !push.ok) host.insertAdjacentHTML('beforeend', `<div class="toast long" role="status">${warnm}<span>${esc(w.mergedPushFailed(t.title, base, sha7(merge), push.error ?? ''))}</span><button class="btn sm quiet" data-acc-go-project="${esc(t.repo)}">${esc(w.goProject)}</button></div>`);
         else host.insertAdjacentHTML('beforeend', `<div class="toast" role="status">${okm}<span>${esc(push?.remote ? w.mergedPushed(t.title, base, push.remote) : w.mergedToast(t.title, base, from, sha7(merge)))}</span>${undoButton}</div>`);
         this.toastTimer = setTimeout(() => host.querySelector('.toast')?.remove(), 15000);

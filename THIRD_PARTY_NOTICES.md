@@ -4,6 +4,39 @@
 
 AgentRouter 基于 DispatchDock v0.1.5（https://github.com/LBEILC/DispatchDock），MIT 许可，Copyright (c) 2026 LBEILC。原版权声明与许可全文保留在 `LICENSE` 中，本仓库保留了 DispatchDock 的完整 git 历史。
 
+## Electron 与 Chromium
+
+安装包里的 Electron 运行时是 Electron 43.7.5（https://github.com/electron/electron），MIT 许可，原样使用、未修改。
+
+Copyright (c) Electron contributors
+Copyright (c) 2013-2020 GitHub Inc.
+
+```text
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+Electron 内含 Chromium、Node.js、V8 等组件，各自按自己的许可发布。这些组件的许可清单随安装包一起附带，安装后在安装目录里，与 `AgentRouter.exe` 同级（默认安装目录是 `%LOCALAPPDATA%\Programs\AgentRouter\`，安装时可以改）：
+
+- `LICENSES.chromium.html`：Chromium 及其第三方组件的许可清单；
+- `LICENSE.electron.txt`：上面的 Electron 许可原文。
+
 ## MiSans
 
 本软件使用 MiSans VF，Version 4.003（字重轴 150–700），原样嵌入字体文件，未修改、转换或子集化。

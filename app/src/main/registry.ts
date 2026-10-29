@@ -9,6 +9,9 @@ import { dispatchMatches, type Platform, type ProcessInfo } from './platform';
 import type { ProcessCheck } from '../shared/types';
 import { legacyRunsName } from '../../../core/lib/compat.mjs';
 import { parseJson } from '../../../core/lib/json.mjs';
+// TODO(lead): core/lib/config.mjs 没有类型声明（core/ 不在允许清单，没法加 .d.mts），先用 ts-expect-error。
+// @ts-expect-error TS7016
+import { slotLimits } from '../../../core/lib/config.mjs';
 // needsScope（协议 14.5）：数组、每项 path 是非空字符串、reason 是字符串或 null、最多 50 条；不合法就当没有。
 function readNeedsScope(value: unknown): NeedsScopeItem[] | undefined {
     if (!Array.isArray(value) || value.length === 0 || value.length > 50)
@@ -73,13 +76,21 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
             if (typeof e.label === 'string') t.label = e.label;
             // 路由说明（Stage07 111）：只有经过路由的任务才有，旧记录没有。
             if (typeof e.route === 'string' && e.route !== '') t.route = e.route;
+            // 参数来源（Stage07c 154、171）：start 里的 settingSources；旧记录没有，不是对象就当没有。
+            if (e.settingSources && typeof e.settingSources === 'object' && !Array.isArray(e.settingSources)) {
+                const source = (v: unknown) => typeof v === 'string' && v !== '' ? v : null;
+                t.settingSources = { model: source(e.settingSources.model), effort: source(e.settingSources.effort) };
+            }
             // 门禁（协议第 2 节）：gate 是布尔；base 是执行者开始时的提交。
             // 老记录没有这两个字段，任务对象保持与以前一致。
             if (typeof e.gate === 'boolean') t.gate = e.gate;
             if (typeof e.base === 'string') t.base = e.base;
             if (e.readOnly === true) t.readOnly = true;
             // worktree 模式（协议 15.3）：只有 start 就是排队；之后的 queued / preparing / worktree / setup 等事件推进阶段。
-            if (e.worktree === true) { t.worktree = true; t.wt = { phase: 'queued', queuedAt: e.started }; }
+            if (e.worktree === true) {
+                t.worktree = true; t.wt = { phase: 'queued', queuedAt: e.started };
+                if (typeof e.baseBranch === 'string' && e.baseBranch.trim() !== '') t.wt.startBase = e.baseBranch;
+            }
             tasks.set(t.id, t);
         }
         else {
@@ -110,6 +121,8 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 delete t.outsideWrites;
                 // worktree 任务重试 / 解决冲突之后回到进行中：冲突与准备失败的标记不再算，之后的 queued / preparing 照常覆盖阶段。
                 if (t.wt) { t.wt.phase = 'live'; delete t.wt.conflictFiles; delete t.wt.setupFailed; delete t.wt.awaitingAt; }
+                // 被批准合并后自动按新基线重跑门禁（154、171）：resume 带 reason: after-merge 与刚合并的任务 id；别的 resume 把它清掉。
+                if (t.wt) { if (e.reason === 'after-merge' && typeof e.after === 'string' && e.after !== '') t.wt.rebaseAfter = e.after; else delete t.wt.rebaseAfter; }
             }
             // worktree 模式的状态事件（协议 15.3 / 15.6 / 15.7）：不认识的字段忽略；cleanup 不改变阶段。
             if (t.wt) {
@@ -117,6 +130,14 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 if (e.event === 'queued') {
                     w.phase = 'queued';
                     if (Number.isFinite(e.at)) w.queuedAt = e.at;
+                    // 排队原因（140）：最近一条 queued 事件说了算，没有 reason 的（等名额）把原因清掉。字段不合法按没有原因处理。
+                    const why = queuedWhy(e);
+                    if (why) w.queuedWhy = why; else delete w.queuedWhy;
+                }
+                else if (e.event === 'overlap-note') {
+                    // 与待验收任务重叠的提示（154、171）：不改阶段；同一个对方只留一条。
+                    const notes = Array.isArray(e.with) ? e.with.filter((x: any) => x && typeof x.id === 'string' && x.id !== '' && typeof x.name === 'string' && x.name !== '').map((x: any) => ({ id: x.id as string, name: x.name as string })) : [];
+                    if (notes.length) w.overlapNotes = [...(w.overlapNotes ?? []).filter(old => !notes.some((n: { id: string }) => n.id === old.id)), ...notes];
                 }
                 else if (e.event === 'preparing')
                     w.phase = 'preparing';
@@ -157,7 +178,24 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 const item: TaskAttempt = { n: e.n, total: Number.isSafeInteger(e.total) ? e.total : null, profile: typeof e.profile === 'string' ? e.profile : null, reason: typeof e.reason === 'string' ? e.reason : '', at: Number.isFinite(e.at) ? e.at : 0 };
                 t.attempts = [...(t.attempts ?? []), item];
                 t.attempt = item;
+                // 新一次尝试（返工、重试）开始：上一次的审查结果不再算这次的。
+                delete t.review;
+                delete t.reviewing;
             }
+            // 交叉审查（Stage08，协议 18.3）：reviewing 之后到 review 事件之前审查进行中；
+            // 手动再审（run 大于 1）没有给出结论时，核心把顶层 review.json 原样放回，所以这样的 review 事件不换掉已有的摘要。
+            if (e.event === 'reviewing' && Number.isSafeInteger(e.attempt) && Number.isFinite(e.at))
+                t.reviewing = { attempt: e.attempt, at: e.at };
+            if (e.event === 'review' && Number.isSafeInteger(e.attempt) && typeof e.verdict === 'string') {
+                delete t.reviewing;
+                const run = Number.isSafeInteger(e.run) && e.run > 1 ? e.run : undefined;
+                if (!(run && !['pass', 'concerns', 'fail'].includes(e.verdict)))
+                    t.review = { attempt: e.attempt, ...(run ? { run } : {}), reviewer: typeof e.reviewer === 'string' && e.reviewer !== '' ? e.reviewer : null, crossed: e.crossed === true, verdict: e.verdict, issues: Number.isSafeInteger(e.issues) && e.issues >= 0 ? e.issues : 0, high: Number.isSafeInteger(e.high) && e.high >= 0 ? e.high : 0, at: Number.isFinite(e.at) ? e.at : 0 };
+            }
+            if (e.event === 'review-needs-human' && t.review)
+                t.review.needsHuman = true;
+            if (e.event === 'review-confirm' && t.review && Number.isFinite(e.at))
+                t.review.confirmedAt = e.at;
             if (e.event === 'attempt-end' && Number.isSafeInteger(e.n)) {
                 const item = (t.attempts ?? []).find(a => a.n === e.n);
                 if (item) {
@@ -193,6 +231,7 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                     t.gateSummary = e.summary;
             }
             if (e.event === 'end') {
+                delete t.reviewing;
                 t.exit = Number.isInteger(e.exit) ? e.exit : null;
                 t.ended = Number.isFinite(e.at) ? e.at : undefined;
                 t.minutes = Number.isFinite(e.minutes) && e.minutes >= 0 ? e.minutes : undefined;
@@ -212,6 +251,7 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
                 }
             }
             if (e.event === 'interrupted' && t.exit === undefined) {
+                delete t.reviewing;
                 t.ended = Number.isFinite(e.at) ? e.at : undefined;
                 t.signal = typeof e.signal==='string' ? e.signal : undefined;
                 t.status = 'stop';
@@ -219,6 +259,26 @@ export function mergeLine(tasks: Map<string, Task>, line: string) {
         }
     }
     catch { /* 单行损坏不影响后续记录。 */ }
+}
+// queued 事件的排队原因（140）：overlap 取第一个阻挡任务的名字与它的前 3 个重叠模式；exclusive 取独占门禁的任务名与命令（blockers[0].name + command）；busy 取 cpu。
+// 没有 reason、reason 不认识或字段不合法都返回 null（界面照旧显示等名额的说明）。
+// TODO(lead): 140 目前只对 overlap 写 queued 事件的 reason；exclusive 与 busy 的字段名是按保守约定读的，核心要写成这个形状（见汇报）。
+export function queuedWhy(e: any): WtInfo['queuedWhy'] | null {
+    const first = Array.isArray(e.blockers) ? e.blockers[0] : null, text = (v: unknown) => typeof v === 'string' && v !== '' ? v : null;
+    if (e.reason === 'overlap') {
+        const name = text(first?.name);
+        return name && Array.isArray(first.paths) ? { reason: 'overlap', name, paths: first.paths.filter((p: unknown) => typeof p === 'string').slice(0, 3) } : null;
+    }
+    if (e.reason === 'exclusive') {
+        const name = text(first?.name ?? e.name), command = text(e.command);
+        return name && command ? { reason: 'exclusive', name, command } : null;
+    }
+    if (e.reason === 'busy') {
+        // 可用内存不够（171）：memLow 为真并带 freeGb 时按内存写；其余照旧按 CPU。
+        if (e.memLow === true && Number.isFinite(e.freeGb)) return { reason: 'busy', memLow: true, freeGb: e.freeGb, ...(Number.isFinite(e.cpu) ? { cpu: Math.round(e.cpu) } : {}) };
+        return Number.isFinite(e.cpu) ? { reason: 'busy', cpu: Math.round(e.cpu) } : null;
+    }
+    return null;
 }
 // 排在它前面的任务数（协议 15.3 / 15.5）：比它先进入排队、现在仍是 queued 的 worktree 任务；先后按进入排队的时刻，相同再按开始时刻与 id。
 export function queuedAhead(tasks: Task[], t: Task): number {
@@ -345,19 +405,23 @@ export class Registry {
     // 同时运行的任务数上限（config.json 的 concurrency，没写或不合法为 2）；每次刷新按文件时间戳重读。
     concurrency = 2;
     private configStamp = '';
+    private autoConfig: Record<string, unknown> | null = null;
     private projectCache = new Map<string, { stamp: string; value: Pick<WtInfo, 'baseBranch' | 'mergeMode'> }>();
     constructor(readonly home: string, readonly data: string, readonly platform: Platform, private changed: (tasks: Task[]) => void, private finished: (t: Task) => void, private error: (e: unknown) => void, readonly legacyHome = home, private conflicted: (t: Task) => void = () => { }) { }
     private async readConcurrency() {
         const file = path.join(this.home, 'config.json');
         const info = await stat(file).catch(() => null);
         const stamp = info ? `${info.mtimeMs}:${info.size}` : '';
-        if (stamp === this.configStamp) return;
+        // 自动档：估算值随可用内存变，配置没变也要按核心重算（slotLimits 给的估算值，上限 concurrencyMax）。
+        if (stamp === this.configStamp) { if (this.autoConfig) this.concurrency = slotLimits(this.autoConfig).limits.concurrency; return; }
         this.configStamp = stamp;
         this.concurrency = 2;
+        this.autoConfig = null;
         if (!info) return;
         try {
-            const value = parseJson(await readFile(file, 'utf8')).concurrency;
-            if (Number.isSafeInteger(value) && value > 0) this.concurrency = value;
+            const config = parseJson(await readFile(file, 'utf8'));
+            if (config.concurrency === 'auto') { this.autoConfig = config; this.concurrency = slotLimits(config).limits.concurrency; }
+            else if (Number.isSafeInteger(config.concurrency) && config.concurrency > 0) this.concurrency = config.concurrency;
         }
         catch { /* 配置读不出来时按默认。 */ }
     }

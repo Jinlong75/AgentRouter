@@ -22,6 +22,9 @@ const validAbsPath = v => typeof v === 'string' && !/[\r\n]/.test(v) && path.isA
 // 相对路径不能以 / 、\ 或盘符开头（Windows 下 \foo 会逃出项目根）。
 const validSpecRel = v => typeof v === 'string' && !/[\r\n]/.test(v) && v.toLowerCase().endsWith('.md') && !/^[/\\]/.test(v) && !/^[A-Za-z]:/.test(v);
 const AUTH = ['login', 'token'];
+// 可担任的角色与模型家族名（与核心 roles.mjs 一致；家族名是否存在由核心按"模板 + familyRules"校验）。
+const ROLE_NAMES = ['executor', 'reviewer', 'lead'];
+const validFamily = v => typeof v === 'string' && /^[a-z0-9-]{1,40}$/.test(v);
 // 任务类型（与核心 spec.mjs 的 SPEC_TYPES 一致；路由规则与试算只认这些）。
 const ROUTE_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review'];
 // 任务记录名：核心 taskDetails 的规则（可含中文与空格；不含 <>:"/\|?* 与控制字符；不以点或空格结尾；不是保留设备名）。
@@ -99,7 +102,7 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
   const invalid = () => { throw new Error(messages.invalid); };
   // 组装参数数组并调用核心，按约定整理结果。
   // soft：核心的 ok:false 结果带着逐条的 errors / 原始输出时原样交给界面（校验、预览），不当作异常。
-  const run = async (args, { input, timeoutMs, cwd, conflict = false, soft = false, routeFailure = false } = {}) => {
+  const run = async (args, { input, timeoutMs, cwd, conflict = false, soft = false, routeFailure = false, probe = false } = {}) => {
     let result;
     try { result = await coreRun(args, { input, timeoutMs, cwd }); }
     catch (error) { throw new Error(messages.failed(error instanceof Error ? error.message : String(error))); }
@@ -108,6 +111,8 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     if (timedOut) throw new Error(messages.timeout(Math.round(timeoutMs / 1000)));
     if (json && json.ok === true) { const { lines, ...rest } = json; return rest; }
     if (soft && json && json.ok === false && (Array.isArray(json.errors) || Array.isArray(json.output))) { const { lines, ...rest } = json; return rest; }
+    // 探针没有查到：退回预设（source 为 preset，reason 是原因），不是通道错误。
+    if (probe && json && json.ok === false && json.source === 'preset' && Array.isArray(json.models)) { const { lines, ...rest } = json; return rest; }
     // 合并冲突（ar accept 退出码 4，json 为 { ok:false, conflict:true, files }）不是错误：原样交给界面显示冲突。
     if (conflict && json && json.ok === false && json.conflict === true) return { conflict: true, files: Array.isArray(json.files) ? json.files.filter(f => typeof f === 'string') : [] };
     // 路由试算失败（没有可用的执行者，退出码 2，json 带 code / error / trace）不是通道错误：原样交给界面显示原因和 trace。
@@ -119,6 +124,8 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       // 推送 / 拉取的取远程状态失败（FETCH_FAILED）带 cause（NO_CREDENTIAL / NETWORK / OTHER）：没有登录多半在这一步暴露。
       // 主进程到渲染层只转交 code，所以 cause 是 NO_CREDENTIAL 时把 code 也换成 NO_CREDENTIAL，界面据此显示登录指引（中文原因不变）。
       if (json.code === 'FETCH_FAILED' && json.cause === 'NO_CREDENTIAL') error.code = 'NO_CREDENTIAL';
+      // GitHub 邮箱隐私拒绝（push 返回 EMAIL_PRIVACY，带 email）：渲染层拿不到 email 字段，所以把被拒的邮箱放进 message（读不到时是空串），横幅的正文由界面文案生成。
+      if (json.code === 'EMAIL_PRIVACY') error.message = typeof json.email === 'string' ? json.email : '';
       throw error;
     }
     throw new Error(messages.noResult);
@@ -197,7 +204,24 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       if (!Number.isInteger(seconds) || seconds < 1 || seconds > 600) invalid();
       return run(['agents', 'test', '--decl', declArg(p?.decl), '--timeout', String(seconds)], { timeoutMs: (seconds + 20) * 1000, soft: true });
     },
-    async 'agents:models'(p) { return run(['agents', 'models', oneName(p)], { timeoutMs: 90000, soft: true }); },
+    // probe: true 走探针（ar agents models <名> --probe）：查到与退回预设都是正常结果（退回时 ok 为 false、带 reason），原样交给界面；
+    // 不带 probe 的调用保持原样（通用适配器的程序列表）。
+    // 带 preset（不带 name）是导入之前查（D102）：ar agents models --preset … --probe，按导入后会得到的配置查，不读不写已有的执行者；
+    // 可带 model / baseUrl / secretVar / auth（和 agents:add 同样的校验），必须带 probe: true。
+    async 'agents:models'(p) {
+      if (p?.preset !== undefined) {
+        if (!validName(p.preset) || p.name !== undefined || p.probe !== true) invalid();
+        const args = ['agents', 'models', '--preset', p.preset];
+        if (p.model !== undefined) { if (!validSingle(p.model)) invalid(); args.push('--model', p.model); }
+        if (p.baseUrl !== undefined) { if (!validSingle(p.baseUrl)) invalid(); args.push('--base-url', p.baseUrl); }
+        if (p.secretVar !== undefined) { if (!validVarName(p.secretVar)) invalid(); args.push('--secret-var', p.secretVar); }
+        if (p.auth !== undefined) { if (!AUTH.includes(p.auth)) invalid(); args.push('--auth', p.auth); }
+        return run([...args, '--probe'], { timeoutMs: 60000, probe: true });
+      }
+      const name = oneName(p);
+      if (p?.probe !== undefined && p.probe !== true) invalid();
+      return p?.probe === true ? run(['agents', 'models', name, '--probe'], { timeoutMs: 60000, probe: true }) : run(['agents', 'models', name], { timeoutMs: 90000, soft: true });
+    },
     // 文件对话框 + 导入 / 导出：选择文件在主进程里完成，渲染层拿不到任意路径读写能力。取消返回 { cancelled: true }。
     async 'agents:choose-program'() {
       const file = await chooseFile({ filters: [{ name: 'exe, cmd, bat, js', extensions: ['exe', 'cmd', 'bat', 'js', 'mjs'] }, { name: '*', extensions: ['*'] }] });
@@ -245,7 +269,24 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     async 'agents:default'(p) { return run(['agents', 'default', oneName(p)], { timeoutMs: 60000 }); },
     async 'agents:test'(p) { return run(['agents', 'test', oneName(p), '--timeout', String(testTimeout)], { timeoutMs: (testTimeout + 20) * 1000 }); },
     // 路由页（Stage07 T8）：读写路由配置都经核心命令 ar route …；规则 / 审查者的 JSON 作为参数数组里的一项传，不经 shell。
+    // 被限流的执行者的 limited.evidence（限流原文片段）由核心给（D104），原样返回，主进程不读 limits.json。
     async 'route:config'() { return run(['route', 'config'], { timeoutMs: 60000 }); },
+    // 角色设置与模型家族（Stage07c 145）：读（ar roles）与写（ar roles set）。roles / modelFamilies 空数组表示恢复默认 / 清除；至少给一项。
+    async 'roles:list'() { return run(['roles'], { timeoutMs: 60000 }); },
+    async 'roles:set'(p) {
+      if (!validName(p?.name)) invalid();
+      const args = ['roles', 'set', p.name];
+      if (p.roles !== undefined) {
+        if (!Array.isArray(p.roles) || p.roles.length > ROLE_NAMES.length || p.roles.some(role => !ROLE_NAMES.includes(role)) || new Set(p.roles).size !== p.roles.length) invalid();
+        args.push(`roles=${p.roles.join(',')}`);
+      }
+      if (p.modelFamilies !== undefined) {
+        if (!Array.isArray(p.modelFamilies) || p.modelFamilies.length > 50 || p.modelFamilies.some(family => !validFamily(family))) invalid();
+        args.push(`modelFamilies=${p.modelFamilies.join(',')}`);
+      }
+      if (args.length === 3) invalid();
+      return run(args, { timeoutMs: 60000 });
+    },
     async 'route:rules'(p) {
       const rules = p?.rules;
       if (!Array.isArray(rules) || rules.length > 200) invalid();
@@ -254,10 +295,14 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
         if (!Array.isArray(rule.types) || !rule.types.length || rule.types.some(type => !ROUTE_TYPES.includes(type))) invalid();
         if (!validName(rule.profile)) invalid();
         if (rule.escalate !== undefined && rule.escalate !== null && !validName(rule.escalate)) invalid();
-        if (Object.keys(rule).some(key => !['types', 'profile', 'escalate'].includes(key))) invalid();
+        // 推理强度（Stage07c T6）：不写、null 或单行非空字符串；是否在执行者支持的范围里由核心校验。
+        if (rule.effort !== undefined && rule.effort !== null && (!validSingle(rule.effort) || !rule.effort.trim())) invalid();
+        if (Object.keys(rule).some(key => !['types', 'profile', 'escalate', 'effort'].includes(key))) invalid();
       }
       return run(['route', 'rules', 'set', JSON.stringify(rules)], { timeoutMs: 60000 });
     },
+    // 按已导入、启用、测试通过的执行者生成建议规则（Stage07c T5，ar route suggest）：只读，不写任何文件；采用走 route:rules。
+    async 'route:suggest'() { return run(['route', 'suggest'], { timeoutMs: 60000 }); },
     // 兜底：name 为 null 表示清除（改回用默认执行者）。
     async 'route:fallback'(p) {
       if (p?.name === null) return run(['route', 'fallback', 'clear'], { timeoutMs: 60000 });
@@ -267,7 +312,16 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     async 'route:reviewer'(p) {
       if (!Array.isArray(p?.profiles) || p.profiles.length > 50 || p.profiles.some(name => !validName(name))) invalid();
       if (typeof p.mustDiffer !== 'boolean') invalid();
-      return run(['route', 'reviewer', 'set', JSON.stringify({ profiles: p.profiles, mustDiffer: p.mustDiffer })], { timeoutMs: 60000 });
+      // differFamily（D128）与 differFromLead 都是可选：不带时核心保留已有的值。
+      if (p.differFamily !== undefined && typeof p.differFamily !== 'boolean') invalid();
+      if (p.differFromLead !== undefined && typeof p.differFromLead !== 'boolean') invalid();
+      return run(['route', 'reviewer', 'set', JSON.stringify({ profiles: p.profiles, mustDiffer: p.mustDiffer, ...(p.differFamily !== undefined ? { differFamily: p.differFamily } : {}), ...(p.differFromLead !== undefined ? { differFromLead: p.differFromLead } : {}) })], { timeoutMs: 60000 });
+    },
+    // 清除限流标记（"已恢复"，154）；强执行者：name 为 null 表示清除（首次引导只用设置）。
+    async 'route:limits-clear'(p) { return run(['route', 'limits', 'clear', oneName(p)], { timeoutMs: 60000 }); },
+    async 'route:strong'(p) {
+      if (p?.name === null) return run(['route', 'strong', 'clear'], { timeoutMs: 60000 });
+      return run(['route', 'strong', 'set', oneName(p)], { timeoutMs: 60000 });
     },
     // 每日上限：tasks / tokens 至少给一个；正整数是设置，null 是删除这一项（核心里用空串表示）。
     async 'route:limit'(p) {
@@ -557,12 +611,59 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       await closableTask(p.project, p.name);
       return run(['diff', p.name], { timeoutMs: 60000, cwd: p.project });
     },
+    // 互相重叠的待验收任务组与建议的批准顺序（Stage07c 154、171，D86）：只读，ar overlaps --project <项目>，不碰项目。
+    // 返回 { groups: [{ tasks: [{ id, name, paths }], order, why }] }；项目被移除后验收页仍可能列着它的任务，所以不要求已登记。
+    async 'tasks:overlaps'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      return run(['overlaps', '--project', p.project], { timeoutMs: 30000, cwd: p.project });
+    },
     // 链路报告（协议 16.1）：只读，分数全由核心算；任务还在进行或不是用任务说明派发的，核心拒绝，原因原样交给界面。
     async 'tasks:report'(p) {
       if (!validAbsPath(p?.project)) invalid();
       if (!validRecord(p?.name)) invalid();
       await registeredProject(p.project);
       return run(['report', p.name, '--json'], { timeoutMs: 60000, cwd: p.project });
+    },
+    // 交叉审查（Stage08 158，协议 18.5）：审查标签读 ar review show，成立 / 不成立写 ar review confirm（软件里点的记为 human），再审一次是 ar review <记录名> [--profile …]。
+    // show 只读，项目被移除后仍可看；confirm 只改任务记录目录，同样不要求项目已登记；再审会在任务的 worktree 里跑审查者，项目被移除后不可用（同重试）。
+    async 'review:show'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      await closableTask(p.project, p.name);
+      return run(['review', 'show', p.name], { timeoutMs: 60000, cwd: p.project });
+    },
+    async 'review:confirm'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      if (typeof p.issue !== 'string' || !/^R\d+(?:\.\d+)?-\d+$/.test(p.issue)) invalid();
+      if (p.result !== 'valid' && p.result !== 'invalid') invalid();
+      if (p.note !== undefined && (typeof p.note !== 'string' || p.note.length > 2000)) invalid();
+      await closableTask(p.project, p.name);
+      const args = ['review', 'confirm', p.name, p.issue, p.result, '--by', 'human'];
+      // 说明是可选的；核心把以 -- 开头的值当成缺值，所以前面补一个空格。
+      const note = typeof p.note === 'string' ? p.note.trim() : '';
+      if (note) args.push('--note', note.startsWith('--') ? ` ${note}` : note);
+      return run(args, { timeoutMs: 60000, cwd: p.project });
+    },
+    // 再审一次：profile 省略 = 按规则自动选；审查者最多试 3 个、每个最长 15 分钟，所以超时放宽到 50 分钟。核心没有结论时（退出码 1）把原因作为错误抛出。
+    async 'review:rerun'(p) {
+      if (!validAbsPath(p?.project)) invalid();
+      if (!validRecord(p?.name)) invalid();
+      // 审查者名不能以 - 开头（核心会把它当成开关）。
+      if (p.profile !== undefined && (!validName(p.profile) || p.profile.startsWith('-'))) invalid();
+      await registeredProject(p.project, { blocked: true });
+      return run(['review', p.name, ...(p.profile === undefined ? [] : ['--profile', p.profile])], { timeoutMs: 50 * 60 * 1000, cwd: p.project });
+    },
+    // 审查者准确率与全局审查设置（路由页）：stats 只读；config-set 至少给 default、block、maxReworks 之一，值由核心校验。
+    async 'review:stats'() { return run(['review', 'stats'], { timeoutMs: 60000 }); },
+    async 'review:config'() { return run(['review', 'config'], { timeoutMs: 60000 }); },
+    async 'review:config-set'(p) {
+      const args = ['review', 'config', 'set'];
+      if (p?.default !== undefined) { if (typeof p.default !== 'boolean') invalid(); args.push(`default=${p.default}`); }
+      if (p?.block !== undefined) { if (p.block !== 'none' && p.block !== 'high') invalid(); args.push(`block=${p.block}`); }
+      if (p?.maxReworks !== undefined) { if (!Number.isInteger(p.maxReworks) || p.maxReworks < 0 || p.maxReworks > 5) invalid(); args.push(`maxReworks=${p.maxReworks}`); }
+      if (args.length === 3) invalid();
+      return run(args, { timeoutMs: 60000 });
     },
     // 门禁失败归因（协议 16.4）：第 n 次尝试的归因改成任务说明（spec）或执行者（worker），核心写 marks.json 并返回重算后的报告。
     async 'tasks:blame'(p) {

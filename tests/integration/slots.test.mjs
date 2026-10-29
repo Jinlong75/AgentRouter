@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { cleanupProcesses, recordedStarts } from '../fixtures/identity.mjs';
 
 // 多个真实进程抢同一组任务名额：任意时刻最多 limit 个持有者；持有者被杀后它的名额被回收。
 // 子进程只由本测试启动，也只结束它们自己；公共目录是系统临时目录里的隔离目录。
@@ -92,4 +94,88 @@ test('三个进程抢两个任务名额：任意时刻最多 2 个持有；杀�
   }
   assert.ok(peak <= 2, `最多同时 ${peak} 个持有者`);
   assert.equal(lines().filter(line => line.startsWith('acq ')).length, 3);
+});
+
+// 端到端：排队期间调大 config.json 的 concurrency，已在排队的任务按新上限开始，不用重新派发。
+// 仓库、公共目录与 worktree 根都在系统临时目录里，执行者是 fake（等放行文件）。
+test('排队中调大 concurrency：B 不重新派发就开始，进度写"并发上限改为 2（原来 1）"', async t => {
+  const script = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+  const since = Date.now();
+  const base = mkdtempSync(path.join(os.tmpdir(), 'ar-slots-e2e-'));
+  const repo = path.join(base, 'repo');
+  const home = path.join(base, 'home');
+  const wtRoot = path.join(base, 'wt');
+  const release = path.join(base, 'go.flag');
+  mkdirSync(repo);
+  mkdirSync(home);
+  const git = args => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+  const write = (file, text) => { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, text, 'utf8'); };
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, AR_WORKTREE_ROOT: wtRoot, CLAUDE_CONFIG_DIR: path.join(base, 'claude'), AR_NO_WATCH: '1' };
+  for (const key of ['AR_DRY_RUN', 'CODEX_DRY_RUN', 'NODE_OPTIONS', 'ELECTRON_RUN_AS_NODE', 'AR_TEST_AGENT', 'CODEX_DISPATCH_TEST_AGENT']) delete env[key];
+  const rows = () => {
+    try { return readFileSync(path.join(home, 'runs.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); }
+    catch { return []; }
+  };
+  t.after(async () => {
+    writeFileSync(release, 'go');
+    await cleanupProcesses(base, { recorded: recordedStarts(rows(), script, since), diagnostic: message => t.diagnostic(message) });
+    assert.ok(path.relative(os.tmpdir(), base).startsWith('ar-slots-e2e-'));
+    rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  git(['init', '-q', '-b', 'main']);
+  git(['config', 'user.name', '名额端到端测试']);
+  git(['config', 'user.email', 'slots-e2e@example.test']);
+  git(['config', 'commit.gpgsign', 'false']);
+  git(['config', 'core.autocrlf', 'false']);
+  write(path.join(repo, '.gitignore'), '.agent-runs/\n');
+  write(path.join(repo, 'src/a.js'), '初始\n');
+  write(path.join(repo, '.agent-router/project.json'), JSON.stringify({
+    v: 1, name: '项目', baseBranch: 'main', specsDir: 'docs/specs', setup: [], verify: [], allowedPaths: ['**'], routing: { rules: [] }, worktree: true,
+  }, null, 2));
+  for (const label of ['甲', '乙']) {
+    write(path.join(repo, `docs/specs/${label}.md`), ['---', 'id: 900', `title: 名额 ${label}`, 'type: code', 'expect_commit: false', 'max_retries: 0', 'allowed_paths:', `  - ${label}/**`, '---', '', '测试说明正文。', ''].join('\n'));
+  }
+  git(['add', '--', '.gitignore', 'src/a.js', '.agent-router/project.json', 'docs/specs/甲.md', 'docs/specs/乙.md']);
+  git(['commit', '-q', '-m', '初始提交']);
+  const profile = { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, releaseFile: release, releaseTimeoutMs: 60000 };
+  const writeConfig = concurrency => writeFileSync(path.join(home, 'config.json'), JSON.stringify({
+    v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake', profiles: { fake: profile }, concurrency,
+  }));
+  writeConfig(1);
+  const ar = args => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [script, ...args], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false });
+    let stdout = '', stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => stdout += chunk);
+    child.stderr.on('data', chunk => stderr += chunk);
+    const timer = setTimeout(() => { child.kill(); reject(Error(`ar ${args.join(' ')} 超时`)); }, 90000);
+    child.on('error', error => { clearTimeout(timer); reject(error); });
+    child.on('close', code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+  });
+  const dispatch = async label => {
+    const result = await ar(['dispatch', `docs/specs/${label}.md`, '--name', `名额${label}`, '--detach', '--json']);
+    assert.equal(result.code, 0, result.stderr + result.stdout);
+    return JSON.parse(result.stdout).id;
+  };
+  const progress = label => { try { return readFileSync(path.join(repo, '.agent-runs', `名额${label}`, 'progress.log'), 'utf8'); } catch { return ''; } };
+  const has = (id, event) => rows().some(row => row.id === id && row.event === event);
+
+  const a = await dispatch('甲');
+  await until(() => has(a, 'spawned'), '甲启动执行者');
+  const b = await dispatch('乙');
+  await until(() => has(b, 'queued'), '乙排队');
+  assert.match(progress('乙'), /排队：同时最多 1 个任务/);
+  await delay(500);
+  assert.equal(has(b, 'preparing'), false, '上限 1 时乙还在排队');
+
+  writeConfig(2);
+  await until(() => has(b, 'spawned'), '乙在新上限下开始（甲还没结束）');
+  assert.equal(has(a, 'end'), false, '甲仍在运行');
+  assert.match(progress('乙'), /排队：并发上限改为 2（原来 1）/);
+  assert.equal([...progress('乙').matchAll(/并发上限改为/g)].length, 1, '只写一次');
+
+  writeFileSync(release, 'go');
+  await until(() => has(a, 'end') && has(b, 'end'), '甲、乙结束', 60000);
+  await until(() => !existsSync(path.join(home, 'slots')) || readdirSync(path.join(home, 'slots')).length === 0, '名额清空');
 });

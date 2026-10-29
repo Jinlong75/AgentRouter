@@ -4,9 +4,10 @@ import { captureSearch } from './shots-search';
 import { captureGate } from './shots-gate';
 import { captureRetry } from './shots-retry';
 import { captureAccept } from './shots-accept';
+import { captureReview } from './shots-review';
 import { captureScore } from './shots-score';
 import { captureAgents } from './shots-agents';
-import { captureNewtask, waitNewtaskReady } from './shots-newtask';
+import { captureNewtask, fixtures as prepareNewtaskFixtures, waitNewtaskReady } from './shots-newtask';
 import { captureRouting } from './shots-routing';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
 import { app, BrowserWindow, nativeTheme } from 'electron';
@@ -61,6 +62,8 @@ const appEnv = appEnvironment(process.env);
  * UI27 路由页（Stage07 T8）：规则增删改与上移下移、兜底、试算（对照 ar route --explain）、每日上限、审查者候选，每一步读 config.json 断言 ——「UI27 …」（shots-routing.ts）
  * UI28 导入向导扩展与模型、推理强度（Stage07）：自定义 CLI 表单 / 校验 / 测试并预览 / 保存并真实派发、Claude 类的推理强度与"升级到"、OpenAI 兼容接口、Qoder 默认模型、导出与从文件导入 ——「UI28 …」（shots-agents.ts：假 CLI 与假执行者，文件对话框用桩）
  * UI29 新建任务页"执行者：自动"：按路由规则实时显示会派给谁、为什么、路由失败时派发照常可点 ——「UI29 …」（shots-newtask.ts）
+ * UI30 审查界面（Stage08 158）：验收页与任务详情的"审查"标签（结论、问题按严重度、成立 / 不成立、跳到改动、再审一次）、列表徽标、轨道"审查"节点、批准确认提示、需人工处理横幅，说明框的焦点保护 ——「UI30 …」（shots-review.ts：真实派发的任务 + 假审查者）
+ * UI31 路由页审查设置与准确率（Stage08 158）：开关 / 分段 / 下拉写入 config.json 的 review、写入失败恢复原值、准确率与 ar review stats 一致 ——「UI31 …」（shots-routing.ts）
  * 「通用 …」是每页通用检查、真实输入自测与环境检查。
  * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
  */
@@ -292,6 +295,12 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'agents', checks, focusRestored: progress.focusRestored }, null, 2));
         return;
     }
+    // 单独复现 UI06 / UI07 / UI08 / UI13（144，AR_SHOTS_FOCUS=preferences）：引导之后只跑偏好页的检查（技能、设置、Codex 表单式编辑、执行者区、导入向导、主题、关于）。
+    if (process.env.AR_SHOTS_FOCUS === 'preferences') {
+        await capturePreferences(h);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'preferences', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 单独复现 UI26（AR_SHOTS_FOCUS=score）：引导之后只跑评分标签与设置页开关的检查，演示数据是原样的。
     if (process.env.AR_SHOTS_FOCUS === 'score') {
         await captureScore(h, registry, win, save);
@@ -302,6 +311,15 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     if (process.env.AR_SHOTS_FOCUS === 'routing') {
         await captureRouting(h, win);
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'routing', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
+    // 单独复现 UI20 清空任务列表（196，AR_SHOTS_FOCUS=UI20-lists）：引导之后、完整流程之前，先准备与新建任务页相同的
+    // 新任务临时仓库（captureLists 用的 sample 项目与 001-已有说明），再跑同一个 captureLists；演示数据原样，不做退出后检查与重置。
+    if (process.env.AR_SHOTS_FOCUS === 'UI20-lists') {
+        await prepareNewtaskFixtures();
+        await captureLists(h, registry, save);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'UI20-lists', checks, focusRestored: progress.focusRestored }, null, 2));
+        console.log(`只跑 UI20 清空列表：${checks.length} 项检查全部通过。`);
         return;
     }
     // UI15 / UI18：项目页在 UI01 之前准备好（UI01 的页面清单里加了"项目"），结束后回到任务页。
@@ -331,6 +349,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // 单独复现 UI24 / UI25（087，AR_SHOTS_FOCUS=accept）：只跑验收页与 worktree 任务的检查，不做退出后检查与重置。
     if (process.env.AR_SHOTS_FOCUS === 'accept') {
         await captureAccept(h, registry, out, save, win);
+        // UI30（Stage08 158）：审查标签、徽标、轨道节点、批准确认提示、需人工处理横幅；用真实派发的任务与假审查者，在 accept 焦点里一起跑。
+        await captureReview(h, registry, out, save, win);
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'accept', checks, focusRestored: progress.focusRestored }, null, 2));
         return;
     }
@@ -819,6 +839,24 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
             }
             assert.ok(await evaluate(`${JSON.stringify(picked.map(t => t.id))}.every(id => !!document.querySelector('[data-task=' + id + ']'))`), '归档不删除任务');
         });
+        // 155（W4）：任务记录里还是旧路径，再勾这两个任务归档一次：核心发现说明已经在 archive/ 里，报"已经归档过"，不再说"还没有被 git 跟踪"；不多出提交。
+        const headsAfter = new Map(picked.map(t => [t.repo, gitIn(t.repo, ['rev-parse', 'HEAD'])]));
+        await press('[data-multi=select]');
+        for (const t of picked) await press(`[data-task=${t.id}]`);
+        await press('[data-multi=archive]');
+        await wait(`!!document.querySelector('.sheet [data-archive-file]')`, '155 W4 再次归档的确认框');
+        await press('.sheet-btns .btn.primary');
+        await wait(`!!document.querySelector('.sheet .sheet-fail')`, '155 W4 再次归档报已经归档过', 30000);
+        await check('155 W4 已归档的说明再归档：报"已经归档过：…（在 …/archive/ 里）"，不是"还没有被 git 跟踪"', `(() => { const t = document.querySelector('.sheet .sheet-fail').textContent; return t.includes('已经归档过：') && t.includes('/archive/') && !t.includes('还没有被 git 跟踪'); })()`);
+        await verify('155 W4 再次归档什么都没改：各仓库 HEAD 不变，archive/ 里的文件还在', async () => {
+            for (const t of picked) {
+                const rel = t.spec!.replace(/\\/g, '/'), to = path.posix.join(path.posix.dirname(rel), 'archive', path.posix.basename(rel));
+                assert.equal(gitIn(t.repo, ['rev-parse', 'HEAD']), headsAfter.get(t.repo));
+                assert.ok(existsSync(path.resolve(t.repo, to)));
+            }
+        });
+        await key('Escape');
+        await press('[data-multi=done]');
         // 只勾没有任务说明的任务（直接文字派发）：没有可归档的说明，给出提示、不弹确认框。
         const textTask = registry.tasks.find(t => t.status !== 'run' && !t.spec && visible.has(t.id));
         assert.ok(textTask, '演示数据里找不到没有任务说明的已结束任务');
@@ -853,6 +891,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         assert.deepEqual(await registry.platform.processes([t2.pid]), []);
         assert.ok((await runs()).some(r => r.id === 't2' && r.event === 'interrupted' && r.signal === 'stopped-by-app'));
     });
+    // 列表先变中断，详情稍后才重绘：先等详情横幅出现且停止按钮消失，再按原条件检查一次。
+    await wait('!document.querySelector("[data-stop]") && document.querySelector(".banner .rt b")?.textContent==="你停止了这个任务"', 'UI04 停止后详情横幅更新', 10000);
     await check('UI04 停止后列表与详情显示中断', 'document.querySelector("[data-task=t2] .mk").classList.contains("stale") && !document.querySelector("[data-stop]") && document.querySelector(".banner .rt b").textContent==="你停止了这个任务"');
 
     // UI22（Stage04 门禁界面）：演示任务 t20～t22 默认隐藏，检查时临时显示、检查完恢复。
@@ -861,6 +901,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await captureRetry(h, registry, out, save);
     // UI24 / UI25（Stage06 worktree 任务与验收页）：演示任务 t30～t35 默认隐藏，检查时临时显示、检查完恢复；另有真实的合并、驳回、冲突、排队与准备失败。
     await captureAccept(h, registry, out, save, win);
+    // UI30（Stage08 158 审查界面）：真实派发的任务 + 假审查者；放在验收页检查之后，结束时同样隐藏自己的任务、恢复配置。
+    await captureReview(h, registry, out, save, win);
     // UI26（Stage06 评分标签与设置页"统计主导的 token 与用时"）：演示任务 t27 默认隐藏，检查时临时显示、检查完恢复。
     await captureScore(h, registry, win, save);
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
@@ -953,7 +995,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
     // UI27 = Stage07 路由页，UI28 = 导入向导扩展与模型、推理强度（107），UI29 = 新建任务页"执行者：自动"的路由结果。
     // UI23 = Stage05 多次尝试界面（061）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、一次真实重试。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26', 'UI27', 'UI28', 'UI29'], '界面功能基线 UI01～UI29 都要有检查');
+    // UI30 = Stage08 审查页与审查徽标，UI31 = 审查设置与准确率；保留严格编号覆盖检查。
+    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26', 'UI27', 'UI28', 'UI29', 'UI30', 'UI31'], '界面功能基线 UI01～UI31 都要有检查');
     console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。
@@ -1568,6 +1611,23 @@ async function captureDataAndReset(h: Harness, win: BrowserWindow, save: (name: 
     }
 }
 
+// ---- 196 收尾错误保留：主流程失败时保留原错误，主流程成功时清理失败必须让检查失败 ----
+// 每步各自执行；主流程已失败时只把清理错误交给 report，不重新抛出，原错误由调用方继续抛出。
+// 单独成函数，便于不启动界面/进程、在内存里确定性核对这三条判定。
+async function runCleanupSteps(mainFailed: boolean, steps: (() => Promise<void>)[], reportCleanupError: (error: unknown) => void) {
+    const errors: unknown[] = [];
+    for (const step of steps) {
+        try { await step(); }
+        catch (error) { errors.push(error); }
+    }
+    if (mainFailed) {
+        for (const error of errors) reportCleanupError(error);
+        return;
+    }
+    if (errors.length) throw errors[0];
+}
+// ---- 196 收尾错误保留结束 ----
+
 // UI20 设置页"列表"一节（018）：清空任务列表与清空项目列表。清空是真删列表状态（hidden / projects.json），
 // 所以检查完把 tasks.json、projects.json、config.json 恢复成检查前的内容（与 UI02 空状态临时改写 runs.jsonl
 // 同类的夹具做法），后面的「再派一次」退出检查继续用演示数据。
@@ -1599,12 +1659,35 @@ async function captureLists(h: Harness, registry: Registry, save: (name: string)
             return;
         throw Error('清空列表的临时任务结束后进程仍未退出');
     };
+    // 等待新任务结束时失败所打的精简诊断：事件类型、排队原因、阻挡任务的名称与相对路径、有没有 end。
+    // 只读 runs.jsonl；不打印配置、密钥或真实路径，本身出错也不覆盖原错误。
+    const printQueueDiagnosis = async (entries: { id: string; label: string }[]) => {
+        try {
+            const list = await rows();
+            for (const { id, label } of entries) {
+                const mine = list.filter(r => r.id === id);
+                const events = [...new Set(mine.map(r => r.event === 'end' ? `end(exit=${r.exit})` : String(r.event)))].join('→') || '（没有记录）';
+                const queued = [...new Set(mine.filter(r => r.event === 'queued').map(r => {
+                    const blockers = Array.isArray(r.blockers) && r.blockers.length
+                        ? r.blockers.map((b: any) => `${b?.name ?? '（无名称）'}（${Array.isArray(b?.paths) && b.paths.length ? b.paths.join('、') : '（无路径）'}）`).join('；')
+                        : '（没有阻挡任务）';
+                    return `${r.reason ?? '（没有原因）'}：${blockers}`;
+                }))].join('；') || '（没有排队记录）';
+                const end = mine.filter(r => r.event === 'end');
+                console.log(`UI20 清空后新任务诊断（${label} ${id}）：事件 ${events}；排队 ${queued}；end ${end.length ? `有（exit=${end.at(-1)!.exit}）` : '没有'}`);
+            }
+        }
+        catch (error) { console.log(`UI20 清空后新任务诊断读取失败（${(error as NodeJS.ErrnoException).code ?? '未知错误'}）`); }
+    };
+    // 结束记录（end 或 interrupted，协议 14.1）：有记录的任务不再停止，没有记录（仍在运行 / 排队）才停。
+    const terminal = async (id: string) => (await rows()).find(r => (r.event === 'end' || r.event === 'interrupted') && r.id === id);
     // UI02 空状态刚把 runs.jsonl 写回原样，先读回清单再清点数量。
     await registry.refresh();
     await press('[data-page=tasks]');
     await wait('!!document.querySelector("[data-task]")');
-    let longId = '';
+    let longId = '', againId = '';
     const longPids: number[] = [], againPids: number[] = [];
+    let mainFailed = false;
     try {
         // 派一个持续一分钟的假任务当"进行中"：确认后任务页要只剩进行中的任务，清空第二次才显示"列表已经是空的"。
         await writeConfig(60000);
@@ -1675,16 +1758,49 @@ async function captureLists(h: Harness, registry: Registry, save: (name: string)
         await wait(`document.querySelector("[data-tasks-note]")?.textContent === ${JSON.stringify(p.listEmpty)}`, 'UI20 清空任务列表空清单说明');
         await check('UI20 清空任务列表没有可清的任务时不弹确认框，行内显示"列表已经是空的"', `!document.querySelector(".confirm-card") && document.querySelector("[data-tasks-note]")?.textContent === ${JSON.stringify(p.listEmpty)}`);
 
+        // "保留运行中任务"的断言都已通过：先结束本函数派出的进行中任务，确认终止事件与派发进程退出，再派第二个。
+        // 不先结束它的话，第二个任务会因同一项目里改动范围重叠而排队：隔离复刻确认了这套夹具排队机制
+        // （后派任务只有 start 与 queued(overlap)，blocker 是前一任务的允许路径）；原门禁内层事件未留存，
+        // 不能据此声称当时观察到排队事件。这是夹具把两个任务放进同一个范围造成的，不改产品调度规则。
+        // 停止写 interrupted（协议 14.1），没有 end。
+        if (!await terminal(longId))
+            try {
+                await registry.stop(longId);
+            }
+            catch (stopError) {
+                // 停止报错后复查一次：已有终止事件就是停止与记录写入的竞态，继续；否则保留原停止错误。
+                // 复查本身失败也不能覆盖原停止错误。
+                let ended = false;
+                try { ended = Boolean(await terminal(longId)); }
+                catch { ended = false; }
+                if (!ended) throw stopError;
+            }
+        await untilRow(() => terminal(longId), '清空列表用的进行中任务结束');
+        await waitDead(longPids);
+        console.log('UI20 清空任务列表：进行中任务已结束、派发进程已退出，再派第二个任务。');
+
         // 清空后新派发的任务照常出现在列表。
         await writeConfig(150);
-        const againId = await dispatch('clear-lists-again');
+        againId = await dispatch('clear-lists-again');
         await untilRow(async () => (await rows()).find(r => r.event === 'start' && r.id === againId), '清空后新任务 start');
         againPids.push(...await pidsOf(againId));
         await registry.refresh();
         await press('[data-page=tasks]');
         await wait(`!!document.querySelector("[data-task=${againId}]")`, 'UI20 清空后新派发的任务行');
         await check('UI20 清空任务列表后新派发的任务照常出现在列表', `!!document.querySelector("[data-task=${againId}]")`);
-        await untilRow(async () => (await rows()).find(r => r.event === 'end' && r.id === againId), '清空后新任务结束', 15000);
+        // 15000 ms 上限不变；等待失败时先打印精简诊断，再保留原错误。
+        try {
+            await untilRow(async () => (await rows()).find(r => r.event === 'end' && r.id === againId), '清空后新任务结束', 15000);
+        }
+        catch (error) {
+            await printQueueDiagnosis([{ id: againId, label: '新派发任务' }, { id: longId, label: '进行中任务' }]);
+            throw error;
+        }
+        await verify('UI20 清空任务列表后新派发的任务正常结束（exit 0）', async () => {
+            const end = (await rows()).find(r => r.event === 'end' && r.id === againId);
+            assert.ok(end, `runs.jsonl 里没有 ${againId} 的 end 行`);
+            assert.equal(end.exit, 0);
+        });
 
         // 清空项目列表：确认框数量=登记项目数，确认后项目页为空、新建任务页没有项目可选、项目文件夹还在。
         const registered = (JSON.parse(await readFile(projectsFile, 'utf8')).projects ?? []) as { path: string }[];
@@ -1733,25 +1849,35 @@ async function captureLists(h: Harness, registry: Registry, save: (name: string)
         await wait(`[...document.querySelectorAll('[data-pj-row]')].some(x => x.dataset.pjRow === ${JSON.stringify(repo)})`, 'UI20 重新添加的项目行', 20000);
         await check('UI20 清空项目列表后重新"添加项目"能加回来', `[...document.querySelectorAll('[data-pj-row]')].some(x => x.dataset.pjRow === ${JSON.stringify(repo)})`);
     }
+    catch (error) {
+        mainFailed = true;
+        throw error;
+    }
     finally {
-        // 无论检查是否通过都收尾：临时任务的进程必须都退出，再把夹具恢复成检查前的内容。
-        if (longId)
-            await registry.stop(longId).catch(() => { });
-        await waitDead([...longPids, ...againPids]).catch(error => console.warn(String(error)));
-        if (originalTasks === null)
-            await rm(tasksFile, { force: true });
-        else
-            await writeFile(tasksFile, originalTasks);
-        await registry.reloadHidden();
-        if (originalProjects === null)
-            await rm(projectsFile, { force: true });
-        else
-            await writeFile(projectsFile, originalProjects);
-        if (originalConfig === null)
-            await rm(configFile, { force: true });
-        else
-            await writeFile(configFile, originalConfig);
-        nativeTheme.themeSource = 'dark';
+        // 无论检查是否通过都收尾：只停本函数派出、还没有终止记录的两个任务（按 Registry 的进程身份核对），
+        // 进程必须都退出，再把夹具恢复成检查前的内容。各步各自执行：主流程失败时保留原错误，
+        // 清理失败只记录、不覆盖它；主流程成功时清理失败必须让本次检查失败。
+        const steps: (() => Promise<void>)[] = [];
+        for (const id of [longId, againId].filter(Boolean))
+            // 读不到终止记录时不结束，避免按未知进程误杀；该步的错误交给 runCleanupSteps 决定去留。
+            steps.push(async () => { if (!await terminal(id)) await registry.stop(id); });
+        steps.push(async () => { await waitDead([...longPids, ...againPids]); });
+        steps.push(async () => {
+            if (originalTasks === null) await rm(tasksFile, { force: true });
+            else await writeFile(tasksFile, originalTasks);
+        });
+        steps.push(() => registry.reloadHidden());
+        steps.push(async () => {
+            if (originalProjects === null) await rm(projectsFile, { force: true });
+            else await writeFile(projectsFile, originalProjects);
+        });
+        steps.push(async () => {
+            if (originalConfig === null) await rm(configFile, { force: true });
+            else await writeFile(configFile, originalConfig);
+        });
+        steps.push(async () => { nativeTheme.themeSource = 'dark'; });
+        await runCleanupSteps(mainFailed, steps, error =>
+            console.warn(`UI20 清空任务列表：收尾时出错（保留原错误）：${String(error).replaceAll(home, '<临时目录>')}`));
     }
 }
 

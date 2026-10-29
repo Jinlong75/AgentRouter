@@ -15,7 +15,10 @@
     "readOnlyArgs": ["-p", "--output-format", "stream-json", "--permission-mode", "dont_ask", "--tools", "Read", "Grep", "Glob", "--no-session-persistence", "-m", "{model}", "--reasoning-effort", "{effort}"],
     "stdin": "{prompt}",
     "output": { "format": "stream-json" },
-    "failureHints": [ { "match": "not logged in|authentication_failed|token .*rejected", "text": "Qoder 国内版没有登录或令牌无效：在 qoder.cn 的账户集成页生成个人访问令牌，设为用户环境变量 QODERCN_PERSONAL_ACCESS_TOKEN" } ]
+    "failureHints": [
+      { "match": "not logged in|authentication_failed|token .*rejected", "text": "Qoder 国内版没有登录或令牌无效：在 qoder.cn 的账户集成页生成个人访问令牌，设为用户环境变量 QODERCN_PERSONAL_ACCESS_TOKEN" },
+      { "match": "\\b429\\b|rate[ _-]?limit|too many requests|quota|insufficient[ _-]?balance|余额不足", "text": "Qoder 国内版额度用完或被限流：等额度恢复，或换别的执行者", "kind": "limit" }
+    ]
   },
   "modelOptions": ["Auto", "Fast", "Qwen3.8-Max", "Qwen3.8-Flash", "DeepSeek-V4-Pro", "DeepSeek-Flash", "GLM-5.3", "GLM-5.3-Flash", "Kimi-K3.1-Pro", "Kimi-K2.8-Preview", "MiniMax-M3.1-Flash"],
   "listModels": ["--list-models"],

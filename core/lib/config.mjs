@@ -2,7 +2,9 @@ import { readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node
 import { join, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homeDirectory, legacyHomeFor, userDirectory, noWatchEnv, pickName } from './compat.mjs';
+import os from 'node:os';
 import { parseJson } from './json.mjs';
+import { concurrencyCap, estimateConcurrency, machineCores, currentLoad, memLowPercentDefault, memLowPercentMax, validMemLowPercent } from './schedule.mjs';
 import { PROXY_MODES, validateProxyUrl, resolveProxy, proxyText } from './proxy.mjs';
 
 export { homeDirectory, userDirectory };
@@ -79,13 +81,35 @@ export function configInvalid(state, action = '这次没有派发') {
   return Object.assign(new Error(`配置：config.json 无法读取（${state.reason}）。为免改用你没有选的执行者，${action}。请修好这个文件，或者删掉它（删掉后按内置默认）：${state.file}`), { arCode: 'CONFIG_INVALID' });
 }
 
+// Windows 上 config.json 的原子替换可能收到 EPERM / EBUSY（192；占用来源尚未确认）。
+// 只对这两种错误、只在 Windows 上有界重试：首次立即尝试，再最多 4 次，每次间隔 50ms（额外总等待至多 200ms）。
+// 其他平台、其他错误码原样抛出；等待用 Atomics.wait，保持同步 API、核心仍是零依赖。
+const renameRetryCodes = new Set(['EPERM', 'EBUSY']);
+const renameRetryLimit = 4;
+const renameRetryDelay = 50;
+const sleepSync = ms => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return renameSync(from, to); }
+    catch (error) {
+      if (process.platform !== 'win32' || !renameRetryCodes.has(error?.code) || attempt >= renameRetryLimit) throw error;
+      sleepSync(renameRetryDelay);
+    }
+  }
+}
+
 function writeAtomic(home, file, config) {
   mkdirSync(home, { recursive: true });
   const temp = join(home, `.config-${randomUUID()}.tmp`);
   try {
     writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
-    renameSync(temp, file);
-  } finally { rmSync(temp, { force: true }); }
+    renameWithRetry(temp, file);
+  } catch (error) {
+    // 替换失败时清理临时文件；清理也失败就把它留在原处，不能让清理错误盖过原来的失败原因（192）。
+    try { rmSync(temp, { force: true }); } catch { /* 删不掉的临时文件保留原样，原错误照原样抛出 */ }
+    throw error;
+  }
+  rmSync(temp, { force: true });
 }
 
 // provider：OpenAI 兼容接口（经 Codex 外壳）。只有 codex 适配器的执行者可以写；
@@ -109,7 +133,20 @@ function validateProvider(name, profile) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(keys[0])) throw new Error(`${at}.secrets 的键必须是环境变量名（它就是 Codex 的 env_key）`);
 }
 
-// routing（路由器用）：rules 每条 { types: [字符串], profile: 字符串, escalate?: 字符串 | null }，fallback 是字符串或 null，reviewer 见下。
+// familyRules（Stage07c 154，D88）：模型名前缀 → 模型家族，补充或覆盖 core/templates/model-families.json。family 只能是小写字母、数字、连字符。
+export const FAMILY_NAME = /^[a-z0-9-]+$/;
+function validateFamilyRules(rules) {
+  if (rules == null) return;
+  if (!Array.isArray(rules)) throw new Error('config.json 的 familyRules 必须为数组');
+  rules.forEach((rule, index) => {
+    const at = `config.json 的 familyRules[${index}]`;
+    if (!object(rule)) throw new Error(`${at} 必须为对象（prefix、family）`);
+    if (typeof rule.prefix !== 'string' || !rule.prefix.trim()) throw new Error(`${at}.prefix 必须为非空字符串`);
+    if (typeof rule.family !== 'string' || !FAMILY_NAME.test(rule.family)) throw new Error(`${at}.family 必须是由小写字母、数字、连字符组成的非空字符串`);
+  });
+}
+
+// routing（路由器用）：rules 每条 { types: [字符串], profile: 字符串, escalate?: 字符串 | null, effort?: 字符串 | null }，fallback 与 strongExecutor 是字符串或 null，reviewer 见下。
 function validateRouting(routing) {
   if (routing == null) return;
   if (!object(routing)) throw new Error('config.json 的 routing 必须为对象');
@@ -121,17 +158,38 @@ function validateRouting(routing) {
       if (!Array.isArray(rule.types) || rule.types.some(item => typeof item !== 'string')) throw new Error(`${at}.types 必须为字符串数组`);
       if (typeof rule.profile !== 'string' || !rule.profile) throw new Error(`${at}.profile 必须为执行者名`);
       if (rule.escalate != null && typeof rule.escalate !== 'string') throw new Error(`${at}.escalate 必须为字符串或 null`);
+      if (rule.effort != null && (typeof rule.effort !== 'string' || !rule.effort.trim())) throw new Error(`${at}.effort 必须为非空字符串或 null`);
     });
   }
   if (routing.fallback != null && typeof routing.fallback !== 'string') throw new Error('config.json 的 routing.fallback 必须为字符串或 null');
-  // reviewer：{ profiles: [执行者名], mustDiffer: 布尔 }；兼容只写一个 profile 的旧写法（对象或字符串）；null 或不写按空处理。
+  // strongExecutor（默认升级链，Stage07c T8）：最后一次自动重试换用的"强执行者"名或 null。这里只校验形状：
+  // 名字指向的执行者之后被删除 / 停用时配置仍然有效，派发时按"没有强执行者"处理并写进度；设置命令（ar route strong set）才校验存在。
+  if (routing.strongExecutor != null && (typeof routing.strongExecutor !== 'string' || !routing.strongExecutor.trim())) throw new Error('config.json 的 routing.strongExecutor 必须为执行者名（非空字符串）或 null');
+  // reviewer：{ profiles: [执行者名], mustDiffer, differFamily, differFromLead }（190 D128 起三个布尔开关都可关）；
+  // 兼容只写一个 profile 的旧写法（对象或字符串）；null 或不写按空处理。
   const reviewer = routing.reviewer;
   if (reviewer != null && typeof reviewer !== 'string') {
     if (!object(reviewer)) throw new Error('config.json 的 routing.reviewer 必须为对象、字符串或 null');
     if (reviewer.profiles != null && (!Array.isArray(reviewer.profiles) || reviewer.profiles.some(name => typeof name !== 'string'))) throw new Error('config.json 的 routing.reviewer.profiles 必须为字符串数组');
     if (reviewer.profile != null && typeof reviewer.profile !== 'string') throw new Error('config.json 的 routing.reviewer.profile 必须为字符串');
     if (reviewer.mustDiffer != null && typeof reviewer.mustDiffer !== 'boolean') throw new Error('config.json 的 routing.reviewer.mustDiffer 必须为布尔值');
+    if (reviewer.differFamily != null && typeof reviewer.differFamily !== 'boolean') throw new Error('config.json 的 routing.reviewer.differFamily 必须为布尔值');
+    if (reviewer.differFromLead != null && typeof reviewer.differFromLead !== 'boolean') throw new Error('config.json 的 routing.reviewer.differFromLead 必须为布尔值');
   }
+}
+
+// review（审查设置，Stage08 T3）：全局 config.json 与项目 project.json 共用。只允许 default（布尔）、block（none | high）、
+// maxReworks（0～5 的整数）三个键；null 与不写都表示没设。at 是出错信息里的位置前缀。
+export const REVIEW_BLOCKS = ['none', 'high'];
+export const REVIEW_DEFAULTS = Object.freeze({ default: false, block: 'none', maxReworks: 1 });
+export const MAX_REWORKS_LIMIT = 5;
+export function validateReviewSetting(review, at = 'config.json 的 review') {
+  if (review == null) return;
+  if (!object(review)) throw new Error(`${at} 必须为对象（default、block、maxReworks）`);
+  for (const key of Object.keys(review)) if (!Object.hasOwn(REVIEW_DEFAULTS, key)) throw new Error(`${at} 不认识的键：${key}（只有 default、block、maxReworks）`);
+  if (review.default !== undefined && typeof review.default !== 'boolean') throw new Error(`${at}.default 必须为布尔值`);
+  if (review.block !== undefined && !REVIEW_BLOCKS.includes(review.block)) throw new Error(`${at}.block 必须为 ${REVIEW_BLOCKS.join(' 或 ')}`);
+  if (review.maxReworks !== undefined && !(Number.isInteger(review.maxReworks) && review.maxReworks >= 0 && review.maxReworks <= MAX_REWORKS_LIMIT)) throw new Error(`${at}.maxReworks 必须是 0～${MAX_REWORKS_LIMIT} 的整数`);
 }
 
 // proxy（网络代理，Stage07 099）：{ mode: off | system | manual, url? }。manual 时 url 必须合法；
@@ -165,6 +223,13 @@ export function validateV2(config) {
     if (profile.auth === 'token' && !Object.keys(profile.secrets ?? {}).length) throw new Error(`config.json 的 profiles.${name} 的 auth 为 token，但 secrets 为空`);
     if (profile.maxTurns != null && !(Number.isInteger(profile.maxTurns) && profile.maxTurns > 0)) throw new Error(`config.json 的 profiles.${name}.maxTurns 必须为正整数或 null`);
     if (profile.label != null && typeof profile.label !== 'string') throw new Error(`config.json 的 profiles.${name}.label 必须为字符串`);
+    // 角色设置（Stage07c T4、190 D128）：roles 是 executor / reviewer / lead 的非空子集，没写是执行者与审查者；
+    // modelFamilies 是用户声明的"可能用到的模型家族"。
+    if (profile.roles != null) {
+      const roles = profile.roles;
+      if (!Array.isArray(roles) || !roles.length || roles.some(role => !['executor', 'reviewer', 'lead'].includes(role)) || new Set(roles).size !== roles.length) throw new Error(`config.json 的 profiles.${name}.roles 必须是 executor、reviewer、lead 中的一项或几项（不重复）`);
+    }
+    if (profile.modelFamilies != null && (!Array.isArray(profile.modelFamilies) || profile.modelFamilies.some(item => typeof item !== 'string' || !item.trim()))) throw new Error(`config.json 的 profiles.${name}.modelFamilies 必须为非空字符串数组`);
     if (profile.adapter === 'codex') for (const key of codexKeys) validate(key, profile[key], 'config.json');
     else validate('path', profile.path, 'config.json');
     if (profile.provider != null) validateProvider(name, profile);
@@ -178,6 +243,8 @@ export function validateV2(config) {
     }
   }
   validateRouting(config.routing);
+  validateFamilyRules(config.familyRules);
+  validateReviewSetting(config.review);
   if (config.defaultProfile != null && typeof config.defaultProfile !== 'string') throw new Error('config.json 的 defaultProfile 必须为字符串或 null');
   if (config.managed !== undefined) validate('managed', config.managed, 'config.json');
   validate('watchWindow', config.watchWindow, 'config.json');
@@ -186,16 +253,36 @@ export function validateV2(config) {
 
 // 并发名额上限（协议 15.5）：concurrency 是任务名额（默认 2），gateConcurrency 是门禁名额（默认 1）。
 // 不是正整数的值按默认处理，warnings 里写一条提示（ar config 显示）。sources 与 formatConfig 的来源列同一写法。
+// 并行调度（Stage07c 140）：concurrency 可以是 1～8 的整数，或 "auto"（按 CPU 核数与可用内存估算，上限 concurrencyMax，默认 8）。
+// 结果另带 mode（'auto' / 'fixed'）、estimate（自动估算值，固定档也算出来供显示）、max（concurrencyMax）；
+// 自动档下 limits.concurrency 就是估算值，所以读它的代码照常工作。probe 供测试注入 { cores, freeMemBytes }。
 export const slotDefaults = { concurrency: 2, gateConcurrency: 1 };
-export function slotLimits(config = {}) {
+export function slotLimits(config = {}, probe = {}) {
   const limits = {}, sources = {}, warnings = [];
+  const inRange = value => Number.isSafeInteger(value) && value >= 1 && value <= concurrencyCap;
+  const maxValue = config?.concurrencyMax;
+  const max = inRange(maxValue) ? maxValue : concurrencyCap;
+  if (maxValue !== undefined && !inRange(maxValue)) warnings.push(`配置：concurrencyMax 必须为 1～${concurrencyCap} 的整数，已按默认值 ${concurrencyCap} 处理`);
+  // memLowPercent（D114，182）：自动档"可用内存低于总内存的这个比例（且不低于 1.5 GB）就暂停"，1～50 的整数，默认 5。
+  const percentValue = config?.memLowPercent;
+  const memLowPercent = validMemLowPercent(percentValue) ? percentValue : memLowPercentDefault;
+  if (percentValue !== undefined && !validMemLowPercent(percentValue)) warnings.push(`配置：memLowPercent 必须为 1～${memLowPercentMax} 的整数，已按默认值 ${memLowPercentDefault} 处理`);
+  const estimate = estimateConcurrency({ cores: probe.cores ?? machineCores(), freeMemBytes: probe.freeMemBytes ?? os.freemem(), max });
+  let mode = 'fixed';
   for (const [key, fallback] of Object.entries(slotDefaults)) {
     const value = config?.[key];
+    if (key === 'concurrency') {
+      if (value === 'auto') { mode = 'auto'; limits[key] = estimate; sources[key] = 'config.json'; continue; }
+      if (inRange(value)) { limits[key] = value; sources[key] = 'config.json'; continue; }
+      limits[key] = fallback; sources[key] = '内置默认';
+      if (value !== undefined) warnings.push(`配置：${key} 必须为 1～${concurrencyCap} 的整数或 "auto"，已按默认值 ${fallback} 处理`);
+      continue;
+    }
     if (Number.isSafeInteger(value) && value > 0) { limits[key] = value; sources[key] = 'config.json'; continue; }
     limits[key] = fallback; sources[key] = '内置默认';
     if (value !== undefined) warnings.push(`配置：${key} 必须为正整数，已按默认值 ${fallback} 处理`);
   }
-  return { limits, sources, warnings };
+  return { limits, sources, warnings, mode, estimate, max, maxSource: inRange(maxValue) ? 'config.json' : '内置默认', memLowPercent, memLowSource: validMemLowPercent(percentValue) ? 'config.json' : '内置默认' };
 }
 
 // 执行者会话记录的保留天数（ar gc 用）：sessionRetentionDays 为正整数，没写为 14；不是正整数的值按默认处理并提示。
@@ -223,6 +310,10 @@ export const reportWeightDefaults = Object.freeze({
     manualRetry: { points: 10, max: 30 }, needsScope: { points: 10, max: null },
     rejected: { points: 20, max: null }, conflict: { points: 5, max: null },
   }),
+  reviewer: Object.freeze({
+    reviewInvalid: { points: 30, max: 60 }, reviewFormat: { points: 10, max: 30 },
+    reviewFalse: { points: 5, max: 30 }, reviewFalseHigh: { points: 10, max: 40 },
+  }),
   capFailed: 40,
   capRejected: 60,
 });
@@ -232,8 +323,8 @@ const positive = value => typeof value === 'number' && Number.isFinite(value) &&
 // 键同扣分表的 key（needsScope 同时出现在两张表里，这里只作用于主导的那一项）；capFailed / capRejected 直接写数。
 // 形状不对按默认；不是正数的值忽略并按默认，warnings 里各写一条（ar config 显示）。
 export function reportWeights(config = {}) {
-  const weights = { executor: {}, lead: {}, capFailed: reportWeightDefaults.capFailed, capRejected: reportWeightDefaults.capRejected };
-  for (const role of ['executor', 'lead']) for (const [key, value] of Object.entries(reportWeightDefaults[role])) weights[role][key] = { ...value };
+  const weights = { executor: {}, lead: {}, reviewer: {}, capFailed: reportWeightDefaults.capFailed, capRejected: reportWeightDefaults.capRejected };
+  for (const role of ['executor', 'lead', 'reviewer']) for (const [key, value] of Object.entries(reportWeightDefaults[role])) weights[role][key] = { ...value };
   const raw = config?.reportWeights;
   if (raw === undefined) return { weights, custom: 0, source: '内置默认', warnings: [] };
   if (!object(raw)) return { weights, custom: 0, source: '内置默认', warnings: ['配置：reportWeights 必须为对象，已按默认处理'] };
@@ -245,7 +336,7 @@ export function reportWeights(config = {}) {
       continue;
     }
     // 同名的 needsScope 只作用于主导；其余键在哪张表里就改哪一项。
-    const role = Object.hasOwn(reportWeightDefaults.lead, key) ? 'lead' : Object.hasOwn(reportWeightDefaults.executor, key) ? 'executor' : null;
+    const role = ['lead', 'executor', 'reviewer'].find(name => Object.hasOwn(reportWeightDefaults[name], key)) ?? null;
     if (!role) { warnings.push(`配置：reportWeights.${key} 不是已知的扣分项，已忽略`); continue; }
     if (!object(value)) { warnings.push(`配置：reportWeights.${key} 必须为对象（points、max），已按默认处理`); continue; }
     for (const field of ['points', 'max']) {
@@ -293,23 +384,35 @@ export function selectProfile(config, opts = {}, env = {}) {
   return { profileName: name, profile };
 }
 
-export function resolveSettings(config, opts = {}, env = {}, profileName) {
+// layers（Stage07c T6，可不传）：{ spec: { model, effort }, rule: { effort } }，只对 model、effort 两项生效。
+// 生效顺序：命令行 > 环境变量 CODEX_*（只对 codex）> 任务说明 > 命中的路由规则 > 执行者配置 > 内置默认（主导决定 D81）。
+export function resolveSettings(config, opts = {}, env = {}, profileName, layers = {}) {
   const v2 = validateV2(config.v === 2 ? config : migrateV1(config));
   const name = profileName ?? v2.defaultProfile ?? 'codex';
   const profile = v2.profiles?.[name] ?? {}, codex = profile.adapter === 'codex';
   const settings = {}, sources = {};
+  const layered = key => ({
+    spec: ['model', 'effort'].includes(key) ? layers?.spec?.[key] : undefined,
+    rule: key === 'effort' ? layers?.rule?.effort : undefined,
+  });
   for (const key of Object.keys(defaults)) {
     const fromFile = key === 'watchWindow' ? v2.watchWindow : profile[key];
     const option = key === 'watchWindow' ? opts['watch-window'] : key === 'path' ? undefined : opts[key];
     // CODEX_* 只作用于 adapter 为 codex 的 profile；关窗口变量对所有执行者有效。
     const envName = key === 'watchWindow' ? pickName(env, ...noWatchEnv) ?? noWatchEnv[0] : `CODEX_${key.toUpperCase()}`;
     const fromEnv = key === 'path' ? undefined : key === 'watchWindow' ? (env[envName] ? 'never' : undefined) : codex ? (env[envName] || undefined) : undefined;
-    validate(key, fromEnv, `环境变量 ${envName}`); validate(key, option, '命令行');
-    const value = option ?? fromEnv ?? fromFile;
+    const { spec: fromSpec, rule: fromRule } = layered(key);
+    validate(key, fromEnv, `环境变量 ${envName}`); validate(key, option, '命令行'); validate(key, fromSpec, '任务说明'); validate(key, fromRule, '路由规则');
+    const value = option ?? fromEnv ?? fromSpec ?? fromRule ?? fromFile;
     settings[key] = value == null ? defaults[key] : value;
-    sources[key] = option != null ? '命令行' : fromEnv != null ? `环境变量 ${envName}` : fromFile !== undefined ? 'config.json' : '内置默认';
+    sources[key] = option != null ? '命令行' : fromEnv != null ? `环境变量 ${envName}` : fromSpec != null ? '任务说明' : fromRule != null ? '路由规则' : fromFile !== undefined ? 'config.json' : '内置默认';
   }
   return { settings, sources };
+}
+
+// 记进 start / dispatch.json 的来源：每次派发都记 model、effort 各自的来源（Stage07c 154，D81：参数标签写明每个值的来源）。
+export function settingSourcesOf(sources) {
+  return { model: sources?.model ?? null, effort: sources?.effort ?? null };
 }
 
 // 只读取得"实际生效"的配置（ar route 用，不写任何文件，也不迁移旧目录的配置）：
@@ -340,7 +443,9 @@ export function loadConfig(home, opts = {}, env = process.env, { choose } = {}) 
   return { ...state, config, profileName, profile, ...chosen, ...resolveSettings(config, opts, env, profileName), warning };
 }
 
-export function writeConfig(home, changes = {}, { init = false } = {}) {
+// profile（可选）：指定写进哪个 Codex 执行者（改过名的 Codex 执行者，如 codex-pro）；必须是已有的、adapter 为 codex 的执行者，
+// 否则报错、什么都不写。不给时仍是 codex（不存在时新建）。
+export function writeConfig(home, changes = {}, { init = false, profile } = {}) {
   const state = readConfig(home);
   // 写入类命令在配置无效时拒绝（063）：坏文件一个字节都不动；config init 也不再拿"文件存在"搪塞。
   if (state.reason) throw configInvalid(state, '这次没有改动配置');
@@ -353,7 +458,12 @@ export function writeConfig(home, changes = {}, { init = false } = {}) {
   validateV2(config);
   // model / effort / tier / sandbox / path 是 Codex 执行者的设置：一律写进 codex profile（不存在时新建），
   // 不写进默认执行者——默认执行者可能是别的适配器（D2：加入其他执行者后默认改用它）。
-  const target = 'codex';
+  const target = profile ?? 'codex';
+  if (profile !== undefined) {
+    const existing = Object.hasOwn(config.profiles ?? {}, profile) ? config.profiles[profile] : null;
+    if (!existing) throw new Error(`找不到执行者：${profile}，这次没有改动配置`);
+    if (existing.adapter !== 'codex') throw new Error(`执行者 ${profile} 不是 Codex 适配器，这次没有改动配置`);
+  }
   for (const [key, value] of Object.entries(changes)) {
     if (key === 'watchWindow' || key === 'managed') config[key] = value;
     else {
@@ -405,16 +515,32 @@ const padColumn = (text, width) => {
   const length = [...text].reduce((sum, char) => sum + (/\p{Script=Han}/u.test(char) ? 2 : 1), 0);
   return text + ' '.repeat(Math.max(0, width - length));
 };
+// 并发"自动"档多显示四行：模式、上限、现在的估算值、现在是不是在暂停（瞬时判断：CPU 持续多久要排队中的任务才知道）。
+function autoLines(slots) {
+  if (slots.mode !== 'auto') return [];
+  const load = currentLoad({ memLowPercent: slots.memLowPercent });
+  const gb = (load.freeMemBytes / 1024 ** 3).toFixed(1);
+  const busy = load.memLow ? `暂停（可用内存 ${gb} GB）` : load.cpu !== null && load.cpu > 85 ? `可能暂停（CPU ${load.cpu}%）` : '正常';
+  return [
+    `${padColumn('concurrencyMode', 16)}${padColumn('auto', 19)}config.json`,
+    `${padColumn('concurrencyMax', 16)}${padColumn(String(slots.max), 19)}${slots.maxSource}`,
+    `${padColumn('memLowPercent', 16)}${padColumn(String(slots.memLowPercent), 19)}${slots.memLowSource}`,
+    `${padColumn('autoEstimate', 16)}${padColumn(String(slots.estimate), 19)}${machineCores()} 核、可用内存 ${gb} GB`,
+    `${padColumn('autoState', 16)}${padColumn(busy, 19)}CPU ${load.cpu ?? '?'}%`,
+  ];
+}
 // ar config 在设置表后面附上两个并发名额上限（gateConcurrency 比其他键长，键列加宽、值列收窄，来源列仍对齐）；
 // 不合法的值按默认处理并提示一行。
 function formatSlotLines(home) {
   const config = readConfig(home).config;
-  const { limits, sources, warnings } = slotLimits(config);
+  const slots = slotLimits(config);
+  const { limits, sources, warnings } = slots;
   const retention = sessionRetention(config);
   const weights = reportWeights(config), prices = priceTable(config), usage = leadUsageSetting(config);
   const priced = Object.keys(prices.prices).length;
   return [
     ...Object.entries(limits).map(([key, value]) => `${padColumn(key, 16)}${padColumn(String(value), 19)}${sources[key]}`),
+    ...autoLines(slots),
     // 键名更长，用自己的列宽，来源列仍对齐在第 35 列。
     `${padColumn('sessionRetentionDays', 21)}${padColumn(String(retention.days), 14)}${retention.source}`,
     // 链路报告的三项设置。

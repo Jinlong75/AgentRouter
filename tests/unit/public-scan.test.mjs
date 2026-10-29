@@ -73,6 +73,14 @@ test('exportPathOf：允许清单与改名', () => {
   assert.equal(exportPathOf('README.public.md'), 'README.md');
   assert.equal(exportPathOf('docs/a.md'), null);
   assert.equal(exportPathOf('README.md'), null);
+  // 194：skills/ 只导出两个已发布技能，第三技能初稿不导出。
+  assert.equal(exportPathOf('skills/agent-router/SKILL.md'), 'skills/agent-router/SKILL.md');
+  assert.equal(exportPathOf('skills/lead-workflow/SKILL.md'), 'skills/lead-workflow/SKILL.md');
+  assert.equal(exportPathOf('skills/lead-practices/SKILL.md'), null);
+  assert.equal(exportPathOf('skills/lead-practices/references/closeout.md'), null);
+  // 194：运行模板与限额样例说明补进文档白名单。
+  assert.equal(exportPathOf('core/templates/review-prompt.md'), 'core/templates/review-prompt.md');
+  assert.equal(exportPathOf('tests/fixtures/limits/README.md'), 'tests/fixtures/limits/README.md');
 });
 
 test('R8：四类命中都报出，词表词被遮成 ***，输出里没有词表内容', () => {
@@ -141,6 +149,25 @@ test('R8：README.public.md 按源路径扫描，二进制按 .gitattributes 跳
   const lines = r8Lines(out);
   assert.equal(lines.length, 1, out);
   assert.ok(lines[0].includes('README.public.md') && lines[0].includes('第 2 行'), out);
+});
+
+test('R8：新纳入白名单的文档进入扫描，第三技能初稿不在扫描范围', () => {
+  const repo = makeRepo({
+    'skills/agent-router/SKILL.md': '技能\n',
+    'skills/lead-workflow/SKILL.md': '技能\n',
+    'core/templates/review-prompt.md': `见 ${INTERNAL_DOC}\n`,
+    'tests/fixtures/limits/README.md': `见 ${PERSONAL_EMAIL}\n`,
+    'skills/lead-practices/SKILL.md': `见 ${INTERNAL_DOC}\n`,
+    'skills/lead-practices/references/closeout.md': `见 ${PERSONAL_EMAIL}\n`,
+    'tools/ok.mjs': 'export const ok = 1;\n',
+  });
+  const { status, out } = lint(repo);
+  const lines = r8Lines(out);
+  assert.equal(status, 1, out);
+  assert.equal(lines.length, 2, out);
+  assert.ok(lines.some(l => l.includes('core/templates/review-prompt.md') && l.includes(`内部文档引用 ${INTERNAL_DOC}`)), out);
+  assert.ok(lines.some(l => l.includes('tests/fixtures/limits/README.md') && l.includes('个人信息 ***@gmail.com')), out);
+  assert.ok(!lines.some(l => l.includes('skills/lead-practices/')), out);
 });
 
 test('collectSpecStems：收进三位及以上编号的任务说明，不收 README 与子目录', () => {

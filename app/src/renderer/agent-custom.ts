@@ -32,8 +32,10 @@ export function openOptionMenu(anchor: HTMLElement, items: Opt[], current: strin
     const close = (refocus = true) => {
         window.removeEventListener('keydown', onKey, true); document.removeEventListener('pointerdown', outside, true);
         menu.remove(); anchor.setAttribute('aria-expanded', 'false'); closeCurrent = null; currentAnchor = null;
-        if (refocus && anchor.isConnected) anchor.focus({ preventScroll: true });
+        if (refocus) anchorNow()?.focus({ preventScroll: true });
     };
+    // 菜单打开期间页面可能重画、下拉按钮被换成新元素：按 data-* 属性找到页面上同一个控件（照 ui.ts 的 triggerNow）。
+    const anchorNow = () => { if (anchor.isConnected) return anchor; const attrs = [...anchor.attributes].filter(a => a.name.startsWith('data-')); return attrs.length ? document.querySelector<HTMLElement>(attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join('')) : null; };
     const onKey = (e: KeyboardEvent) => {
         if (e.key === 'Escape' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); close(); return; }
         if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
@@ -206,7 +208,7 @@ export function openCustomForm(o: CustomFormOptions): Sheet {
         ${field(gx.argsTpl, esc(gx.argsTplHelp), tagsHtml('args', S.args, gx.argsTpl, gx.argAdd, true) + err('args'), true)}
         ${field(gx.stdin, exampleHelp(gx.stdinHelp), example(input('stdin', S.stdin, gx.stdin, { ph: gx.stdinPh })) + err('stdin'))}
         ${field(gx.outFormat, '', seg('format', FORMATS, gx.formats, S.format, gx.outFormat) + err('format'), true)}
-        ${S.format === 'jsonl' ? field(gx.mapping, esc(gx.mappingHelp), `<div class="map-list">${mapRows()}<button type="button" class="btn sm" data-map-add>${icon('add-line')}${esc(gx.mapAdd)}</button></div>${err('map')}`, true) : ''}
+        ${S.format === 'jsonl' ? field(gx.mapping, exampleHelp(gx.mappingHelp), `<div class="map-list">${mapRows()}<button type="button" class="btn sm" data-map-add>${icon('add-line')}${esc(gx.mapAdd)}</button></div>${err('map')}`, true) : ''}
         ${S.format === 'stream-json' ? '' : field(gx.reportFrom, '', seg('report', REPORTS, gx.reports, S.report, gx.reportFrom) + err('report'))}
         ${field(gx.readOnlyArgs, exampleHelp(gx.readOnlyArgsHelp), example(tagsHtml('readOnly', S.readOnly, gx.readOnlyArgs, gx.readOnlyPh, false)) + err('readOnly'))}
         ${field(gx.secretVar, exampleHelp(gx.secretVarHelp), example(input('secretVar', S.secretVar, gx.secretVar, { ph: gx.secretVarPh })) + err('secretVar'))}</div>`;
@@ -411,13 +413,15 @@ export function openCustomForm(o: CustomFormOptions): Sheet {
     });
     // 空输入框里按 → 填入示例，光标放到末尾，并触发和手动输入一样的 input 事件；不为空时保持默认（移动光标）。
     // 只读参数只填进输入框文字，不自动加成小方块（回车才加）。Tab 不受影响。
+    // 事件映射每一行的两个框（data-m）：示例就是框里灰色的占位文字（type = message / text ← content）。
     root.addEventListener('keydown', e => {
         const t = e.target as HTMLInputElement;
         if (e.key !== 'ArrowRight' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey || e.isComposing || !t.matches?.('input') || t.value) return;
         const key = t.dataset.c === 'stdin' ? 'stdin' : t.dataset.c === 'secretVar' ? 'secretVar' : t.dataset.tagIn === 'readOnly' ? 'readOnly' : '';
-        if (!key) return;
+        const example = key ? gx.examples[key] : t.dataset.m ? t.placeholder : '';
+        if (!example) return;
         e.preventDefault();
-        t.value = gx.examples[key];
+        t.value = example;
         t.setSelectionRange(t.value.length, t.value.length);
         t.dispatchEvent(new Event('input', { bubbles: true }));
     });

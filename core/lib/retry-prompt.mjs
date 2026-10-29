@@ -16,14 +16,17 @@ const REQUIREMENTS = `要求：
 // 生成这一次发给执行者的完整指令。
 // base：原始指令；n：第几次尝试（从 1 开始）；total：一共允许几次（手动重试为 null）；
 // failure：上一次的失败（null 表示没有）；note：主导补充说明（可为空）。
+// escalation：默认升级链这一次做了什么的一句话（提高了推理强度 / 换了执行者），写在标题下面；没有就不写。
 // 没有失败也没有补充说明时原样返回 base（第 1 次尝试的指令不变）。
-export function buildPrompt(base, { n, total, failure, note } = {}) {
+export function buildPrompt(base, { n, total, failure, note, escalation } = {}) {
   if (!failure && !note) return base;
   const paragraphs = [base];
   if (failure?.kind === 'conflict') paragraphs.push(...conflictParagraphs(failure));
+  else if (failure?.kind === 'review') paragraphs.push(...reviewParagraphs(failure));
   else if (failure) {
     paragraphs.push(
       `## 上一次尝试没有通过验收（第 ${n - 1} 次${total == null ? '' : `，共允许 ${total} 次`}）`,
+      ...(escalation ? [escalation] : []),
       ...failureParagraphs(failure),
       REQUIREMENTS,
     );
@@ -44,6 +47,29 @@ function conflictParagraphs({ files = [], baseBranch = '主分支' }) {
 2. 解决后重新运行验收命令，确认通过。
 3. 提交合并结果（不要放弃这次合并，也不要重新建分支）。
 4. 汇报里说明每个冲突文件是怎么取舍的。`,
+  ];
+}
+
+// 审查触发的返工（Stage08 T3）：门禁已经通过，审查者提出了问题。
+// failure：{ kind: 'review', issues: [{ id, severity, file, line, title, detail, confirmation }] }。
+// 列出没有被标为"不成立"的 high 问题与 medium 问题，high 在前，最多 10 条；low 不列。
+const REVIEW_ISSUE_LIMIT = 10;
+const SEVERITY_ORDER = { high: 0, medium: 1 };
+function reviewParagraphs({ issues = [] }) {
+  const listed = (Array.isArray(issues) ? issues : [])
+    .filter(issue => issue && Object.hasOwn(SEVERITY_ORDER, issue.severity) && issue.confirmation?.result !== 'invalid')
+    .map((issue, index) => ({ issue, index }))
+    .sort((a, b) => SEVERITY_ORDER[a.issue.severity] - SEVERITY_ORDER[b.issue.severity] || a.index - b.index)
+    .slice(0, REVIEW_ISSUE_LIMIT)
+    .map(({ issue }) => {
+      const where = issue.file ? `${issue.file}${Number.isInteger(issue.line) ? `:${issue.line}` : ''}` : '（没有指明文件）';
+      const detail = String(issue.detail ?? '').trim().replace(/\r?\n/g, '\n  ');
+      return `- ${issue.id}（${issue.severity}）${where}　${issue.title}${detail ? `\n  ${detail}` : ''}`;
+    });
+  return [
+    '## 上一次审查发现了这些问题',
+    listed.join('\n'),
+    '如果你认为某条问题不成立，在汇报里说明理由，不要为了通过审查做无意义的修改。',
   ];
 }
 

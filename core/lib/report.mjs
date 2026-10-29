@@ -8,7 +8,7 @@ import { git } from './git.mjs';
 import { readJson } from './json.mjs';
 import { readNeedsScope } from './needs-scope.mjs';
 import { readOutsideWrites } from './outside-writes.mjs';
-import { revertedOf, taskState } from './status.mjs';
+import { revertedOf, taskBaseBranch, taskState } from './status.mjs';
 import { locateStart, reverseRows } from './wait.mjs';
 
 export const notSpecTask = '这个任务不是用任务说明派发的，没有评分';
@@ -29,7 +29,13 @@ const labels = {
     specEdit: ['派发后改任务说明', '次'], specBlame: ['门禁失败归因到任务说明', '次'], manualRetry: ['手动重试', '次'],
     needsScope: ['执行者写了"需要越界"', '次'], rejected: ['驳回', '次'], conflict: ['合并时冲突', '次'], envBlame: ['环境原因', '次'],
   },
+  reviewer: {
+    reviewInvalid: ['改了文件（审查无效）', '次'], reviewFormat: ['没按格式给结论', '次'],
+    reviewFalse: ['被标为"不成立"的问题', '个'], reviewFalseHigh: ['被标为"不成立"的高严重度问题', '个'],
+  },
 };
+
+const severityLabels = { high: '高', medium: '中', low: '低' };
 
 const blameValues = ['spec', 'worker', 'environment'];
 const envCount = blamed => [...blamed.values()].filter(who => who === 'environment').length;
@@ -75,9 +81,10 @@ function recordDir(start) {
 const marksFile = start => path.join(recordDir(start), 'marks.json');
 
 // 归因标记：{ v: 1, blame: { "<n>": "spec" | "environment" } }。读不了、格式不对、未知值都当作没有。返回 Map<尝试编号, 'spec' | 'environment'>。
-function readMarks(start) {
+const readMarks = start => readMarksAt(marksFile(start));
+function readMarksAt(file) {
   try {
-    const value = readJson(marksFile(start));
+    const value = readJson(file);
     const blamed = new Map();
     if (value && typeof value.blame === 'object' && value.blame && !Array.isArray(value.blame)) {
       for (const [key, who] of Object.entries(value.blame)) if ((who === 'spec' || who === 'environment') && /^[1-9]\d*$/.test(key)) blamed.set(Number(key), who);
@@ -115,13 +122,15 @@ function readAttempts({ start, rows, dir, blamed }) {
     return {
       ...item, gate, gateFile,
       summary: typeof gateFile?.summary === 'string' ? gateFile.summary : null,
-      blame: gate === false ? (blamed.get(item.n) ?? 'worker') : null,
+      // 门禁没通过的尝试可以归因到任务说明 / 环境，默认执行者；执行者自己失败（没跑门禁）的尝试只认"环境"（限流、服务不可用，Stage07c T7），没标记就没有归因。
+      blame: gate === false ? (blamed.get(item.n) ?? 'worker')
+        : gate === null && item.end?.ok === false && blamed.get(item.n) === 'environment' ? 'environment' : null,
     };
   });
 }
 
-// events.jsonl：统计工具调用与出错。读不了按没有。
-function readEventCounts(start, dir) {
+// events.jsonl：统计工具调用与出错。读不了按没有。被归因到环境的尝试（含限流 / 服务不可用自动归因）里的出错不计（skip：这些尝试的编号）。
+function readEventCounts(start, dir, skip = new Set()) {
   const counts = { toolCalls: 0, toolErrors: 0 };
   let text = '';
   try { text = readFileSync(typeof start.events === 'string' && start.events ? start.events : path.join(dir, 'events.jsonl'), 'utf8'); } catch { return counts; }
@@ -130,11 +139,12 @@ function readEventCounts(start, dir) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     if (!event || typeof event !== 'object') continue;
+    const environment = skip.has(event.attempt);
     if (event.kind === 'tool') counts.toolCalls += 1;
-    else if (event.kind === 'error') counts.toolErrors += 1;
+    else if (event.kind === 'error') { if (!environment) counts.toolErrors += 1; }
     else if (event.kind === 'cmd') {
       if (event.phase === 'start') counts.toolCalls += 1;
-      else if (event.phase === 'end' && event.exit != null && event.exit !== 0) counts.toolErrors += 1;
+      else if (event.phase === 'end' && event.exit != null && event.exit !== 0 && !environment) counts.toolErrors += 1;
     }
   }
   return counts;
@@ -142,8 +152,10 @@ function readEventCounts(start, dir) {
 
 function executorItems({ attempts, counts, blamed }) {
   const byReason = reason => attempts.filter(item => item.reason === reason);
-  // 第 n 次被归因到任务说明或环境时，第 n+1 次（reason: gate）不算执行者的。
+  // 第 n 次被归因到任务说明或环境时，第 n+1 次（reason: gate）不算执行者的；
+  // 执行者自己失败的那次被归因到环境（限流 / 服务不可用，Stage07c T7）时，第 n+1 次（reason: agent）同样不算。
   const relieved = byReason('gate').filter(item => blamed.has(item.n - 1)).length;
+  const relievedAgent = byReason('agent').filter(item => blamed.has(item.n - 1)).length;
   const outside = new Set(), protectedPaths = new Set(), added = [];
   const listed = [];
   for (const item of attempts) {
@@ -160,13 +172,15 @@ function executorItems({ attempts, counts, blamed }) {
     if (scopeList) listed.push({ n: item.n, list: scopeList });
   }
   for (const file of protectedPaths) outside.delete(file);
-  const retried = byReason('gate').concat(byReason('agent'));
-  const firstProfile = attempts[0]?.profile ?? null;
+  // 被归因到环境的尝试（限流 / 服务不可用后自动换人，或手动归因）本身不算"换执行者"。
+  const retried = byReason('gate').concat(byReason('agent')).filter(item => blamed.get(item.n) !== 'environment');
+  // "升级了执行者"的基线是第一次没被归因到环境的尝试：限流后自动换人（第 1 次被归因到环境）不算升级。
+  const firstProfile = (attempts.find(item => blamed.get(item.n) !== 'environment') ?? attempts[0])?.profile ?? null;
   const switched = retried.filter(item => item.profile !== firstProfile);
   const needsScopePaths = [...new Set(listed.flatMap(item => item.list.map(entry => entry.path)))];
   return [
     { key: 'attemptGate', count: Math.max(0, byReason('gate').length - relieved), detail: null },
-    { key: 'attemptAgent', count: byReason('agent').length, detail: null },
+    { key: 'attemptAgent', count: Math.max(0, byReason('agent').length - relievedAgent), detail: null },
     { key: 'outsideFile', count: outside.size, detail: outside.size ? first5([...outside]) : null },
     { key: 'protectedFile', count: protectedPaths.size, detail: protectedPaths.size ? first5([...protectedPaths]) : null },
     { key: 'outsideWrites', count: added.length ? 1 : 0, detail: added.length ? first5(added.map(entry => `${entry.root}/${entry.name}`)) : null },
@@ -186,8 +200,10 @@ function specEdits({ root, start, rows, endAt }) {
     const accepted = rows.findLast(row => row.event === 'accepted');
     if (accepted && typeof accepted.merge === 'string' && sha.test(accepted.merge)) ref = `${accepted.merge}^1`;
     else {
-      let baseBranch = null;
-      try { baseBranch = readJson(path.join(root, '.agent-router', 'project.json')).baseBranch; } catch { /* 读不到就用当前分支。 */ }
+      let projectBranch = null;
+      try { projectBranch = readJson(path.join(root, '.agent-router', 'project.json')).baseBranch; } catch { /* 读不到就用当前分支。 */ }
+      // 这次派发指定了基线分支（--base）就以它为准（136）。
+      const baseBranch = taskBaseBranch(start, projectBranch);
       if (typeof baseBranch === 'string' && baseBranch.trim() && !baseBranch.startsWith('-')) ref = baseBranch.trim();
     }
   }
@@ -280,6 +296,83 @@ function executorPerf({ attempts, counts, start, prices }) {
   };
 }
 
+const readReviewFile = file => {
+  try {
+    const value = readJson(file);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch { return null; }
+};
+
+// 审查者一组。有 review 事件、且最近一次审查有审查者才有（没有可用的审查者时 reviewer 是 null，不出这一组）。
+// 扣分来自这个任务所有审查文件里的 tries（换过审查者时，扣分算到当时那个审查者身上，但只出一组，标题是给出当前结论的审查者，即顶层 review.json 的；顶层读不到才取最近一次）；
+// 问题数与"成立 / 不成立"取顶层 review.json（最近一次给出结论的审查，确认只写在它上面）；顶层读不到就用最近一次审查自己的文件。
+function reviewerGroup({ rows, dir, weights }) {
+  const events = rows.filter(row => row.event === 'review' && Number.isSafeInteger(row.attempt));
+  if (!events.length) return null;
+  const top = readReviewFile(path.join(dir, 'review.json'));
+  const seen = new Set(), reviews = [];
+  for (const event of events) {
+    const run = Number.isSafeInteger(event.run) && event.run > 1 ? event.run : 1;
+    const key = `${event.attempt}.${run}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const matchesTop = top && top.attempt === event.attempt && (Number.isSafeInteger(top.run) && top.run > 1 ? top.run : 1) === run;
+    reviews.push({ event, review: matchesTop ? top : readReviewFile(path.join(dir, 'attempts', String(event.attempt), run > 1 ? `review-${run}.json` : 'review.json')) });
+  }
+  const latest = reviews.at(-1);
+  // 标题与问题数据同源：顶层 review.json 有审查者就取它的（给出当前结论的那位）；读不到才按最近一次审查。
+  const fromTop = typeof top?.reviewer === 'string' && top.reviewer !== '';
+  const profile = fromTop ? top.reviewer : typeof latest.event.reviewer === 'string' && latest.event.reviewer ? latest.event.reviewer : typeof latest.review?.reviewer === 'string' && latest.review.reviewer ? latest.review.reviewer : null;
+  if (!profile) return null;
+  const crossed = fromTop ? top.crossed === true : typeof latest.event.crossed === 'boolean' ? latest.event.crossed : latest.review?.crossed === true;
+
+  const failures = { invalid: [], format: [] };
+  for (const { review } of reviews) {
+    for (const entry of Array.isArray(review?.tries) ? review.tries : []) {
+      if (!entry || typeof entry !== 'object' || entry.ok !== false) continue;
+      const who = typeof entry.reviewer === 'string' && entry.reviewer ? entry.reviewer : profile;
+      if (entry.kind === 'invalid') failures.invalid.push(who);
+      // "没能启动"（start）不是审查者没按格式给结论，不扣分。
+      else if (entry.kind === 'parse' || entry.kind === 'timeout' || entry.kind === 'exit') failures.format.push(who);
+    }
+  }
+  const source = top ?? latest.review;
+  const issues = (Array.isArray(source?.issues) ? source.issues : []).filter(issue => issue && typeof issue === 'object');
+  const result = issue => (issue.confirmation?.result === 'valid' || issue.confirmation?.result === 'invalid' ? issue.confirmation.result : null);
+  const invalid = issues.filter(issue => result(issue) === 'invalid');
+  const invalidHigh = invalid.filter(issue => issue.severity === 'high');
+  const invalidOther = invalid.filter(issue => issue.severity !== 'high');
+  const names = list => (list.length ? first5([...new Set(list)]) : null);
+  const severities = list => {
+    const counts = ['high', 'medium', 'low'].map(key => [key, list.filter(issue => (severityLabels[issue.severity] ? issue.severity : 'medium') === key).length]).filter(([, n]) => n > 0);
+    return counts.length === 1 ? severityLabels[counts[0][0]] : counts.map(([key, n]) => `${severityLabels[key]} ${n}`).join(' · ');
+  };
+  const scored = scoreRole([
+    { key: 'reviewInvalid', count: failures.invalid.length, detail: names(failures.invalid) },
+    { key: 'reviewFormat', count: failures.format.length, detail: names(failures.format) },
+    { key: 'reviewFalse', count: invalidOther.length, detail: invalidOther.length ? severities(invalidOther) : null },
+    { key: 'reviewFalseHigh', count: invalidHigh.length, detail: null },
+  ], weights);
+
+  const count = severity => issues.filter(issue => (severityLabels[issue.severity] ? issue.severity : 'medium') === severity).length;
+  const sumUsage = field => {
+    const values = reviews.map(({ review }) => review?.usage?.[field]).filter(value => Number.isFinite(value));
+    return values.length ? sum(values) : null;
+  };
+  const input = sumUsage('input'), output = sumUsage('output');
+  return {
+    score: scored.score, items: scored.items,
+    perf: {
+      issues: { total: issues.length, high: count('high'), medium: count('medium'), low: count('low') },
+      confirmed: issues.filter(issue => result(issue)).length,
+      valid: issues.filter(issue => result(issue) === 'valid').length,
+      ms: sum(reviews.map(({ review }) => (Number.isFinite(review?.ms) ? review.ms : 0))),
+      usage: input === null && output === null ? null : { input, output },
+    },
+    profile, crossed,
+  };
+}
+
 // 只读：返回报告对象。home 可以是公共目录，也可以是 [新目录, 旧目录]。任务还在进行、不是用任务说明派发的任务抛出中文原因（退出码 2）。
 export function buildReport({ home, root, name, env = process.env }) {
   const homes = homesOf(home);
@@ -295,7 +388,7 @@ export function buildReport({ home, root, name, env = process.env }) {
   const attempts = readAttempts({ start, rows, dir, blamed: marks });
   // 只有门禁没通过的尝试才能被归因；标记里多出来的编号不算。
   const blamed = new Map(attempts.filter(item => item.blame === 'spec' || item.blame === 'environment').map(item => [item.n, item.blame]));
-  const counts = readEventCounts(start, dir);
+  const counts = readEventCounts(start, dir, new Set([...blamed].filter(([, who]) => who === 'environment').map(([n]) => n)));
 
   const startedAt = Number.isFinite(start.started) ? start.started : Number.isFinite(start.at) ? start.at : null;
   const ends = rows.filter(row => row.event === 'end' && Number.isFinite(row.at));
@@ -317,13 +410,16 @@ export function buildReport({ home, root, name, env = process.env }) {
     usage = read.usage; usageState = read.state;
   }
 
+  // 审查者：没有审查时没有这个键，其余输出不变。
+  const reviewer = reviewerGroup({ rows, dir, weights: weights.reviewer });
   const warnings = [...weightSetting.warnings, ...priceSetting.warnings, ...usageSetting.warnings];
   return {
     ok: true, id: start.id, name: start.name, state: taskStateName,
     executor: { score: executor.score, cap, items: executor.items, perf: executorPerf({ attempts, counts, start, prices: priceSetting.prices }) },
     lead: { score: lead.score, items: lead.items, perf: { ms: startedAt !== null && lastEnd && Number.isFinite(lastEnd.at) ? lastEnd.at - startedAt : null, awaitMs, usage, usageState } },
+    ...(reviewer ? { reviewer } : {}),
     attempts: attempts.map(item => ({ n: item.n, reason: item.reason, profile: item.profile, exit: Number.isFinite(item.end?.exit) ? item.end.exit : null, gate: item.gate, summary: item.summary, blame: item.blame })),
-    weights,
+    weights: reviewer ? weights : (({ reviewer: _, ...rest }) => rest)(weights),
     ...(warnings.length ? { warnings } : {}),
   };
 }
@@ -335,15 +431,25 @@ export function setBlame({ home, root, name, n, blame }) {
   const { start, rows } = loadTask({ homes: homesOf(home), root, name });
   const attempt = rows.findLast(row => row.event === 'attempt-end' && row.n === n);
   if (!attempt || attempt.gate !== false) throw new Error(`第 ${n} 次尝试的门禁没有失败，不能归因（只有门禁未通过的尝试才能归因）`);
-  const blamed = readMarks(start);
+  writeBlame(marksFile(start), n, blame);
+  return { ok: true, n, blame };
+}
+
+// 写一项归因：读出现有标记、改这一项、先写临时文件再改名。worker 是默认，写 worker 时删掉这个键。
+function writeBlame(file, n, blame) {
+  const blamed = readMarksAt(file);
   if (blame === 'worker') blamed.delete(n); else blamed.set(n, blame);
-  const file = marksFile(start);
   const temp = `${file}.${process.pid}.tmp`;
   try {
     writeFileSync(temp, `${JSON.stringify({ v: 1, blame: Object.fromEntries([...blamed].sort((a, b) => a[0] - b[0]).map(([key, who]) => [String(key), who])) })}\n`, { flag: 'w' });
     renameSync(temp, file);
   } finally { rmSync(temp, { force: true }); }
-  return { ok: true, n, blame };
+}
+
+// 派发流程自动归因（限流 / 服务不可用，Stage07c T7）：把任务记录目录里第 n 次尝试标成"环境"。
+// 不检查任务状态（任务还在进行）、不要求门禁失败过；手动 --blame 仍走 setBlame。
+export function markEnvironment(recordDirectory, n) {
+  writeBlame(path.join(recordDirectory, 'marks.json'), n, 'environment');
 }
 
 const durationText = ms => (ms < 60000 ? `${(ms / 1000).toFixed(1)} 秒` : `${(ms / 60000).toFixed(1)} 分钟`);
@@ -375,5 +481,15 @@ export function reportLines(report) {
     ...(lead.awaitMs === null ? [] : [`等待验收 ${durationText(lead.awaitMs)}`]),
     lead.usageState === 'off' ? 'token 没有读取（config.json 的 leadUsage 为 false）' : lead.usage ? tokenText(lead.usage) : 'token 读取不到会话记录',
   ]);
+  if (report.reviewer) {
+    const review = report.reviewer, perf = review.perf;
+    section('审查者', review, 'reviewer', [
+      `审查者 ${review.profile}${review.crossed ? '（交叉）' : '（非交叉）'}`,
+      `问题 ${perf.issues.total} 个（高 ${perf.issues.high} · 中 ${perf.issues.medium} · 低 ${perf.issues.low}）`,
+      `成立 ${perf.valid} / 已确认 ${perf.confirmed}`,
+      `用时 ${durationText(perf.ms)}`,
+      perf.usage ? tokenText(perf.usage) : 'token 没有记录',
+    ]);
+  }
   return lines;
 }

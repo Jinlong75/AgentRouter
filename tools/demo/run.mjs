@@ -5,13 +5,20 @@ import path from 'node:path';
 import electron from 'electron';
 import { preferenceFixture } from './preferences.mjs';
 import { demo } from './index.mjs';
-import { tasks, reportRich } from './data.mjs';
+import { tasks, reportRich, demoExecutorB, demoLimits } from './data.mjs';
+import { builtinConfig } from '../../core/lib/config.mjs';
 import { isolatedEnvKey, isolationOverrides } from '../../app/src/main/app-env.mjs';
-const fixture=await demo();
+// confirmations：npm run demo 里带上"人确认审查问题"的 review-confirm 事件（路由页准确率能看到演示审查者）；界面验收的夹具不带（见 index.mjs）。
+const fixture=await demo({confirmations:true});
 try {
   // 演示汇报正文（任务 011）：index.mjs 写的是默认汇报，这里用 data.mjs 的 reportRich 覆盖，演示里能看到完整排版。
   const t3=tasks.find(t=>t.id==='t3');
   await writeFile(path.join(fixture.home,'projects',t3.project,'.agent-runs',t3.record??t3.name,'report.md'),reportRich);
+  // 演示执行者 B 与限流标签（188，D125）：config.json 在内置默认（Codex 可用，仍是默认执行者）之外加"演示执行者 B"；
+  // Agent 页它那一行显示"额度到 HH:MM 恢复"，悬停是限流原文，恢复时间按这次启动的时刻现算，点"已恢复"可清掉。Codex 不带限流标记。
+  const config=builtinConfig();config.profiles[demoExecutorB.name]=demoExecutorB.profile;
+  await writeFile(path.join(fixture.home,'config.json'),JSON.stringify(config,null,2)+'\n');
+  await writeFile(path.join(fixture.home,'limits.json'),JSON.stringify(demoLimits(Date.now()),null,2)+'\n');
   // 隔离环境只交给软件内部使用（AR_ISOLATED_ENV，见 app/src/main/app-env.mjs）；Electron 进程本身拿用户真实环境，
   // 这样软件打开的外部程序（编辑器等）不会带走演示的假 USERPROFILE / APPDATA / LOCALAPPDATA。
   const real={...process.env};delete real.ELECTRON_RUN_AS_NODE;

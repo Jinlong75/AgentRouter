@@ -9,7 +9,7 @@ import { pollUntil, type Harness } from './shots-input';
 import type { Registry } from './registry';
 import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
-import { c, gt, pj, wt as w } from '../shared/copy';
+import { c, gt, pj, rv, wt as w } from '../shared/copy';
 import { worktreeState, type Task, type WtState } from '../shared/types';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
@@ -36,6 +36,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
     const tasksFile = path.join(registry.data, 'tasks.json'), configFile = path.join(home, 'config.json');
     const root = path.join(home, 'shots-accept'), repo = path.join(root, 'sample'), repo2 = path.join(root, 'setup-fail');
     const agentFile = path.join(root, 'agent.mjs'), resolveFlag = path.join(root, 'resolve-release.flag'), holdFlag = path.join(root, 'hold-release.flag');
+    // 171：验收命令 hold-gate.mjs 等这个放行文件出现才退出（见 171 一节）。
+    const ovGateFlag = path.join(root, 'ov-gate-go.flag');
     const jsonOf = async <T,>(file: string, fallback: T): Promise<T> => JSON.parse(await readFile(file, 'utf8').catch(() => JSON.stringify(fallback)));
     const hiddenOf = async () => { const saved = await jsonOf<{ hidden?: string[] }>(tasksFile, {}); return Array.isArray(saved.hidden) ? saved.hidden : []; };
     const writeHidden = async (hidden: string[]) => { const saved = await jsonOf<Record<string, unknown>>(tasksFile, { imports: [] }); await writeFile(tasksFile, JSON.stringify({ ...saved, hidden: [...new Set(hidden)] }) + '\n'); await registry.reloadHidden(); };
@@ -50,6 +52,12 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
     };
     const taskOf = (id: string) => registry.tasks.find(t => t.id === id);
     const untilState = async (id: string, state: WtState, timeoutMs = 90000) => untilRow(async () => { await registry.refresh(); const t = taskOf(id); return t && worktreeState(t) === state ? t : null; }, `任务 ${id} 进入 ${state}`, timeoutMs);
+    // 154（D86）：批准一个任务后，与它改动范围重叠、仍待验收的任务由核心自动按新基线重跑门禁：清单里 resume 的 reason 是 after-merge、after 是刚合并的任务 id。
+    // 等这条 resume 出现（核心写的，不会误认旧的）；再等重跑结束进入 state（门禁通过回到 awaiting，合并有冲突进 conflict）。
+    const untilRerun = async (id: string, afterId: string, state: WtState, timeoutMs = 90000) => {
+        await untilRow(async () => (await eventsOf(id)).find(r => r.event === 'resume' && r.reason === 'after-merge' && r.after === afterId), `任务 ${id} 因 ${afterId} 合并而自动重跑门禁`, timeoutMs);
+        return untilState(id, state, timeoutMs);
+    };
     const core = async (args: string[], cwd?: string) => {
         const r = await coreRun(args, { timeoutMs: 60000, cwd });
         assert.equal(r.code, 0, `ar ${args.join(' ')}：${r.stderr || r.json?.error}`);
@@ -148,6 +156,26 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await press('[data-filter=await]');
         await check('UI24 点"待验收"筛选：只剩待验收与冲突两项', `[...document.querySelectorAll('[data-task]')].map(x => x.dataset.task).sort().join() === 't32,t33' && document.querySelector('[data-filter=await]').classList.contains('on')`);
         await press('[data-filter=all]');
+        // 188（D125，替换 185 的折行检查）：列表里有审查的任务（t32）第二行不折行：徽标（执行者、尝试、门禁、审查）一行放下、不收缩，只有项目名与状态在太长时被截断；
+        // 行高与没有审查的行（t33）一样。宽度够时审查徽标是"图标 + 文字"，窄时只剩"图标 + 问题数"；悬停提示与 aria-label 两种写法下都是全文。
+        // 都用真实窗口尺寸与真实布局量：量的是徽标的真实位置是否落在第二行的可见范围里、行高与第二行高度和对照行是否一样。
+        const reviewBadgeIn = (rowSelector: string, refSelector: string, mode: 'icon' | 'text') => `(() => { const row = document.querySelector(${jsonStr(rowSelector)}), ref = document.querySelector(${jsonStr(refSelector)}); const meta = row.querySelector('.tm > span'), m = meta.getBoundingClientRect(); const inside = e => { const q = e.getBoundingClientRect(); return q.width > 0 && q.left >= m.left - 0.5 && q.right <= m.right + 0.5 && q.top >= m.top - 0.5 && q.bottom <= m.bottom + 0.5; }; const b = row.querySelector('[data-review-badge]'), t = b.querySelector('.rvb-t'); const same = Math.abs(row.getBoundingClientRect().height - ref.getBoundingClientRect().height) < 0.5 && Math.abs(m.height - ref.querySelector('.tm > span').getBoundingClientRect().height) < 0.5; const items = [...row.querySelectorAll('.xtag, .att, .gbadge')]; const num = getComputedStyle(b, '::after').content; const full = ${jsonStr(rv.badgeIssuesFull(3))}; const hidden = getComputedStyle(t).display === 'none'; return same && items.length === 4 && items.every(inside) && b.title === full && b.getAttribute('aria-label') === full && b.textContent.trim() === ${jsonStr(rv.badgeIssues(3))} && (${jsonStr(mode)} === 'icon' ? hidden && num === '"3"' && inside(b.querySelector('i')) : !hidden && num !== '"3"' && inside(t)); })()`;
+        const rowHeights = (selector: string) => evaluate(`JSON.stringify([...document.querySelectorAll(${jsonStr(selector)})].map(r => [r.dataset.task ?? r.dataset.acc, Math.round(r.getBoundingClientRect().height * 10) / 10]))`);
+        win.setContentSize(960, 600);
+        await pause(500);
+        await check('UI24 最小窗口 960×600：任务页列表里有审查的任务（t32）第二行不折行，执行者、尝试、门禁、审查四个徽标一行放下（审查徽标是图标加问题数 3，文字收起），行高与没有审查的任务（t33）一样，悬停提示与 aria-label 是全文', reviewBadgeIn('[data-task=t32]', '[data-task=t33]', 'icon'));
+        console.log('UI24 最小窗口 960×600 任务页列表各行高度（px）：', await rowHeights('[data-task=t30],[data-task=t31],[data-task=t32],[data-task=t33],[data-task=t34],[data-task=t35]'));
+        await save('accept-list-960x600-dark');
+        win.setContentSize(1160, 720);
+        await pause(500);
+        await check('UI24 默认窗口 1160×720：同一行（t32，带尝试徽标，徽标组比这一列宽）审查徽标也是图标加问题数，不折行、行高一样', reviewBadgeIn('[data-task=t32]', '[data-task=t33]', 'icon'));
+        await save('accept-list-dark');
+        // 宽度够时显示文字：把列表栏临时撑宽（--list-w 是列表栏宽度的令牌变量），同一行的审查徽标换成"图标 + 文字"。
+        await evaluate(`document.documentElement.style.setProperty('--list-w', '440px'); true`);
+        await pause(500);
+        await check('UI24 列表栏宽到放得下文字时：t32 的审查徽标显示文字"审查 3 个问题"，仍不折行、行高一样，悬停提示与 aria-label 是全文', reviewBadgeIn('[data-task=t32]', '[data-task=t33]', 'text'));
+        await evaluate(`document.documentElement.style.removeProperty('--list-w'); true`);
+        await pause(350);
         await check('UI24 侧栏"验收"在"新建任务"下面，徽标是待验收与冲突的数量 2（品牌色底），悬停提示写有几个任务', `(() => { const b = [...document.querySelectorAll('.nav > button[data-page]')].map(x => x.dataset.page); const n = document.querySelector('[data-page=accept]'); const count = n.querySelector('.count'); return b.slice(0, 3).join() === 'tasks,newtask,accept' && n.textContent.startsWith(${jsonStr(w.nav)}) && count.textContent === '2' && count.classList.contains('brand') && n.dataset.tip === ${jsonStr(w.navTip(2))}; })()`);
         // 任务页详情：状态行、轨道、横幅、标题行按钮。
         await press('[data-task=t30]');
@@ -159,7 +187,9 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await check('UI24 准备中：状态行、横幅与"建好 worktree"一行、轨道执行节点运行中，标题行只有"停止"', `(() => { const n = [...document.querySelectorAll('.track .node')]; const row = document.querySelector('.wt-slot .tl.k-turn .c'); return document.querySelector('.dh-state').textContent === ${jsonStr(w.linePreparing)} && document.querySelector('.banner-holder .banner.info .rt b').textContent === ${jsonStr(w.preparingTitle)} && document.querySelector('.banner-holder .banner.info .rt span').textContent === ${jsonStr(w.preparingHelp('ar/3b7d5f19e0', 'main'))} && row?.textContent === ${jsonStr(w.worktreeRow('ar/3b7d5f19e0', 'main', 'a1b2c3d'))} && n[1].classList.contains('running') && n[1].querySelector('.sub').textContent === ${jsonStr(w.trackPreparing)} && !!document.querySelector('[data-stop]') && !document.querySelector('[data-retry]') && !document.querySelector('[data-redispatch]'); })()`);
         await press('[data-task=t32]');
         await wait(`document.querySelector('.dh h2')?.textContent === '020-成就弹窗'`);
-        await check('UI24 待验收：状态行、轨道五段（待验收节点等你，合并节点待办）、横幅与"去验收"，标题行"去验收"主按钮与"再派一次"、没有重试', `(() => { const n = [...document.querySelectorAll('.track .node')]; const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.goAccept !== undefined ? 'go' : b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); const banner = document.querySelector('.banner-holder .banner.brand'); return document.querySelector('.dh-state').textContent.startsWith(${jsonStr(w.lineAwaiting('').slice(0, 6))}) && document.querySelector('.dh-state').classList.contains('brand') && n.length === 5 && n.map(x => x.querySelector('span:nth-child(2)').textContent).join() === ${jsonStr([gt.track.dispatch, gt.track.run, gt.track.gate, w.track.awaiting, w.track.merge].join())} && n[3].classList.contains('attn') && n[3].querySelector('.sub').textContent === ${jsonStr(w.trackWaitYou)} && n[3].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.awaiting, w.nodeAwaiting))} && n[4].classList.contains('todo') && n[4].querySelector('.sub').textContent === 'main' && n[4].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.merge, w.nodeMergePending('main')))} && n.every(x => x.tagName === 'BUTTON' && x.getAttribute('aria-label')) && banner.querySelector('.rt b').textContent === ${jsonStr(w.awaitingTitle)} && banner.querySelector('.rt span').textContent === ${jsonStr(w.awaitingHelp('main'))} && banner.querySelector('[data-go-accept]').textContent === ${jsonStr(w.goAccept)} && acts.join() === 'go,again,more' && document.querySelector('.dh-1 [data-go-accept]').classList.contains('primary'); })()`);
+        // 185（D117 演示数据补审查）改写：原断言——轨道五段（派发、执行、门禁、待验收、合并），待验收节点是 n[3]、合并节点是 n[4]；
+        // 新断言——t32 现在带演示的审查结果，门禁与待验收之间多一个"审查"节点（n[3]，小字 rv.nodeIssues(3)），待验收节点后移为 n[4]、合并节点为 n[5]，其余断言不变；原因：演示数据补了 v0.8.0 的审查形态。
+        await check('UI24 待验收：状态行、轨道六段（t32 带演示的审查结果：派发、执行、门禁、审查、待验收、合并；待验收节点等你，合并节点待办）、横幅与"去验收"，标题行"去验收"主按钮与"再派一次"、没有重试',`(() => { const n = [...document.querySelectorAll('.track .node')]; const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.goAccept !== undefined ? 'go' : b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); const banner = document.querySelector('.banner-holder .banner.brand'); return document.querySelector('.dh-state').textContent.startsWith(${jsonStr(w.lineAwaiting('').slice(0, 6))}) && document.querySelector('.dh-state').classList.contains('brand') && n.length === 6 && n.map(x => x.querySelector('span:nth-child(2)').textContent).join() === ${jsonStr([gt.track.dispatch, gt.track.run, gt.track.gate, rv.node, w.track.awaiting, w.track.merge].join())} && n[3].dataset.tab === 'review' && n[3].querySelector('.sub').textContent === ${jsonStr(rv.nodeIssues(3))} && n[4].classList.contains('attn') && n[4].querySelector('.sub').textContent === ${jsonStr(w.trackWaitYou)} && n[4].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.awaiting, w.nodeAwaiting))} && n[5].classList.contains('todo') && n[5].querySelector('.sub').textContent === 'main' && n[5].getAttribute('aria-label') === ${jsonStr(gt.nodeLabel(w.track.merge, w.nodeMergePending('main')))} && n.every(x => x.tagName === 'BUTTON' && x.getAttribute('aria-label')) && banner.querySelector('.rt b').textContent === ${jsonStr(w.awaitingTitle)} && banner.querySelector('.rt span').textContent === ${jsonStr(w.awaitingHelp('main'))} && banner.querySelector('[data-go-accept]').textContent === ${jsonStr(w.goAccept)} && acts.join() === 'go,again,more' && document.querySelector('.dh-1 [data-go-accept]').classList.contains('primary'); })()`);
         await press('.dtabs [data-tab=flow]');
         await wait(`!!document.querySelector('.events-host')`);
         await check('UI24 待验收任务的进展末尾有"门禁通过 · 进入待验收"，开头有"建好 worktree"一行', `document.querySelector('.events-host').textContent.includes(${jsonStr(w.awaitingRow)}) && document.querySelector('.wt-slot .tl.k-turn .c')?.textContent === ${jsonStr(w.worktreeRow('ar/5f3a9c1e2d', 'main', 'a1b2c3d'))}`);
@@ -173,6 +203,13 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await press('[data-task=t35]');
         await wait(`document.querySelector('.dh h2')?.textContent === '017-换肤主题'`);
         await check('UI24 已驳回：状态行、轨道（待验收节点已驳回、合并节点不合并）、横幅写驳回原因，只有"再派一次"', `(() => { const n = [...document.querySelectorAll('.track .node')]; const banner = document.querySelector('.banner-holder .banner.stale'); const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.redispatch !== undefined ? 'again' : b.dataset.more !== undefined ? 'more' : b.dataset.retry !== undefined ? 'retry' : b.textContent.trim()); return /^已驳回 · .+ 你驳回$/.test(document.querySelector('.dh-state').textContent) && n[3].classList.contains('stopped') && n[3].querySelector('.sub').textContent === ${jsonStr(w.trackRejected)} && n[4].classList.contains('skip') && n[4].querySelector('.sub').textContent === ${jsonStr(w.trackNoMerge)} && banner.querySelector('.rt b').textContent === ${jsonStr(w.rejectedTitle)} && banner.querySelector('.rt span').textContent.startsWith('方向不对：主题跟随系统即可，不要加手动开关（') && banner.querySelector('.rt span').textContent.endsWith('你驳回）。worktree 已删除，分支已删除。') && acts.join() === 'again,more'; })()`);
+        // 171：没有 settingSources 的旧任务（演示数据 t32）：参数标签里模型、推理强度各有一行，值后面不写来源。
+        await press('[data-task=t32]');
+        await wait(`document.querySelector('.dh h2')?.textContent === '020-成就弹窗'`);
+        await press('.dtabs [data-tab=params]');
+        await wait(`!!document.querySelector('.tab-body .rows .r')`, '171 演示任务的参数标签');
+        await check('171 没有 settingSources 的旧任务：参数标签里模型、推理强度后面不写来源', `(() => { const rows = [...document.querySelectorAll('.tab-body .rows .r')]; const val = k => rows.find(r => r.querySelector('.k').textContent === k)?.querySelector('.v').textContent; const model = val(${jsonStr(c.model)}), effort = val(${jsonStr(c.effort)}); return model !== undefined && effort !== undefined && !model.includes('（来自') && !effort.includes('（来自'); })()`);
+        await press('.dtabs [data-tab=flow]');
         // 点横幅上的"去验收"：切到验收页并选中这个任务（键盘 Tab 到按钮、回车）。
         await press('[data-task=t32]');
         await wait(`!!document.querySelector('.banner-holder [data-go-accept]')`);
@@ -189,7 +226,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
 
         // ================= 演示数据：验收页 =================
         await selectAccept('t32');
-        await check('UI24 验收页骨架：标题"验收"、左列表（分组 wt.listGroup 与数量）、右详情（标题、状态行、轨道、标签、底部操作栏）', `(() => { const tabs = [...document.querySelectorAll('.detail.acc .dtabs button')]; return document.querySelector('.page-h h1').textContent === ${jsonStr(w.pageTitle)} && document.querySelector('.page-h .lead').textContent === ${jsonStr(w.pageLead)} && document.querySelector('.tgroup .mono').textContent === '2' && !!document.querySelector('.detail.acc .track') && tabs.map(b => b.dataset.atab).join() === 'overview,diff,gate,review' && tabs[3].disabled === true && tabs[3].title === ${jsonStr(w.reviewLater)} && tabs[0].getAttribute('aria-pressed') === 'true' && !!document.querySelector('.detail.acc .actbar'); })()`);
+        await check('UI24 验收页骨架：标题"验收"、左列表（分组 wt.listGroup 与数量）、右详情（标题、状态行、轨道、标签、底部操作栏）', `(() => { const tabs = [...document.querySelectorAll('.detail.acc .dtabs button')]; return document.querySelector('.page-h h1').textContent === ${jsonStr(w.pageTitle)} && document.querySelector('.page-h .lead').textContent === ${jsonStr(w.pageLead)} && document.querySelector('.tgroup .mono').textContent === '2' && !!document.querySelector('.detail.acc .track') && tabs.map(b => b.dataset.atab).join() === 'overview,diff,gate,review' && tabs[3].disabled === false && tabs[3].title === '' && tabs[0].getAttribute('aria-pressed') === 'true' && !!document.querySelector('.detail.acc .actbar'); })()`);
         await wait(`!!document.querySelector('.detail.acc .specbox') && document.querySelector('.detail.acc .specbox p')?.textContent.length > 0 && !!document.querySelector('.detail.acc .md')`, 'UI24 概览读到任务说明与汇报', 20000);
         await check('UI24 概览：任务说明摘要（目标取任务说明"目标"的第一段、允许改动、验收命令读 dispatch.json 的 gate.merged）+ 汇报（TODO(lead) 与推断清单高亮）', `(() => { const box = document.querySelector('.specbox'); const k = [...box.querySelectorAll('.sb-k')].map(x => [x.children[0].textContent, x.children[1].textContent]); const hl = document.querySelectorAll('.detail.acc .md .hl.brand'); return box.querySelector('.sb-h b').textContent === ${jsonStr(w.specBox)} && box.querySelector('.sb-h .mono').textContent === 'docs/specs/020-成就弹窗.md' && box.querySelector('p').textContent === '解锁成就时弹出提示，自动收起；同时解锁多个时排队显示。' && JSON.stringify(k) === ${jsonStr(JSON.stringify([[w.specAllowed, 'src/** · tests/**'], [w.specVerify, 'npm test · npm run lint']]))} && hl.length === 2 && document.querySelector('.detail.acc .sum .mono').textContent === 'c2d4e61'; })()`);
         await check('UI24 验收页详情头：状态行、分支、基线→提交（wt.baseToHead）、执行者；底部操作栏三个按钮（驳回 / 重试 / 批准并合并）与后果说明', `(() => { const h = document.querySelector('.detail.acc .dh-2').textContent; const acts = [...document.querySelectorAll('.detail.acc .actbar button')].map(b => b.textContent.trim()); return h.includes('ar/5f3a9c1e2d') && h.includes(${jsonStr(w.baseToHead('main', 'a1b2c3d', 'c2d4e61'))}) && h.includes('DeepSeek V4 Pro') && acts.join() === ${jsonStr([w.reject, w.retry, w.approve].join())} && document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteApprove('main'))} && document.querySelector('.actbar .btn.primary').textContent === ${jsonStr(w.approve)}; })()`);
@@ -212,8 +249,24 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await h.happened('UI24 复制分支名写入剪贴板', () => effects.copyLog.length > copiesBefore, 3000);
         await verify('UI24 复制分支名：剪贴板桩收到分支名', () => assert.equal(effects.copyLog.at(-1)!.text, 'ar/5f3a9c1e2d'));
         await shots('accept-overview');
+        // 188（D125）：验收页左列表的同一行（t32）在最小窗口里也一样（原断言：第二行完整显示四个徽标；新断言：同上并且不折行、行高与 t33 一样、审查徽标是图标加问题数；原因：D125 不折行）。
+        // reviewBadgeIn 在上面任务页列表那一节里定义。
+        win.setContentSize(960, 600);
+        await pause(500);
+        await check('UI24 最小窗口 960×600：验收页列表里有审查的任务（t32）第二行不折行，四个徽标一行放下（审查徽标是图标加问题数 3），行高与 t33 一样，悬停提示与 aria-label 是全文', reviewBadgeIn('[data-acc=t32]', '[data-acc=t33]', 'icon'));
+        console.log('UI24 最小窗口 960×600 验收页列表各行高度（px）：', await rowHeights('[data-acc]'));
+        win.setContentSize(1160, 720);
+        await pause(350);
+        // 185（D117 演示数据补审查）：t32 带演示的审查结果，"审查"标签可点，内容是 data.mjs 的 reviews.t32（Codex 交叉审查、concerns、三个问题，R1-2 已确认成立、R1-3 已确认不成立）。
+        await press('[data-atab=review]');
+        await wait(`!!document.querySelector('.detail.acc [data-rv-head]') && document.querySelectorAll('.detail.acc [data-rv-card]').length === 3`, 'UI24 t32 的审查标签读到演示的审查结果', 20000);
+        await check('UI24 t32 的审查标签：结论横幅是 concerns，问题按严重度排（R1-1、R1-2 中，R1-3 低），R1-2 标"成立"、R1-3 标"不成立"、R1-1 没有确认', `(() => { const cards = [...document.querySelectorAll('.detail.acc [data-rv-card]')]; const conf = id => document.querySelector('.detail.acc [data-rv-card="' + id + '"] [data-rv-conf]')?.dataset.rvConf ?? null; return document.querySelector('.detail.acc [data-rv-head] .rt b').textContent === ${jsonStr(rv.verdict.concerns)} && cards.map(x => x.dataset.rvCard).join() === 'R1-1,R1-2,R1-3' && [conf('R1-1'), conf('R1-2'), conf('R1-3')].join() === ',valid,invalid' && cards.map(x => x.dataset.severity).join() === 'medium,medium,low'; })()`);
+        await shots('accept-review');
+        await press('[data-atab=overview]');
         await press('[data-acc=t33]');
         await wait(`document.querySelector('.trow.on')?.dataset.acc === 't33'`);
+        // 185：t33 没有审查，它的"审查"标签仍是灰的（原来 t32 的那条断言，演示数据补审查后换到 t33）。
+        await check('UI24 没有审查的待验收任务（t33）：验收页"审查"标签是灰的，悬停提示 rv.none', `(() => { const b = document.querySelector('.detail.acc [data-atab=review]'); return !!b && b.disabled === true && b.title === ${jsonStr(rv.none)}; })()`);
         await check('UI24 验收页冲突：横幅（冲突文件逐个列出、解释"解决冲突并重试"），底部只有"驳回…"与主按钮"解决冲突并重试"，后果说明 wt.noteConflict', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.fail'); const acts = [...document.querySelectorAll('.detail.acc .actbar button')].map(x => x.textContent.trim()); return b.querySelector('.rt b').textContent === ${jsonStr(w.conflictTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.conflictPageHelp('main', ['src/save/schema.ts', 'tests/save-migration.test.ts']))} && acts.join() === ${jsonStr([w.reject, w.resolve].join())} && document.querySelector('.actbar .btn.primary').textContent === ${jsonStr(w.resolve)} && document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteConflict)} && document.querySelector('.dh-state').textContent === ${jsonStr(w.lineConflict(2))}; })()`);
         await shots('accept-conflict');
         // 演示任务的改动已不可查（演示仓库没有这个分支）：说明文案。
@@ -244,15 +297,17 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             git(dir, ['add', '--', '.gitignore', 'src/a.txt', 'src/shared.txt', '.agent-router/project.json']);
             git(dir, ['commit', '-m', '初始提交', '--', '.gitignore', 'src/a.txt', 'src/shared.txt', '.agent-router/project.json']);
         };
-        const specs: Record<string, { title: string; file: string; verify: string }> = {
+        const specs: Record<string, { title: string; file: string; verify: string; paths?: string }> = {
             a: { title: '验收通过任务', file: '091-验收通过', verify: 'git cat-file -e HEAD:src/ok.txt' },
             b: { title: '验收驳回任务', file: '092-验收驳回', verify: 'git cat-file -e HEAD:src/rej.txt' },
             x: { title: '冲突任务甲', file: '093-冲突甲', verify: 'git cat-file -e HEAD:src/shared.txt' },
             y: { title: '冲突任务乙', file: '094-冲突乙', verify: 'git cat-file -e HEAD:src/shared.txt' },
             q1: { title: '排队任务一', file: '095-排队一', verify: 'git cat-file -e HEAD:src/q1.txt' },
             q2: { title: '排队任务二', file: '096-排队二', verify: 'git cat-file -e HEAD:src/q2.txt' },
+            // 153：带 --base 进入待验收的任务。改动范围放在 docs/base4 下，和一直在待验收的排队任务一（src/**）不重叠，不会因“改动范围重叠”排队。
+            q4: { title: '基线跟随任务', file: '098-基线跟随', verify: 'git cat-file -e HEAD:docs/base4/n.txt', paths: 'docs/base4/**' },
         };
-        const specText = (id: number, s: { title: string; verify: string }) => ['---', `id: 9${id}`, `title: ${s.title}`, 'type: code', 'allowed_paths:', '  - src/**', 'verify:', `  - ${s.verify}`, 'max_retries: 0', '---', '', '## 目标', '', `${s.title}：验收页检查用的任务。`, '', '## 范围 / 不做什么', '', '只改 src 下的文件。', ''].join('\n');
+        const specText = (id: number, s: { title: string; verify: string; paths?: string }) => ['---', `id: 9${id}`, `title: ${s.title}`, 'type: code', 'allowed_paths:', `  - ${s.paths ?? 'src/**'}`,'verify:', `  - ${s.verify}`, 'max_retries: 0', '---', '', '## 目标', '', `${s.title}：验收页检查用的任务。`, '', '## 范围 / 不做什么', '', '只改 src 下的文件。', ''].join('\n');
         // 调研类任务（Stage07 T6）：type: research，只读运行，没有 allowed_paths 与 verify。
         const researchSpec = (id: number, title: string) => ['---', `id: 9${id}`, `title: ${title}`, 'type: research', 'max_retries: 0', '---', '', '## 目标', '', `${title}：调研类任务的检查用说明。`, '', '## 范围 / 不做什么', '', '只读，不改任何文件。', ''].join('\n');
         await initRepo(repo, 'sample', []);
@@ -296,16 +351,21 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
                 y: { adapter: 'codex', label: '丁执行者', enabled: true, path: agentFile },
                 hold: profile('戊执行者', { releaseFile: holdFlag, releaseTimeoutMs: 120000, writes: [{ path: 'src/q1.txt', content: 'q1\n' }], commit: '戊：排队任务' }),
                 plain: profile('己执行者', {}),
+                base4: profile('基线执行者', { writes: [{ path: 'docs/base4/n.txt', content: 'base4\n' }], commit: '基线：新增 docs/base4/n.txt' }),
                 research: profile('调研执行者', {}),
                 sneak: profile('偷改执行者', { writes: [{ path: 'src/a.txt', content: 'sneaky\n' }] }),
                 pu1: profile('推送甲执行者', { writes: [{ path: 'src/pu1.txt', content: 'pu1\n' }], commit: '推送甲：新增 pu1' }),
                 pu2: profile('推送乙执行者', { writes: [{ path: 'src/pu2.txt', content: 'pu2\n' }], commit: '推送乙：新增 pu2' }),
+                // 171：重叠分组检查用（ov1 / ov2 改 src 下，ov3 改 docs/ov3 下）。
+                ovp1: profile('重叠甲执行者', { writes: [{ path: 'src/ov1.txt', content: 'ov1\n' }], commit: '重叠甲：新增 ov1' }),
+                ovp2: profile('重叠乙执行者', { writes: [{ path: 'src/ov2.txt', content: 'ov2\n' }], commit: '重叠乙：新增 ov2' }),
+                ovp3: profile('重叠丙执行者', { writes: [{ path: 'docs/ov3/n.txt', content: 'ov3\n' }], commit: '重叠丙：新增 ov3' }),
             },
         }, null, 2) + '\n');
         await writeConfig(2);
         const noticesBefore = effects.notices.length;
-        const dispatchTask = async (rel: string, name: string, profileName: string, cwd = repo) => {
-            const r = await core(['dispatch', `docs/specs/${rel}.md`, '--name', name, '--profile', profileName, '--host', 'agentrouter', '--detach'], cwd);
+        const dispatchTask = async (rel: string, name: string, profileName: string, cwd = repo, extra: string[] = []) => {
+            const r = await core(['dispatch', `docs/specs/${rel}.md`, '--name', name, '--profile', profileName, '--host', 'agentrouter', '--detach', ...extra], cwd);
             const id = String(r.id);
             assert.ok(id, '派发没有返回 id');
             await untilRow(async () => (await rows()).find(x => x.id === id && x.event === 'start'), `任务 ${name} 的 start`, 30000);
@@ -445,7 +505,9 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             assert.equal(worktreeState(taskOf(A.id)!), 'awaiting');
         });
         await check('UI24 提交成功后右下角提示"已提交 <哈希>（2 个文件）"', `document.querySelector('.notice')?.textContent === ${jsonStr(pj.commitDone(git(repo, ['rev-parse', '--short', 'HEAD']), 2))}`);
-        // 提示在右下角停留 5 秒，会盖住底栏的主按钮；等它自己消失后再批准（真实输入的命中测试不会点穿它）。
+        // 155（W3）：提示的矩形与底栏里每个按钮的矩形都不相交，且背景不透明（来自令牌，不是半透明色）。
+        await check('155 W3 验收页提交成功的提示与 .actbar 里的每个按钮都不相交', `(() => { const n = document.querySelector('.notice').getBoundingClientRect(); const btns = [...document.querySelectorAll('.actbar .btn')]; return btns.length >= 2 && btns.every(b => { const r = b.getBoundingClientRect(); return r.width > 0 && (n.right <= r.left || n.left >= r.right || n.bottom <= r.top || n.top >= r.bottom); }); })()`);
+        // 提示在右下角停留 5 秒；等它自己消失后再批准（真实输入的命中测试不会点穿它）。
         await wait(`!document.querySelector('.notice')`, 'UI24 提交提示消失', 15000);
 
         // ---- 批准并合并 ----
@@ -481,7 +543,20 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             assert.equal(text, w.undoText(sha7(mergeSha), 'no-ff'));
             assert.equal(git(repo, ['rev-parse', `${sha7(mergeSha)}^{commit}`]), mergeSha);
         });
-        await check('UI24 批准之后侧栏"验收"徽标减一（剩下 B、X、Y 三个）', `document.querySelector('[data-page=accept] .count').textContent === '3'`);
+        // 154（D86）起：B、X、Y 的改动范围（src/**）都和刚合并的 A 重叠，批准 A 后它们自动按新基线重跑门禁（不启动执行者）。
+        // 重跑期间不算待验收，侧栏徽标是重跑完回到待验收之后才是 3；门禁都能通过，合并 main 也没有冲突，所以三个都回到 awaiting。
+        for (const t of [B, X, Y]) await untilRerun(t.id, A.id, 'awaiting');
+        await verify('UI24 批准 A 之后：B、X、Y 的 resume 都带 reason: after-merge 与 A 的 id，门禁重跑通过后回到待验收（没有 accepted / rejected / conflict 事件）', async () => {
+            for (const t of [B, X, Y]) {
+                const events = await eventsOf(t.id);
+                const resume = events.findLast(r => r.event === 'resume');
+                assert.equal(resume?.reason, 'after-merge');
+                assert.equal(resume?.after, A.id);
+                assert.ok(!events.some(r => ['accepted', 'rejected', 'conflict'].includes(r.event)), `${t.name} 不该有 accepted / rejected / conflict`);
+            }
+        });
+        await wait(`document.querySelector('[data-page=accept] .count')?.textContent === '3'`, 'UI24 重跑完后侧栏"验收"徽标是 3', 30000);
+        await check('UI24 批准之后侧栏"验收"徽标减一（剩下 B、X、Y 三个，它们重跑完门禁回到待验收之后）', `document.querySelector('[data-page=accept] .count').textContent === '3'`);
         // 任务页：已合并。
         await untilState(A.id, 'accepted', 30000);
         await selectTask(A.id);
@@ -600,12 +675,11 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await wait(`!document.querySelector('[data-acc="${X.id}"]') && !!document.querySelector('.toast')`, 'UI25 先批准 X 成功', 90000);
         await verify('UI25 先批准的 X 合并成功：main 上 shared.txt 是 X 的版本', async () => { assert.equal(await readFile(path.join(repo, 'src', 'shared.txt'), 'utf8'), 'one\nTWO-X\nthree\n'); });
         const mainBeforeConflict = git(repo, ['rev-parse', 'main']), indexBeforeConflict = git(repo, ['ls-files', '-s']);
+        // 154（D86）起：Y 与刚合并的 X 改动范围重叠，批准 X 时核心就自动把 main 合并进 Y 的 worktree 重跑门禁；Y 和 X 改同一行，合并有冲突，
+        // 核心撤销这次合并（main 与 Y 的 worktree 都不留合并中的痕迹），Y 直接进入冲突状态——不用再点“批准并合并”才发现冲突。
+        await untilRerun(Y.id, X.id, 'conflict');
         await selectAccept(Y.id);
-        await press(`[data-acc-approve="${Y.id}"]`);
-        await wait('!!document.querySelector(".confirm-card")');
-        await press('.confirm-actions .btn.primary');
         await wait(`!!document.querySelector('.detail.acc .tab-body .banner.fail') && !!document.querySelector('[data-acc-rebase]')`, 'UI25 冲突横幅与"解决冲突并重试"', 90000);
-        await untilState(Y.id, 'conflict', 30000);
         await check('UI25 冲突横幅：列出冲突文件、说明 main 没有变化；主按钮变成"解决冲突并重试"，底部只有驳回与它，状态行是冲突', `(() => { const b = document.querySelector('.detail.acc .tab-body .banner.fail'); const acts = [...document.querySelectorAll('.detail.acc .actbar button')].map(x => x.textContent.trim()); return b.querySelector('.rt b').textContent === ${jsonStr(w.conflictTitle)} && b.querySelector('.rt span').textContent === ${jsonStr(w.conflictPageHelp('main', ['src/shared.txt']))} && acts.join() === ${jsonStr([w.reject, w.resolve].join())} && document.querySelector('.actbar .btn.primary').textContent === ${jsonStr(w.resolve)} && document.querySelector('.dh-state').textContent === ${jsonStr(w.lineConflict(1))} && document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteConflict)}; })()`);
         await verify('UI25 冲突之后主分支字节不变（main 的提交、暂存区、git status 与批准前相同，没有合并进行中的痕迹），清单有 conflict 事件且文件清单是 src/shared.txt', async () => {
             assert.equal(git(repo, ['rev-parse', 'main']), mainBeforeConflict);
@@ -615,6 +689,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             assert.equal(await readFile(path.join(repo, 'src', 'shared.txt'), 'utf8'), 'one\nTWO-X\nthree\n');
             const conflict = (await eventsOf(Y.id)).findLast(r => r.event === 'conflict');
             assert.deepEqual(conflict.files, ['src/shared.txt']);
+            assert.equal((await eventsOf(Y.id)).findLast(r => r.event === 'resume')?.after, X.id, '冲突是批准 X 之后自动重跑门禁时发现的');
             assert.ok(!(await eventsOf(Y.id)).some(r => r.event === 'accepted'));
         });
         await shots('accept-conflict-real');
@@ -629,6 +704,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await wait(`!document.querySelector('[data-acc="${Y.id}"]')`, 'UI25 回到进行中后验收页不再列它', 20000);
         await goTasks();
         await wait(`document.querySelector('[data-task="${Y.id}"] .mk')?.classList.contains('run') === true`, 'UI25 任务页显示进行中', 20000);
+        // 取任务名额在 resume 与新 attempt 之间是异步的，先等 resume 之后的 conflict 原因尝试写入清单
+        await untilRow(async () => { const ev = await eventsOf(Y.id); const at = ev.findLastIndex(r => r.event === 'resume'); return ev.slice(at + 1).some(r => r.event === 'attempt' && r.reason === 'conflict') ? true : null; }, 'UI25 resume 之后出现 conflict 原因的新尝试', 60000);
         await verify('UI25 解决冲突并重试：核心在原 worktree 里合并 main，清单 resume 之后是 conflict 原因的新尝试，worktree 仍是同一个目录', async () => {
             const events = await eventsOf(Y.id);
             const attempt = events.findLast(r => r.event === 'attempt');
@@ -677,7 +754,12 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await registry.refresh();
         await untilState(Q2.id, 'queued', 20000);
         await selectTask(Q2.id);
-        await check('UI25 排队中：列表第二行 wt.subQueued、状态行"排队中 · 已等"、横幅写并发上限 1 与前面的任务数 0、标题行只有"停止"', `(() => { const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.stop !== undefined ? 'stop' : b.dataset.more !== undefined ? 'more' : b.textContent.trim()); return document.querySelector('[data-task="${Q2.id}"] .tm > span').textContent.endsWith(${jsonStr(' · ' + w.subQueued(0))}) && /^排队中 · 已等 \\d+:\\d\\d$/.test(document.querySelector('.dh-state').textContent) && document.querySelector('.banner-holder .banner.info .rt span').textContent === ${jsonStr(w.queuedHelp(1, 0))} && acts.join() === 'stop,more' && !document.querySelector('[data-go-accept]'); })()`);
+        // 141：两个任务的改动范围都是 src/**，第二个先因“改动范围重叠”排队（140 写的 queued 事件带 reason: overlap 与阻挡任务），横幅正文是 queuedOverlap + queuedStopSafe。
+        const q2Queued = (await eventsOf(Q2.id)).findLast(r => r.event === 'queued');
+        assert.equal(q2Queued.reason, 'overlap');
+        assert.equal(q2Queued.blockers[0].name, 'queue-1');
+        const overlapBody = w.queuedOverlap(q2Queued.blockers[0].name, q2Queued.blockers[0].paths.slice(0, 3).join('、')) + w.queuedStopSafe;
+        await check('UI25 排队中（改动范围重叠）：列表第二行 wt.subQueued、状态行"排队中 · 已等"、横幅是 queuedOverlap(queue-1, 重叠模式) + queuedStopSafe、标题行只有"停止"', `(() => { const acts = [...document.querySelectorAll('.dh-1 .acts button')].map(b => b.dataset.stop !== undefined ? 'stop' : b.dataset.more !== undefined ? 'more' : b.textContent.trim()); return document.querySelector('[data-task="${Q2.id}"] .tm > span').textContent.endsWith(${jsonStr(' · ' + w.subQueued(0))}) && /^排队中 · 已等 \\d+:\\d\\d$/.test(document.querySelector('.dh-state').textContent) && document.querySelector('.banner-holder .banner.info .rt span').textContent === ${jsonStr(overlapBody)} && acts.join() === 'stop,more' && !document.querySelector('[data-go-accept]'); })()`);
         await shots('wt-queued-real');
         await audit('任务页（排队中）', async () => { await press('[data-page=tasks]'); await press(`[data-task="${Q2.id}"]`); });
         await press('[data-stop]');
@@ -694,6 +776,29 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
             assert.equal(worktreeState(taskOf(Q2.id)!), 'stopped');
         });
         await check('UI25 列表显示中断（标记 stale），详情里不再有"停止"', `document.querySelector('[data-task="${Q2.id}"] .mk').classList.contains('stale') && !!document.querySelector('[data-task="${Q2.id}"] .mk i.ri-stop-circle-line') && !document.querySelector('[data-stop]')`);
+        // ---- 141 基线行：--base 指定了基线分支的任务，详情多一行 baseBranchRow；没指定的（队列一）没有 ----
+        git(repo, ['branch', 'base-x', 'main']);
+        const Q3 = await dispatchTask(specs.q2.file, 'queue-3', 'hold', repo, ['--base', 'base-x']);
+        await untilRow(async () => (await eventsOf(Q3.id)).find(r => r.event === 'queued'), '141 带 --base 的任务开始排队', 60000);
+        await registry.refresh();
+        await untilState(Q3.id, 'queued', 20000);
+        await selectTask(Q3.id);
+        const baseRowCount = `[...document.querySelectorAll('.wt-slot .k-turn .c')].filter(c => c.textContent === ${jsonStr(w.baseBranchRow('base-x'))}).length`;
+        await wait(`${baseRowCount} === 1`, '141 带 --base 的任务详情出现基线行');
+        await check('141 带 --base base-x 的任务：详情有一行 baseBranchRow(base-x)；同样在排队的横幅仍是改动范围重叠', `${baseRowCount} === 1 && document.querySelector('.banner-holder .banner.info .rt span').textContent.startsWith(${jsonStr(w.queuedOverlap('queue-1', '').split('（')[0])})`);
+        // 153：合并目标跟随 --base——合并节点的小字与提示都写这个任务自己的基线分支（没有 --base 的任务写项目主分支 main）。
+        const mergeNode = `(() => { const n = document.querySelectorAll('.track .node')[4]; return n.querySelector('.sub').textContent + '|' + n.title; })()`;
+        await check('153 带 --base base-x 的任务：轨道“合并”节点写 base-x 与 nodeMergePending(base-x)，不写 main', `${mergeNode} === ${jsonStr('base-x|' + w.nodeMergePending('base-x'))}`);
+        await shots('wt-queued-base');
+        await selectTask(Q1.id);
+        await wait(`${baseRowCount} === 0 && !![...document.querySelectorAll('.wt-slot .k-turn')].length`, '141 没指定基线的任务详情没有基线行');
+        await check('153 没指定 --base 的任务（队列一）：轨道“合并”节点仍写项目主分支 main', `${mergeNode} === ${jsonStr('main|' + w.nodeMergePending('main'))}`);
+        await check('141 没指定 --base 的任务（队列一）：详情没有基线行，仍有“建好 worktree”一行', `${baseRowCount} === 0 && [...document.querySelectorAll('.wt-slot .k-turn .c')].some(c => c.textContent.startsWith(${jsonStr(w.worktreeRow('', '', '').split(' · ')[0])}))`);
+        await selectTask(Q3.id);
+        await press('[data-stop]');
+        await wait('!!document.querySelector(".confirm-card")');
+        await press('.confirm-actions .btn.danger');
+        await untilRow(async () => (await eventsOf(Q3.id)).find(r => r.event === 'interrupted'), '141 停止带 --base 的排队任务', 60000);
         await verify('UI25 第一个任务这时仍在运行（占着名额），没有被停止', async () => { await registry.refresh(); assert.equal(worktreeState(taskOf(Q1.id)!), 'running'); });
         await writeFile(holdFlag, 'go\n');
         await untilState(Q1.id, 'awaiting', 120000);
@@ -704,6 +809,30 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         });
         await goAccept();
         await check('UI25 第一个任务出现在验收页（待验收），第二个（已中断）不在', `!!document.querySelector('[data-acc="${Q1.id}"]') && !document.querySelector('[data-acc="${Q2.id}"]')`);
+
+        // ---- 153 合并目标跟随 --base：带 --base base-x 的任务进入待验收后，验收页与详情写的都是 base-x ----
+        const Q4 = await dispatchTask(specs.q4.file, 'queue-4', 'base4', repo, ['--base', 'base-x']);
+        await untilState(Q4.id, 'awaiting', 120000);
+        const tQ4 = taskOf(Q4.id)!;
+        await selectAccept(Q4.id);
+        await check('153 带 --base 的任务在验收页：底栏说明是 noteApprove(base-x)', `document.querySelector('.actbar .note').textContent === ${jsonStr(w.noteApprove('base-x'))}`);
+        await press(`[data-acc-approve="${Q4.id}"]`);
+        await wait('!!document.querySelector(".confirm-card")', '153 批准确认框');
+        await check('153 带 --base 的任务批准确认框：标题是 approveTitle(任务名, base-x)', `document.querySelector('.confirm-card h2').textContent === ${jsonStr(w.approveTitle(tQ4.title, 'base-x'))}`);
+        await press('.confirm-actions .btn:not(.primary)');
+        await wait('!document.querySelector(".confirm-card")', '153 批准确认框关闭');
+        await selectTask(Q4.id);
+        await check('153 带 --base 的任务在任务页详情：待验收横幅是 awaitingHelp(base-x)，合并节点写 base-x 与 nodeMergePending(base-x)', `(() => { const n = document.querySelectorAll('.track .node')[4]; return document.querySelector('.banner-holder .banner.brand .rt span').textContent === ${jsonStr(w.awaitingHelp('base-x'))} && n.querySelector('.sub').textContent === 'base-x' && n.title === ${jsonStr(w.nodeMergePending('base-x'))}; })()`);
+        // 进展页签里“建好 worktree”一行写基线 base-x（点轨道上的“执行”节点切到进展）。
+        await press('.track .node[data-tab=flow]');
+        await wait(`[...document.querySelectorAll('.wt-slot .k-turn .c')].some(c => c.textContent.includes(${jsonStr(w.worktreeRow('', 'base-x', '').split(' · ')[2].trim())}))`, '153 进展里 worktree 行写基线 base-x');
+        await selectAccept(Q4.id);
+        await press(`[data-acc-reject="${Q4.id}"]`);
+        await wait('!!document.querySelector(".sheet [data-reject-reason]")', '153 驳回弹窗');
+        await check('153 带 --base 的任务驳回弹窗：说明是 rejectNote(base-x)', `document.querySelector('.sheet .sheet-f .note').textContent === ${jsonStr(w.rejectNote('base-x'))}`);
+        await type('[data-reject-reason]', 'base follow check');
+        await press('.sheet [data-sheet-btn="1"]');
+        await wait(`!document.querySelector('.sheet') && !document.querySelector('[data-acc="${Q4.id}"]')`, '153 驳回成功：弹窗关闭、列表移除这一项', 60000);
 
         // ---- 准备失败 ----
         console.log('验收检查进度：排队检查完成，开始准备失败');
@@ -928,6 +1057,10 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await check('UI24 132 批准并推送成功的 toast：wt.mergedPushed(任务名, main, origin)，仍带“撤销说明”', `(() => { const t = document.querySelector('.toast'); return t.getAttribute('role') === 'status' && ${toastText} === ${jsonStr(w.mergedPushed(tQ1.title, 'main', 'origin'))} && t.querySelector('[data-acc-undo]')?.textContent === ${jsonStr(w.undoHelp)}; })()`);
         await shots('accept-merged-pushed');
 
+        // 154（D86）：PU1、PU2 的改动范围（src/**）和刚合并的 Q1 重叠，批准 Q1 后它们自动按新基线重跑门禁；等它们回到待验收再继续（重跑不推送，裸仓库不变）。
+        await untilRerun(PU1.id, Q1.id, 'awaiting');
+        await untilRerun(PU2.id, Q1.id, 'awaiting');
+
         // ---- PU1：取消勾选再批准 → 只合并不推送（传 --no-push），裸仓库不变 ----
         const tPU1 = taskOf(PU1.id)!;
         await selectAccept(PU1.id);
@@ -947,6 +1080,9 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         });
         await check('UI24 132 取消勾选后的 toast 是普通的已合并提示（w.mergedToast 的样子，不提“并推送”与“推送失败”，任务名里的“推送”二字不算）', `${toastText}.startsWith(${jsonStr(`已合并「${tPU1.title}」到 main：`)}) && ${toastText}.endsWith(${jsonStr(sha7(String(pu1Merge.merge)))}) && !${toastText}.includes('并推送') && !${toastText}.includes('推送失败')`);
 
+        // 154（D86）：批准 PU1 后，PU2（仍待验收、范围重叠）又自动按新基线重跑一次门禁；等它回到待验收。
+        await untilRerun(PU2.id, PU1.id, 'awaiting');
+
         // ---- PU2：远程不可达 → 合并成功、推送失败；提示带“去项目页”，任务照常离开验收列表 ----
         const tPU2 = taskOf(PU2.id)!;
         git(repo, ['remote', 'set-url', 'origin', path.join(root, 'no-such-remote', 'origin.git')]);
@@ -962,7 +1098,8 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await verify('UI24 132 推送失败不影响合并：main 多了合并提交、任务已 accepted，push 事件 ok: false 带 code；裸仓库没变', async () => {
             assert.notEqual(mainOf(), mainBeforePU2);
             assert.equal(pu2Merge.merge, mainOf());
-            assert.equal(git(repo, ['rev-list', '--count', '--merges', `${mainBeforePU2}..${mainOf()}`]), '1');
+            // D86：批准 PU1 后 PU2 自动合并主分支重跑门禁，任务分支自带合并提交；只沿 main 主线数，仍断言恰好一个。
+            assert.equal(git(repo, ['rev-list', '--count', '--merges', '--first-parent', `${mainBeforePU2}..${mainOf()}`]), '1');
             assert.equal(pu2Push.ok, false);
             assert.equal(typeof pu2Push.code, 'string');
             assert.equal(originMain(), originBeforePU2);
@@ -981,6 +1118,98 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         await press('[data-pj=remote-push]');
         await wait(`!!document.querySelector('[data-pj-remote=same]') && document.querySelector('[data-pj=remote-refresh]')?.disabled === false`, 'UI24 132 在项目页重试推送后同步', 60000);
         await verify('UI24 132 在项目页重试推送：之前没推上去的两个合并提交都到了裸仓库', () => { assert.equal(originMain(), mainOf()); });
+
+        // ================= 171：参数来源、与待验收任务重叠的提示、验收页按重叠分组 =================
+        // 新建项目 overlap-sample 和三个真实任务：ov-first、ov-second 的改动范围都是 src/**（重叠），ov-third 只改 docs/ov3/**（不重叠）。
+        // 验收命令里的 hold-gate.mjs 等放行文件出现才退出：先放行让三个任务都进待验收，再收回放行文件，批准 ov-first 之后 ov-second 自动按新基线重跑门禁，就会停在“门禁中”，界面才看得到那一行。
+        console.log('验收检查进度：开始参数来源与重叠分组（171）');
+        const repoO = path.join(root, 'overlap-sample');
+        await initRepo(repoO, 'overlap-sample', []);
+        await writeFile(path.join(repoO, 'hold-gate.mjs'), ["import { existsSync } from 'node:fs';", `while (!existsSync(${jsonStr(ovGateFlag)})) await new Promise(resolve => setTimeout(resolve, 100));`, ''].join('\n'));
+        const ovSpec = (id: number, title: string, verify: string[], paths: string, front: string[] = []) => ['---', `id: ${id}`, `title: ${title}`, 'type: code', 'allowed_paths:', `  - ${paths}`, 'verify:', ...verify.map(line => `  - ${line}`), 'max_retries: 0', ...front, '---', '', '## 目标', '', `${title}：重叠分组检查用的任务。`, '', '## 范围 / 不做什么', '', `只改 ${paths}。`, ''].join('\n');
+        await writeFile(path.join(repoO, 'docs', 'specs', '111-重叠一.md'), ovSpec(971, '重叠任务一', ['git cat-file -e HEAD:src/ov1.txt', 'node hold-gate.mjs'], 'src/**'));
+        await writeFile(path.join(repoO, 'docs', 'specs', '112-重叠二.md'), ovSpec(972, '重叠任务二', ['git cat-file -e HEAD:src/ov2.txt', 'node hold-gate.mjs'], 'src/**', ['model: m-spec', 'effort: high']));
+        await writeFile(path.join(repoO, 'docs', 'specs', '113-不重叠.md'), ovSpec(973, '不重叠任务', ['git cat-file -e HEAD:docs/ov3/n.txt'], 'docs/ov3/**'));
+        git(repoO, ['add', '--', 'hold-gate.mjs', 'docs/specs']);
+        git(repoO, ['commit', '-m', '任务说明与验收脚本', '--', 'hold-gate.mjs', 'docs/specs']);
+        await core(['projects', 'add', repoO]);
+        registered.push(repoO);
+        await writeConfig(2);
+        await writeFile(ovGateFlag, 'go\n');
+        // ov-first 用命令行给了模型与推理强度（来源：命令行）；ov-second 的模型与推理强度写在任务说明里（来源：任务说明）。
+        const OV1 = await dispatchTask('111-重叠一', 'ov-first', 'ovp1', repoO, ['--model', 'ov-model-1', '--effort', 'high']);
+        await untilState(OV1.id, 'awaiting', 150000);
+        const OV2 = await dispatchTask('112-重叠二', 'ov-second', 'ovp2', repoO);
+        await untilState(OV2.id, 'awaiting', 150000);
+        const OV3 = await dispatchTask('113-不重叠', 'ov-third', 'ovp3', repoO);
+        await untilState(OV3.id, 'awaiting', 150000);
+        const overlaps = await core(['overlaps', '--project', repoO], repoO) as { groups: { tasks: { id: string; name: string }[]; order: string[]; why: string }[] };
+        await verify('171 核心：start 记了参数来源；ov-second 的清单有 overlap-note（对方是 ov-first），ov-first 和 ov-third 没有；ar overlaps 把 ov-first、ov-second 放一组（先派发的在前），ov-third 不在任何组里', async () => {
+            assert.deepEqual((await eventsOf(OV1.id)).find(r => r.event === 'start').settingSources, { model: '命令行', effort: '命令行' });
+            assert.deepEqual((await eventsOf(OV2.id)).find(r => r.event === 'start').settingSources, { model: '任务说明', effort: '任务说明' });
+            const note = (await eventsOf(OV2.id)).find(r => r.event === 'overlap-note');
+            assert.ok(note, 'ov-second 应有 overlap-note');
+            assert.deepEqual(note.with.map((x: { id: string }) => x.id), [OV1.id]);
+            for (const task of [OV1, OV3]) assert.ok(!(await eventsOf(task.id)).some(r => r.event === 'overlap-note'), `${task.name} 不该有 overlap-note`);
+            assert.equal(overlaps.groups.length, 1);
+            assert.deepEqual(overlaps.groups[0].order, [OV1.id, OV2.id]);
+            assert.ok(!JSON.stringify(overlaps.groups).includes(OV3.id));
+        });
+        const ovGroup = overlaps.groups[0];
+        const ovOrder = w.overlapOrder(ovGroup.tasks.map(x => x.name).join(' → '));
+        const sourceText = (key: string) => c.fromSource(c.sourceLabels[key]);
+        // ---- 参数标签：每个值后面写来源 ----
+        await selectTask(OV1.id);
+        await press('.dtabs [data-tab=params]');
+        await wait(`!!document.querySelector('.tab-body .rows .r')`, '171 ov-first 的参数标签');
+        const paramValue = (k: string) => `(() => [...document.querySelectorAll('.tab-body .rows .r')].find(r => r.querySelector('.k').textContent === ${jsonStr(k)})?.querySelector('.v').textContent)()`;
+        await check('171 参数标签：命令行给的模型与推理强度，值后面写「（来自单次派发）」（来源与 start.settingSources 对应）', `${paramValue(c.model)} === ${jsonStr('ov-model-1' + sourceText('cli'))} && ${paramValue(c.effort)} === ${jsonStr('high' + sourceText('cli'))}`);
+        await selectTask(OV2.id);
+        await press('.dtabs [data-tab=params]');
+        await wait(`!!document.querySelector('.tab-body .rows .r')`, '171 ov-second 的参数标签');
+        await check('171 参数标签：任务说明给的模型与推理强度，值后面写「（来自任务说明）」', `${paramValue(c.model)} === ${jsonStr('m-spec' + sourceText('spec'))} && ${paramValue(c.effort)} === ${jsonStr('high' + sourceText('spec'))}`);
+        // ---- 与待验收任务重叠的提示：任务页 ----
+        await press('.dtabs [data-tab=flow]');
+        await wait(`!!document.querySelector('.banner-holder [data-overlap-note]')`, '171 任务页出现重叠提示行', 20000);
+        await check('171 任务页：ov-second 的详情里一行 tag info「与待验收的 ov-first 改动范围重叠…」', `(() => { const lines = [...document.querySelectorAll('.banner-holder [data-overlap-note] .tag.info')].map(x => x.textContent); return lines.length === 1 && lines[0] === ${jsonStr(c.overlapAwaiting(OV1.name))}; })()`);
+        await selectTask(OV1.id);
+        await check('171 任务页：ov-first（没有 overlap-note）详情里没有重叠提示行', `!document.querySelector('[data-overlap-note]')`);
+        // ---- 验收页：按重叠分组 ----
+        await goAccept();
+        await wait(`!!document.querySelector('[data-acc="${OV1.id}"]')?.closest('[data-ov-group]')`, '171 验收页把 ov-first 放进重叠组', 30000);
+        await check('171 验收页：ov-first、ov-second 成一组，组上方是 wt.overlapGroupTitle 与 wt.overlapOrder(顺序)，下面是核心给的 why（都等于 ar overlaps --json 的结果）；ov-third 不在组里', `(() => { const g = document.querySelector('[data-acc="${OV1.id}"]').closest('[data-ov-group]'); const third = document.querySelector('[data-acc="${OV3.id}"]'); return [...g.querySelectorAll('[data-acc]')].map(x => x.dataset.acc).join() === ${jsonStr([OV1.id, OV2.id].join())} && g.querySelector('[data-ov-title]').textContent === ${jsonStr(w.overlapGroupTitle)} && g.querySelector('[data-ov-order]').textContent === ${jsonStr(ovOrder)} && g.querySelector('[data-ov-why]').textContent === ${jsonStr(ovGroup.why)} && !!third && !third.closest('[data-ov-group]'); })()`);
+        await shots('accept-overlap-group');
+        await selectAccept(OV2.id);
+        await check('171 验收页：ov-second 的概览顶部一行 tag info「与待验收的 ov-first 改动范围重叠…」', `(() => { const lines = [...document.querySelectorAll('.detail.acc .tab-body [data-overlap-note] .tag.info')].map(x => x.textContent); return lines.length === 1 && lines[0] === ${jsonStr(c.overlapAwaiting(OV1.name))}; })()`);
+        await shots('accept-overlap-note');
+        await selectAccept(OV1.id);
+        await check('171 验收页：ov-first 没有重叠提示行', `!document.querySelector('.detail.acc [data-overlap-note]')`);
+        // ---- 批准第一个：第二个自动按新基线重跑门禁，回到“门禁中” ----
+        await rm(ovGateFlag, { force: true });
+        await press('[data-acc-approve]');
+        await wait('!!document.querySelector(".confirm-card")');
+        await press('.confirm-actions .btn.primary');
+        await wait(`!document.querySelector('[data-acc="${OV1.id}"]') && !!document.querySelector('.toast')`, '171 批准 ov-first 成功：列表移除这一项并出现 toast', 90000);
+        await untilState(OV2.id, 'gating', 90000);
+        await verify('171 批准 ov-first 之后：ov-second 的 resume 带 reason: after-merge 与 ov-first 的 id，ov-third（不重叠）没有被重跑', async () => {
+            const resume = (await eventsOf(OV2.id)).findLast(r => r.event === 'resume');
+            assert.equal(resume?.reason, 'after-merge');
+            assert.equal(resume?.after, OV1.id);
+            assert.ok(!(await eventsOf(OV3.id)).some(r => r.event === 'resume'));
+        });
+        await check('171 门禁中的 ov-second 不在验收页列表里，ov-third 还在、不在任何组里', `!document.querySelector('[data-acc="${OV2.id}"]') && !!document.querySelector('[data-acc="${OV3.id}"]') && !document.querySelector('[data-acc="${OV3.id}"]').closest('[data-ov-group]')`);
+        await selectTask(OV2.id);
+        await wait(`!!document.querySelector('.banner-holder [data-overlap-note]')`, '171 任务页出现合并后重跑门禁的提示行', 20000);
+        await check('171 任务页：ov-second 回到门禁中（清单状态 gating），详情里只有一行 tag info，内容是 c.rebaseAfterMerge(ov-first)（ov-first 已合并，不再写 c.overlapAwaiting）', `(() => { const lines = [...document.querySelectorAll('.banner-holder [data-overlap-note] .tag.info')].map(x => x.textContent); return lines.length === 1 && lines[0] === ${jsonStr(c.rebaseAfterMerge(OV1.name))}; })()`);
+        await shots('wt-rebase-after-merge');
+        // 放行门禁：ov-second 回到待验收，重跑那一行消失（说的是“正在重跑”），验收页里它不再和谁成组。
+        await writeFile(ovGateFlag, 'go\n');
+        await untilState(OV2.id, 'awaiting', 90000);
+        await goAccept();
+        await wait(`!!document.querySelector('[data-acc="${OV2.id}"]')`, '171 ov-second 重新出现在验收页', 20000);
+        await selectAccept(OV2.id);
+        await check('171 重跑完回到待验收：ov-second 不再和谁成组', `!document.querySelector('[data-acc="${OV2.id}"]').closest('[data-ov-group]')`);
+        await check('171 重跑完回到待验收：ov-second 概览里没有重叠提示行', `!document.querySelector('.detail.acc [data-overlap-note]')`);
 
         // ================= T116（Stage07 116）：项目从列表移除后，它的待验收任务不卡死 =================
         // 甲项目（gone-a）有三个待验收任务：G1（驳回）、G2（重新添加项目）、G4（调研类，确认）；丙项目（gone-missing）的 G3 用来查文件夹被删的情况。
@@ -1118,6 +1347,7 @@ export async function captureAccept(h: Harness, registry: Registry, out: string,
         if (await evaluate('!!document.querySelector(".sheet, .confirm-overlay")').catch(() => false)) await key('Escape').catch(() => { });
         await writeFile(resolveFlag, 'go\n').catch(() => { });
         await writeFile(holdFlag, 'go\n').catch(() => { });
+        await writeFile(ovGateFlag, 'go\n').catch(() => { });
         await endDemo().catch(() => { });
         // 真实任务也藏起来（它们是这次检查自己建的，后面的检查不该看到）。
         const hidden = await hiddenOf().catch(() => [] as string[]);

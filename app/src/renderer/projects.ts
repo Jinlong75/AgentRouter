@@ -423,7 +423,15 @@ export class ProjectsView {
                             : r.state === 'diverged' ? [bmark('fail'), pj.remoteDiverged(ahead, behind), ''] as const
                                 : [bmark('info'), pj.remoteNotFetched, ''] as const;
         const rows = `<div class="rows remote" data-pj-remote="${esc(r.state ?? 'unknown')}"><div class="r"><span class="k mono">${esc(remote)}</span><span class="v"><span class="mono">${esc(r.url ?? '')}</span></span></div><div class="r">${mark}<span class="v">${esc(line)}</span><span class="sp"></span>${button}</div></div>`;
-        return `<div class="sec-t">${esc(pj.remoteSec)}<span class="sp"></span>${refresh}</div>${rows}${this.remoteNoticeHtml(failed, mine ? this.remoteNote : '', branch, remote)}`;
+        return `<div class="sec-t">${esc(pj.remoteSec)}<span class="sp"></span>${refresh}</div>${rows}${r.state === 'diverged' ? this.divergedHow(s.path) : ''}${this.remoteNoticeHtml(failed, mine ? this.remoteNote : '', branch, remote)}`;
+    }
+    // 分叉时的做法（155 B8）：两条命令各带说明和"复制命令"，复制的是带项目路径的完整命令（在哪个目录里粘贴都行）。软件仍不替用户合并。
+    private divergedHow(path: string): string {
+        const row = (cmd: string, help: string) => {
+            const full = `git -C "${path}" ${cmd.replace(/^git /, '')}`;
+            return `<div class="r" data-pj-diverged-cmd><span class="v mono">${esc(cmd)}</span><span class="v muted">${esc(help)}</span><button class="btn sm" data-pj="remote-copy" data-pj-copy="${esc(full)}">${esc(pj.pushCopyCommand)}</button></div>`;
+        };
+        return `<div class="dv-how" data-pj-diverged><div class="r"><span class="v">${esc(pj.remoteDivergedHow)}</span></div>${row(pj.remoteDivergedRebase, pj.remoteDivergedRebaseHelp)}${row(pj.remoteDivergedMerge, pj.remoteDivergedMergeHelp)}</div>`;
     }
     // 成功提示与失败横幅（在远程一节下面）。
     private remoteNoticeHtml(f: RemoteFailure | null, note: string, branch: string, remote: string): string {
@@ -431,6 +439,8 @@ export class ProjectsView {
             const noCredential = f.code === 'NO_CREDENTIAL';
             // 刷新失败没有专门的标题：用普通的失败行。
             if (f.op === 'refresh') return errorLine(noCredential ? pj.pushNoCredential : f.text);
+            // GitHub 的邮箱隐私拒绝（GH007，155 W2）：console 通道把被拒的邮箱放在 text 里；右边按钮打开"设置 git 提交身份"。不改已有提交。
+            if (f.op === 'push' && f.code === 'EMAIL_PRIVACY') return banner('fail', pj.pushFailedTitle, (f.text ? pj.pushEmailPrivacy(f.text) : pj.pushEmailPrivacyNoEmail), `<button class="btn sm" data-pj="identity" ${this.busy ? 'disabled' : ''}>${esc(pj.pushEmailPrivacyAction)}</button>`);
             const copy = noCredential ? `<button class="btn sm" data-pj="remote-copy" data-pj-copy="${esc(`git push ${remote} ${branch}`)}">${esc(pj.pushCopyCommand)}</button>` : '';
             return banner('fail', f.op === 'push' ? pj.pushFailedTitle : pj.pullFailedTitle, noCredential ? pj.pushNoCredential : pj.pushFailedHelp(f.text.replace(/[。.]+$/, '')), copy);
         }

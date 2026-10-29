@@ -11,6 +11,7 @@ import { parseJson, readJson } from './json.mjs';
 import { git as bigGit, gitVersion, gitTooOldMessage, requireModernGit } from './git.mjs';
 import { remoteNameValid, remoteSummary } from './push.mjs';
 import { projectLeftovers } from './gc.mjs';
+import { validateReviewSetting } from './config.mjs';
 
 export const BEGIN = '<!-- agent-router:begin -->', END = '<!-- agent-router:end -->';
 const templateDir = fileURLToPath(new URL('../templates/', import.meta.url));
@@ -248,11 +249,13 @@ function applyProjectSetting(config, root, key, value) {
       config.baseBranch = value;
       return;
     }
-    case 'setup': case 'verify': case 'allowedPaths': {
+    // 独占命令（并行调度 140）：验收命令和其中某条完全相同的门禁独占运行；可以是空数组，模板里不带这个键。
+    case 'setup': case 'verify': case 'allowedPaths': case 'exclusiveCommands': {
       let list;
       try { list = JSON.parse(value); } catch { throw new Error(`${key} 必须是 JSON 字符串数组`); }
       if (!Array.isArray(list) || list.some(item => typeof item !== 'string' || !item || item.includes('\n'))) throw new Error(`${key} 必须是 JSON 字符串数组，每项非空且不含换行`);
       if (key === 'allowedPaths' && !list.length) throw new Error('allowedPaths 不能为空数组');
+      if (key === 'exclusiveCommands' && list.some(item => item.trim() === '')) throw new Error('exclusiveCommands 每项都不能为空');
       config[key] = list;
       return;
     }
@@ -280,6 +283,16 @@ function applyProjectSetting(config, root, key, value) {
       const [min, max] = key === 'maxRetries' ? [0, 5] : [1, 240];
       if (!/^\d+$/.test(value) || Number(value) < min || Number(value) > max) throw new Error(`${key} 必须是 ${min}～${max} 的整数（留空表示删掉）：${value}`);
       config[key] = Number(value);
+      return;
+    }
+    // 审查设置（Stage08 T3）：值是 JSON 对象 {"default":…,"block":…,"maxReworks":…}，与全局 config.json 的 review 同一份校验；留空表示删掉。
+    case 'review': {
+      if (value === '') { delete config.review; return; }
+      let review;
+      try { review = JSON.parse(value); } catch { throw new Error('review 必须是 JSON 对象，例如 {"default":true,"block":"high","maxReworks":1}（留空表示删掉）'); }
+      if (review === null || typeof review !== 'object' || Array.isArray(review)) throw new Error('review 必须是 JSON 对象，例如 {"default":true,"block":"high","maxReworks":1}（留空表示删掉）');
+      validateReviewSetting(review, '项目配置的 review');
+      if (Object.keys(review).length) config.review = review; else delete config.review;
       return;
     }
     case 'mergeMode': {

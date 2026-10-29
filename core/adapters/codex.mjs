@@ -66,6 +66,9 @@ export function mapLine(line, { root }) {
   }
 }
 
+// 最后的结果事件（执行者不自行退出的兜底，runner.mjs）：turn.completed（映射为 turn）；Codex 的失败（turn.failed / error）会自己退出，不算结果。
+const finalResult = batch => (batch.some(e => e.kind === 'turn') ? { ok: true } : null);
+
 // 值写成 TOML 基本字符串：JSON.stringify 的结果（引号、反斜杠、控制字符的转义）就是合法的 TOML 基本字符串。
 const toml = value => JSON.stringify(String(value));
 
@@ -127,6 +130,7 @@ export const codex = {
     return { executable: launcher.executable, args, stdin: prompt };
   },
   mapLine,
+  finalResult,
   // 订阅登录（auth: login）的状态：codex login status 的输出（与软件 Agent 页同一判断）。
   loginStatus({ env = process.env, detection, tracePrefix } = {}) {
     if (!detection?.launcher) return 'unknown';
@@ -142,6 +146,10 @@ export const codex = {
   },
   failureHint(stderr) {
     if (/Not inside a trusted directory/i.test(stderr)) return '当前目录不是 git 仓库，Codex 拒绝运行。在项目目录里先运行 git init，或换到已有的 git 仓库再派发。';
+    // 限流 / 额度（Stage07c T7）。原文出处：openai/codex 的 codex-rs/protocol/src/error.rs（UsageLimitReachedError、QuotaExceeded、RateLimitExceeded 等的 Display）：
+    // "You’ve hit your usage limit. … Try again at 3:15 PM."、"Quota exceeded. Check your plan and billing details."、"exceeded retry limit, last status: 429 Too Many Requests"。
+    if (/usage limit|hit your .{0,40}limit|quota exceeded/i.test(stderr)) return 'Codex 的使用额度已用完：等额度恢复，或换别的执行者';
+    if (/\b429\b|rate[ _-]?limit|too many requests/i.test(stderr)) return '请求过于频繁，被限流；稍后重试或降低并发';
     return null;
   },
 };

@@ -2,15 +2,17 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：v0.7.0。本仓库仅包含运行、构建与测试所需的文件。
+> 状态：v0.8.0 开发分支（尚未发布）。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: v0.7.0. This repository contains only the files needed to run, build and test the project.
+> Status: v0.8.0 development branch (not released). This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 
+主导不必使用Claude Code：能读取项目约定并调用`ar`的交互式Agent也可以手动在项目目录工作。当前软件的一键启动入口仅支持Claude Code，选择其他主导的启动入口尚待交付；角色设置不会切换已运行的会话。
+
 ### 项目介绍
 
-AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Agent（Claude Code）当主导，负责方案、拆解、验收；能写清楚要求的执行工作，路由给便宜或专长的 Agent（DeepSeek、Xiaomi MiMo、Codex 等）。软件是统一调度中心：导入 Agent、添加项目、新建任务派发、查看进度与汇报、停止与再派一次，都能在软件里完成。
+AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：用户选定的强 Agent 当主导，负责方案、拆解、验收；能写清楚要求的执行工作，路由给便宜或专长的 Agent（DeepSeek、Xiaomi MiMo、Codex 等）。软件是统一调度中心：导入 Agent、添加项目、新建任务派发、查看进度与汇报、停止与再派一次，都能在软件里完成。
 
 本项目基于 [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5（MIT）。
 
@@ -29,7 +31,9 @@ AgentRouter 是一个 Windows 桌面软件加一组 Claude Code 技能：强 Age
 | 自动重试与升级：失败原因交回执行者、同一工作区再试，每次尝试留档；`ar retry` 与软件"重试"、尝试切换与重试历史 | ✅ |
 | worktree 隔离、并行与验收合并：每个任务独立的 worktree 与分支、准备命令、并行与排队、验收页、`ar diff · accept · reject · gc · status`；执行者需要越界时停下、工作区外写入检查；任务评分（`ar report`）；任务与项目的搜索排序 | ✅ |
 | 接入与路由：通用适配器（零代码接入任意 CLI Agent：导入向导填表、"测试并预览"、声明导出与导入）；Qoder（国内版 / 国际版）与 OpenAI 兼容接口预设；导入与编辑时选模型、推理强度和"升级到"；按任务类型自动选执行者的路由页（规则、兜底、试算、每日上限）；调研 / 审查任务只读运行与"确认"；设置页网络代理；门禁失败可归因到环境；合并主分支后重跑门禁 | ✅ |
-| 软件里提交、推送与拉取、撤销合并；交叉审查 | 🚧 计划中 |
+| 项目的 git 操作：软件里提交、推送与快进拉取（从不强制推送）、批准时合并后推送、撤销合并；项目配置"高级"区；更新协作约定；归档任务说明 | ✅ |
+| 执行者与路由增强：导入与编辑时从账号实际可用的列表选模型与推理强度（导入前就能查）、Codex 编辑改成表单式；"可担任"（主导 / 执行者 / 审查者）与模型家族；路由页按你的执行者生成建议规则、一键采用；任务说明与路由规则可以写推理强度和模型，参数标签写明来源；额度用完 / 限流时自动换人并标"额度到 HH:MM 恢复"，便宜执行者最后一次重试换强执行者；并行调度（自动档按 CPU 与内存、改动范围重叠时排队、独占命令）；与待验收任务改动重叠时提示，合并后自动按新基线重跑门禁；执行者给出结果后不退出时自动收尾 | ✅ |
+| 交叉审查：门禁通过后按用户配置的身份和模型家族约束选择审查者，只读审查，问题按严重度列出；验收页与任务详情的"审查"标签（成立 / 不成立、跳到改动里的那一行、再审一次）、轨道节点与列表徽标；默认只建议，可选高严重度拦截与自动返工；审查者准确率；评分加审查者一组 | ✅ |
 
 ### 技术栈
 
@@ -126,11 +130,11 @@ verify:
 
 项目配置 `.agent-router/project.json` 写了 `"worktree": true` 时（`ar init` 生成的配置默认如此），用任务说明派发的任务不在你的工作区里改代码：
 
-1. **独立的 worktree 与分支**：每个任务在项目外的 git worktree 里运行（Windows 默认在 `%LOCALAPPDATA%\agent-router\wt\`），分支是 `ar/<记录名>`，基线是项目配置的主分支 `baseBranch`。执行者碰不到你的工作区，你可以照常写代码。任务说明要先提交到主分支，执行者才看得到它。
+1. **独立的 worktree 与分支**：每个任务在项目外的 git worktree 里运行（Windows 默认在 `%LOCALAPPDATA%\agent-router\wt\`），分支是 `ar/<记录名>`，基线是项目配置的主分支 `baseBranch`。执行者默认在独立 worktree 中工作，你可以继续编辑主工作区；worktree 本身不构成操作系统权限隔离，实际访问边界取决于执行者的沙箱与权限配置。任务说明要先提交到主分支，执行者才看得到它。
 2. **准备命令**：新 worktree 里没有依赖。项目配置的 `setup`（例如 `["npm ci"]`）在 worktree 建好后逐条运行。失败时执行者不启动，worktree 留着供排查；修好后点"重试"会重跑准备命令，不要这个任务了就驳回。
-3. **并行与排队**：同时运行的任务默认最多 2 个，可以在设置页"并行"或 `config.json` 的 `concurrency` 里改（1～4）。多出来的任务排队，轮到时自动开始。门禁同一时间只跑一个，免得互相拖慢。
+3. **并行与排队**：同时运行的任务默认最多 2 个，可以在设置页"并行"或 `config.json` 的 `concurrency` 里改（1～8，或"自动"：按 CPU 核数与可用内存估算，机器正忙时暂停启动新任务）。多出来的任务排队，轮到时自动开始。门禁同一时间只跑一个，免得互相拖慢。
 4. **待验收**：门禁通过后任务进入"待验收"，改动还在任务自己的分支里。在软件的"验收"页看概览、改动和门禁结果，然后选一个：
-   - **批准并合并**（`ar accept <记录名>`）：在主分支上新建一个合并提交（`--no-ff`；项目配置写 `"mergeMode": "squash"` 时压成一个提交），然后删除 worktree 与分支。撤销整个任务用 `git revert -m 1 <合并提交>`。主工作区必须在主分支上而且干净，否则什么都不改，并说明原因。
+   - **批准并合并**（`ar accept <记录名>`）：在主分支上新建一个合并提交（`--no-ff`；项目配置写 `"mergeMode": "squash"` 时压成一个提交），然后删除 worktree 与分支。撤销整个任务：任务详情里点"撤销这次合并…"，或 `ar revert <记录名>`（只追加一个反向提交）。主工作区必须在主分支上而且干净，否则什么都不改，并说明原因。
    - **驳回**（`ar reject <记录名> --reason "…"`）：写明原因，删除 worktree；分支可以选择保留。
    - **重试**：和失败后的手动重试一样，在同一个 worktree 里继续。
 5. **合并冲突**：批准时如果和主分支上的新提交冲突，会撤回这次合并，主分支不变，任务标为"合并冲突"。"解决冲突并重试"（`ar retry <记录名> --rebase`）在 worktree 里合并主分支：没有冲突就重新跑门禁；有冲突就让执行者解决、再跑门禁，之后回到待验收。
@@ -174,9 +178,11 @@ npm run fonts            # 从官方来源取界面字体（不进仓库）
 
 ## English
 
+The lead does not have to use Claude Code: another interactive agent can work in the project directory if it can read the project conventions and invoke `ar`. The app currently launches only Claude Code with one click; launch selection for other tools is planned. Assigning the lead role does not switch a running session.
+
 ### Introduction
 
-AgentRouter is a Windows desktop app plus a set of Claude Code skills. A strong agent (Claude Code) leads: it plans, breaks down work and reviews results, and routes clearly specified execution work to cheaper or specialised agents (DeepSeek, Xiaomi MiMo, Codex and others). The app is the dispatch console: import agents, add projects, dispatch new tasks, follow progress and reports, stop or re-dispatch — all from the app.
+AgentRouter is a Windows desktop app plus a set of Claude Code skills. A user-selected strong agent leads: it plans, breaks down work and reviews results, and routes clearly specified execution work to cheaper or specialised agents (DeepSeek, Xiaomi MiMo, Codex and others). The app is the dispatch console: import agents, add projects, dispatch new tasks, follow progress and reports, stop or re-dispatch — all from the app.
 
 Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 
@@ -195,7 +201,9 @@ Based on [DispatchDock](https://github.com/LBEILC/DispatchDock) v0.1.5 (MIT).
 | Automatic retry and escalation: failures handed back to the worker, retried in the same tree, every attempt kept; `ar retry` and Retry in the app, attempt switcher and retry history | ✅ |
 | Worktree isolation, parallel runs and accept/merge: one worktree and branch per task, setup commands, parallel runs and a queue, an Accept page, `ar diff · accept · reject · gc · status`; stop when the scope is too narrow, check for writes outside the working tree; task scores (`ar report`); search and sort for tasks and projects | ✅ |
 | Adding agents and routing: a generic adapter (any CLI agent without code — fill in a form in the import wizard, "Test and preview", export and import declarations); Qoder (China / international) and OpenAI-compatible presets; pick a model, reasoning effort and an escalation target when importing or editing; a Routing page that picks the worker by task type (rules, fallback, try-out, daily limits); read-only research and review tasks with Confirm; a network proxy setting; gate failures can be blamed on the environment; re-run the gate after merging the main branch | ✅ |
-| Commit, push and pull, and revert a merge in the app; cross review | 🚧 Planned |
+| Project git operations: commit, push and fast-forward pull (never a force push), push after merging when approving, and revert a merge in the app; an Advanced section in the project config; update the collaboration conventions; archive task specs | ✅ |
+| Better agents and routing: pick a model and reasoning effort from what your account can actually use when importing or editing (even before importing), and a form-style Codex editor; "Can act as" (lead / worker / reviewer) and model families; the Routing page suggests rules from your agents and adopts them in one click; task specs and routing rules can set reasoning effort and model, and the parameter tag shows where each value came from; switch agents automatically on quota or rate limits and mark "quota back at HH:MM", and move the last retry of a cheap worker to a strong one; parallel scheduling (automatic by CPU and memory, queue when changed files overlap, exclusive commands); warn when a task overlaps one awaiting acceptance and re-run its gate on the new base after a merge; clean up a worker that stays running after giving its result | ✅ |
+| Cross review: after the gate passes, a reviewer selected under the configured identity and model-family constraints reviews the change read-only and lists issues by severity; a Review tab on the Accept page and in task details (valid / invalid, jump to the changed line, review again), a track node and list badges; advisory by default, with optional blocking on high severity and automatic rework; reviewer accuracy; a reviewer group in the score | ✅ |
 
 ### Tech stack
 
@@ -292,11 +300,11 @@ A task dispatched from a spec does not fail on its first miss. AgentRouter tries
 
 When the project config `.agent-router/project.json` sets `"worktree": true` (the default in configs created by `ar init`), a task dispatched from a spec never edits your working tree:
 
-1. **Its own worktree and branch**: each task runs in a git worktree outside the project (on Windows, under `%LOCALAPPDATA%\agent-router\wt\` by default), on branch `ar/<name>`, based on the project's main branch `baseBranch`. The worker cannot touch your working tree, so you can keep coding. Commit the spec to the main branch first, or the worker cannot see it.
+1. **Its own worktree and branch**: each task runs in a git worktree outside the project (on Windows, under `%LOCALAPPDATA%\agent-router\wt\` by default), on branch `ar/<name>`, based on the project's main branch `baseBranch`. The worker runs in a separate worktree, so you can keep coding in your main working tree. A worktree is not an operating-system sandbox; access restrictions depend on the agent and its permission settings. Commit the spec to the main branch first, or the worker cannot see it.
 2. **Setup commands**: a new worktree has no dependencies. The project's `setup` commands (for example `["npm ci"]`) run one by one after the worktree is created. If one fails, the worker does not start and the worktree is kept for inspection. Fix the command and click Retry to run setup again, or reject the task if you no longer need it.
-3. **Parallel runs and the queue**: by default up to 2 tasks run at the same time. Change this under Parallel in Settings or with `concurrency` in `config.json` (1–4). Extra tasks wait in a queue and start on their own. Only one gate runs at a time, so gates do not slow each other down.
+3. **Parallel runs and the queue**: by default up to 2 tasks run at the same time. Change this under Parallel in Settings or with `concurrency` in `config.json` (1–8, or "auto": estimated from CPU cores and free memory, pausing new starts while the machine is busy). Extra tasks wait in a queue and start on their own. Only one gate runs at a time, so gates do not slow each other down.
 4. **Awaiting acceptance**: after the gate passes, the task waits for acceptance and its changes stay on its own branch. Review the overview, changes and gate result on the Accept page, then choose one:
-   - **Approve and merge** (`ar accept <name>`): creates one merge commit on the main branch (`--no-ff`; with `"mergeMode": "squash"` in the project config, a single squashed commit), then removes the worktree and the branch. To undo the whole task, run `git revert -m 1 <merge commit>`. The main working tree must be on the main branch and clean; otherwise nothing changes and you are told why.
+   - **Approve and merge** (`ar accept <name>`): creates one merge commit on the main branch (`--no-ff`; with `"mergeMode": "squash"` in the project config, a single squashed commit), then removes the worktree and the branch. To undo the whole task, click "撤销这次合并…" (revert this merge) in the task details or run `ar revert <name>` (it only adds a reverting commit). The main working tree must be on the main branch and clean; otherwise nothing changes and you are told why.
    - **Reject** (`ar reject <name> --reason "…"`): records why and removes the worktree. You can keep the branch.
    - **Retry**: same as a manual retry after a failure, in the same worktree.
 5. **Merge conflicts**: if approving conflicts with newer commits on the main branch, the merge is rolled back, the main branch is unchanged and the task is marked as a merge conflict. Resolve and retry (`ar retry <name> --rebase`) merges the main branch into the worktree: with no conflict the gate runs again; with a conflict the worker resolves it, the gate runs again, and the task comes back for acceptance.

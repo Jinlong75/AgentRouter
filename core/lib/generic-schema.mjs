@@ -6,7 +6,7 @@ export const KINDS = ['say', 'think', 'cmd', 'file', 'plan', 'tool', 'turn', 'er
 export const REPORTS = ['stdout', 'lastSay', 'file'];
 
 const TOP_FIELDS = [
-  'label', 'executable', 'detect', 'args', 'readOnlyArgs', 'stdin', 'env', 'secrets',
+  'label', 'executable', 'detect', 'args', 'readOnlyArgs', 'readOnlyEnv', 'stdin', 'env', 'secrets',
   'output', 'report', 'timeoutMin', 'failureHints',
 ];
 // stream-json：Claude Code 风格的流式 JSON（Claude Code、Qoder 等兼容），由适配器内置映射，不需要 output.map。
@@ -147,13 +147,15 @@ export function validateGeneric(decl, { path = 'generic' } = {}) {
   }
 
   // env / secrets
-  if (decl.env !== undefined) {
-    if (!isObj(decl.env)) err(`${path}.env`, 'env 必须是对象（变量名 → 字符串值）。');
+  // env 与 readOnlyEnv（只读任务额外设置的变量）同一套规则
+  for (const field of ['env', 'readOnlyEnv']) {
+    if (decl[field] === undefined) continue;
+    if (!isObj(decl[field])) err(`${path}.${field}`, `${field} 必须是对象（变量名 → 字符串值）。`);
     else {
-      for (const [k, v] of Object.entries(decl.env)) {
-        if (!VAR_NAME.test(k)) err(`${path}.env.${k}`, `环境变量名 "${k}" 不合法，只能用字母、数字、下划线，且不能以数字开头。`);
-        else if (SECRET_SUFFIX.test(k)) err(`${path}.env.${k}`, `"${k}" 看起来是密钥，请放进 secrets（env 里只存非机密的值）。`);
-        if (!isStr(v)) err(`${path}.env.${k}`, `env.${k} 的值必须是字符串。`);
+      for (const [k, v] of Object.entries(decl[field])) {
+        if (!VAR_NAME.test(k)) err(`${path}.${field}.${k}`, `环境变量名 "${k}" 不合法，只能用字母、数字、下划线，且不能以数字开头。`);
+        else if (SECRET_SUFFIX.test(k)) err(`${path}.${field}.${k}`, `"${k}" 看起来是密钥，请放进 secrets（${field} 里只存非机密的值）。`);
+        if (!isStr(v)) err(`${path}.${field}.${k}`, `${field}.${k} 的值必须是字符串。`);
       }
     }
   }
@@ -224,6 +226,8 @@ export function validateGeneric(decl, { path = 'generic' } = {}) {
           try { new RegExp(h.match, 'i'); } catch (e) { err(`${p}.match`, `match 不是合法的正则表达式：${e.message}`); }
         }
         if (!isStr(h.text) || h.text.trim() === '') err(`${p}.text`, 'text 必须是非空字符串。');
+        // kind（可选）：limit = 限流 / 额度用完，unavailable = 服务不可用 / 网络；命中时派发流程自动换执行者。
+        if (h.kind !== undefined && h.kind !== 'limit' && h.kind !== 'unavailable') err(`${p}.kind`, `kind 只能是 "limit"（限流 / 额度用完）或 "unavailable"（服务不可用 / 网络），现在是 ${JSON.stringify(h.kind)}。`);
       });
     }
   }

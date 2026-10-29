@@ -240,7 +240,12 @@ test('4 拒绝的情况：每种都退出码 2、中文原因、什么都不改'
   const f = fixture(t);
   const refused = async (name, matcher, label, code) => {
     const before = f.snapshot();
-    const count = rows(f.home).length;
+    // 只数被撤销的那个任务自己的事件（别的任务可能在后台自动重跑门禁，也会写事件）。
+    const own = () => {
+      const ids = new Set(rows(f.home).filter(row => row.event === 'start' && row.name === name).map(row => row.id));
+      return rows(f.home).filter(row => ids.has(row.id)).length;
+    };
+    const count = own();
     const result = await f.revert(name);
     assert.equal(result.code, 2, `${label}：${result.stderr}${result.stdout}`);
     const value = JSON.parse(result.stdout);
@@ -248,7 +253,7 @@ test('4 拒绝的情况：每种都退出码 2、中文原因、什么都不改'
     assert.match(value.error, matcher, label);
     if (code) assert.equal(value.code, code, label);
     assert.deepEqual(f.snapshot(), before, `${label}：主工作区什么都没改`);
-    assert.equal(rows(f.home).length, count, `${label}：没有写任何事件`);
+    assert.equal(own(), count, `${label}：被撤销的任务没有写任何事件`);
     return value;
   };
 

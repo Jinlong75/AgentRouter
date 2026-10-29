@@ -33,7 +33,7 @@ test('agents：add → list → disable → enable → remove；--json 只输出
   assert.equal(added.code, 0); assert.equal(added.out.length, 1);
   assert.deepEqual({ ...added.json, secretStatus: added.json.secretStatus }, { ok: true, name: 'deepseek', preset: 'deepseek', madeDefault: true, secrets: ['DEEPSEEK_API_KEY'], secretStatus: { DEEPSEEK_API_KEY: 'set' } });
   // 预设里给界面下拉用的说明字段（modelOptions / effortOptions 等）不写进配置，其余与预设一致。
-  const { modelOptions, effortOptions, ...writtenPreset } = loadPreset('deepseek').profile;
+  const { modelOptions, effortOptions, types, ...writtenPreset } = loadPreset('deepseek').profile;
   assert.ok(modelOptions && effortOptions);
   assert.deepEqual(config().profiles.deepseek, writtenPreset);
   assert.equal(config().defaultProfile, 'deepseek', '有了 DeepSeek 后默认执行者是它');
@@ -109,20 +109,20 @@ test('agents presets --json：按 order 排序，含 title/description/recommend
   const { call } = setup(t);
   const r = await call(['agents', 'presets', '--json']);
   assert.equal(r.code, 0); assert.equal(r.out.length, 1);
-  assert.deepEqual(r.json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'openai-compat']);
+  assert.deepEqual(r.json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'deepseek-harness', 'openai-compat']);
   assert.deepEqual(r.json.presets.filter(p => p.recommended).map(p => p.name), ['deepseek'], '推荐标记只在 DeepSeek 上');
   const deepseek = r.json.presets[0];
-  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Pro', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' },
-    modelOptions: ['deepseek-v4-pro', 'deepseek-v4-flash'], effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'] });
+  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Pro', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, supportsEffort: true,
+    modelOptions: ['deepseek-v4-pro', 'deepseek-v4-flash'], effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'] });
   const codex = r.json.presets.find(p => p.name === 'codex');
-  assert.deepEqual(codex, { name: 'codex', title: 'Codex', description: '用 ChatGPT 登录或 OpenAI API Key', recommended: false, adapter: 'codex', label: 'Codex', auth: 'login', env: {}, secrets: {},
-    effortOptions: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+  assert.deepEqual(codex, { name: 'codex', title: 'Codex', description: '用 ChatGPT 登录或 OpenAI API Key', recommended: false, adapter: 'codex', label: 'Codex', auth: 'login', env: {}, secrets: {}, supportsEffort: true,
+    effortOptions: ['minimal', 'low', 'medium', 'high', 'xhigh'], types: ['code', 'fix', 'refactor'] });
   const compat = r.json.presets.find(p => p.name === 'compat');
   assert.equal(compat.auth, 'token'); assert.equal(compat.recommended, false);
   assert.deepEqual(compat.env, { ANTHROPIC_BASE_URL: '', ANTHROPIC_MODEL: '' });
   assert.deepEqual(compat.secrets, { ANTHROPIC_AUTH_TOKEN: 'COMPAT_API_KEY' });
   const text = await call(['agents', 'presets']);
-  assert.match(text.out.join('\n'), /^可用预设：deepseek、mimo、mimo-payg、claude-native、claude-subscription、compat、codex、qoder-cn、qoder、openai-compat$/);
+  assert.match(text.out.join('\n'), /^可用预设：deepseek、mimo、mimo-payg、claude-native、claude-subscription、compat、codex、qoder-cn、qoder、deepseek-harness、openai-compat$/);
 });
 
 test('预设 mimo / mimo-payg：完整内容与模板文件精确一致', () => {
@@ -130,7 +130,7 @@ test('预设 mimo / mimo-payg：完整内容与模板文件精确一致', () => 
     adapter: 'claude-code', label: 'MiMo V2.6 Pro', enabled: true,
     auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'MIMO_API_KEY' }, maxTurns: null,
     price: { inputPer1M: null, outputPer1M: null, currency: 'CNY' }, recommended: false,
-    effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'],
+    effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'],
     // 导入向导按服务合并卡片用的字段（112）：两个预设同一张卡片、同一个分段标签。
     card: { id: 'mimo', title: 'Xiaomi MiMo', description: '经 Claude Code 外壳运行，Token Plan 或按量付费' },
   };

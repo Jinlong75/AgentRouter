@@ -179,7 +179,7 @@ async function boundedWait(t, f, condition, entries, ms) {
     }
   }
 }
-async function fixture(t, { exit = 0, duration = 150, stderr = '', tree = false } = {}) {
+async function fixture(t, { exit = 0, duration = 150, stderr = '', tree = false, hold = false } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dispatchdock-managed-'));
   const home = path.join(base, 'home'), repo = path.join(base, 'repo'), host = path.join(base, 'host');
   for (const dir of [home, repo, host]) fs.mkdirSync(dir);
@@ -198,7 +198,8 @@ const settings=JSON.parse(fs.readFileSync(path.join(__dirname,'agent.json'),'utf
 ${tree ? "require('node:child_process').spawn(process.execPath,[path.join(__dirname,'descendant.cjs')],{stdio:'ignore',windowsHide:true,shell:false});" : ''}
 fs.writeFileSync(path.join(__dirname,'echo.json'),JSON.stringify({pid:process.pid,args:process.argv.slice(2),prompt,home:process.env.CODEX_HOME,key:process.env.OPENAI_API_KEY}));
 console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'隔离任务正在执行'}}));
-setTimeout(()=>{fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'隔离汇报');if(settings.stderr)process.stderr.write(settings.stderr+'\\n');process.exitCode=settings.exit;},settings.duration);
+const finish=()=>setTimeout(()=>{fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'隔离汇报');if(settings.stderr)process.stderr.write(settings.stderr+'\\n');process.exitCode=settings.exit;},settings.duration);
+${hold ? "const release=path.join(__dirname,'release');const wait=()=>fs.existsSync(release)?finish():setTimeout(wait,50);wait();" : 'finish();'}
 });`);
   const configFile = path.join(home, 'config.json');
   fs.writeFileSync(configFile, JSON.stringify({ v: 1, managed: true, watchWindow: 'never', agents: { codex: { path: agent } } }));
@@ -583,15 +584,18 @@ test('请求校验的派活方取值：claude-code / unknown / agentrouter 合�
 });
 
 test('Windows 实测：终止假派活方整棵进程树，执行者和假 agent 继续到 end', { skip:process.platform!=='win32' }, async t => {
-  const f=await fixture(t,{duration:2500});await f.service();
+  // 175：假派活方与假 agent 都不再按固定时长自己结束：派活方用定时器一直活着（只能被 taskkill 结束），
+  // 假 agent 等到 release 文件出现才开始 150 ms 的收尾；因此 taskkill 动手时整棵树必然还在，负载再重也一样。
+  const f=await fixture(t,{hold:true});await f.service();
   const hostFile=path.join(f.base,'fake-host.mjs');
-  fs.writeFileSync(hostFile,`import {spawn} from 'node:child_process';const child=spawn(process.execPath,[${JSON.stringify(f.script)},'隔离任务'],{stdio:'inherit',windowsHide:true,shell:false});child.on('close',code=>process.exit(code));`);
+  fs.writeFileSync(hostFile,`import {spawn} from 'node:child_process';spawn(process.execPath,[${JSON.stringify(f.script)},'隔离任务'],{stdio:'inherit',windowsHide:true,shell:false});setInterval(()=>{},1000);`);
   const host=f.launch(hostFile,[]);
   const started=await until(()=>rows(f.home).find(r=>r.event==='spawned'),10000,'执行者启动假 agent（spawned）',f.home);
   await until(()=>fs.existsSync(path.join(f.base,'echo.json')),10000,'假 agent 写出 echo.json',f.home);
   const executor=rows(f.home)[0];
   await execute('taskkill.exe',['/PID',String(host.pid),'/T','/F'],{windowsHide:true});
   assert.equal(alive(host.pid),false);assert.equal(alive(executor.pid),true);assert.equal(alive(started.agentPid),true);
+  fs.writeFileSync(path.join(f.base,'release'),'1'); // 断言完成后才放行假 agent 收尾
   const end=await until(()=>rows(f.home).find(r=>r.event==='end'),10000,`结束派活方后任务写出 end（执行者 ${executor.pid} ${alive(executor.pid)?'存活':'不在'}，假 agent ${started.agentPid} ${alive(started.agentPid)?'存活':'不在'}）`,f.home);assert.equal(end.exit,0);
   t.diagnostic('taskkill.exe /PID <本测试假派活方 PID> /T /F：派活方与等待者退出；执行者、假 agent 存活；唯一 end.exit=0。');
 });
