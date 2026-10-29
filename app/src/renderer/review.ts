@@ -157,10 +157,12 @@ export class ReviewView {
         const where = issue.file ? `${issue.file}${Number.isInteger(issue.line) ? `:${issue.line}` : ''}` : '';
         const jump = issue.file ? `<button class="btn sm quiet mono" data-rv-f="jump:${id}" data-rv-jump data-rv-task="${task}" data-rv-file="${esc(issue.file)}" data-rv-line="${Number.isInteger(issue.line) ? issue.line : ''}" title="${esc(rv.jump)}" aria-label="${esc(`${rv.jump}：${where}`)}">${esc(where)}</button>` : '';
         const note = slot.drafts.get(issue.id) ?? conf?.note ?? '';
+        // 当次渲染时的已保存说明（不是最新异步数据，也不是显示用的草稿）：capture 据此判断用户是否改过输入框。
+        const base = conf?.note ?? '';
         const fail = slot.fail.get(issue.id);
         return `<div class="rv-issue" data-rv-card="${id}" data-severity="${esc(issue.severity)}"><div class="rv-h"><span class="mono muted">${id}</span><span class="tag ${tone}">${esc(rv.severity[issue.severity] ?? issue.severity)}</span><b>${esc(issue.title)}</b>${tag}<span class="sp"></span><span class="segm sm" role="group">${button('valid', rv.valid)}${button('invalid', rv.invalid)}</span></div>`
             + `<div class="rv-b">${jump}<p>${esc(issue.detail ?? '')}</p></div>`
-            + `<div class="rv-n"><input class="inp" data-rv-f="note:${id}" data-rv-note="${id}" data-rv-task="${task}" autocomplete="off" placeholder="${esc(rv.note)}" aria-label="${esc(`${issue.id} ${rv.note}`)}" value="${esc(note)}"></div>`
+            + `<div class="rv-n"><input class="inp" data-rv-f="note:${id}" data-rv-note="${id}" data-rv-task="${task}" data-rv-base="${esc(base)}" autocomplete="off" placeholder="${esc(rv.note)}" aria-label="${esc(`${issue.id} ${rv.note}`)}" value="${esc(note)}"></div>`
             + `${fail ? `<div class="fhint fail" data-rv-fail="${id}" role="alert">${esc(fail)}</div>` : ''}</div>`;
     }
 
@@ -170,9 +172,10 @@ export class ReviewView {
         if (!root) return null;
         this.muteFocusOutUntil = Date.now() + 300;
         for (const input of root.querySelectorAll<HTMLInputElement>('input[data-rv-note]')) {
+            // 和渲染这个输入框时的说明基线比，不和刷新后的最新数据比：否则远端更新会被旧 DOM 误判成空草稿。
             const slot = this.slot(input.dataset.rvTask ?? ''), id = input.dataset.rvNote ?? '';
-            const saved = slot.review?.issues.find(issue => issue.id === id)?.confirmation?.note ?? '';
-            if (input.value !== saved) slot.drafts.set(id, input.value); else slot.drafts.delete(id);
+            const base = input.dataset.rvBase ?? '';
+            if (input.value !== base) slot.drafts.set(id, input.value); else slot.drafts.delete(id);
         }
         const el = document.activeElement;
         if (!(el instanceof HTMLElement) || !el.dataset.rvF || !(root as Node).contains(el)) return null;

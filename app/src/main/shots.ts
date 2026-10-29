@@ -22,7 +22,7 @@ import type { Registry } from './registry';
 import { dispatchMatches, windowsPlatform } from './platform';
 import { coreRun, coreScript } from './core';
 import { effects } from './effects';
-import { createHarness, progress, saveFailureScene, windowFocusState, type Harness } from './shots-input';
+import { createHarness, instantFocusState, progress, saveFailureScene, windowFocusState, type Harness } from './shots-input';
 import { internal, spawnPhases, startProbe, wall, type SpawnPhases } from './shots-probe';
 import { appEnvironment, isolatedEnvKey } from './app-env.mjs';
 // 演示汇报正文与 npm run demo 同源（tools/demo/data.mjs）；只在验收里写入，不改演示生成器。
@@ -1101,6 +1101,19 @@ async function captureFocusRing(h: Harness, win: BrowserWindow) {
     await reset(); await rawTab(wizard); const lost = await state('③ 窗口失焦后 rawTab（不恢复焦点）');
     assert.deepEqual([lost.el, lost.fv, lost.f, lost.docFocus], ['button[wizard]', false, false, false]);
     await assert.rejects(h.focusRing('焦点实验 ③ 失焦'), /焦点环不可见/);
+    // 224：失败那一刻的即时记录（带 ISO 时刻、不来自截图）要真的进入本次失败现场的 extra，且带上本轮 focusRestored；
+    // 原断言信息与上面的拒绝条件保持不变。
+    const iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    const instant = await instantFocusState(win);
+    assert.match(instant.at, iso);
+    assert.deepEqual([instant.page?.focusVisible, instant.page?.focus, instant.page?.hasFocus, instant.win?.isFocused], [false, false, false, false]);
+    assert.equal(instant.readError, null);
+    const failedExtra = progress.sceneExtra as { focusFailure?: { at?: string; activeElement?: { focusVisible?: boolean | null } | null; document?: { hasFocus?: boolean | null } | null; window?: { isFocused?: boolean | null } | null }; focusRestored?: unknown } | undefined;
+    assert.ok(failedExtra?.focusFailure, '焦点失败没有登记即时记录');
+    assert.match(String(failedExtra.focusFailure.at), iso);
+    assert.deepEqual([failedExtra.focusFailure.activeElement?.focusVisible, failedExtra.focusFailure.document?.hasFocus, failedExtra.focusFailure.window?.isFocused], [false, false, false]);
+    assert.ok(Array.isArray(failedExtra.focusRestored), '失败现场没有带上本轮 focusRestored');
+    progress.sceneExtra = undefined;
     // ④ 同样失焦，改走 tabTo（key() 先恢复焦点）：焦点环回来。
     await reset(); await h.tabTo(wizard); const restored = await state('④ 窗口失焦后 tabTo');
     assert.deepEqual([restored.fv, restored.f, restored.docFocus], [true, true, true]);
@@ -1112,6 +1125,13 @@ async function captureFocusRing(h: Harness, win: BrowserWindow) {
     await h.tabTo(wizard); const guarded = await state('⑤ 之后 tabTo');
     console.log(`[焦点实验] 页面是否失去过焦点：${!hiddenLost.docFocus}；focusRestored 新增 ${progress.focusRestored.length - before} 条`);
     if (!hiddenLost.docFocus) assert.equal(progress.focusRestored.length - before, 1);
+    // 224：焦点恢复记录带恢复前/后时刻与状态，且 label 是 tabTo 的准确目标，不是旧的检查标签。
+    for (const entry of progress.focusRestored.slice(before)) {
+        assert.match(entry.before.at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        assert.match(entry.after.at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        assert.equal(entry.after.docFocus, entry.restored);
+        assert.ok(entry.label.includes(wizard), `焦点恢复记录的标签不是 tabTo 目标：${entry.label}`);
+    }
     assert.deepEqual([guarded.fv, guarded.docFocus], [true, true]); await h.focusRing('焦点实验 ⑤ 恢复后');
     console.log(`[焦点实验] focusRestored = ${JSON.stringify(progress.focusRestored)}`);
 }

@@ -150,7 +150,7 @@ export const ag = {
     // Stage07c T2 / T3（D79）：模型与推理强度的下拉来自探针；"刷新列表"重新查；查不到时用预设值并写原因
     refreshList: '刷新列表', refreshingList: '正在查询…',
     // Stage07c T4（D85）：可担任、模型家族；T7（D83）：被限流的执行者
-    canDo: '可担任', canDoHelp: '路由只在"执行者"里选；审查者候选的顺序在路由页；设为"主导"的 Agent 用来判断审查者与主导是否同家族（D128）', roleNames: { lead: '主导', executor: '执行者', reviewer: '审查者' } as Record<string, string>,
+    canDo: '可担任', canDoHelp: '路由只在"执行者"里选；审查者候选的顺序在路由页；设为"主导"的 Agent 用来判断审查者与主导是否同家族', roleNames: { lead: '主导', executor: '执行者', reviewer: '审查者' } as Record<string, string>,
     // 2026-10-27 走查 U6：两个角色都取消时的提示（替换 agents.ts 里的占位）。
     canDoNeedOne: '至少保留一个角色才能保存', modelRangeChange: '修改…',
     // 2026-10-27 走查 U5：按核心 ar roles 的 familiesSource 写实际依据（model / host / adapter / declared）；替换 modelRangeAuto，168 换过去后删掉旧键。
@@ -348,7 +348,7 @@ export const gt = {
     // Stage05 开工前第 5 条：受保护的路径（.agent-router/ 与任务说明目录）超出范围时的行尾标注；删除的文件单独一块（只是提示）
     scopeProtected: '受保护的路径', deletedSec: '删除的文件', deletedNone: '没有', deletedNoneHelp: '这次没有删除任何文件', deletedCount: (n: number) => `${n} 个`,
     commandsSec: '验收命令', commandsNone: '没有验收命令', timedOut: '超时', truncated: '只保留了最后 200 行', ms: (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} 秒`,
-    pending: '门禁结束后显示结果', missing: '没有找到门禁结果文件（gate.json）',
+    pending: '门禁结束后显示结果', missing: '没有找到门禁结果文件（gate.json）', readError: '门禁结果无法读取',
 };
 
 // Stage05 多次尝试与重试（界面稿 app/design/preview.js 的"自动重试中 / 重试历史 / 按尝试看汇报 / 重试弹窗 / 完成后再改"）

@@ -57,6 +57,9 @@ export function pushInput<T extends InputEntry>(log: T[], entry: T, size = INPUT
 
 export interface ScenePage { outerHTML?: string | null; outlineStyle?: string; outlineWidth?: string; outlineColor?: string; boxShadow?: string; focusVisible?: boolean | null; focus?: boolean | null; hasFocus?: boolean; visibilityState?: string }
 export interface SceneWindow { isFocused?: boolean; webContentsIsFocused?: boolean; isVisible?: boolean; isMinimized?: boolean; focusedWindowIsThis?: boolean }
+// 224：焦点失败即时记录。焦点恢复记录带恢复前/后状态与时刻；即时状态是失败那一刻读到的页面与窗口状态（限时、只读）。
+export interface FocusRestoredEntry { label: string; at: string; restored: boolean; before: { at: string; docFocus: boolean; webContentsIsFocused: boolean }; after: { at: string; docFocus: boolean; webContentsIsFocused: boolean } }
+export interface InstantFocus { at: string; page: ScenePage | null; win: SceneWindow | null; readError: string | null }
 export interface SceneInput { message: string; label: string; now?: number; page?: ScenePage | null; win?: SceneWindow | null; inputs?: InputEntry[]; screenshot?: string | null; captureError?: string | null; readError?: string | null; extra?: unknown; roots?: string[] }
 
 // 现场 JSON：字段固定，路径一律脱敏；page / win 读不到时对应字段为 null（captureError / readError 写原因）。
@@ -90,7 +93,13 @@ export function sceneRecord(input: SceneInput): Record<string, any> {
         } : null,
         recentInputs: (input.inputs ?? []).slice(-INPUT_LOG_SIZE).map(e => Object.fromEntries(Object.entries(e).map(([name, value]) => [name, typeof value === 'string' ? red(value) : value]))),
     };
-    if (input.extra !== undefined) record.extra = deepRedact(input.extra, roots);
+    if (input.extra !== undefined) {
+        record.extra = deepRedact(input.extra, roots);
+        // 224：新诊断的 outerHTML 与顶层 activeElement 同一顺序——先完整脱敏、再按同一上限截断；
+        // 根目录跨过截断点时也不会留下路径片段。只处理焦点失败诊断，不改其他专项现场的含义。
+        const extraPage = (record.extra as { focusFailure?: { activeElement?: { outerHTML?: unknown } | null } | null } | null)?.focusFailure?.activeElement;
+        if (extraPage && typeof extraPage.outerHTML === 'string') extraPage.outerHTML = truncate(extraPage.outerHTML, OUTER_HTML_LIMIT);
+    }
     return record;
 }
 
@@ -213,6 +222,49 @@ export async function windowFocusState(win: BrowserWindow) {
         focusedWindowIsThis: BrowserWindow.getFocusedWindow()?.id === win.id,
     };
 }
+// 224：焦点检查失败时采集的即时状态（页面焦点元素、document、窗口焦点），带 ISO 时刻。at 是采样开始的时刻；
+// 页面与窗口依次采样，不是同一瞬间的原子快照。只读且各自限时；任何读取失败或超时只记进 readError，
+// 不抛出、不改变原断言。只读验收窗口自己的状态，不查系统前台进程或其他应用。
+export const INSTANT_READ_LIMIT = 2000;
+export async function instantFocusState(win: BrowserWindow, limitMs = INSTANT_READ_LIMIT): Promise<InstantFocus> {
+    const at = new Date().toISOString();
+    let page: ScenePage | null = null, state: SceneWindow | null = null;
+    const errors: string[] = [];
+    try { page = await bounded(win.webContents.executeJavaScript(SCENE_PAGE), limitMs, '即时读取页面焦点'); }
+    catch (e) { errors.push(`页面：${e instanceof Error ? e.message : String(e)}`); }
+    try { state = await bounded(windowFocusState(win), limitMs, '即时读取窗口状态'); }
+    catch (e) { errors.push(`窗口：${e instanceof Error ? e.message : String(e)}`); }
+    return { at, page, win: state, readError: errors.length ? errors.join('；') : null };
+}
+// 224：focusRing 失败时的即时记录，写进本次失败现场的 extra。与 saveFailureScene 在保存现场时读到的
+// "外层保存时记录"分开命名（后者在本文件顶层 activeElement / document / window / screenshot 字段；保存时可能已清理，
+// 不是即时记录，也不冒充截图）。outerHTML 在这里保持完整，由 sceneRecord 取得 roots 后先脱敏再截断。
+// focusRestored 是失败前本轮的焦点恢复记录（失败轮不写 checks.json，靠这里带走）。
+export function focusFailureExtra(instant: InstantFocus, focusRestored: FocusRestoredEntry[], observed?: unknown): Record<string, any> {
+    const page = instant.page;
+    return {
+        focusFailure: {
+            phase: '即时记录（focusRing 断言之前）',
+            at: instant.at,
+            activeElement: page ? {
+                outerHTML: page.outerHTML ?? null,
+                focus: page.focus ?? null,
+                focusVisible: page.focusVisible ?? null,
+            } : null,
+            document: page ? { hasFocus: page.hasFocus ?? null, visibilityState: page.visibilityState ?? null } : null,
+            window: instant.win ? {
+                isFocused: instant.win.isFocused ?? null,
+                webContentsIsFocused: instant.win.webContentsIsFocused ?? null,
+                isVisible: instant.win.isVisible ?? null,
+                isMinimized: instant.win.isMinimized ?? null,
+            } : null,
+            observed: observed === undefined ? null : observed,
+            readError: instant.readError,
+        },
+        outerCleanup: { phase: '外层保存时记录（可能已经清理，不是即时记录）', fields: ['activeElement', 'document', 'window', 'screenshot', 'captureError', 'readError'] },
+        focusRestored: focusRestored.slice(),
+    };
+}
 export async function saveFailureScene(win: BrowserWindow, error: unknown, out: string, roots: string[]): Promise<string | null> {
     const dir = path.join(out, 'failures');
     try {
@@ -252,7 +304,7 @@ export interface Harness {
     happened: (label: string, fn: () => boolean, limitMs: number) => Promise<number>;
     verify: (label: string, fn: () => Promise<void> | void) => Promise<void>;
     press: (selector: string) => Promise<void>;
-    key: (keyCode: string, modifiers?: Electron.InputEvent['modifiers']) => Promise<void>;
+    key: (keyCode: string, modifiers?: Electron.InputEvent['modifiers'], label?: string) => Promise<void>;
     type: (selector: string, text: string) => Promise<void>;
     tabTo: (selector: string, max?: number) => Promise<void>;
     focusRing: (label: string) => Promise<void>;
@@ -269,7 +321,7 @@ export interface Harness {
 // 当前这次验收已经通过的检查（失败时由 capture 打印完成范围，PR #5 CI 环境实验要比较各组实际跑到哪里）。
 // 066：current 是最近开始的检查标签（失败现场里的"检查标签"）；inputs 是最近 20 次真实输入；focusRestored 是检查前恢复过输入焦点的记录（写进 checks.json）。
 // sceneExtra：个别检查失败前登记的专项现场（例如截图隐私检查的含路径元素），原样写进现场 JSON 的 extra。
-export const progress = { checks: [] as string[], current: '', inputs: [] as InputEntry[], focusRestored: [] as { label: string; at: string; restored: boolean }[], sceneExtra: undefined as unknown };
+export const progress = { checks: [] as string[], current: '', inputs: [] as InputEntry[], focusRestored: [] as FocusRestoredEntry[], sceneExtra: undefined as unknown };
 const recordInput = (entry: Omit<InputEntry, 'at'>) => { pushInput(progress.inputs, { ...entry, at: new Date().toISOString() }); };
 export function createHarness(win: BrowserWindow, save: (name: string) => Promise<void>): Harness {
     const checks: string[] = [], consoleErrors: string[] = [];
@@ -385,17 +437,20 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // 066：键盘输入（key / tabTo）之前确认页面有输入焦点（document.hasFocus()）。页面没有焦点时 Tab 仍会移动焦点，但 :focus / :focus-visible 都不成立，
     // 焦点环样式不生效（对照实验见 shots.ts captureFocusRing）。没有焦点就先恢复、等到页面取得焦点（上限 1 秒），
     // 打印一行并记进 progress.focusRestored（写入 checks.json），不悄悄恢复；恢复不了也只记录，不在这里判失败。
-    const ensureInputFocus = async () => {
+    // 224：记录里加恢复前/后状态与时刻；label 由调用方给准确目标（tabTo 传目标选择器），等待与成功判断保持不变。
+    const ensureInputFocus = async (label = progress.current) => {
         if (await evaluate('document.hasFocus()') === true) return;
-        const label = progress.current, at = new Date().toISOString();
+        const at = new Date().toISOString();
+        const before = { at, docFocus: false, webContentsIsFocused: win.webContents.isFocused() };
         win.webContents.focus();
         const back = (await pollUntil(() => evaluate('document.hasFocus()'), 1000, 20)).ok;
-        progress.focusRestored.push({ label, at, restored: back });
+        const after = { at: new Date().toISOString(), docFocus: back, webContentsIsFocused: win.webContents.isFocused() };
+        progress.focusRestored.push({ label, at, restored: back, before, after });
         console.log(back ? `检查前窗口没有输入焦点，已恢复（${label}）` : `检查前窗口没有输入焦点，恢复后 1 秒内页面仍未取得焦点（${label}）`);
     };
-    const key = async (keyCode: string, modifiers: Electron.InputEvent['modifiers'] = []) => {
+    const key = async (keyCode: string, modifiers: Electron.InputEvent['modifiers'] = [], label?: string) => {
         recordInput({ type: 'key', key: [...(modifiers ?? []), keyCode].join('+') });
-        await ensureInputFocus();
+        await ensureInputFocus(label);
         // 验收窗口不显示，键盘事件前确保 webContents 有输入焦点，否则按键不按键盘导航处理（:focus-visible 不生效）。
         if (!win.webContents.isFocused()) win.webContents.focus();
         win.webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
@@ -419,13 +474,25 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         recordInput({ type: 'tabTo', selector });
         for (let i = 0; i < max; i++) {
             if (await evaluate(`document.activeElement === document.querySelector(${JSON.stringify(selector)})`)) return;
-            await key('Tab');
+            // 224：焦点恢复记录用准确的目标标签，而不是当时进度里可能过期的检查标签。
+            await key('Tab', [], `Tab 到 ${selector}`);
         }
         assert.fail(`${selector}：按 ${max} 次 Tab 仍无法到达`);
     };
     const focusRing = async (label: string) => {
         progress.current = label;
         const ring = await evaluate(`(() => { const el = document.activeElement, s = getComputedStyle(el); const ok = (s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) > 0) || (s.boxShadow && s.boxShadow !== 'none'); return ok ? true : el.outerHTML.slice(0, 120) + ' outline=' + s.outlineStyle + ' ' + s.outlineWidth + ' focusVisible=' + el.matches(':focus-visible'); })()`);
+        // 224：失败时先收即时状态（带时刻）放进本次失败的 extra，再抛原断言；取样失败只记采样错误，不改变原错误信息。
+        if (ring !== true) {
+            try { progress.sceneExtra = focusFailureExtra(await instantFocusState(win), progress.focusRestored, ring); }
+            catch (error) {
+                progress.sceneExtra = {
+                    focusFailure: { phase: '即时记录（focusRing 断言之前）', at: new Date().toISOString(), samplingError: error instanceof Error ? error.message : String(error) },
+                    outerCleanup: { phase: '外层保存时记录（可能已经清理，不是即时记录）' },
+                    focusRestored: progress.focusRestored.slice(),
+                };
+            }
+        }
         assert.equal(ring, true, `${label}：焦点环不可见（${ring}）`);
     };
     const wheel = async (selector: string, deltaY: number) => {

@@ -101,7 +101,7 @@ export function gateTab(t: Task, file: GateFile | null, result: GateResult, atte
     if (state === 'notrun')
         return `<div class="empty">${icon('shield-check-line')}<b>门禁没有运行</b><p>执行者没有正常结束（exit=${esc(t.agentExit ?? t.exit ?? '—')}），门禁只在执行者以 0 退出后运行。</p></div>`;
     if (result && typeof result === 'object' && 'error' in result)
-        return `<div class="empty">${icon('shield-check-line')}<b>【文案待定：门禁结果无法读取】</b><p>${esc(result.error)}</p></div>`;
+        return `<div class="empty">${icon('shield-check-line')}<b>${esc(gt.readError)}</b><p>${esc(result.error)}</p></div>`;
     if (!file)
         return `<div class="empty">${icon('shield-check-line')}<b>${esc(gt.missing)}</b></div>`;
     const commands = file.commands ?? [], outside = file.scope?.outside ?? [], changed = file.scope?.changed ?? [], uncommitted = file.uncommitted ?? [];
