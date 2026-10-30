@@ -308,6 +308,7 @@ export interface Harness {
     type: (selector: string, text: string) => Promise<void>;
     tabTo: (selector: string, max?: number) => Promise<void>;
     focusRing: (label: string) => Promise<void>;
+    keyboardFocusRing: (label: string, id: string) => Promise<void>;
     wheel: (selector: string, deltaY: number) => Promise<void>;
     hits: (selector: string) => Promise<{ x: number; y: number } | { error: string }>;
     save: (name: string) => Promise<void>;
@@ -322,6 +323,8 @@ export interface Harness {
 // 066：current 是最近开始的检查标签（失败现场里的"检查标签"）；inputs 是最近 20 次真实输入；focusRestored 是检查前恢复过输入焦点的记录（写进 checks.json）。
 // sceneExtra：个别检查失败前登记的专项现场（例如截图隐私检查的含路径元素），原样写进现场 JSON 的 extra。
 export const progress = { checks: [] as string[], current: '', inputs: [] as InputEntry[], focusRestored: [] as FocusRestoredEntry[], sceneExtra: undefined as unknown };
+// 066 / 243：键盘输入前与通用审计断言前恢复输入焦点共用的上限（原值 1 秒）。
+export const INPUT_FOCUS_LIMIT = 1000;
 const recordInput = (entry: Omit<InputEntry, 'at'>) => { pushInput(progress.inputs, { ...entry, at: new Date().toISOString() }); };
 export function createHarness(win: BrowserWindow, save: (name: string) => Promise<void>): Harness {
     const checks: string[] = [], consoleErrors: string[] = [];
@@ -330,6 +333,8 @@ export function createHarness(win: BrowserWindow, save: (name: string) => Promis
     const pause = (ms = 300) => new Promise<void>(resolve => setTimeout(resolve, ms));
     // 最近一次真实输入（鼠标或键盘）的时刻：within 的用时与时间标准都从这里算起（press 之后固定停的 300 ms 也计入）。
     let lastInput = clock();
+    // 243：最近一次 key 开始时登记的输入焦点恢复截止点（单调时钟），key 的输入前恢复与 audit 的断言前复核共用。
+    let inputFocusDeadline = 0;
     const evaluate = async (expression: string) => {
         try { return await win.webContents.executeJavaScript(expression); }
         catch (error) { throw Error(`验收表达式失败：${expression}（${error instanceof Error ? error.message : String(error)}）`, { cause: error }); }
@@ -438,19 +443,23 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
     // 焦点环样式不生效（对照实验见 shots.ts captureFocusRing）。没有焦点就先恢复、等到页面取得焦点（上限 1 秒），
     // 打印一行并记进 progress.focusRestored（写入 checks.json），不悄悄恢复；恢复不了也只记录，不在这里判失败。
     // 224：记录里加恢复前/后状态与时刻；label 由调用方给准确目标（tabTo 传目标选择器），等待与成功判断保持不变。
-    const ensureInputFocus = async (label = progress.current) => {
-        if (await evaluate('document.hasFocus()') === true) return;
+    // 243：截止点在 key 开始时登记；这里的恢复与 audit 断言前的复核共用剩余预算，不各重新给 1 秒。
+    const ensureInputFocus = async (label = progress.current, deadline = clock() + INPUT_FOCUS_LIMIT) => {
+        if (await evaluate('document.hasFocus()') === true) return true;
         const at = new Date().toISOString();
         const before = { at, docFocus: false, webContentsIsFocused: win.webContents.isFocused() };
         win.webContents.focus();
-        const back = (await pollUntil(() => evaluate('document.hasFocus()'), 1000, 20)).ok;
+        const back = (await pollUntil(() => evaluate('document.hasFocus()'), Math.max(0, deadline - clock()), 20)).ok;
         const after = { at: new Date().toISOString(), docFocus: back, webContentsIsFocused: win.webContents.isFocused() };
         progress.focusRestored.push({ label, at, restored: back, before, after });
-        console.log(back ? `检查前窗口没有输入焦点，已恢复（${label}）` : `检查前窗口没有输入焦点，恢复后 1 秒内页面仍未取得焦点（${label}）`);
+        console.log(back ? `检查前窗口没有输入焦点，已恢复（${label}）` : `检查前窗口没有输入焦点，恢复后剩余预算内页面仍未取得焦点（${label}）`);
+        return back;
     };
     const key = async (keyCode: string, modifiers: Electron.InputEvent['modifiers'] = [], label?: string) => {
         recordInput({ type: 'key', key: [...(modifiers ?? []), keyCode].join('+') });
-        await ensureInputFocus(label);
+        const focusDeadline = clock() + INPUT_FOCUS_LIMIT;
+        inputFocusDeadline = focusDeadline;
+        await ensureInputFocus(label, focusDeadline);
         // 验收窗口不显示，键盘事件前确保 webContents 有输入焦点，否则按键不按键盘导航处理（:focus-visible 不生效）。
         if (!win.webContents.isFocused()) win.webContents.focus();
         win.webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
@@ -494,6 +503,42 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
             }
         }
         assert.equal(ring, true, `${label}：焦点环不可见（${ring}）`);
+    };
+    // 243：通用审计在真实 Tab 之后、原 focusRing 紧前复核 document 输入焦点。两次检查之间页面失焦时（触发者未知），
+    // 只复用 webContents.focus 与有界轮询恢复输入焦点：不调用 DOM.focus、不重发 Tab / Shift+Tab、不强制伪类、不 show / restore 窗口。
+    // 恢复后必须仍是 audit 已读到的同一个 data-audit 元素；元素变了或丢了就失败，不把下一个元素冒充本元素。
+    // 预算与 key 输入前恢复共用同一个截止点；耗尽或恢复不了仍按原 focusRing 的严格条件失败，不当作成功。
+    // 已聚焦路径不恢复、不记录；CSS 没有焦点环仍由原 focusRing 判红。
+    const keyboardFocusRing = async (label: string, id: string) => {
+        progress.current = label;
+        if (await evaluate('document.hasFocus()') === true) { await focusRing(label); return; }
+        const at = new Date().toISOString();
+        const before = { at, docFocus: false, webContentsIsFocused: win.webContents.isFocused() };
+        // 243 补修：没有本次 key 登记的预算（初值 0），或绝对截止点已到/已过时，不能再 focus，
+        // 也不能用 Math.max(0, 截止点 - 现在) 新开 0 ms 的相对 poll 窗口（首次真值会误过）。
+        // 只如实记录 restored=false，再走原 focusRing 的严格条件失败。
+        if (clock() >= inputFocusDeadline) {
+            const after = { at: new Date().toISOString(), docFocus: false, webContentsIsFocused: win.webContents.isFocused() };
+            progress.focusRestored.push({ label: `${label}（断言前复核）`, at, restored: false, before, after });
+            console.log(`断言前窗口没有输入焦点，本次 key 的恢复预算不可用或已用尽，未恢复（${label}）`);
+            await focusRing(label);
+            assert.fail(`${label}：本次 key 的恢复预算不可用或已用尽，页面仍未取得输入焦点`);
+            return;
+        }
+        win.webContents.focus();
+        const back = (await pollUntil(() => evaluate('document.hasFocus()'), Math.max(0, inputFocusDeadline - clock()), 20)).ok;
+        const afterId = back ? await evaluate('document.activeElement?.getAttribute("data-audit")') : null;
+        const after = { at: new Date().toISOString(), docFocus: back, webContentsIsFocused: win.webContents.isFocused() };
+        progress.focusRestored.push({ label: `${label}（断言前复核）`, at, restored: back, before, after });
+        console.log(back ? `断言前窗口没有输入焦点，已恢复（${label}）` : `断言前窗口没有输入焦点，剩余预算内页面仍未取得焦点（${label}）`);
+        if (!back) {
+            // 原严格条件：焦点环仍不可见时在这里失败；即时现场与本轮 focusRestored 照常带走。
+            await focusRing(label);
+            assert.equal(back, true, `${label}：恢复输入焦点后页面仍未取得焦点`);
+            return;
+        }
+        assert.equal(afterId, id, `${label}：恢复输入焦点后焦点元素变了（期望 data-audit=${id}，实际 ${afterId === null ? 'null' : afterId}）`);
+        await focusRing(label);
     };
     const wheel = async (selector: string, deltaY: number) => {
         const box = await hits(selector);
@@ -557,7 +602,7 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
                 await key('Tab');
                 await covered('Tab');
                 const id = await evaluate('document.activeElement?.getAttribute("data-audit")');
-                if (id !== null && id !== undefined) { seen.add(id); await focusRing(`${where} 第 ${id} 个可操作元素`); }
+                if (id !== null && id !== undefined) { seen.add(id); await keyboardFocusRing(`${where} 第 ${id} 个可操作元素`, id); }
             }
             // 有吸顶页头的页面：从当前焦点再 Shift+Tab 倒退走一遍，次数与上面的 Tab 循环相同。
             if (sticky) for (let i = 0; i < tabSteps; i++) { await key('Tab', ['shift']); await covered('Shift+Tab'); }
@@ -582,5 +627,5 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         }
         await evaluate('document.querySelectorAll("[data-audit]").forEach(el => el.removeAttribute("data-audit")); document.activeElement?.blur(); true');
     };
-    return { pause, evaluate, wait, check, within, happened, verify, press, key, type, tabTo, focusRing, wheel, hits, save, audit, scene, checks, consoleErrors };
+    return { pause, evaluate, wait, check, within, happened, verify, press, key, type, tabTo, focusRing, keyboardFocusRing, wheel, hits, save, audit, scene, checks, consoleErrors };
 }

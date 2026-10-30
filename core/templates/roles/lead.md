@@ -3,7 +3,7 @@
 ## 负责什么
 
 - 和用户沟通，定方向和范围，做取舍。
-- 写方案与 `docs/specs/` 下的任务说明，派给执行者（`ar dispatch`，默认就带执行者角色）。任务说明的 `worker` 写 `auto` 或不写，就按 AgentRouter 的路由规则选执行者；需要另一个模型把关的写 `review: true`。
+- 写方案与 `docs/specs/` 下的任务说明，派给执行者（`ar dispatch`，默认就带执行者角色）。任务说明的 `worker` 写 `auto` 或不写，就按 AgentRouter 的路由规则选执行者；需要只读审查的写 `review: true`，审查者及差异约束由配置决定。
 - 验收：看汇报、推断清单、测试结果和改动。有交叉审查的任务先读审查问题（`ar review show <记录名>`），逐条标成立或不成立（`ar review confirm <记录名> <编号> valid|invalid`）；成立的要么让执行者修，要么在驳回 / 重试的说明里写明。
 - 版本控制：分支、提交、合并。
 

@@ -289,6 +289,11 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     console.log('验收开始时的 CPU（1 秒采样）：' + await cpuNow());
     await captureWizard(h);
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 项目页准备路径（完整审计与 AR_SHOTS_FOCUS=keyboard-audit 共用）：从点侧栏"项目"之前算起（含点击后固定 300 ms），
+    // 到列表行与详情标题都出现；上限 10 秒，即原验收标准（默认等待上限）。
+    // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复；用时按单调时钟计。
+    // 每次都打印这段时间里的核心调用与核心进程各阶段，慢的那次能看出卡在哪个调用、哪个进程的哪一步。
+    const prepareProjects = async () => { const started = clock(), ipcFrom = ipcSeq(), coreFrom = coreSeq(); await press('[data-page=projects]'); await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '项目页列表与详情'); console.log(`项目页加载用时：${Math.round(clock() - started)}ms；核心调用：${ipcReport(ipcFrom)}；核心进程：${coreReport(coreFrom)}`); };
     // 单独复现 UI28（AR_SHOTS_FOCUS=agents）：引导之后只跑导入向导扩展的检查（自定义 CLI、模型与推理强度、OpenAI 兼容接口、导出与导入）。
     if (process.env.AR_SHOTS_FOCUS === 'agents') {
         await captureAgents(h, win);
@@ -324,6 +329,14 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     }
     // UI15 / UI18：项目页在 UI01 之前准备好（UI01 的页面清单里加了"项目"），结束后回到任务页。
     await captureProjects(h);
+    // 单独复现项目页通用键盘审计（243）：调用同一个 h.audit 与项目页准备路径，保留深浅两主题 × 两种尺寸的真实 Tab 遍历；
+    // 不显示额外窗口、不复制或另造一套审计，也不运行 066 的闪窗口对照。
+    if (process.env.AR_SHOTS_FOCUS === 'keyboard-audit') {
+        await audit('项目页', prepareProjects);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'keyboard-audit', checks, focusRestored: progress.focusRestored }, null, 2));
+        console.log(`只跑项目页通用键盘审计：${checks.length} 项检查全部通过。`);
+        return;
+    }
     // UI02 / UI15 / UI07：任务页与项目页的搜索和排序、侧栏底部的执行者负载、设置页的“并行”与“清理”。
     // 放在这里是因为演示数据还是原样的（两个进行中的任务、13 条任务）；检查结束时偏好、配置、窗口大小与主题都已恢复。
     await captureSearch(h, registry, win);
@@ -921,10 +934,8 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
 
     // 每页通用检查与 UI11：深浅两主题 × 1160×720 / 960×600。
     await audit('任务页', async () => { await press('[data-page=tasks]'); await press('[data-task=t3]'); });
-    // 项目页加载：从点侧栏"项目"之前算起（含点击后固定 300 ms），到列表行与详情标题都出现；上限 10 秒，即原验收标准（默认等待上限）。
-    // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复；用时按单调时钟计。
-    // 每次都打印这段时间里的核心调用与核心进程各阶段，慢的那次能看出卡在哪个调用、哪个进程的哪一步。
-    await audit('项目页', async () => { const started = clock(), ipcFrom = ipcSeq(), coreFrom = coreSeq(); await press('[data-page=projects]'); await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '项目页列表与详情'); console.log(`项目页加载用时：${Math.round(clock() - started)}ms；核心调用：${ipcReport(ipcFrom)}；核心进程：${coreReport(coreFrom)}`); });
+    // 项目页加载（描述与计时见 prepareProjects，和 AR_SHOTS_FOCUS=keyboard-audit 共用同一路径）。
+    await audit('项目页', prepareProjects);
     await audit('Agent 页', async () => { await press('[data-page=connect]'); await wait('!!document.querySelector("[data-host-card]") && !document.querySelector("[data-pref=detect]").disabled'); });
     await audit('设置页', async () => { await press('[data-page=settings]'); await wait('!!document.querySelector("[data-pref=notifications]")'); });
     await audit('关于页', async () => { await press('[data-page=about]'); await wait('!!document.querySelector(".about")'); });

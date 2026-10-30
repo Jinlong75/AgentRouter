@@ -1,6 +1,6 @@
 ---
 name: lead-workflow
-description: 主导 / 执行者协作模式，适用于任何类型的工作（游戏、网页、视频、应用、文档、数据可视化……）：当前对话的模型担任主导，只做审美、方向、决策与验收；执行者（用 agent-router 派发，可以是 Codex、DeepSeek、MiMo、Claude、Qoder 等，由 AgentRouter 的路由决定）承担工程性、执行性的工作；需要时再由另一个模型只读审查。目的是把大部分 token 花在便宜或专长的执行者上。用于在项目里建立或沿用这种分工、按角色干活、把执行工作写成任务说明派出去。
+description: 主导 / 执行者协作模式，适用于任何类型的工作（游戏、网页、视频、应用、文档、数据可视化……）：当前对话的模型担任主导，只做审美、方向、决策与验收；执行者（用 agent-router 派发，可以是 Codex、DeepSeek、MiMo、Claude、Qoder 等，由 AgentRouter 的路由决定）承担工程性、执行性的工作；需要时按审查者配置安排只读审查。目的是把大部分 token 花在便宜或专长的执行者上。用于在项目里建立或沿用这种分工、按角色干活、把执行工作写成任务说明派出去。
 argument-hint: "[setup | 角色名]"
 allowed-tools:
   - Read

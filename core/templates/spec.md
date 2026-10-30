@@ -11,7 +11,7 @@ expect_commit: true
 verify_timeout_min: 10
 # effort: high   # 可选：这个任务用的推理强度，要在执行者支持的范围内；不写就按路由规则或执行者配置
 # model: 【模型名】   # 可选：这个任务用的模型；不写就按执行者配置
-# review: true   # 可选：门禁通过后由另一个模型只读审查；reviewer: 【执行者名】 指定审查者，review_block: high 时高严重度问题打回返工
+# review: true   # 可选：门禁通过后按审查者配置安排只读审查；reviewer: 【执行者名】 指定审查者，review_block: high 时高严重度问题打回返工
 ---
 
 ## 目标

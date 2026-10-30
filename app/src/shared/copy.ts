@@ -697,7 +697,7 @@ export const rv = {
     badgeIssuesFull: (n: number) => `审查：${n} 个问题`,
     node: '审查', nodePass: '通过', nodeIssues: (n: number) => `${n} 个问题`, nodeFail: '不通过', nodeUnknown: '没审成', nodeRunning: '审查中',
     nodeHelpUnknown: '没有可用的审查者或审查失败，不影响验收',
-    by: (reviewer: string, crossed: boolean, dur: string) => `${reviewer} 审查${crossed ? '（交叉：与执行者、主导都不是同一家族）' : '（非交叉：和执行者是同一个配置）'}，用时 ${dur}。`,
+    by: (reviewer: string, crossed: boolean, dur: string) => `${reviewer} 审查${crossed ? '（交叉：与执行者使用不同的 Agent 配置）' : '（非交叉：与执行者使用同一个 Agent 配置）'}，用时 ${dur}。`,
     severity: { high: '高', medium: '中', low: '低' } as Record<string, string>,
     valid: '成立', invalid: '不成立', note: '说明（可选）', jump: '跳到改动里的这一行',
     reviewed: '看过的文件', again: '再审一次…', againTitle: '再审一次', againHelp: '用最近一次的提交与门禁结果，换一个审查者或同一个再审；不改任务状态。',

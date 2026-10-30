@@ -200,13 +200,35 @@ export function parseReview(report, { attempt = 1 } = {}) {
 
 // ---- 运行 ----
 
+// Windows 上 review.json 的原子替换可能收到 EPERM / EBUSY（192 同类问题，占用来源尚未确认）。
+// 与 config.json 的有界策略一致：首次立即尝试，再最多 4 次，每次间隔 50ms（额外总等待至多 200ms）。
+// 其他平台、其他错误码原样抛出；等待用 Atomics.wait，保持同步 API、核心仍是零依赖。
+const renameRetryCodes = new Set(['EPERM', 'EBUSY']);
+const renameRetryLimit = 4;
+const renameRetryDelay = 50;
+const sleepSync = ms => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return renameSync(from, to); }
+    catch (error) {
+      if (process.platform !== 'win32' || !renameRetryCodes.has(error?.code) || attempt >= renameRetryLimit) throw error;
+      sleepSync(renameRetryDelay);
+    }
+  }
+}
+
 // 临时文件 + 改名，读的人要么读到完整文件，要么什么都读不到。
 function writeJson(file, value) {
   const temp = `${file}.${process.pid}.tmp`;
   try {
     writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    renameSync(temp, file);
-  } finally { rmSync(temp, { force: true }); }
+    renameWithRetry(temp, file);
+  } catch (error) {
+    // 替换失败时清理临时文件；清理也失败就把它留在原处，不能让清理错误盖过原来的失败原因（192）。
+    try { rmSync(temp, { force: true }); } catch { /* 删不掉的临时文件保留原样，原错误照原样抛出 */ }
+    throw error;
+  }
+  rmSync(temp, { force: true });
 }
 
 const gitText = (dir, args) => {
