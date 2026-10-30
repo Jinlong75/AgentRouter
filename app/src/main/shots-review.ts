@@ -23,7 +23,18 @@ const git = (cwd: string, args: string[]) => {
 // 用真实核心：测试自己的临时 git 仓库（隔离的公共目录与 AR_WORKTREE_ROOT）、假执行者、经通用适配器接入的假审查者（一个会按次数换结论的小脚本），
 // 真实派发、真实审查，成立 / 不成立、再审一次都走 ar review …；全程不碰用户的目录与进程。
 export async function captureReview(h: Harness, registry: Registry, out: string, save: (name: string) => Promise<void>, win: BrowserWindow) {
-    const { evaluate, wait, check, verify, press, key, type, pause, audit } = h;
+    const { evaluate, wait, check, verify, press, drag, hits, key, type, tabTo, focusRing, pause, audit, wheel } = h;
+    // 244：隐藏窗口的原生尺寸先改变，渲染视口要等新帧才同步；只停350ms仍可能读到旧宽布局。
+    // 请求一帧并核对原生/渲染尺寸一致，再测布局；保留原等待上限，不通过重试断言求绿。
+    const resize = async (width: number, height: number) => {
+        win.setContentSize(width, height);
+        await win.webContents.capturePage();
+        const [actualWidth, actualHeight] = win.getContentSize();
+        await wait(`innerWidth === ${actualWidth} && innerHeight === ${actualHeight}`, `UI30 渲染视口同步到原生内容区 ${actualWidth}×${actualHeight}`);
+    };
+    // 244：窄面板可读性用的匿名长路径与长正文（写进假审查者的结果，不改问题数 / 状态夹具）。
+    const longFile = 'src/' + 'very-long-anonymous-directory-name/'.repeat(5) + 'notes.txt';
+    const longDetail = '这是一段很长的匿名说明，用来确认窄面板里问题正文可以完整换行阅读，不会截断或横向撑出面板。'.repeat(3);
     const home = appEnv.AGENT_ROUTER_HOME!, worktreeRoot = appEnv.AR_WORKTREE_ROOT!;
     assert.ok(home && path.isAbsolute(home), '截图验收必须在隔离公共目录里运行');
     assert.ok(worktreeRoot && path.resolve(worktreeRoot).toLowerCase().startsWith(path.resolve(home).toLowerCase()), 'worktree 根目录必须在隔离公共目录里');
@@ -51,14 +62,14 @@ export async function captureReview(h: Harness, registry: Registry, out: string,
     // 深浅色 × 默认 / 最小窗口各一张截图（深浅色 × 默认 / 最小窗口四张）。
     const shots = async (name: string) => {
         for (const [width, height, suffix] of [[1160, 720, ''], [960, 600, '-960x600']] as const) {
-            win.setContentSize(width, height);
+            await resize(width, height);
             for (const theme of ['dark', 'light'] as const) {
                 nativeTheme.themeSource = theme;
                 await pause(350);
                 await save(`${name}-${theme}${suffix}`);
             }
         }
-        win.setContentSize(1160, 720);
+        await resize(1160, 720);
         nativeTheme.themeSource = 'dark';
         await pause(350);
     };
@@ -123,16 +134,18 @@ export async function captureReview(h: Harness, registry: Registry, out: string,
             "let count = 0;",
             "try { count = Number(readFileSync(stateFile, 'utf8')) || 0; } catch { }",
             "writeFileSync(stateFile, String(count + 1));",
+            `const longFile = ${JSON.stringify(longFile)};`,
+            `const longDetail = ${JSON.stringify(longDetail)};`,
             "const modes = list.split(',');",
             "const mode = modes[Math.min(count, modes.length - 1)];",
             "console.log('读写模式：' + (args.includes('--read-only') ? 'readonly' : 'readwrite'));",
             "const json = value => console.log('```json\\n' + JSON.stringify(value) + '\\n```');",
             "const issue = (severity, file, line, title, detail) => ({ severity, file, line, title, detail });",
-            "if (mode === 'main') json({ verdict: 'concerns', summary: '功能完成，但有几处要看', reviewed: ['src/a.txt', 'src/z.txt'], issues: [",
+            "if (mode === 'main') json({ verdict: 'concerns', summary: '功能完成，但有几处要看', reviewed: ['src/a.txt', 'src/z.txt', longFile], issues: [",
             "  issue('low', 'src/a.txt', 500, '低：这一行不在改动里', '审查者指的行超出了文件，改动里找不到。'),",
             "  issue('medium', 'src/a.txt', 5, '中：第 5 行的写法', '这一行在默认展开的第一个文件里。'),",
             "  issue('high', 'src/z.txt', 2, '高：z.txt 第 2 行', '这个文件在改动列表的最后，默认是收起的。'),",
-            "  issue('medium', 'docs/none.md', 3, '中：文件不在改动里', '这个文件没有被改动。'),",
+            "  issue('medium', 'docs/none.md', 3, '中：文件不在改动里', longDetail),",
             "] });",
             "else if (mode === 'again') json({ verdict: 'concerns', summary: '再审：只剩两条', reviewed: ['src/b.txt'], issues: [",
             "  issue('medium', 'src/b.txt', 3, '再审的中问题', '第二次审查给出的意见。'),",
@@ -225,8 +238,113 @@ export async function captureReview(h: Harness, registry: Registry, out: string,
         await press('.detail.acc .track .node[data-tab=review]');
         await wait(`document.querySelector('[data-atab=review]').classList.contains('on') && document.querySelectorAll('[data-rv-card]').length === 4`, 'UI30 验收页点审查节点：到审查标签', 20000);
         await check('UI30 审查标签：结论横幅（标题 rv.verdict.concerns；审查者、交叉、用时 + 摘要）、问题卡片按严重度排序、编号与 review.json 一致、每张卡片有严重度标签、标题、说明、文件:行按钮', `(() => { const head = document.querySelector('[data-rv-head]'); const cards = [...document.querySelectorAll('[data-rv-card]')]; return head.classList.contains('info') && head.querySelector('.rt b').textContent === ${jsonStr(rv.verdict.concerns)} && head.querySelector('.rt span').textContent.startsWith(${jsonStr(rv.by('审查甲', true, '\u0000').split('\u0000')[0])}) && head.querySelector('.rt span').textContent.includes('功能完成，但有几处要看') && cards.map(c => c.dataset.rvCard).join() === 'R1-3,R1-2,R1-4,R1-1' && cards.map(c => c.querySelector('.tag').textContent).join() === ${jsonStr(['高', '中', '中', '低'].join())} && cards.map(c => c.querySelector('[data-rv-jump]').textContent).join() === ${jsonStr(['src/z.txt:2', 'src/a.txt:5', 'docs/none.md:3', 'src/a.txt:500'].join())} && cards.every(c => c.querySelector('b').textContent.length > 0 && c.querySelector('.rv-b p').textContent.length > 0 && c.querySelectorAll('.segm button').length === 2); })()`);
-        await check('UI30 审查标签：看过的文件一行（rv.reviewed + 文件名）和"再审一次…"按钮在底部', `(() => { const s = [...document.querySelectorAll('.tab-body .sec-t')].at(-1); return s.firstChild.textContent.startsWith(${jsonStr(rv.reviewed)}) && s.textContent.includes('src/a.txt') && s.querySelector('[data-rv-again]').textContent.trim() === ${jsonStr(rv.again)}; })()`);
+        await check('UI30 审查标签：看过的文件独立一区（rv.reviewed 标题、完整路径列表）和"再审一次…"按钮在底部一区，长路径完整保留', `(() => { const f = document.querySelector('[data-rv-reviewed]'); const files = [...document.querySelectorAll('[data-rv-reviewed-file]')].map(el => el.textContent); const head = f?.querySelector('.rv-reviewed-head > span'); const again = f?.querySelector('[data-rv-again]'); return !!f && document.querySelector('.tab-body').lastElementChild === f && head?.textContent === ${jsonStr(rv.reviewed)} && files.length === 3 && files.includes('src/a.txt') && files.includes(${jsonStr(longFile)}) && again?.textContent.trim() === ${jsonStr(rv.again)}; })()`);
         await shots('review-tab');
+        // 244：深浅 × 两种窗口尺寸都用真实布局读回可读性（不只是截图）。
+        for (const [width, height] of [[1160, 720], [960, 600]] as const) for (const theme of ['dark', 'light'] as const) {
+            await resize(width, height);
+            nativeTheme.themeSource = theme;
+            await pause(350);
+            const where = `${theme}，${width}×${height}`;
+            await check(`UI30 244 审查标签（${where}）：看过的文件独立成区，标题一行，完整路径换行可读，再审按钮在标题行里可操作`, `(() => {
+                const box = document.querySelector('[data-rv-reviewed]');
+                const head = box?.querySelector('.rv-reviewed-head');
+                const title = head?.querySelector('span');
+                const files = [...document.querySelectorAll('[data-rv-reviewed-file]')];
+                const long = files.find(el => el.textContent === ${jsonStr(longFile)});
+                const lines = el => { const r = document.createRange(); r.selectNodeContents(el); return r.getClientRects().length; };
+                const fits = el => el.scrollWidth <= el.clientWidth + 1;
+                const again = box?.querySelector('[data-rv-again]');
+                return !!box && document.querySelector('.tab-body')?.lastElementChild === box && !!title && title.textContent === ${jsonStr(rv.reviewed)} && lines(title) === 1 && fits(head) && files.length === 3 && !!long && lines(long) > 1 && fits(long) && fits(again) && again.getBoundingClientRect().width > 0 && again.getBoundingClientRect().height > 0;
+            })()`);
+            await check(`UI30 244 审查标签（${where}）：问题长正文换行读完，标题、文件行、成立/不成立按钮不被压成竖排、不撑出面板`, `(() => {
+                const card = document.querySelector('[data-rv-card="R1-4"]');
+                const body = card?.querySelector('.rv-b p'), title = card?.querySelector('.rv-h b'), jump = card?.querySelector('[data-rv-jump]');
+                const lines = el => { const r = document.createRange(); r.selectNodeContents(el); return r.getClientRects().length; };
+                const fits = el => el.scrollWidth <= el.clientWidth + 1;
+                const buttons = [...(card?.querySelectorAll('.segm button') ?? [])];
+                return !!card && body.textContent === ${jsonStr(longDetail)} && lines(body) > 1 && fits(body) && fits(title) && fits(jump) && buttons.length === 2 && buttons.every(b => b.getBoundingClientRect().width > 0 && b.getBoundingClientRect().height > 0);
+            })()`);
+            await check(`UI30 244 审查标签（${where}）：面板与整页都没有水平越界`, `(() => { const sc = document.querySelector('.detail.acc .dbody .scroll'); return document.scrollingElement.scrollWidth <= innerWidth && (!sc || sc.scrollWidth <= sc.clientWidth + 1); })()`);
+            const box = await hits('[data-rv-again]');
+            await verify(`UI30 244 审查标签（${where}）：再审按钮命中可点`, () => assert.ok(!('error' in box), 'error' in box ? box.error : ''));
+            const sc = '.detail.acc .dbody .scroll';
+            await wheel(sc, -3000);
+            const beforeScroll = await evaluate(`document.querySelector(${jsonStr(sc)})?.scrollTop`);
+            await wheel(sc, 3000);
+            await check(`UI30 244 审查标签（${where}）：真实滚轮滚到父容器纵向底部后，最后一个看过的文件完整可见`, `(() => { const sc = document.querySelector(${jsonStr(sc)}); const last = [...document.querySelectorAll('[data-rv-reviewed-file]')].at(-1); if (!sc || !last) return false; const r = last.getBoundingClientRect(), v = sc.getBoundingClientRect(); return sc.scrollTop > ${beforeScroll} && r.top >= v.top - 0.5 && r.bottom <= v.bottom + 0.5 && r.height > 0; })()`);
+        }
+        await resize(1160, 720);
+        nativeTheme.themeSource = 'dark';
+        await pause(350);
+        // 244：两个宿主的流水线在最小窗口用真实鼠标拖动；Tab 到末节点、刷新后焦点与浏览位置都保留，键盘仍能激活。
+        const trackHost = async (kind: 'tasks' | 'accept') => {
+            const scope = kind === 'accept' ? '.detail.acc' : '.detail:not(.acc)';
+            const track = `${scope} .track`, last = `${track} .node:last-of-type`;
+            const where = kind === 'accept' ? '验收页' : '任务详情';
+            const activeTab = kind === 'accept' ? '[data-atab=review]' : '.dtabs [data-tab=review]';
+            await resize(960, 600);
+            nativeTheme.themeSource = 'dark';
+            await pause(350);
+            if (kind === 'tasks') {
+                await press('.dtabs [data-tab=review]');
+                await wait(`document.querySelector('.dtabs [data-tab=review]').classList.contains('on') && document.querySelectorAll('[data-rv-card]').length === 4`, 'UI30 244 任务详情审查标签', 20000);
+            }
+            // 单次原子读取故障瞬间的几何与页面状态；失败图在 finally 清理前保存。
+            const geometry = await evaluate(`(() => {
+                const tracks = [...document.querySelectorAll(${jsonStr(track)})], tr = tracks[0];
+                const rect = el => { if (!el) return null; const r = el.getBoundingClientRect(); return { x:r.x, y:r.y, width:r.width, height:r.height, left:r.left, right:r.right }; };
+                const css = el => el ? { display:getComputedStyle(el).display, overflowX:getComputedStyle(el).overflowX } : null;
+                return { innerWidth, innerHeight, page:document.querySelector('[data-page][aria-current="page"]')?.dataset.page ?? null,
+                    taskSelected:!!document.querySelector('.trow.on'), tab:document.querySelector(${jsonStr(activeTab)})?.className ?? null,
+                    trackCount:tracks.length, nodeCount:tr?.querySelectorAll('.node').length ?? 0,
+                    clientWidth:tr?.clientWidth ?? null, scrollWidth:tr?.scrollWidth ?? null, scrollLeft:tr?.scrollLeft ?? null,
+                    track:rect(tr), holder:rect(tr?.parentElement), detail:rect(tr?.closest('.detail')),
+                    children:tr ? [...tr.children].map(el => ({ className:el.className, bounds:rect(el) })) : [],
+                    trackCss:css(tr), holderCss:css(tr?.parentElement) };
+            })()`);
+            const nativeSize = win.getContentSize(), minimumSize = win.getMinimumSize();
+            await writeFile(path.join(out, `review-track-${kind}-geometry.json`), JSON.stringify({ ...geometry, requestedSize: [960, 600], nativeSize, minimumSize }, null, 2));
+            // 用户批准：实际最小内容高度可能含原生边框取整差异；严格核对960宽、产品最小尺寸及渲染/原生一致。
+            const geometryOk = minimumSize[0] === 960 && minimumSize[1] === 600 && nativeSize[0] === 960 && geometry.innerWidth === 960 && geometry.innerHeight === nativeSize[1] && geometry.trackCount === 1 && geometry.nodeCount === 6 && geometry.scrollWidth > geometry.clientWidth;
+            if (!geometryOk) await save(`review-track-${kind}-geometry-failure`);
+            await verify(`UI30 244 ${where}流水线（960×600）：6 个节点超出窄面板，可在自身区域横向滚动`, () => assert.equal(geometryOk, true, `即时几何：${JSON.stringify(geometry)}`));
+            await drag(track, -100);
+            const dragged = await evaluate(`document.querySelector(${jsonStr(track)}).scrollLeft`);
+            await check(`UI30 244 ${where}流水线：真实鼠标按住拖动改变横向位置，拖动不切换标签`, `(() => { const tr = document.querySelector(${jsonStr(track)}); return tr.scrollLeft >= 40 && document.querySelector(${jsonStr(activeTab)}).classList.contains('on'); })()`);
+            await drag(track, 100);
+            const draggedBack = await evaluate(`document.querySelector(${jsonStr(track)}).scrollLeft`);
+            await check(`UI30 244 ${where}流水线：反方向拖动回到接近起点（${dragged} → ${draggedBack}）`, `${draggedBack} < 40`);
+            // 轻点仍是原点击：门禁节点切到门禁标签，审查节点切回审查标签；拖动之后的这次点击已经过去（只吞拖动那一次）。
+            const gateTab = kind === 'accept' ? '[data-atab=gate]' : '.dtabs [data-tab=gate]';
+            await press(`${track} .node[data-tab=gate]`);
+            await wait(`document.querySelector(${jsonStr(gateTab)}).classList.contains('on')`, `UI30 244 ${where}流水线轻点切到门禁标签`, 15000);
+            await press(`${track} .node[data-tab=review]`);
+            await wait(`document.querySelector(${jsonStr(activeTab)}).classList.contains('on') && !!document.querySelector('[data-rv-card]')`, `UI30 244 ${where}流水线轻点审查节点切回`, 20000);
+            await check(`UI30 244 ${where}流水线：轻点节点仍按原行为切标签（门禁 → 审查）`, `document.querySelector(${jsonStr(activeTab)}).classList.contains('on') && !!document.querySelector(${jsonStr(gateTab)})`);
+            await tabTo(last, 160);
+            await focusRing(`UI30 244 ${where}流水线末节点（Tab 后焦点环）`);
+            await check(`UI30 244 ${where}流水线：Tab 到末节点后它完整落在轨道可视范围内，可用键盘继续操作`, `(() => { const tr = document.querySelector(${jsonStr(track)}), a = document.activeElement, node = tr.querySelector('.node:last-of-type'); const r = node.getBoundingClientRect(), t = tr.getBoundingClientRect(); return a === node && tr.scrollLeft > 0 && r.left >= t.left - 0.5 && r.right <= t.right + 0.5; })()`);
+            const before = await evaluate(`document.querySelector(${jsonStr(track)}).scrollLeft`);
+            await evaluate(`window.__ar244Node = document.querySelector(${jsonStr(last)}); true`);
+            // 真实的核心写入让清单里的 review 事件变化，宿主刷新 / 完整重画（不是测试里手动重画）。
+            await core(['review', 'confirm', 'rv-main', 'R1-2', 'valid', '--by', 'lead'], repo);
+            await wait(`document.querySelector(${jsonStr(last)}) !== window.__ar244Node`, `UI30 244 ${where}流水线刷新重画`, 20000);
+            await check(`UI30 244 ${where}流水线：同任务刷新后保留横向位置，焦点回到原来的末节点并仍可见`, `(() => { const tr = document.querySelector(${jsonStr(track)}), a = document.activeElement, node = tr.querySelector('.node:last-of-type'); const r = node.getBoundingClientRect(), t = tr.getBoundingClientRect(); return a === node && Math.abs(tr.scrollLeft - ${before}) <= 1 && r.left >= t.left - 0.5 && r.right <= t.right + 0.5; })()`);
+            await focusRing(`UI30 244 ${where}流水线末节点（刷新恢复后的焦点环）`);
+            await key('Enter');
+            const activated = kind === 'tasks' ? `document.querySelector('.dtabs [data-tab=flow]').classList.contains('on')` : `document.querySelector('[data-page=tasks]').getAttribute('aria-current') === 'page'`;
+            await wait(activated, `UI30 244 ${where}流水线末节点回车激活`, 15000);
+            await check(`UI30 244 ${where}流水线：末节点仍能用键盘激活原来的操作`, activated);
+            await resize(1160, 720);
+            await pause(350);
+        };
+        await trackHost('accept');
+        await trackHost('tasks');
+        // 回到验收页的审查标签，继续后面的成立 / 不成立检查。
+        await selectAccept(M.id);
+        await press('[data-atab=review]');
+        await wait(`document.querySelector('[data-atab=review]').classList.contains('on') && document.querySelectorAll('[data-rv-card]').length === 4`, 'UI30 244 之后回到审查标签', 20000);
 
         // ================= 成立 / 不成立 =================
         await type('[data-rv-note="R1-3"]', '确实会越界');
@@ -337,11 +455,12 @@ export async function captureReview(h: Harness, registry: Registry, out: string,
         await type('[data-rv-note="R1.2-1"]', '补充');
         await key('Enter');
         await untilRow(async () => (await reviewOf('rv-main')).issues.find((i: any) => i.id === 'R1.2-1').confirmation.by === 'human' ? true : null, 'UI30 回车后说明写进了 review.json', 20000);
-        await verify('UI30 回车把说明随确认一起写：R1.2-1 仍是 valid，说明是"主导标的补充"，by 变成 human；清单多一条 review-confirm', async () => {
+        await verify('UI30 回车把说明随确认一起写：R1.2-1 仍是 valid，说明是"主导标的补充"，by 变成 human；清单只多一条 review-confirm', async () => {
             const issue = (await reviewOf('rv-main')).issues.find((i: any) => i.id === 'R1.2-1');
             assert.deepEqual([issue.confirmation.result, issue.confirmation.by, issue.confirmation.note], ['valid', 'human', '主导标的补充']);
+            assert.equal((await eventsOf(M.id)).filter(r => r.event === 'review-confirm' && r.issue === 'R1.2-1' && r.by === 'human').length, 1, '回车只写一次，失焦不重复提交');
         });
-        await check('UI30 回车之后焦点仍在说明框里（没有被重画掉）', `document.activeElement?.dataset.rvNote === 'R1.2-1'`);
+        await check('UI30 回车结束说明编辑：确认内容完整写入，焦点离开说明框，后续重画不把焦点带回说明框', `(() => { const a = document.activeElement, n = document.querySelector('[data-rv-note="R1.2-1"]'); return !!n && n.value === '主导标的补充' && a !== n && a?.dataset?.rvNote !== 'R1.2-1'; })()`);
 
         // ================= 需人工处理（拦截模式用完返工次数）=================
         const B = await dispatchTask('952-审查拦截', 'rv-block', 'blocker');

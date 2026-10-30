@@ -289,6 +289,12 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     console.log('验收开始时的 CPU（1 秒采样）：' + await cpuNow());
     await captureWizard(h);
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 244：沿用 UI30 原 captureReview 的完整隔离夹具与检查，只聚焦审查界面。
+    if (process.env.AR_SHOTS_FOCUS === 'review-ui') {
+        await captureReview(h, registry, out, save, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'review-ui', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 项目页准备路径（完整审计与 AR_SHOTS_FOCUS=keyboard-audit 共用）：从点侧栏"项目"之前算起（含点击后固定 300 ms），
     // 到列表行与详情标题都出现；上限 10 秒，即原验收标准（默认等待上限）。
     // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复；用时按单调时钟计。

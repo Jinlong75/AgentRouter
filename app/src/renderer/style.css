@@ -493,6 +493,10 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .track .node.stopped .dot { border-color: var(--stale); color: var(--stale); }
 .track .node.skip .dot { border-style: dashed; }
 .track .node.skip, .track .node.todo { color: var(--text-3); }
+/* 244：窄面板里流水线在自身区域横向滚动（原生滚动 + track-scroll.ts 的按住拖动），节点保持最小可读宽度。 */
+.track { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding-bottom: 6px; touch-action: pan-y; }
+.track .node { flex: none; white-space: nowrap; }
+.track.dragging, .track.dragging .node { cursor: grabbing; user-select: none; }
 @media (prefers-reduced-motion: reduce) { .track .node.running .dot { animation: none; } }
 
 /* 列表行第二行的门禁徽标：图标 + 文字，颜色跟状态 */
@@ -919,6 +923,19 @@ mark.hit { background: var(--brand-soft); color: var(--text); border-radius: 2px
 .rv-n { margin-top: 8px; }
 .rv-n .inp { width: 100%; }
 .rv-issue .fhint { margin-top: 6px; }
+/* 244：审查窄窗口。看过的文件独立成区（标题 + 操作行、完整路径列表），路径按原文本换行，不截断。 */
+.rv-reviewed { margin-top: 12px; min-width: 0; font-size: var(--fs-small); color: var(--text-3); }
+.rv-reviewed-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.rv-reviewed-head > span { flex: none; white-space: nowrap; }
+.rv-reviewed-head .btn { flex: none; }
+.rv-reviewed-files { list-style: none; margin: 8px 0 0; padding: 0; min-width: 0; }
+.rv-reviewed-files li { margin: 4px 0; overflow-wrap: anywhere; white-space: normal; }
+.rv-h { flex-wrap: wrap; }
+.rv-h > .mono, .rv-h > .tag, .rv-h > .segm { flex: none; white-space: nowrap; }
+.rv-h b { flex: 1 1 180px; }
+.rv-b { flex-wrap: wrap; }
+.rv-b p { flex: 1 1 200px; }
+.rv-b .btn { max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; }
 /* 点"文件:行"跳到改动之后，这一行标出来。 */
 .dl.rv-hit { background: var(--brand-soft); box-shadow: inset 2px 0 0 var(--brand); }
 /* 批准确认框里"审查还有问题没确认"的一句提示（不拦着批准）。 */

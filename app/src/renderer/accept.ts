@@ -9,6 +9,7 @@ import { attemptBadge, lastFailure, openRetrySheet } from './attempts';
 import { openCommitSheet } from './projects';
 import { reviewerLabel, reviewHint, ReviewView, reviewSumItem } from './review';
 import { baseBranchOf, bannerHtml, closeBlocked, loadRepoState, needsAccept, overlapLines, listMeta, readdProject, repoBanner, reviewBadge, sha7, waitedSince, writeBlocked, wtMark, wtStateLine, wtTrack } from './wt';
+import { captureTrack, restoreTrack } from './track-scroll';
 
 // 验收页（Stage06，协议 15.6～15.9；界面稿 app/design/preview.js 的 acceptRow / diffView / acceptOverview / acceptPage）：
 // 左边是待验收与冲突的任务，右边是详情（概览 · 改动 · 门禁 · 审查）与底部操作栏（驳回 · 重试 · 批准并合并 / 解决冲突并重试）。
@@ -326,6 +327,8 @@ export class AcceptView {
     private renderDetail(t: Task) {
         const box = this.root?.querySelector<HTMLElement>('.detail.acc');
         if (!box) return;
+        // 244：整个详情重画前先记下流水线的横向位置与节点焦点；renderHead() 重画轨道后恢复。
+        captureTrack(box, 'accept');
         box.innerHTML = '<div class="dh"></div><div class="track-holder"></div><div class="dtabs"></div><div class="dbody edge"><div class="scroll" tabindex="0"><div class="tab-body"></div></div></div><div class="actbar"></div>';
         this.renderHead(t);
         this.renderTabs();
@@ -340,7 +343,10 @@ export class AcceptView {
         const from = sha7(file?.base ?? t.wt?.base), to = sha7(file?.head ?? '');
         const commit = to ? `<span>${icon('git-commit-line')}<span class="mono">${esc(w.baseToHead(baseBranchOf(t), from, to))}</span></span>` : '';
         box.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2><span class="ttl">${esc(t.title)}</span></h2><span class="acts"><button class="btn icon quiet" data-acc-more data-tip="${esc(w.moreTip)}" aria-label="${esc(w.moreTip)}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2"><span class="dh-state ${line.cls}">${mark.html}${esc(line.text)}</span><span>${icon('folder-3-line')}${esc(t.repo.split(/[\\/]/).filter(Boolean).at(-1) ?? '')}</span><span>${icon('git-branch-line')}<span class="mono">${esc(t.wt?.branch ?? '')}</span></span>${commit}<span>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span></div>`;
-        box.querySelector('.track-holder')!.innerHTML = wtTrack(t, file);
+        const holder = box.querySelector<HTMLElement>('.track-holder')!;
+        captureTrack(box, 'accept');
+        holder.innerHTML = wtTrack(t, file);
+        restoreTrack(box, 'accept', t.id);
     }
     private renderTabs() {
         const t = this.current();

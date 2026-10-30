@@ -7,6 +7,7 @@ import { SearchField, closeSortMenu, foundRow, hit, matches, openSortMenu, paint
 import { executorAdapter, executorLabel, executorTag, isCodexTask } from '../shared/executor';
 import { installScrollMaterial } from './floatingThumb';
 import { Timeline } from './timeline';
+import { bindTrackDrag, captureTrack, restoreTrack } from './track-scroll';
 import { PreferencesView } from './preferences';
 import { ProjectsView } from './projects';
 import { NewTaskView } from './newtask';
@@ -136,7 +137,8 @@ function attView(t: Task, att: { n: number }): { report: string; gate: GateResul
 }
 const headerKey = (t: Task) => JSON.stringify([t.id, t.title, t.status, t.role, t.started, t.ended, t.minutes, t.exit, t.signal, t.commit, t.dispatcher?.host,t.managed,preferences.settings?.managed, attemptOf(t), t.gate, t.base, t.gatingAt, t.gateOk, t.gateSummary, t.agentExit, t.attempts, t.needsScope, t.outsideWrites, t.wt, t.review, t.reviewing, state.concurrency, overlapLines(t, state.tasks)]);
 const action = (name: string, value?: string) => { trace('action-send', { task: selected, name }); return window.dock.action(selected, name, value).then(() => trace('action-done', { name }), error => { trace('action-error', { name, error: String((error as Error)?.message ?? error) }); notice(error); }); };
-function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="wordmark">${c.app}</span></div><div class="tb-r"></div><nav class="nav"></nav><section class="content"></section>`; nav(); pageView(); }
+let trackDragBound = false;
+function shell() { root.innerHTML = `<div class="tb-l">${brand}<span class="wordmark">${c.app}</span></div><div class="tb-r"></div><nav class="nav"></nav><section class="content"></section>`; if (!trackDragBound) { trackDragBound = true; bindTrackDrag(root.querySelector<HTMLElement>('.content')!); } nav(); pageView(); }
 // 侧栏只在内容变化时重建：异步刷新晚到时不替换按钮，避免吞掉正在进行的点击；重建后焦点放回同一个导航按钮。
 let navHtml = '';
 function nav() {
@@ -438,6 +440,8 @@ function detail() {
         attLabels = new Map();
         attLabelsLoaded = false;
     }
+    // 244：整个详情重画前先记下流水线的横向位置与节点焦点；header() 重画轨道后恢复。
+    captureTrack(root, 'tasks');
     box.innerHTML = '<div class="dh"></div><div class="track-holder"></div><div class="dtabs"></div><div class="banner-holder"></div><div class="dbody edge"><div class="scroll" tabindex="0"><div class="tab-body"></div></div><button class="plan-compact plan-h" data-plan-top hidden></button><button class="btn sm follow" data-latest hidden></button></div>';
     header();
     const viewport = box.querySelector<HTMLElement>('.dbody > .scroll')!;
@@ -541,7 +545,12 @@ function header() {
     root.querySelector('.dh')!.innerHTML = `<div class="dh-1"><h2>${taskTitle(t)}</h2>${t.managed?`<span class="tag">${c.managed}</span>`:''}${t.legacy?`<span class="tag" data-legacy>${c.legacy}</span>`:''}<span class="acts">${goAccept}${retry}${rebase}${redispatch}${t.status === 'run' ? `<button class="btn sm danger" data-stop ${processOk() ? '' : `disabled data-tip="${esc(c.processUnknownBlocked)}"`}>${icon('stop-circle-line')}${c.stop}</button>` : ''}<button class="btn icon quiet" data-more data-tip="${c.more}" aria-label="${c.more}" aria-haspopup="menu">${icon('more-2-fill')}</button></span></div><div class="dh-2">${stateLine ? `<span class="dh-state ${stateLine.cls}">${taskMark(t)}${esc(stateLine.text)}</span>` : `<span class="dh-state ${marks[t.status][0]}">${mark(t.status)}${c.status[t.status]}${stateTail}</span>`}<span>${icon('folder-3-line')}${esc(project(t))}</span><span data-dispatcher-line>${icon('user-line')}<em>${c.dispatcher}</em>${esc(host(t))}</span><span data-executor-line>${icon('robot-2-line')}<em>${c.executor}</em>${esc(executorLabel(t))}</span><span>${icon('time-line')}${clock(t.started)} ${c.started}</span>${t.commit ? `<span>${icon('git-commit-line')}<span class="mono">${t.commit}</span></span>` : ''}</div>`;
     // 流水线轨道（B3）：只给带 gate 字段的任务画；放在标题区下面、标签栏上面。
     const track = root.querySelector<HTMLElement>('.track-holder');
-    if (track) track.innerHTML = t.worktree ? wtTrack(t, gateFile(gateResult)) : gateTrack(t, gateFile(gateResult));
+    if (track) {
+        // 244：重画流水线前后保留横向浏览位置与节点焦点（同任务；换任务从起点开始）。
+        captureTrack(root, 'tasks');
+        track.innerHTML = t.worktree ? wtTrack(t, gateFile(gateResult)) : gateTrack(t, gateFile(gateResult));
+        restoreTrack(root, 'tasks', t.id);
+    }
     // 再派失败、门禁、执行者失败 / 中断的横幅都在 banners() 里；门禁标签里有自己的横幅，不再重复。
     const gateBanner = tab !== 'gate' && (gateFail || (t.status === 'run' && gate === 'running'));
     trace('header', { task: t.id, banner: !!(redispatchError && redispatchErrorFor === t.id || gateBanner), busy, errorFor: redispatchErrorFor });

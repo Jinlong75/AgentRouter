@@ -57,6 +57,8 @@ interface Slot {
     rerunError: string;
     // 说明输入框里还没提交的文字（按问题编号）：重画时放回去。
     drafts: Map<string, string>;
+    // 244：上一次说明提交还没回来时又失焦/回车引出的最新说明，串行排在这一条后面（按问题编号，不同问题互不影响）。
+    pending: Map<string, { result: 'valid' | 'invalid'; note: string }>;
 }
 export interface ReviewSnapshot { key: string; start: number | null; end: number | null }
 
@@ -65,11 +67,14 @@ export class ReviewView {
     // 宿主重画（capture 之后马上换掉 innerHTML）时，被换掉的说明框会触发 focusout：这不是用户离开了说明框，不能当成“失去焦点时提交”。
     // capture 记下时刻，这之后很短的时间里忽略 focusout。
     private muteFocusOutUntil = 0;
+    // 244：回车结束时主动 blur 会引出一次 focusout；这次提交由 keydown 发起，focusout 不再重复写。
+    private enterBlurInput: HTMLInputElement | null = null;
+    private enterBlurUntil = 0;
     constructor(private host: ReviewHost) { }
 
     private slot(id: string): Slot {
         let slot = this.slots.get(id);
-        if (!slot) { slot = { key: '', loading: false, review: null, error: '', busy: new Set(), fail: new Map(), rerun: false, rerunError: '', drafts: new Map() }; this.slots.set(id, slot); }
+        if (!slot) { slot = { key: '', loading: false, review: null, error: '', busy: new Set(), fail: new Map(), rerun: false, rerunError: '', drafts: new Map(), pending: new Map() }; this.slots.set(id, slot); }
         return slot;
     }
     private find(id: string) { return this.host.tasks().find(t => t.id === id); }
@@ -143,10 +148,12 @@ export class ReviewView {
         const head = bannerHtml(tone, title, `${by}${review.summary ?? ''}`).replace('class="banner ', 'data-rv-head class="banner ');
         const rerunFail = slot.rerunError ? bannerHtml('fail', rv.again, slot.rerunError).replace('class="banner fail"', 'class="banner fail" data-rv-rerun-error') : '';
         const rows = issueOrder(review.issues).map(issue => this.issueCard(t, slot, issue)).join('');
-        const seen = (review.reviewed ?? []).map(file => `<span class="mono">${esc(file)}</span>`).join('、');
+        // 244：看过的文件独立成一区（标题 + 完整路径列表），不再和再审按钮挤在同一行；路径按原文本换行，不截断。
+        const seen = review.reviewed ?? [];
         const rerunnable = worktreeState(t) === 'awaiting';
         const again = rerunnable ? `<button class="btn sm" data-rv-f="again" data-rv-again data-rv-task="${esc(t.id)}" ${slot.rerun ? 'disabled' : ''}>${slot.rerun ? `${runm}${esc(rv.rerunning)}` : `${icon('refresh-line')}${esc(rv.again)}`}</button>` : '';
-        return `${head}${rerunFail}<div class="rv-list-issues" data-rv-issues>${rows}</div><div class="sec-t">${esc(rv.reviewed)}${seen ? ` · ${seen}` : ''}<span class="sp"></span>${again}</div>`;
+        const reviewed = `<div class="rv-reviewed" data-rv-reviewed><div class="rv-reviewed-head"><span>${esc(rv.reviewed)}</span>${again}</div>${seen.length ? `<ul class="rv-reviewed-files" data-rv-reviewed-files>${seen.map(file => `<li><span class="mono" data-rv-reviewed-file>${esc(file)}</span></li>`).join('')}</ul>` : ''}</div>`;
+        return `${head}${rerunFail}<div class="rv-list-issues" data-rv-issues>${rows}</div>${reviewed}`;
     }
     private issueCard(t: Task, slot: Slot, issue: ReviewIssue): string {
         const [tone] = SEVERITY[issue.severity] ?? ['', 3];
@@ -213,27 +220,52 @@ export class ReviewView {
     }
     private keydown(e: KeyboardEvent) {
         const input = (e.target as Element).closest<HTMLInputElement>('input[data-rv-note]');
-        if (input && e.key === 'Enter') { e.preventDefault(); this.commitNote(input); }
+        if (!input || e.key !== 'Enter') return;
+        // 输入法组合态（isComposing / 旧式 229）里的 Enter 是给输入法的，不提交、不夺焦点。
+        if (e.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        // 回车结束编辑：先 blur（用户要求不再聚焦），再按原来的确认结果写一次说明；未确认的问题不自动制造确认。
+        this.enterBlurInput = input;
+        this.enterBlurUntil = Date.now() + 300;
+        input.blur();
+        this.commitNote(input);
     }
     private focusOut(e: FocusEvent) {
         const input = (e.target as Element).closest<HTMLInputElement>('input[data-rv-note]');
-        if (input && input.isConnected && Date.now() >= this.muteFocusOutUntil) this.commitNote(input);
+        if (!input || !input.isConnected) return;
+        // 回车引起的 blur 已经由 keydown 提交过：这次 focusout 只消费标记，不再写一次。
+        if (this.enterBlurInput === input && Date.now() <= this.enterBlurUntil) { this.enterBlurInput = null; return; }
+        if (Date.now() >= this.muteFocusOutUntil) this.commitNote(input);
     }
     // 已经有确认结果的问题：说明改了，回车或失去焦点时按原来的结果再写一次；还没有结果的，说明随下一次点"成立 / 不成立"一起写。
     private commitNote(input: HTMLInputElement) {
         const t = this.find(input.dataset.rvTask ?? ''), id = input.dataset.rvNote ?? '';
-        const issue = t && this.slots.get(t.id)?.review?.issues.find(item => item.id === id);
-        if (!t || !issue?.confirmation) return;
-        if (input.value.trim() === (issue.confirmation.note ?? '').trim()) return;
+        if (!t) return;
+        const slot = this.slot(t.id), issue = slot.review?.issues.find(item => item.id === id);
+        // 验收页会先生成HTML再capture；结束编辑前须把最新内容存为草稿，首轮重画才不会闪回旧值。
+        // 保存中回改旧基线也是新意图；未确认的问题同样保留草稿，但不制造确认。
+        if (slot.busy.has(id) || input.value !== (input.dataset.rvBase ?? '')) slot.drafts.set(id, input.value);
+        else slot.drafts.delete(id);
+        if (!issue?.confirmation) return;
+        // 在途写入可能把旧基线改掉；此时回改旧值也是新的保存意图，交给 pending 覆盖先前排队值。
+        if (!slot.busy.has(id) && input.value.trim() === (issue.confirmation.note ?? '').trim()) return;
         void this.confirm(t, id, issue.confirmation.result, input.value);
     }
 
     // ---- 成立 / 不成立 ----
     private async confirm(t: Task, id: string, result: 'valid' | 'invalid', noteText?: string) {
         const slot = this.slot(t.id);
-        if (slot.busy.has(id)) return;
+        // 244：同一问题的上一条说明还没回来时，失焦/回车引出的新说明排队，等前一条回来再串行写；
+        // 按钮点击（不带 noteText）仍按原来的行为忽略。不同问题各排各的，不全局串行。
+        if (slot.busy.has(id)) {
+            if (noteText !== undefined) slot.pending.set(id, { result, note: noteText });
+            return;
+        }
         const input = document.querySelector<HTMLInputElement>(`input[data-rv-note="${CSS.escape(id)}"][data-rv-task="${CSS.escape(t.id)}"]`);
-        const note = (noteText ?? input?.value ?? slot.drafts.get(id) ?? '').trim();
+        const rawNote = noteText ?? input?.value ?? slot.drafts.get(id) ?? '';
+        const note = rawNote.trim();
+        // 排队请求也从这里重新进入；每次提交都须在首次重画前保存这次的原始文字。
+        slot.drafts.set(id, rawNote);
         slot.busy.add(id);
         slot.fail.delete(id);
         this.host.changed(t.id);
@@ -241,11 +273,20 @@ export class ReviewView {
             const done = await call('review:confirm', { project: t.repo, name: t.name, issue: id, result, ...(note ? { note } : {}) }) as { by?: string; note?: string | null };
             const issue = slot.review?.issues.find(item => item.id === id);
             if (issue) issue.confirmation = { result, by: done.by ?? 'human', note: done.note ?? (note || null), at: Date.now() };
-            slot.drafts.delete(id);
+            // 回来的结果只删掉和这次写入相同的草稿；期间又输入的新文字（B）要留着，不能被 A 覆盖。
+            const draft = slot.drafts.get(id);
+            if (draft === undefined || draft.trim() === note) slot.drafts.delete(id);
         }
         catch (error) { slot.fail.set(id, messageOf(error)); }
         slot.busy.delete(id);
         this.host.changed(t.id);
+        // 排队的后一次失焦：和已保存的说明相同就不重复写，否则按当时的确认结果再写一次。
+        const next = slot.pending.get(id);
+        if (next) {
+            slot.pending.delete(id);
+            const saved = slot.review?.issues.find(item => item.id === id)?.confirmation;
+            if (next.note.trim() !== (saved?.note ?? '').trim()) void this.confirm(t, id, next.result, next.note);
+        }
     }
 
     // ---- 再审一次 ----

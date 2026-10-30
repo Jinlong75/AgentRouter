@@ -304,6 +304,8 @@ export interface Harness {
     happened: (label: string, fn: () => boolean, limitMs: number) => Promise<number>;
     verify: (label: string, fn: () => Promise<void> | void) => Promise<void>;
     press: (selector: string) => Promise<void>;
+    // 244：在目标上用真实鼠标按住拖动（mouseDown → 多步 mouseMove → mouseUp），返回输入轨迹。
+    drag: (selector: string, deltaX: number, steps?: number) => Promise<{ from: { x: number; y: number }; to: { x: number; y: number }; points: { x: number; y: number }[] }>;
     key: (keyCode: string, modifiers?: Electron.InputEvent['modifiers'], label?: string) => Promise<void>;
     type: (selector: string, text: string) => Promise<void>;
     tabTo: (selector: string, max?: number) => Promise<void>;
@@ -438,6 +440,31 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
         lastInput = clock();
         await pause();
+    };
+    // 244：按住拖动：起点必须命中目标（和 press 一样先做命中测试），每一步都在窗口内；用系统级 mouseDown / mouseMove / mouseUp 让渲染层的 pointer 事件真的发生。
+    const drag = async (selector: string, deltaX: number, steps = 6) => {
+        recordInput({ type: 'drag', selector, text: `Δx=${Math.round(deltaX)}` });
+        const box = await hits(selector);
+        assert.ok(!('error' in box), `${selector}：${'error' in box ? box.error : ''}`);
+        const from = { x: (box as { x: number; y: number }).x, y: (box as { x: number; y: number }).y };
+        const size = await evaluate('({ width: innerWidth, height: innerHeight })') as { width: number; height: number };
+        assert.ok(Number.isInteger(steps) && steps > 0, '拖动步数必须是正整数');
+        const points = Array.from({ length: steps + 1 }, (_, i) => ({ x: Math.round(from.x + deltaX * i / steps), y: from.y }));
+        for (const point of points) assert.ok(point.x >= 0 && point.y >= 0 && point.x <= size.width && point.y <= size.height, `拖动路径出窗口：${JSON.stringify(point)}（窗口 ${size.width}×${size.height}）`);
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: from.x, y: from.y });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button: 'left', clickCount: 1 });
+        const to = points.at(-1)!;
+        try {
+            for (const point of points.slice(1)) {
+                win.webContents.sendInputEvent({ type: 'mouseMove', x: point.x, y: point.y });
+                await pause(30);
+            }
+        } finally {
+            win.webContents.sendInputEvent({ type: 'mouseUp', x: to.x, y: to.y, button: 'left', clickCount: 1 });
+        }
+        lastInput = clock();
+        await pause();
+        return { from, to, points };
     };
     // 066：键盘输入（key / tabTo）之前确认页面有输入焦点（document.hasFocus()）。页面没有焦点时 Tab 仍会移动焦点，但 :focus / :focus-visible 都不成立，
     // 焦点环样式不生效（对照实验见 shots.ts captureFocusRing）。没有焦点就先恢复、等到页面取得焦点（上限 1 秒），
@@ -627,5 +654,5 @@ ${recentReport(Math.max(30000, timeoutMs + 5000))}
         }
         await evaluate('document.querySelectorAll("[data-audit]").forEach(el => el.removeAttribute("data-audit")); document.activeElement?.blur(); true');
     };
-    return { pause, evaluate, wait, check, within, happened, verify, press, key, type, tabTo, focusRing, keyboardFocusRing, wheel, hits, save, audit, scene, checks, consoleErrors };
+    return { pause, evaluate, wait, check, within, happened, verify, press, drag, key, type, tabTo, focusRing, keyboardFocusRing, wheel, hits, save, audit, scene, checks, consoleErrors };
 }

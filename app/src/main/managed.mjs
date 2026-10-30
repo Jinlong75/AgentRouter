@@ -4,6 +4,24 @@ import { join, basename, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 
+function completeRejection(file, readJson) {
+  try { return typeof readJson(file)?.reason === 'string'; }
+  catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+}
+
+export function rejectManaged(file, reason, readJson, onError, io = { writeFileSync, renameSync, unlinkSync }) {
+  const target = file.replace(/\.(request|claimed)\.json$/, '.rejected.json');
+  try {
+    if (!completeRejection(target, readJson)) {
+      let value;
+      try { value = readJson(file); } catch (e) { if (e.code === 'ENOENT') return; if (!(e instanceof SyntaxError)) throw e; value = {}; }
+      io.writeFileSync(target + '.tmp', JSON.stringify({ ...value, reason }), { mode: 0o600 });
+      io.renameSync(target + '.tmp', target);
+    }
+    try { io.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  } catch (e) { onError(e); }
+}
+
 // 执行者可以用系统 Node，也可以用软件自带的 Node（AgentRouter.exe / 开发时 electron.exe，需 ELECTRON_RUN_AS_NODE=1）。
 const runtimes = ['node', 'node.exe', 'agentrouter.exe', 'electron.exe'];
 const embedded = node => !['node', 'node.exe'].includes(basename(node).toLowerCase());
@@ -15,18 +33,10 @@ export async function createManaged(root, env = process.env, onError = console.e
     load('installer/lib/install.mjs'), load('core/lib/config.mjs'), load('core/lib/managed.mjs'),
     load('core/lib/options.mjs'), load('core/lib/json.mjs')]);
   const home = config.homeDirectory(env), dir = join(home, 'managed');
-  const terminal = new Map();
+  const terminal = new Map(), preflightErrors = new Map();
   let watcher, timer, closed = false;
   const remove = file => { try { unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') onError(e); } };
-  function reject(file, reason) {
-    const target = file.replace(/\.(request|claimed)\.json$/, '.rejected.json');
-    try {
-      renameSync(file, target);
-      let value; try { value = json.readJson(target); } catch { value = {}; }
-      writeFileSync(target + '.tmp', JSON.stringify({ ...value, reason }), { mode: 0o600 });
-      renameSync(target + '.tmp', target);
-    } catch (e) { if (e.code !== 'ENOENT') onError(e); }
-  }
+  const reject = (file, reason) => rejectManaged(file, reason, json.readJson, onError);
   function verify(r, file) {
     if (!common.validRequest(r) || basename(file) !== r.id + '.request.json') return '请求文件无效';
     try {
@@ -66,9 +76,22 @@ export async function createManaged(root, env = process.env, onError = console.e
   }
   function scan() {
     if (closed) return;
-    for (const name of readdirSync(dir)) {
+    const names = readdirSync(dir), present = new Set(names);
+    for (const name of preflightErrors.keys()) if (!present.has(name)) preflightErrors.delete(name);
+    for (const name of names) {
       const file = join(dir, name);
       if (name.endsWith('.request.json')) {
+        const rejected = file.replace(/\.request\.json$/, '.rejected.json');
+        // 清理源失败后，已发布的回执优先，不能再次启动执行者。
+        let complete;
+        try { complete = completeRejection(rejected, json.readJson); preflightErrors.delete(name); }
+        catch (e) {
+          // 回执无法读取时不能确定是否已经拒绝，跳过本请求并继续扫描其他请求。
+          const key = `${e.code ?? ''}:${e.message}`;
+          if (preflightErrors.get(name) !== key) { preflightErrors.set(name, key); onError(e); }
+          continue;
+        }
+        if (complete) { remove(file); continue; }
         let r; try { r = json.readJson(file); } catch { reject(file, '请求文件无效'); continue; }
         const reason = verify(r, file); if (reason) { reject(file, reason); continue; }
         const claimed = file.replace(/\.request\.json$/, '.claimed.json');
