@@ -290,7 +290,7 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   return pipeline({
     root, paths, id, registry, progress, started, interactive, home,
     adapter, label, profile, settings, detection, childEnv, envError, env, proxy,
-    prompt: details.prompt, gateInfo, onGate,
+    prompt: details.prompt, gateInfo, onGate, taskTitle: details.title, taskSpec: details.spec,
     profileName, maxRetries, escalate, strong, effortOptions, effortSupported, settingSources, sources,
     ...(wt ? { worktree: { base: wt.base, setup: setupCommands(root), dir: null } } : {}),
   });
@@ -533,7 +533,7 @@ function requireGateBase(root, specPath) {
 export function profileConfig(profile = {}, adapter = null) {
   const extra = Object.fromEntries((adapter?.snapshotKeys ?? []).filter(key => profile[key] !== undefined).map(key => [key, profile[key]]));
   return { env: profile.env ?? {}, secrets: profile.secrets ?? {}, auth: profile.auth ?? null, maxTurns: profile.maxTurns ?? null, label: profile.label ?? null,
-    adapter: profile.adapter ?? adapter?.id ?? null, path: profile.path ?? null, ...extra };
+    adapter: profile.adapter ?? adapter?.id ?? null, path: profile.path ?? null, ...(profile.autoCommit === true ? { autoCommit: true } : {}), ...extra };
 }
 
 // ===== 手动重试（协议 14.3，任务 059）=====
@@ -652,7 +652,7 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   return pipeline({
     root, paths, id, registry, progress, started, interactive, home,
     adapter, label, profile, profileName, settings, detection, childEnv, env, envError, proxy,
-    prompt, gateInfo, onGate,
+    prompt, gateInfo, onGate, taskTitle: plan.start.title, taskSpec: saved.spec,
     maxRetries: 0, escalate: null, sources,
     retry: { n, note: opts.note, failure, ...(rebase ? { rebase } : {}) },
     // worktree 任务在原 worktree 里继续，也要占任务名额（协议 15.2、15.5）。

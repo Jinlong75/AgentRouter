@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
-import { readConfig, slotLimits } from '../../core/lib/config.mjs';
+import { readConfig, slotLimits, validateV2 } from '../../core/lib/config.mjs';
 
 // 注入读取函数模拟不同平台的错误码：公共目录被一个文件占着时，Linux 读 config.json 得到 ENOTDIR，Windows 得到 ENOENT，
 // 在 Windows 上没法用真实的文件系统构造 ENOTDIR。
@@ -100,4 +100,9 @@ test('concurrencyMax：1～8 的整数，默认 8；其他值按默认并提示'
     assert.equal(result.limits.concurrency, 8, String(bad));
     assert.deepEqual(result.warnings, ['配置：concurrencyMax 必须为 1～8 的整数，已按默认值 8 处理'], String(bad));
   }
+});
+
+test('autoCommit boolean validation', () => {
+  for (const value of [true, false]) assert.doesNotThrow(() => validateV2({ v: 2, profiles: { fake: { adapter: 'fake', autoCommit: value } } }));
+  for (const value of [null, 1, 'true', {}, []]) assert.throws(() => validateV2({ v: 2, profiles: { fake: { adapter: 'fake', autoCommit: value } } }), /profiles\.fake\.autoCommit/);
 });

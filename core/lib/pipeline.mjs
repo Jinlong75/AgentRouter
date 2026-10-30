@@ -23,10 +23,10 @@ import { acquireSlot } from './slots.mjs';
 import { awaitingOverlaps, createOverlapWatcher, createTaskLimit, enterGate, exclusiveCommandOf, overlapLine, overlapNoteLine, readProject, waitForOverlap } from './schedule.mjs';
 import { readDispatch } from './records.mjs';
 import { taskBaseBranch } from './status.mjs';
-import { createWorktree, mergeInto, requireSpecAt, resolveBase, runSetup } from './worktree.mjs';
+import { createWorktree, mergeInto, requireSpecAt, resolveBase, runSetup, specRelative } from './worktree.mjs';
 import { OUTSIDE_NOTE, diffRoots, outsideField, outsideLine, outsideRecord, snapshotRoots, uncheckedLine, userTempLine } from './outside-writes.mjs';
 import { homedir } from 'node:os';
-import { git } from './git.mjs';
+import { git, headSha, uncommittedFiles } from './git.mjs';
 import { chooseReviewer, markNeedsHuman, reviewApplies, reviewDecision, reviewSettings, reviewSpecOf, runReview } from './review.mjs';
 
 // 排队时每轮重读 config.json 里的名额上限；配置读不了（正在写、坏了）时抛错，由 acquireSlot 沿用上一轮的值。
@@ -84,7 +84,7 @@ export async function pipeline(ctx) {
     adapter, label, profile, profileName, settings, detection, childEnv, env, envError,
     // 派发 / 手动重试启动前算出的网络代理（Stage07 099）；没传时按"没有代理"。
     proxy = null,
-    prompt, gateInfo, onGate,
+    prompt, gateInfo, onGate, taskTitle, taskSpec,
     maxRetries = 0, escalate = null, strong = null, effortOptions: initialEffortOptions = null, effortSupported: initialEffortSupported = true, settingSources = null, sources = [], retry = null, worktree = null,
     // 工作区外写入检查列的用户目录根：核心进程的 os.homedir()（不是交给执行者的沙箱目录），ctx 里可替换（测试用）。
     userHome = homedir(),
@@ -340,6 +340,17 @@ export async function pipeline(ctx) {
     // 上一次被停止时可能留下配对一半的命令或 lastResult，不该漏进这次。只弹一次进度窗口（第 1 次尝试）。
     const mapLine = run.adapter.createMapper ? run.adapter.createMapper() : run.adapter.mapLine;
     const attemptStarted = Date.now();
+    let initialHead = null;
+    let commitTitle = taskTitle;
+    if (run.profile.autoCommit === true && worktree && !readOnly && gateInfo?.enabled && gateInfo.merged?.expect_commit === true && !rebaseOnly) {
+      try {
+        initialHead = headSha(workdir);
+        const rel = specRelative(root, taskSpec);
+        const shown = rel && git(workdir, ['show', `${initialHead}:${rel}`]);
+        // 标题读不出来只回退到派发时的标题，不影响是否代提交。
+        if (shown?.status === 0) try { commitTitle = validateSpec(parseSpec(shown.stdout, rel), rel).title ?? taskTitle; } catch { commitTitle = taskTitle; }
+      } catch (error) { initialHead = null; progress(`AgentRouter 代提交失败：${error.message}`); }
+    }
     // 工作区外写入检查（协议 12.4）：启动执行者之前先列一遍用户目录根与公共目录根的第一层。
     const rootsBefore = snapshotRoots({ userHome, home });
     lastRun = rebaseOnly ? { exit: 0, lastSay: null, result: null, stderrTail: '', startFailed: false } : await runOnce({
@@ -360,6 +371,28 @@ export async function pipeline(ctx) {
     const outside = diffRoots(rootsBefore, snapshotRoots({ userHome, home }));
     if (!outside.checked) progress(uncheckedLine(outside.error));
     else if (outside.userTemp?.length) progress(userTempLine(outside.userTemp));
+
+    let autoCommit = null;
+    if (initialHead && lastRun.exit === 0 && !stopping) {
+      try {
+        if (headSha(workdir) === initialHead) {
+          const files = [...new Set(uncommittedFiles(workdir))];
+          if (files.length) {
+            for (const key of ['user.name', 'user.email']) {
+              const identity = git(workdir, ['config', '--get', key]);
+              if (identity.status !== 0 || !identity.stdout.trim()) throw new Error(`无法读取提交身份 ${key}：${identity.stderr.trim() || '未配置'}`);
+            }
+            const add = git(workdir, ['add', '--', ...files]);
+            if (add.status !== 0) throw new Error(add.stderr.trim() || `git add 退出码 ${add.status}`);
+            const commit = git(workdir, ['commit', '-m', `[执行] ${commitTitle}（执行者没能提交，由 AgentRouter 代提交）`, '--', ...files]);
+            if (commit.status !== 0) throw new Error(commit.stderr.trim() || `git commit 退出码 ${commit.status}`);
+            const sha = headSha(workdir);
+            autoCommit = { sha, files };
+            progress(`AgentRouter 代提交了 ${files.length} 个文件：${sha.slice(0, 7)}`);
+          }
+        }
+      } catch (error) { progress(`AgentRouter 代提交失败：${error.message}`); }
+    }
 
     // 门禁（协议第 12 节）：执行者以 0 结束且启用门禁时跑，dir 指这次的 attempts/<n>/。
     let gate = null;
@@ -453,6 +486,7 @@ export async function pipeline(ctx) {
       usage: { input: usage.sawInput ? usage.input : null, output: usage.sawOutput ? usage.output : null },
       ms: Date.now() - attemptStarted, at: Date.now(),
       ...(needsScope.length ? { needsScope } : {}),
+      ...(autoCommit ? { autoCommit } : {}),
       ...(outsideRecord(outside) ? { outsideWrites: outsideRecord(outside) } : {}),
     });
     if (needsScope.length) progress(needsScopeLine(needsScope));

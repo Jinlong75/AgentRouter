@@ -332,3 +332,15 @@ test('并行一节的机器正忙带原因：CPU 与可用内存分开，不忙�
   await writeFile(load,JSON.stringify({busy:false,cpu:10,memLow:true}));
   info=await parallel();assert.equal(info.busy,false);assert.equal(info.busyReason,null);assert.equal(info.busyFreeGb,null);
 });
+
+test('remove legacy operation validates host and supports rollback', async t => {
+  const {env,service} = await fixture(t), target = path.join(env.CLAUDE_CONFIG_DIR,'skills','codex-dispatch');
+  await mkdir(target, {recursive:true}); await writeFile(path.join(target,'SKILL.md'),'legacy skill');
+  await assert.rejects(service.run('install',{host:'unknown',operation:'removeLegacy'}));
+  assert.equal(await readFile(path.join(target,'SKILL.md'),'utf8'),'legacy skill');
+  const result = await service.run('install',{host:'claude-code',operation:'removeLegacy'});
+  assert.deepEqual(result.changed.map(i=>i.skill),['codex-dispatch']);
+  await assert.rejects(readFile(path.join(target,'SKILL.md')));
+  await service.run('install',{host:'claude-code',operation:'rollback'});
+  assert.equal(await readFile(path.join(target,'SKILL.md'),'utf8'),'legacy skill');
+});

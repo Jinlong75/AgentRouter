@@ -27,16 +27,28 @@ const runtimes = ['node', 'node.exe', 'agentrouter.exe', 'electron.exe'];
 const embedded = node => !['node', 'node.exe'].includes(basename(node).toLowerCase());
 // onWarn：已经自动恢复、不影响使用的情况，只打一行说明（不带堆栈），避免看起来像崩溃。
 // spawnProcess：启动执行者的函数，默认 child_process.spawn，可注入以模拟启动失败（Linux 上无执行权限是 'error' 事件，Windows 上多为同步抛出）。
-export async function createManaged(root, env = process.env, onError = console.error, onWarn = message => console.warn(message), spawnProcess = spawn) {
+export async function createManaged(root, env = process.env, onError = console.error, onWarn = message => console.warn(message), spawnProcess = spawn, io = { writeFileSync, renameSync, unlinkSync }) {
   const load = file => import(pathToFileURL(join(root, file)).href);
   const [install, config, common, options, json] = await Promise.all([
     load('installer/lib/install.mjs'), load('core/lib/config.mjs'), load('core/lib/managed.mjs'),
     load('core/lib/options.mjs'), load('core/lib/json.mjs')]);
   const home = config.homeDirectory(env), dir = join(home, 'managed');
-  const terminal = new Map(), preflightErrors = new Map();
+  const terminal = new Map(), preflightErrors = new Map(), operationErrors = new Map();
   let watcher, timer, closed = false;
-  const remove = file => { try { unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') onError(e); } };
-  const reject = (file, reason) => rejectManaged(file, reason, json.readJson, onError);
+  const fileError = (errors, name, e) => {
+    const key = `${e.code ?? ''}:${e.message}`;
+    if (errors.get(name) !== key) { errors.set(name, key); onError(e); }
+  };
+  const remove = file => {
+    const name = basename(file);
+    try { io.unlinkSync(file); operationErrors.delete(name); }
+    catch (e) { if (e.code === 'ENOENT') operationErrors.delete(name); else fileError(operationErrors, name, e); }
+  };
+  const reject = (file, reason) => {
+    const name = basename(file); let failed = false;
+    rejectManaged(file, reason, json.readJson, e => { failed = true; fileError(operationErrors, name, e); }, io);
+    if (!failed) operationErrors.delete(name);
+  };
   function verify(r, file) {
     if (!common.validRequest(r) || basename(file) !== r.id + '.request.json') return '请求文件无效';
     try {
@@ -77,21 +89,23 @@ export async function createManaged(root, env = process.env, onError = console.e
   function scan() {
     if (closed) return;
     const names = readdirSync(dir), present = new Set(names);
-    for (const name of preflightErrors.keys()) if (!present.has(name)) preflightErrors.delete(name);
+    for (const errors of [preflightErrors, operationErrors])
+      for (const name of errors.keys()) if (!present.has(name)) errors.delete(name);
     for (const name of names) {
       const file = join(dir, name);
-      if (name.endsWith('.request.json')) {
-        const rejected = file.replace(/\.request\.json$/, '.rejected.json');
+      if (/\.(request|claimed)\.json$/.test(name)) {
+        const rejected = file.replace(/\.(request|claimed)\.json$/, '.rejected.json');
         // 清理源失败后，已发布的回执优先，不能再次启动执行者。
         let complete;
         try { complete = completeRejection(rejected, json.readJson); preflightErrors.delete(name); }
         catch (e) {
           // 回执无法读取时不能确定是否已经拒绝，跳过本请求并继续扫描其他请求。
-          const key = `${e.code ?? ''}:${e.message}`;
-          if (preflightErrors.get(name) !== key) { preflightErrors.set(name, key); onError(e); }
+          fileError(preflightErrors, name, e);
           continue;
         }
         if (complete) { remove(file); continue; }
+      }
+      if (name.endsWith('.request.json')) {
         let r; try { r = json.readJson(file); } catch { reject(file, '请求文件无效'); continue; }
         const reason = verify(r, file); if (reason) { reject(file, reason); continue; }
         const claimed = file.replace(/\.request\.json$/, '.claimed.json');

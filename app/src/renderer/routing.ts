@@ -477,7 +477,11 @@ export class RoutingView {
             menu(button, [0, 1, 2, 3, 4, 5].map(n => ({ label: String(n), run: () => { if (n !== current) this.setReview({ maxReworks: n }, '[data-ro-rv-max]'); } })), true);
             return;
         }
-        if (d.roDiffer !== undefined) { this.setReviewer(this.config.reviewer.profiles, !this.config.reviewer.mustDiffer); return; }
+        if (d.roDiffer !== undefined) {
+            const reviewer = this.config.reviewer;
+            this.setReviewer(reviewer.profiles, !reviewer.mustDiffer, undefined, { differFamily: reviewer.differFamily ?? reviewer.mustDiffer });
+            return;
+        }
         if (d.roDifferFamily !== undefined) {
             const family = this.config.reviewer.differFamily ?? this.config.reviewer.mustDiffer;
             this.setReviewer(this.config.reviewer.profiles, this.config.reviewer.mustDiffer, undefined, { differFamily: !family });
@@ -618,7 +622,7 @@ export class RoutingView {
         this.setReviewer(cfg.reviewer.profiles.filter(item => item !== name), cfg.reviewer.mustDiffer, '[data-ro-review-add]');
     }
 
-    // differFamily / differFromLead 只在点对应开关时带上；其余改动不带它们，核心保留已有的值。
+    // 切换本人约束时保留当前家族约束的有效值；候选改动不带约束，核心保留已有的值。
     private setReviewer(profiles: string[], mustDiffer: boolean, focus?: string, change: { differFamily?: boolean; differFromLead?: boolean } = {}) {
         const kept = this.config!.reviewer;
         this.config!.reviewer = { profiles: [...profiles], mustDiffer, differFamily: change.differFamily ?? kept.differFamily ?? mustDiffer, differFromLead: change.differFromLead ?? kept.differFromLead ?? true };

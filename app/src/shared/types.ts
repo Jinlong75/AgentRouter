@@ -630,7 +630,7 @@ export interface Settings {
 }
 export interface Connections {
     availableVersion: string;
-    hosts: { host: string; detected: boolean; root: string; installedAt: number; actions: string[]; legacy?: string[]; skills: { skill: string; version: string | null; state: string; checked: boolean }[] }[];
+    hosts: { host: string; detected: boolean; root: string; installedAt: number; actions: string[]; legacy?: { skill: string; link: boolean }[]; skills: { skill: string; version: string | null; state: string; checked: boolean }[] }[];
     codex: { installed: boolean; version: string | null; login: string; path: string | null; change?: { old: string; next: string } };
 }
 declare global {

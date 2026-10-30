@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 import { isolatedEnvKey, isolationOverrides } from '../app/src/main/app-env.mjs';
 import { unsafeHomeReason } from '../core/lib/compat.mjs';
+import { preserveFailures } from './shots-failures.mjs';
 // 界面验收可能跨午夜（037 第 2 项）：演示数据生成与软件里的"今天 / 昨天"分组用同一个"现在"——
 // AR_DEMO_NOW（毫秒时间戳）。这里在生成演示数据之前设好；外部已设时沿用不覆盖（负向验证要指定时刻）。
 process.env.AR_DEMO_NOW ||= String(Date.now());
@@ -78,7 +79,7 @@ async function unsafeHomeStartupCheck(out,real,isolated) {
   console.log(`启动前检查：主进程拒绝把公共目录设为用户目录（退出码 2，用时 ${elapsed} ms，假用户目录没有任何改动）`);
 }
 
-// 066：失败现场目录（任何检查失败时由软件写入截图与焦点 JSON）。每次验收开始时清空，只清这一个目录。
+// 066：失败现场目录（任何检查失败时由软件写入截图与焦点 JSON）。
 const failuresDir=path.resolve('app/dist/shots','failures');
 async function announceFailures() {
   const files=await readdir(failuresDir).catch(()=>[]);
@@ -89,7 +90,8 @@ const fixture=await demo();
 let reposAside='',resetTemp='';
 try {
   const out=path.resolve('app/dist/shots');
-  await rm(failuresDir,{recursive:true,force:true});
+  const preserved=await preserveFailures(out);
+  if(preserved) console.log('上一次的失败现场已保留到 '+path.relative(process.cwd(),preserved));
   // 与 npm run demo 相同：隔离环境只经 AR_ISOLATED_ENV 交给软件内部，Electron 进程本身拿用户真实环境（见 app/src/main/app-env.mjs）。
   const real={...process.env};delete real.ELECTRON_RUN_AS_NODE;
   // AR_TEST_LOAD_FILE（核心已有的负载注入钩子，格式 { busy, cpu }）：测试工具在这里指到公共目录里的一个文件，软件与它的设置线程、核心子进程经隔离环境都拿得到；

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { composeSkill } from '../../installer/lib/compose.mjs';
-import { createPlan, executePlan, installationStatus, detectHosts, getStatus, rollback, uninstall, readTree, project, version } from '../../installer/lib/install.mjs';
+import { createPlan, executePlan, installationStatus, detectHosts, getStatus, rollback, uninstall, removeLegacy, readTree, project, version } from '../../installer/lib/install.mjs';
 import { runInstaller } from '../../installer/cli.mjs';
 import { readCodexConfig } from '../../installer/lib/codex-config.mjs';
 import { readConfig, writeConfig, loadConfig, formatConfig } from '../../core/lib/config.mjs';
@@ -656,11 +656,81 @@ test('旧版 DispatchDock 技能：识别并显示，安装、卸载都不改动
   write(join(root, 'codex-dispatch', 'SKILL.md'), '旧技能'); write(join(root, 'codex-dispatch', '.dispatchdock.json'), JSON.stringify({ v: 1, version: '0.1.5' }));
   write(join(root, 'dual-role-workflow', 'SKILL.md'), '手装的旧技能');
   const before = snapshot(root);
-  assert.deepEqual(getStatus(s.options)[0].legacy, [{ skill: 'codex-dispatch', target: join(root, 'codex-dispatch'), version: '0.1.5' }, { skill: 'dual-role-workflow', target: join(root, 'dual-role-workflow'), version: null }]);
+  assert.deepEqual(getStatus(s.options)[0].legacy, [{ skill: 'codex-dispatch', target: join(root, 'codex-dispatch'), version: '0.1.5', link: false }, { skill: 'dual-role-workflow', target: join(root, 'dual-role-workflow'), version: null, link: false }]);
   const output = [];
   await runInstaller(['--yes', '--no-config'], { ...s.options, output: line => output.push(line) });
   assert.ok(output.join('\n').split('\n').some(line => line.startsWith('检测到旧版 DispatchDock 技能：codex-dispatch、dual-role-workflow（安装器不会改动')));
   uninstall(s.options);
   const after = snapshot(root).filter(([name]) => name.startsWith('codex-dispatch') || name.startsWith('dual-role-workflow'));
   assert.deepEqual(after, before);
+});
+
+
+test('remove legacy skills backs up and rollback restores bytes', t => {
+  const s = setup(t), root = detectHosts(s.options)[0].root;
+  const names = ['codex-dispatch', 'dual-role-workflow'];
+  for (const name of names) {
+    write(join(root, name, 'SKILL.md'), `content ${name}`);
+    write(join(root, name, '.dispatchdock.json'), Buffer.from([0, 1, 2, 255]));
+    write(join(root, name, 'nested', 'file'), 'content');
+  }
+  write(join(root, 'other', 'keep'), 'content');
+  const before = names.map(name => snapshot(join(root, name)));
+  const result = removeLegacy(s.options), record = JSON.parse(fs.readFileSync(join(result.backup, 'backup.json')));
+  assert.equal(record.reason, 'removeLegacy'); assert.deepEqual(record.items.map(i => i.skill), names);
+  for (const [i, name] of names.entries()) {
+    assert.equal(fs.existsSync(join(root, name)), false);
+    assert.deepEqual(snapshot(join(result.backup, 'claude-code', name)), before[i]);
+  }
+  assert.equal(fs.readFileSync(join(root, 'other', 'keep'), 'utf8'), 'content');
+  rollback(s.options);
+  for (const [i, name] of names.entries()) assert.deepEqual(snapshot(join(root, name)), before[i]);
+  rollback(s.options);
+  for (const name of names) assert.equal(fs.existsSync(join(root, name)), false);
+});
+
+test('remove only detected skills and no backup for no-op', t => {
+  const s = setup(t), root = detectHosts(s.options)[0].root;
+  assert.deepEqual(removeLegacy(s.options), { changed: [], backup: null, leftovers: [] });
+  assert.equal(fs.existsSync(join(s.home, 'backups')), false);
+  write(join(root, 'codex-dispatch', 'SKILL.md'), 'content');
+  const result = removeLegacy(s.options);
+  assert.deepEqual(result.changed.map(i => i.skill), ['codex-dispatch']);
+  assert.equal(JSON.parse(fs.readFileSync(join(result.backup, 'backup.json'))).items.length, 1);
+  rollback(s.options); assert.equal(fs.readFileSync(join(root, 'codex-dispatch', 'SKILL.md'), 'utf8'), 'content');
+});
+
+test('failed removal restores earlier directories', t => {
+  const s = setup(t), root = detectHosts(s.options)[0].root, names = ['codex-dispatch', 'dual-role-workflow'];
+  for (const name of names) write(join(root, name, 'SKILL.md'), name);
+  const before = names.map(name => snapshot(join(root, name))), original = new Error('simulated failure');
+  assert.throws(() => removeLegacy({ ...s.options, onCommit: target => { if (target === join(root, names[1])) throw original; } }), error => error === original);
+  for (const [i, name] of names.entries()) assert.deepEqual(snapshot(join(root, name)), before[i]);
+});
+
+
+test('remove legacy skips linked skill and preserves its target', t => {
+  const s = setup(t), root = detectHosts(s.options)[0].root;
+  const normal = join(root, 'codex-dispatch'), linked = join(root, 'dual-role-workflow'), target = join(s.base, 'linked-target');
+  write(join(normal, 'SKILL.md'), 'ordinary skill');
+  write(join(target, 'SKILL.md'), 'linked skill');
+  const before = snapshot(target), normalBefore = snapshot(normal);
+  try { fs.symlinkSync(target, linked, process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) { t.skip(`无法创建目录链接：${error.code || error.message}`); return; }
+  const linkBefore = fs.readlinkSync(linked);
+  assert.deepEqual(getStatus(s.options)[0].legacy.map(({ skill, link }) => ({ skill, link })), [
+    { skill: 'codex-dispatch', link: false }, { skill: 'dual-role-workflow', link: true },
+  ]);
+  const result = removeLegacy(s.options);
+  assert.deepEqual(result.changed.map(item => item.skill), ['codex-dispatch']);
+  assert.equal(fs.existsSync(normal), false);
+  assert.equal(fs.lstatSync(linked).isSymbolicLink(), true);
+  assert.equal(fs.readlinkSync(linked), linkBefore);
+  assert.deepEqual(snapshot(target), before);
+  assert.deepEqual(removeLegacy(s.options), { changed: [], backup: null, leftovers: [] });
+  rollback(s.options);
+  assert.deepEqual(snapshot(normal), normalBefore);
+  assert.equal(fs.lstatSync(linked).isSymbolicLink(), true);
+  assert.equal(fs.readlinkSync(linked), linkBefore);
+  assert.deepEqual(snapshot(target), before);
 });

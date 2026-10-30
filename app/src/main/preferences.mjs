@@ -123,7 +123,7 @@ export async function createPreferences(root, data, env = process.env) {
       }
       let backup = false;
       try { backup = install.rollbackPlan({ env, host: h.host }).items.length > 0; } catch { /* 损坏的备份不提供回退按钮。 */ }
-      return { host: h.host, detected: h.detected, root: shorten(h.root), installedAt, skills, legacy: (h.legacy ?? []).map(l => l.skill), actions: hostActions(skills, backup) };
+      return { host: h.host, detected: h.detected, root: shorten(h.root), installedAt, skills, legacy: (h.legacy ?? []).map(({ skill, link }) => ({ skill, link })), actions: hostActions(skills, backup) };
     });
     const detected = adapter.codex.detect({ env: { ...env, ELECTRON_RUN_AS_NODE: '1' }, settings: { path: state.values.path } });
     const version = detected.version;
@@ -202,8 +202,9 @@ export async function createPreferences(root, data, env = process.env) {
       if (action === 'finish') { if (payload.configure && !existsSync(join(home,'config.json'))) config.writeConfig(home); saveOwn({ wizardDone: true }); return settings(); }
       if (action === 'ack') { saveOwn({ versionChange: null }); return detect(); }
       if (action === 'install') {
-        if (!install.hosts.includes(payload.host) || !['install','update','reinstall','replace','rollback','selected'].includes(payload.operation)) throw Error('Invalid operation');
+        if (!install.hosts.includes(payload.host) || !['install','update','reinstall','replace','rollback','selected','removeLegacy'].includes(payload.operation)) throw Error('Invalid operation');
         if (payload.operation === 'rollback') return install.rollback({ env, host: payload.host });
+        if (payload.operation === 'removeLegacy') return install.removeLegacy({ env, host: payload.host });
         const plan = install.createPlan({ env, host: payload.host, sourceRoot: join(root,'skills'), replaceExisting: ['replace','selected'].includes(payload.operation) });
         if (!plan.statuses[0]?.detected) throw Error('Host no longer detected');
         const allowed = { install: ['missing'], update: ['update'], reinstall: ['latest'], replace: ['custom'], selected: ['missing','update','latest','custom'] }[payload.operation];

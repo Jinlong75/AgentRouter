@@ -140,10 +140,15 @@ function select(options) {
 
 export function legacyInstalls(root) {
   if (!root) return [];
-  return legacySkills.filter(skill => directory(join(root, skill))).map(skill => {
+  return legacySkills.flatMap(skill => {
+    const target = join(root, skill);
+    let stat;
+    try { stat = fs.lstatSync(target); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    const link = stat.isSymbolicLink();
+    if (!link && !stat.isDirectory()) return [];
     let version = null;
-    try { version = json(join(root, skill, legacyMarker)).version ?? null; } catch { /* 手装或改过的旧技能没有记录。 */ }
-    return { skill, target: join(root, skill), version };
+    if (!link) try { version = json(join(target, legacyMarker)).version ?? null; } catch { /* 手装或改过的旧技能没有记录。 */ }
+    return [{ skill, target, version, link }];
   });
 }
 
@@ -282,6 +287,16 @@ export function uninstall(options = {}) {
   return executePlan(plan, options);
 }
 
+export function removeLegacy(options = {}) {
+  const items = [];
+  for (const h of select(options)) {
+    for (const entry of legacyInstalls(h.root).filter(entry => !entry.link)) {
+      items.push({ ...entry, host: h.host, ...installationStatus(entry.target, h.host, entry.skill), action: 'uninstall' });
+    }
+  }
+  return executePlan({ items, reason: 'removeLegacy' }, options);
+}
+
 export function rollbackPlan(options = {}) {
   select(options);
   // 卡片按宿主操作：从保留批次里找该宿主（及所选技能）最近的一次操作。
@@ -298,7 +313,7 @@ export function rollbackPlan(options = {}) {
   if (!latest) return { version, statuses: getStatus(options), items: [], warnings: [], reason: 'rollback' };
   const items = [];
   for (const item of record.items) {
-    if (!hosts.includes(item.host) || !skills.includes(item.skill) || !isAbsolute(item.from)) throw new Error('备份说明无效');
+    if (!hosts.includes(item.host) || !(skills.includes(item.skill) || (['removeLegacy', 'rollback'].includes(record.reason) && legacySkills.includes(item.skill))) || !isAbsolute(item.from)) throw new Error('备份说明无效');
     if (options.host && options.host !== 'all' && options.host !== item.host || options.skill && options.skill !== 'all' && options.skill !== item.skill) continue;
     const h = detectHosts(options).find(h => h.host === item.host);
     // 不信任备份中的任意写入路径；目录覆盖必须与这次请求的目标一致。

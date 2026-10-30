@@ -11,6 +11,19 @@ export { homeDirectory, userDirectory };
 // codex 执行者的派发设置与窗口策略的内置默认值。
 export const defaults = { model: null, effort: null, tier: null, sandbox: 'workspace-write', path: null, watchWindow: 'auto' };
 const codexKeys = ['model', 'effort', 'tier', 'sandbox', 'path'];
+const parallelKeys = ['concurrency', 'concurrencyMax', 'gateConcurrency', 'memLowPercent'];
+function parallelValue(key, value) {
+  if (key === 'concurrency' && value === 'auto') return value;
+  const number = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  const integer = Number.isSafeInteger(number) && number > 0;
+  const valid = key === 'memLowPercent' ? validMemLowPercent(number)
+    : key === 'gateConcurrency' ? integer : integer && number <= concurrencyCap;
+  if (!valid) {
+    const requirement = key === 'gateConcurrency' ? '正整数' : key === 'memLowPercent' ? `1～${memLowPercentMax} 的整数` : `1～${concurrencyCap} 的整数${key === 'concurrency' ? '或 auto' : ''}`;
+    throw new Error(`命令行的 ${key} 必须为${requirement}`);
+  }
+  return number;
+}
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const noProfile = '还没有可用的执行者：在软件的 Agent 页导入，或运行 ar agents 查看';
 
@@ -213,6 +226,7 @@ export function validateV2(config) {
     if (!object(profile)) throw new Error(`config.json 的 profiles.${name} 必须为对象`);
     if (typeof profile.adapter !== 'string' || !profile.adapter) throw new Error(`config.json 的 profiles.${name}.adapter 必须为非空字符串`);
     if (profile.enabled !== undefined && typeof profile.enabled !== 'boolean') throw new Error(`config.json 的 profiles.${name}.enabled 必须为布尔值`);
+    if (profile.autoCommit !== undefined && typeof profile.autoCommit !== 'boolean') throw new Error(`config.json 的 profiles.${name}.autoCommit 必须为布尔值`);
     // env 与 secrets：值都是字符串；secrets 的值是"从哪个环境变量读"的变量名，不是密钥本身。
     for (const key of ['env', 'secrets']) {
       if (profile[key] != null && (!object(profile[key]) || Object.values(profile[key]).some(v => typeof v !== 'string'))) throw new Error(`config.json 的 profiles.${name}.${key} 必须为字符串映射`);
@@ -450,7 +464,9 @@ export function writeConfig(home, changes = {}, { init = false, profile } = {}) 
   // 写入类命令在配置无效时拒绝（063）：坏文件一个字节都不动；config init 也不再拿"文件存在"搪塞。
   if (state.reason) throw configInvalid(state, '这次没有改动配置');
   if (init && state.exists) return { ...state, unchanged: true };
+  changes = { ...changes };
   for (const [key, value] of Object.entries(changes)) {
+    if (parallelKeys.includes(key)) { changes[key] = parallelValue(key, value); continue; }
     if (key !== 'managed' && !Object.hasOwn(defaults, key)) throw new Error(`未知配置键：${key}`);
     validate(key, value, '命令行');
   }
@@ -465,7 +481,7 @@ export function writeConfig(home, changes = {}, { init = false, profile } = {}) 
     if (existing.adapter !== 'codex') throw new Error(`执行者 ${profile} 不是 Codex 适配器，这次没有改动配置`);
   }
   for (const [key, value] of Object.entries(changes)) {
-    if (key === 'watchWindow' || key === 'managed') config[key] = value;
+    if (key === 'watchWindow' || key === 'managed' || parallelKeys.includes(key)) config[key] = value;
     else {
       config.profiles ??= {};
       config.profiles[target] ??= { adapter: 'codex', label: 'Codex', enabled: true };

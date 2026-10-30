@@ -280,6 +280,31 @@ export async function capturePreferences(h: Harness) {
     await wait('!!document.querySelector("[data-agent=deepseek] .xresult") && !document.querySelector("[data-test=deepseek]").disabled', '重新测试 deepseek 连接', 60000);
     await check('UI06 Agent 页 claude-code 执行者（deepseek）行的版本是 Claude Code 风格、不含 codex-cli', 'document.querySelector("[data-agent=deepseek]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=deepseek]").textContent.includes("codex-cli")');
     await check('UI06 Agent 页 Codex 行的版本含 codex-cli（claude-code 行串版本不波及它）', 'document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
+    // 旧版技能在隔离宿主目录中验证删除与回退。
+    const legacyNames = ['codex-dispatch', 'dual-role-workflow'];
+    const legacyRoot = path.join(claude, 'skills');
+    for (const name of legacyNames) {
+        await mkdir(path.join(legacyRoot, name), { recursive: true });
+        await writeFile(path.join(legacyRoot, name, 'SKILL.md'), name);
+        await writeFile(path.join(legacyRoot, name, '.dispatchdock.json'), JSON.stringify({ version: '0.1.5' }));
+    }
+    await refresh(); await wait('!!document.querySelector("[data-legacy-remove]")');
+    await check('UI06 legacy text and button', `document.querySelector('[data-legacy-skills]').textContent.includes(${JSON.stringify(p.legacySkills(legacyNames.join('\u3001')))}) && document.querySelector('[data-legacy-remove]').textContent === ${JSON.stringify(p.removeLegacy)}`);
+    await save('ui-legacy-skills');
+    await tabTo('[data-legacy-remove]'); await key('Enter'); await wait('!!document.querySelector(".confirm-card")');
+    await check('UI06 legacy confirmation', `document.querySelector('.confirm-card h2').textContent === ${JSON.stringify(p.removeLegacyTitle)} && document.querySelector('.confirm-card').textContent.includes(${JSON.stringify(p.removeLegacyBody(legacyNames.join('\u3001')))}) && document.activeElement === document.querySelector(".confirm-actions .btn")`);
+    await press('.confirm-actions .btn');
+    await check('UI06 cancel restores focus', 'document.activeElement === document.querySelector("[data-legacy-remove]")');
+    await verify('UI06 cancel preserves directories', async () => { for (const name of legacyNames) assert.equal(await exists(path.join(legacyRoot, name, 'SKILL.md')), true); });
+    await press('[data-legacy-remove]'); await press('.confirm-actions .danger');
+    await wait('!document.querySelector("[data-legacy-skills]") && !!document.querySelector("[data-operation=rollback][data-host=claude-code]")');
+    await check('UI06 deletion result', `!document.querySelector('[data-legacy-remove]') && document.querySelector('[data-host-card=claude-code] .note').textContent === ${JSON.stringify(p.legacyRemoved)}`);
+    await verify('UI06 directories removed', async () => { for (const name of legacyNames) assert.equal(await exists(path.join(legacyRoot, name)), false); });
+    await press('[data-operation=rollback][data-host=claude-code]'); await press('.confirm-actions .primary');
+    await wait('!!document.querySelector("[data-legacy-remove]")');
+    await verify('UI06 rollback restores files', async () => { for (const name of legacyNames) { assert.equal(await readFile(path.join(legacyRoot, name, 'SKILL.md'), 'utf8'), name); assert.equal(JSON.parse(await readFile(path.join(legacyRoot, name, '.dispatchdock.json'), 'utf8')).version, '0.1.5'); } });
+    for (const name of legacyNames) await rm(path.join(legacyRoot, name), { recursive: true });
+    await refresh(); await wait('!document.querySelector("[data-legacy-skills]")');
     await writeFile(marker, JSON.stringify({ ...JSON.parse(originalMarker), version: '0.0.0' }));
     await writeFile(agent, JSON.stringify({ version: 'codex-cli 0.157.0', loggedIn: true }));
     await refresh(); await wait('!!document.querySelector("[data-agent=codex] [data-agent-ack]")'); await save('connect-update-dark');

@@ -5,6 +5,11 @@ import { commands, usage } from '../../core/lib/cli.mjs';
 // ar help 按用途分组（v0.7.5 走查：用户反馈 ar help 难读）：每个子命令一行、说明另起缩进一行，行宽尽量不超过 100 个字符。
 const lines = usage.split('\n');
 
+test('ar help：config 说明支持设置并发上限', () => {
+  const index = lines.findIndex(line => line.startsWith('  ar config '));
+  assert.match(lines[index + 1], /并发上限/);
+});
+
 test('ar help：分组标题都在，且按固定顺序出现', () => {
   const titles = ['【派发与查看】', '【验收与 git】', '【执行者与路由】', '【审查】', '【项目与任务说明】', '【其他】'];
   const at = titles.map(title => lines.indexOf(title));

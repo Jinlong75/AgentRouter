@@ -157,7 +157,7 @@ export class PreferencesView {
             const buttons = [...h.actions].sort((a,b)=>order.indexOf(a)-order.indexOf(b)).flatMap(action => action==='replace' ? h.skills.filter(s=>s.state==='custom').map(s=>this.button(p.actions[action],'host','sm',`data-host="${h.host}" data-operation="replace" data-skill="${s.skill}"`)) : [this.button(p.actions[action],'host',`sm ${action==='update'?'primary':action==='rollback'?'quiet':''}`,`data-host="${h.host}" data-operation="${action}"`)]).join('');
             const date=new Date(h.installedAt),pad=(n:number)=>String(n).padStart(2,'0');
             const installed=h.installedAt?p.lastInstall(`${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`):'';
-            return `<div class="card ${!h.detected?'is-off':custom?'is-brand':''}" data-host-card="${h.host}"><div class="card-h">${icon('terminal-line')}<b>${hostName(h.host)}</b><span class="aside">${h.detected?mark('ok')+p.detected:p.missingHost}</span></div><div class="card-b">${h.detected?`<div class="path mono">${esc(h.root)}</div>${skills}${h.skills.some(s=>s.skill==='agent-router'&&s.state==='custom')?hint(p.customHelp):''}${h.legacy?.length?`<div data-legacy-skills>${hint(p.legacySkills(h.legacy.join('、')))}</div>`:''}`:hint(p.hostMissing(hostName(h.host)))}${banner(this.hostErrors.get(h.host)||'')}</div>${h.detected?`<div class="card-f"><span class="note" role="status">${esc(this.messages.get(h.host)||(custom?p.customIdle:installed))}</span>${buttons}</div>`:''}</div>`;
+            return `<div class="card ${!h.detected?'is-off':custom?'is-brand':''}" data-host-card="${h.host}"><div class="card-h">${icon('terminal-line')}<b>${hostName(h.host)}</b><span class="aside">${h.detected?mark('ok')+p.detected:p.missingHost}</span></div><div class="card-b">${h.detected?`<div class="path mono">${esc(h.root)}</div>${skills}${h.skills.some(s=>s.skill==='agent-router'&&s.state==='custom')?hint(p.customHelp):''}${h.legacy?.length?`<div data-legacy-skills>${hint(p.legacySkills(h.legacy.map(l=>l.skill).join('、')))}${h.legacy.some(l=>!l.link)?this.button(p.removeLegacy,'host','sm',`data-legacy-remove data-host="${h.host}" data-operation="removeLegacy"`):''}</div>`:''}`:hint(p.hostMissing(hostName(h.host)))}${banner(this.hostErrors.get(h.host)||'')}</div>${h.detected?`<div class="card-f"><span class="note" role="status">${esc(this.messages.get(h.host)||(custom?p.customIdle:installed))}</span>${buttons}</div>`:''}</div>`;
         }).join('');
         return section(p.dispatchers,p.dispatchHelp,`<div class="cards2">${hosts}</div>`)+`<div data-agents></div>`;
     }
@@ -748,13 +748,14 @@ export class PreferencesView {
             finally { this.busy=false; await this.refreshSettings(); if(this.wizard&&this.step===3) void this.loadWizardPresets(); }
         }
         if(d.pref==='host') {
+            if(d.operation==='removeLegacy'&&!await confirmAction(p.removeLegacyTitle,p.removeLegacyBody(this.connections?.hosts.find(h=>h.host===d.host)?.legacy?.filter(l=>!l.link).map(l=>l.skill).join('\u3001') || ''),p.removeLegacy,b,true)) return;
             if(d.operation==='rollback'&&!await confirmAction(p.rollbackTitle(hostName(d.host!)),p.rollbackBody,p.actions.rollback,b)) return;
             if(d.operation==='replace'&&!await confirmAction(p.replaceTitle(d.skill!),p.replaceBody,p.replace,b,true)) return;
             this.busy=true; this.hostErrors.delete(d.host!); this.render(); trace('host-op-start', { host: d.host, operation: d.operation });
             try {
                 const result=await window.dock.preferences('install',{host:d.host,operation:d.operation,...(d.skill?{skills:[d.skill]}:{})});
                 trace('host-op-done', { host: d.host, operation: d.operation, changed: result.changed.length });
-                this.messages.set(d.host!,d.operation==='rollback'?p.rolledBack:p.installed(result.changed.length));
+                this.messages.set(d.host!,d.operation==='rollback'?p.rolledBack:d.operation==='removeLegacy'?p.legacyRemoved:p.installed(result.changed.length));
                 clearTimeout(this.messageTimers.get(d.host!));
                 this.messageTimers.set(d.host!,setTimeout(()=>{this.messages.delete(d.host!);this.messageTimers.delete(d.host!);trace('host-message-cleared', { host: d.host, wizard: this.wizard, active: this.active });if(!this.wizard&&this.active==='connect')this.render();},3000));
             } catch(e) { this.hostErrors.set(d.host!,String((e as Error).message||e)); trace('host-op-error', { host: d.host, operation: d.operation, error: String((e as Error).message||e) }); }

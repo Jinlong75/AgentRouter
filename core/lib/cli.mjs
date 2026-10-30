@@ -145,7 +145,7 @@ export const usage = [
   '',
   '【其他】',
   '  ar config [键=值 … | init]',
-  '      查看或修改全局配置',
+  '      查看或修改全局配置，包括并发上限',
   '  ar proxy resolve',
   '      这一刻的网络代理：config.json 的 proxy 模式、读到的地址与要给执行者设置的变量，只读',
   '  ar version | ar help',

@@ -409,28 +409,36 @@ export async function captureRouting(h: Harness, win: BrowserWindow) {
         await press('[data-ro-review-remove=alpha]');
         await wait('!document.querySelector("[data-ro-chip=alpha]")', 'UI27 移除 Alpha 候选');
         await settled('UI27 移除 alpha：profiles 是 [beta]', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true }); });
+        await verify('UI27 切换本人约束前未存 differFamily', async () => { assert.ok(!('differFamily' in (await readConfig()).routing.reviewer)); });
         await tabTo('[data-ro-differ]');
         await focusRing('UI27 "必须与执行者不同"的焦点环');
         await key('Enter');
         await wait(`document.querySelector('[data-ro-differ]').getAttribute('aria-checked') === 'false'`, 'UI27 取消必须与执行者不同');
         await settled('UI27 取消勾选：mustDiffer 是 false，profiles 不变，其余字段不变', async () => {
             const after = await readConfig();
-            assert.deepEqual(after.routing.reviewer, { profiles: ['beta'], mustDiffer: false });
+            assert.deepEqual(after.routing.reviewer, { profiles: ['beta'], mustDiffer: false, differFamily: true });
             assert.deepEqual(rest(after), rest(before));
         });
+        await check('UI27 取消本人约束后家族约束仍勾选', `document.querySelector('[data-ro-differ-family]').getAttribute('aria-checked') === 'true'`);
+        await verify('UI27 取消本人约束后核心家族约束仍为 true', async () => { assert.equal((await core(['roles'])).differFamily, true); });
+        await enter('UI27 重新进入页面（本人约束已取消）');
+        await check('UI27 重新进入页面后家族约束仍勾选', `document.querySelector('[data-ro-differ-family]').getAttribute('aria-checked') === 'true'`);
         await reveal('reviewers');
         await pause(300);
         await shot('ui27-routing-reviewers');
         await press('[data-ro-differ]');
         await wait(`document.querySelector('[data-ro-differ]').getAttribute('aria-checked') === 'true'`, 'UI27 再勾选');
-        await settled('UI27 再勾选：mustDiffer 回到 true', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true }); });
+        await settled('UI27 再勾选：mustDiffer 回到 true', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFamily: true }); });
+        await check('UI27 再勾选本人约束后家族约束仍勾选', `document.querySelector('[data-ro-differ-family]').getAttribute('aria-checked') === 'true'`);
+        await verify('UI27 再勾选本人约束后核心家族约束仍为 true', async () => { assert.equal((await core(['roles'])).differFamily, true); });
         await enter('UI27 重新进入页面（所有改动仍在）');
+        await check('UI27 再勾选后重新进入页面家族约束仍勾选', `document.querySelector('[data-ro-differ-family]').getAttribute('aria-checked') === 'true'`);
         await settled('UI27 重新进入页面后读到的就是刚写的配置：规则 2 条、兜底 beta、alpha 上限 1、审查者 [beta]', async () => {
             const after = await readConfig();
             assert.equal(after.routing.rules.length, 2);
             assert.equal(after.routing.fallback, 'beta');
             assert.deepEqual(after.profiles.alpha.limits, { maxTasksPerDay: 1 });
-            assert.deepEqual(after.routing.reviewer, { profiles: ['beta'], mustDiffer: true });
+            assert.deepEqual(after.routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFamily: true });
             const dom = JSON.parse(await evaluate(`JSON.stringify({ rules: document.querySelectorAll('[data-ro-rule]').length, fallback: document.querySelector('[data-ro-fallback] span').textContent, tasks: document.querySelector('[data-ro-limit=alpha][data-ro-kind=tasks]').value, chips: [...document.querySelectorAll('[data-ro-chip]')].map(c => c.dataset.roChip) })`));
             assert.deepEqual(dom, { rules: 2, fallback: 'Beta 阅读者', tasks: '1', chips: ['beta'] });
         });
@@ -444,12 +452,12 @@ export async function captureRouting(h: Harness, win: BrowserWindow) {
         await focusRing('UI27 "默认也与主导的模型家族不同"的焦点环');
         await key('Enter');
         await wait(`document.querySelector('[data-ro-differ-lead]').getAttribute('aria-checked') === 'false'`, 'UI27 取消与主导不同');
-        await settled('UI27 取消勾选：differFromLead 是 false，profiles、mustDiffer 不变', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFromLead: false }); });
+        await settled('UI27 取消勾选：differFromLead 是 false，profiles、mustDiffer 不变', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFromLead: false, differFamily: true }); });
         await verify('UI27 核心读到的同一个值：ar roles --json 的 differFromLead 为 false', async () => { assert.equal((await core(['roles'])).differFromLead, false); });
         // 改"必须与执行者不同"不带 differFromLead：核心保留已有的值。
         await press('[data-ro-differ]');
         await wait(`document.querySelector('[data-ro-differ]').getAttribute('aria-checked') === 'false'`, 'UI27 取消必须与执行者不同');
-        await settled('UI27 改"必须与执行者不同"时 differFromLead 保持 false', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: false, differFromLead: false }); });
+        await settled('UI27 改"必须与执行者不同"时 differFromLead 保持 false', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: false, differFromLead: false, differFamily: true }); });
         await check('UI27 重画后"与主导不同"仍是未勾选', `document.querySelector('[data-ro-differ-lead]').getAttribute('aria-checked') === 'false' && document.querySelector('[data-ro-differ]').getAttribute('aria-checked') === 'false'`);
         await reveal('reviewers');
         await pause(300);
@@ -457,7 +465,7 @@ export async function captureRouting(h: Harness, win: BrowserWindow) {
         await press('[data-ro-differ]');
         await press('[data-ro-differ-lead]');
         await wait(`document.querySelector('[data-ro-differ-lead]').getAttribute('aria-checked') === 'true' && document.querySelector('[data-ro-differ]').getAttribute('aria-checked') === 'true'`, 'UI27 再勾选两项');
-        await settled('UI27 再勾选：differFromLead 回到 true', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFromLead: true }); });
+        await settled('UI27 再勾选：differFromLead 回到 true', async () => { assert.deepEqual((await readConfig()).routing.reviewer, { profiles: ['beta'], mustDiffer: true, differFromLead: true, differFamily: true }); });
         await enter('UI27 重新进入页面（与主导不同）');
         await check('UI27 重新进入页面后读到的是 true', `document.querySelector('[data-ro-differ-lead]').getAttribute('aria-checked') === 'true'`);
 

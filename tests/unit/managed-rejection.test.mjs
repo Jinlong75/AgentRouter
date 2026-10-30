@@ -164,3 +164,73 @@ test('corrupt receipt skips its request and does not interrupt other requests', 
   assert.equal(errors.length, 1);
   assert.ok(errors[0] instanceof SyntaxError);
 });
+
+
+test('claimed cleanup retries after launch failure without changing receipt', async t => {
+  const { home, dir, request } = fixture(t);
+  request('test');
+  const source = join(dir, 'test.claimed.json'), target = join(dir, 'test.rejected.json');
+  const failure = Object.assign(new Error('cleanup blocked'), { code: 'EPERM' });
+  const errors = []; let launches = 0, blocked = true;
+  const io = { ...fs, unlinkSync(file) { if (file === source && blocked) throw failure; fs.unlinkSync(file); } };
+  const service = await createManaged(root, { AGENT_ROUTER_HOME: home }, e => errors.push(e), () => {},
+    () => { launches++; throw Error('launch failed'); }, io);
+  t.after(() => service.close());
+  service.scan();
+  assert.equal(launches, 1);
+  assert.equal(fs.existsSync(source), true);
+  const receipt = fs.readFileSync(target, 'utf8');
+  blocked = false; service.scan();
+  assert.equal(fs.existsSync(source), false);
+  assert.equal(launches, 1);
+  assert.equal(fs.readFileSync(target, 'utf8'), receipt);
+  assert.deepEqual(errors, [failure]);
+});
+
+test('corrupt claimed receipt is reported once and other requests continue', async t => {
+  const { home, dir, request } = fixture(t);
+  request('a-broken'); request('b-valid');
+  fs.renameSync(join(dir, 'a-broken.request.json'), join(dir, 'a-broken.claimed.json'));
+  fs.writeFileSync(join(dir, 'a-broken.rejected.json'), '{');
+  const errors = []; let launches = 0;
+  const service = await createManaged(root, { AGENT_ROUTER_HOME: home }, e => errors.push(e), () => {},
+    () => { launches++; return { on() {}, unref() {} }; });
+  t.after(() => service.close());
+  service.scan(); service.scan();
+  assert.equal(launches, 1);
+  assert.equal(fs.existsSync(join(dir, 'a-broken.claimed.json')), true);
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0] instanceof SyntaxError);
+});
+
+for (const operation of ['publication', 'rename', 'cleanup']) test(`scan deduplicates ${operation} errors and resets`, async t => {
+  const { home, dir, request } = fixture(t);
+  const source = join(dir, 'test.request.json'), target = join(dir, 'test.rejected.json');
+  const first = Object.assign(new Error('blocked'), { code: 'EPERM' });
+  const changed = Object.assign(new Error('changed'), { code: 'EPERM' });
+  const changedCode = Object.assign(new Error('changed'), { code: 'EACCES' });
+  let failure = first;
+  const io = { ...fs,
+    writeFileSync(file, ...args) { if (operation === 'publication' && file === target + '.tmp' && failure) throw failure; fs.writeFileSync(file, ...args); },
+    renameSync(from, to) { if (operation === 'rename' && from === target + '.tmp' && failure) throw failure; fs.renameSync(from, to); },
+    unlinkSync(file) { if (operation === 'cleanup' && file === source && failure) throw failure; fs.unlinkSync(file); }
+  };
+  const errors = [];
+  const service = await createManaged(root, { AGENT_ROUTER_HOME: home }, e => errors.push(e), () => {}, () => {}, io);
+  t.after(() => service.close());
+  function makeSource() { fs.writeFileSync(source, '{'); }
+  makeSource();
+  service.scan(); service.scan(); service.scan();
+  assert.deepEqual(errors, [first]);
+  failure = changed; service.scan();
+  assert.deepEqual(errors, [first, changed]);
+  failure = changedCode; service.scan();
+  assert.deepEqual(errors, [first, changed, changedCode]);
+  failure = null; service.scan();
+  assert.equal(fs.existsSync(source), false);
+  fs.rmSync(target, { force: true }); makeSource(); failure = first; service.scan();
+  assert.deepEqual(errors, [first, changed, changedCode, first]);
+  fs.unlinkSync(source); service.scan();
+  fs.rmSync(target, { force: true }); makeSource(); service.scan();
+  assert.deepEqual(errors, [first, changed, changedCode, first, first]);
+});

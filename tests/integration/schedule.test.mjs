@@ -249,6 +249,32 @@ test('3 独占命令：独占门禁运行期间新任务排队，门禁结束后
   assert.equal(existsSync(path.join(f.home, 'slots', 'exclusive.json')), false, '孤立标记被回收');
 });
 
+test('ar config 写入并发设置并拒绝非法值', async t => {
+  const f = fixture(t);
+  const file = path.join(f.home, 'config.json');
+  for (const [key, good, bad] of [
+    ['concurrency', '8', ['0', '9', '4.5', '08x', '']],
+    ['concurrencyMax', '3', ['0', '9', '4.5', '08x', '']],
+    ['gateConcurrency', '12', ['0', '-1', '4.5', '08x', '9007199254740992', '']],
+    ['memLowPercent', '50', ['0', '51', '4.5', '08x', '']],
+  ]) {
+    const result = await f.ar(['config', `${key}=${good}`]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8'))[key], Number(good));
+    for (const value of bad) {
+      const before = readFileSync(file);
+      const rejected = await f.ar(['config', `${key}=${value}`]);
+      assert.equal(rejected.code, 2, `${key}=${value}: ${rejected.stderr}`);
+      assert.match(rejected.stderr, /必须为/);
+      assert.deepEqual(readFileSync(file), before);
+    }
+  }
+  const shown = await f.ar(['config', 'concurrency=auto', 'concurrencyMax=3']);
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).concurrency, 'auto');
+  assert.match(shown.stdout, /^concurrencyMax\s+3\s+config\.json$/m);
+});
+
 test('4 并发自动档：机器忙时排队的任务不开始，不忙后开始；ar config 显示估算值与上限', async t => {
   const f = fixture(t, { config: { concurrency: 'auto', concurrencyMax: 3 } });
   const spec = f.spec('docs/specs/G.md', { allowed: ['docs/g/**'] });
