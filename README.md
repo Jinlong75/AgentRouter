@@ -2,9 +2,9 @@
 <h1 align="center">AgentRouter</h1>
 <p align="center"><a href="#中文">中文</a> · <a href="#english">English</a></p>
 
-> 状态：v0.8.0 开发分支（尚未发布）。本仓库仅包含运行、构建与测试所需的文件。
+> 状态：v0.8.0 已发布。本仓库仅包含运行、构建与测试所需的文件。
 >
-> Status: v0.8.0 development branch (not released). This repository contains only the files needed to run, build and test the project.
+> Status: v0.8.0 released. This repository contains only the files needed to run, build and test the project.
 
 ## 中文
 
