@@ -107,6 +107,28 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
     try {
         await agentsPage();
 
+        // 在隔离配置中检查无候选、读取失败和不可交互的通用配置。
+        await wait('!!document.querySelector("[data-lead-empty]")', '451 无候选提示出现');
+        await check('451 无候选时说明原因', `(() => { const e = document.querySelector('[data-lead-empty]'); return document.querySelector('[data-lead-open]').disabled && !!e && e.getClientRects().length > 0 && e.textContent === ${jsonStr(ag.leadNoCandidates)}; })()`);
+        const beforeLeadCases = await readFile(config, 'utf8');
+        try {
+            await writeFile(config, '{');
+            await agentsPage();
+            await wait('!!document.querySelector("[data-lead-roles-error]")', '451 角色读取失败提示出现');
+            await check('451 角色读取失败显示原因和重试', `(() => { const e = document.querySelector('[data-lead-roles-error]'); return e.textContent.startsWith(${jsonStr(ag.leadRolesFailed(''))}) && e.textContent.length > ${ag.leadRolesFailed('').length} && !!document.querySelector('[data-lead-roles-retry]') && !document.querySelector('[data-lead-empty]'); })()`);
+            await writeFile(config, beforeLeadCases);
+            await press('[data-lead-roles-retry]');
+            await wait('!document.querySelector("[data-lead-roles-error]") && !!document.querySelector("[data-lead-empty]")', '451 重试成功');
+            await check('451 修复配置后重试清除错误', '!document.querySelector("[data-lead-roles-error]") && !document.querySelector("[data-lead-roles-retry]")');
+            await writeFile(config, jsonStr({ v: 2, defaultProfile: 'custom', managed: false, watchWindow: 'never', profiles: {
+                custom: { adapter: 'generic', generic: 'custom', label: '自定义测试', enabled: true, roles: ['lead'] },
+            }, generics: { custom: { label: '自定义测试', executable: 'fake-cli', args: [], stdin: '{prompt}', output: { format: 'text' } } } }));
+            await agentsPage();
+            await wait('!!document.querySelector("[data-agent=custom]") && !!document.querySelector("[data-lead-empty]")', '451 不可交互 generic 配置已读取');
+            await check('451 只有不可交互 generic 时说明无候选', `(() => { const e = document.querySelector('[data-lead-empty]'); return document.querySelector('[data-lead-open]').disabled && !!e && e.getClientRects().length > 0 && e.textContent === ${jsonStr(ag.leadNoCandidates)}; })()`);
+        } finally { await writeFile(config, beforeLeadCases); }
+        await agentsPage(); await wait('!!document.querySelector("[data-agent=sonnet]")');
+
         // ---- 导入第 1 步：新增的卡片 ----
         await openWizard();
         await check('UI28 第 1 步：预设卡片后面固定两张——自定义 CLI、从文件导入，文案来自 gx', `(() => { const cards = [...document.querySelectorAll('.sheet .preset')], names = cards.map(c => c.dataset.preset); const last2 = cards.slice(-2); return names.slice(-2).join() === '@custom,@file' && last2[0].querySelector('b').textContent === ${jsonStr(gx.custom)} && last2[0].querySelector('.pk > span').textContent === ${jsonStr(gx.customDesc)} && last2[1].querySelector('b').textContent === ${jsonStr(gx.fromFile)} && last2[1].querySelector('.pk > span').textContent === ${jsonStr(gx.fromFileDesc)} && names.includes('openai-compat') && names.includes('qoder-cn'); })()`);
@@ -747,6 +769,8 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await writeFile(config, jsonStr(withDs));
         await writeFile(limitsFile, jsonStr({ v: 1, profiles: { ds: { kind: 'limit', until, since: Date.now(), evidence } } }));
         await agentsPage(); await wait('!!document.querySelector("[data-agent=ds] [data-limited]")', 'UI28 被限流的执行者行出现限流标签');
+        // 列表与角色由同一次刷新读回，刷新还没结束时先等它画完（断言不变）。
+        await wait(`(() => { const rows = [...document.querySelectorAll('[data-agent]')].filter(r => !r.querySelector('.x1').textContent.includes(${jsonStr(ag.disabled)})); return rows.length >= 4 && rows.every(r => { const x2 = r.querySelector('.x2'), a = r.querySelector('[data-roles]'), f = r.querySelector('[data-family-row]'); return a && f && x2.lastElementChild === f && x2.contains(a) && a.textContent.startsWith(${jsonStr(ag.canDoRow(''))}) && (f.textContent === ${jsonStr(ag.familyUnknown)} || f.textContent.startsWith(${jsonStr(ag.familyRow(''))})); }); })()`, '行末的可担任与家族已画出');
         await check('UI28 每个已启用的执行者行第二行末尾都有"可担任 …"和"家族 …"（家族未知时写 familyUnknown）', `(() => { const rows = [...document.querySelectorAll('[data-agent]')].filter(r => !r.querySelector('.x1').textContent.includes(${jsonStr(ag.disabled)})); return rows.length >= 4 && rows.every(r => { const x2 = r.querySelector('.x2'), a = r.querySelector('[data-roles]'), f = r.querySelector('[data-family-row]'); return a && f && x2.lastElementChild === f && x2.contains(a) && a.textContent.startsWith(${jsonStr(ag.canDoRow(''))}) && (f.textContent === ${jsonStr(ag.familyUnknown)} || f.textContent.startsWith(${jsonStr(ag.familyRow(''))})); }); })()`);
         await check('UI28 行里的值与核心一致：sonnet 可担任 执行者 · 审查者、家族 claude；ds 家族 deepseek；fake 执行者家族未知', `(() => { const t = (n, s) => document.querySelector('[data-agent=' + n + '] ' + s).textContent; return t('sonnet', '[data-roles]') === ${jsonStr(ag.canDoRow(both))} && t('sonnet', '[data-family-row]') === ${jsonStr(ag.familyRow('claude'))} && t('ds', '[data-family-row]') === ${jsonStr(ag.familyRow('deepseek'))} && t('ok', '[data-family-row]') === ${jsonStr(ag.familyUnknown)}; })()`);
         await verify('UI28 行里的家族和 ar roles --json 一致（界面不自己判断）', async () => { const view = await rolesNow(); const sonnet = view.profiles.find(x => x.name === 'sonnet')!, ds = view.profiles.find(x => x.name === 'ds')!; assert.deepEqual(sonnet.families, ['claude']); assert.deepEqual(ds.families, ['deepseek']); assert.equal(view.profiles.find(x => x.name === 'ok')!.familiesUnknown, true); });

@@ -73,6 +73,7 @@
   --surface-2: #24282D;
   --selected: #1D2024;
   --border: #262A30;
+  --control-border: #747A84; /* D189：开关关闭态、未勾选复选框、未选单选的边框，对 bg / surface / surface-2 ≥3:1 */
   --divider: #1C1F23;
   --chip: #2E333A;
   --text: #ECEEF1;
@@ -112,6 +113,7 @@
   --surface-2: #FFFFFF;
   --selected: #EAEAE6;
   --border: #E4E4E0;
+  --control-border: #82868D;
   --divider: #EDEDEA;
   --chip: #D9DADD;
   --text: #141518;

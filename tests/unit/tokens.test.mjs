@@ -42,7 +42,7 @@ test('深浅两套令牌名完全一致', () => {
 const same = value => value?.toLowerCase().replaceAll(' ', '').replace(/([,(])0\./g, '$1.');
 
 test('令牌取值与颜色表逐项一致；已删除的旧令牌不再出现', () => {
-  assert.equal(table.length, 25, '颜色表行数');
+  assert.equal(table.length, 26, '颜色表行数');
   for (const row of table) {
     assert.equal(same(dark[row.name]), same(row.dark), `深色 --${row.name}`);
     assert.equal(same(light[row.name]), same(row.light), `浅色 --${row.name}`);

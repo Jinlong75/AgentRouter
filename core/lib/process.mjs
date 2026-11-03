@@ -43,7 +43,7 @@ export const KILL_TREE_TIMEOUT_MS = 30000; // killProcessTree 总时限（含其
 export const TERMINATE_TIMEOUT_MS = 20000; // terminateByIdentity 单次调用（killProcessTree 里还会被剩余时间截短）
 export const STOP_WAIT_TIMEOUT_MS = 30000; // stop.mjs 结束进程树后等派发进程退出的总时限
 
-const secondsText = ms => { const s = Math.round(ms / 100) / 10; return Number.isInteger(s) ? String(s) : s.toFixed(1); };
+const secondsText = ms => String(ms / 1000);
 
 // execFile 因 timeout 结束子进程时 killed 为真并带 signal；超出 maxBuffer 也会 killed，但不是超时。
 const isTimeout = error => !!error && error.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && (error.killed === true || !!error.signal);
@@ -206,7 +206,13 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) throw Error('无效的目标进程');
   const deadline = Date.now() + timeout;
   const remaining = () => Math.max(1, deadline - Date.now());
-  const snapshot = await list(undefined, platform, remaining());
+  let scanIncomplete = false;
+  // 已开始的查询至少有十秒（显式较短的总时限仍受尊重）；循环仍按原截止时间停止。
+  // 截止后必要的收尾查询也有最低时限，因此实际结束可超过截止时间，但查询次数有界。
+  const queryTimeout = () => Math.max(Math.min(timeout, PROCESS_LIST_TIMEOUT_MS / 2), remaining());
+  // 结束操作也需要最低时限，避免慢查询耗尽预算后只剩一毫秒。
+  const killTimeout = () => Math.max(Math.min(timeout, PROCESS_LIST_TIMEOUT_MS / 2), remaining());
+  const snapshot = await list(undefined, platform, queryTimeout());
   trace(`进程树结束 目标 pid=${pid} 初次快照 ${snapshot.length} 项`);
   const root = snapshot.find(p => p.pid === pid);
   if (!root) {
@@ -232,11 +238,11 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   const known = new Set(snapshot.map(identityKey));
   // 取一次新快照；查询失败重试一次（时限内），仍失败就抛出——不能把"查不到"当成"已退出"。
   const takeSnapshot = async () => {
-    try { return await list(undefined, platform, remaining()); }
+    try { return await list(undefined, platform, queryTimeout()); }
     catch (error) {
       if (Date.now() >= deadline) throw error;
       trace(`进程树结束 目标 pid=${pid} 取快照出错（${error.message}），重试一次`);
-      return list(undefined, platform, remaining());
+      return list(undefined, platform, queryTimeout());
     }
   };
   // 结束前核对：只留下身份仍在快照里的进程；其余（已退出或 PID 已被复用）不结束。
@@ -259,7 +265,7 @@ export async function killProcessTree(pid, { platform = process.platform, list =
     const byPid = items.filter(p => alive(p.pid));
     if (!byPid.length || Date.now() - since < settleMs) return byPid;
     try {
-      const current = await list(undefined, platform, remaining());
+      const current = await list(undefined, platform, queryTimeout());
       return byPid.filter(p => {
         if (identityAlive(current, p)) return true;
         trace(`进程树结束 目标 pid=${pid} ${describeProcess(p)} pidAlive 为真但身份不在（PID 已被复用），按已退出处理`);
@@ -272,7 +278,7 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   };
   const taskkill = (pids, label) => {
     const args = [...pids.flatMap(p => ['/PID', String(p.pid)]), '/F'];
-    return executeFile('taskkill.exe', args, { windowsHide: true, shell: false, timeout: remaining() })
+    return executeFile('taskkill.exe', args, { windowsHide: true, shell: false, timeout: killTimeout() })
       .then(() => trace(`进程树结束 目标 pid=${pid} ${label} ${pids.length} 个`))
       .catch(error => { failure ??= error; trace(`进程树结束 目标 pid=${pid} ${label} ${pids.length} 个出错：${error.message}`); });
   };
@@ -281,7 +287,7 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   const killBatch = async (items, label, { verify = true } = {}) => {
     if (terminate) {
       try {
-        const results = await terminate(items.map(p => ({ pid: p.pid, created: p.created })), { timeout: remaining() });
+        const results = await terminate(items.map(p => ({ pid: p.pid, created: p.created })), { timeout: killTimeout() });
         for (const p of items) {
           const result = results.get(p.pid);
           if (result === 'killed') continue;
@@ -321,13 +327,20 @@ export async function killProcessTree(pid, { platform = process.platform, list =
       if (descendants.length) await killBatch(descendants, '结束子孙');
       // 补充轮：根结束前刚派生的进程不在初次快照里，重新取快照后一并结束（最多 2 轮）。
       // 这个快照既用来认出新子孙，也是结束它们之前的身份核对。
-      for (let round = 0; round < 2 && Date.now() < deadline; round++) {
+      scanIncomplete = true;
+      let cleanupDeadline;
+      for (let round = 0; round < 2; round++) {
+        if (Date.now() >= deadline && cleanupDeadline === undefined) {
+          cleanupDeadline = Date.now() + Math.min(timeout, PROCESS_LIST_TIMEOUT_MS / 2);
+        }
+        if (round > 0 && cleanupDeadline !== undefined && Date.now() >= cleanupDeadline) break;
         const current = await takeSnapshot();
         const candidates = current.filter(p => !known.has(identityKey(p)) && tree.some(t => t.pid === p.parent));
         const fresh = candidates.filter(p => isTreeChild(p, current));
         for (const p of candidates) {
           if (!fresh.includes(p)) trace(`进程树结束 目标 pid=${pid} 补充轮：${describeProcess(p)} 的父 PID 虽在树里，但父进程的身份已不在或它是在 PID 复用之后创建的，不算子孙，不结束`);
         }
+        scanIncomplete = fresh.length > 0;
         if (!fresh.length) break;
         for (const p of fresh) { tree.push(p); known.add(identityKey(p)); }
         // 句柄方式在结束时再次核对；taskkill 退路下 fresh 刚从上面的快照里取得，不再多取一次。
@@ -336,14 +349,22 @@ export async function killProcessTree(pid, { platform = process.platform, list =
     } else {
       // 先逐层暂停并重新扫描，纳入初次快照之后刚派生的子孙。
       try {
+        scanIncomplete = true;
+        let cleanupDeadline;
+        let scanned = 0;
         for (let i = 0; i < tree.length; i++) {
-          if (Date.now() >= deadline) throw Error('等待进程退出超时');
+          if (Date.now() >= deadline && cleanupDeadline === undefined) {
+            cleanupDeadline = Date.now() + Math.min(timeout, PROCESS_LIST_TIMEOUT_MS / 2);
+          }
+          if (cleanupDeadline !== undefined && Date.now() >= cleanupDeadline) { scanIncomplete = true; break; }
           const p = tree[i];
           try { process.kill(p.pid, 'SIGSTOP'); } catch (e) { if (e.code !== 'ESRCH') throw e; }
-          for (const q of await list(undefined, platform, remaining())) {
+          for (const q of await list(undefined, platform, queryTimeout())) {
             if (q.parent === p.pid && !seen.has(q.pid) && q.created >= p.created) { tree.push(q); seen.add(q.pid); }
           }
+          scanned++;
         }
+        scanIncomplete = scanned !== tree.length;
         // 同样先结束根，再按叶到根结束其余子孙（派发进程来不及补写 end）。
         const kill = p => {
           try { process.kill(p.pid, 'SIGKILL'); trace(`进程树结束 目标 pid=${pid} SIGKILL ${describeProcess(p)} 结果=已发送`); }
@@ -357,7 +378,7 @@ export async function killProcessTree(pid, { platform = process.platform, list =
         // 等根按身份退出（僵尸进程不在快照里，算已退出）；时限内没退出也继续结束子孙，最后按时限抛错。
         let rootStays = true;
         while (rootStays && Date.now() < deadline) {
-          try { rootStays = identityAlive(await list(undefined, platform, remaining()), root); }
+          try { rootStays = identityAlive(await list(undefined, platform, queryTimeout()), root); }
           catch { /* 查询失败无法确认，按仍存活处理，到时限为止。 */ }
           if (rootStays) await delay(Math.min(50, remaining()));
         }
@@ -380,10 +401,13 @@ export async function killProcessTree(pid, { platform = process.platform, list =
   do {
     if (platform === 'win32') survivors = await stillThere(tree, checkStart);
     else {
-      const current = await list(undefined, platform, remaining());
+      const current = await list(undefined, platform, queryTimeout());
       survivors = tree.filter(p => identityAlive(current, p));
     }
-    if (!survivors.length) { traceNoneAlive(pid, tree); return; }
+    if (!survivors.length) {
+      if (scanIncomplete) throw Error(failure?.message ?? '等待进程退出超时');
+      traceNoneAlive(pid, tree); return;
+    }
     if (Date.now() >= deadline) break;
     await delay(Math.min(50, remaining()));
   } while (Date.now() < deadline);

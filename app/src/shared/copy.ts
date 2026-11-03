@@ -201,7 +201,7 @@ export const ag = {
     harnessHelp: '开发者预览版；装到 AgentRouter 自己的目录，不改 PATH。', harnessCheck: '重新检测',
     harnessUpdateFailed: (text: string) => `更新失败：${text}`, harnessInstalledNote: (version: string) => `当前版本 ${version}`,
     // Stage09 / 294：Agent 页主导卡（界面稿 preview.js 的 leadCard；能力几行来自启动检测）
-    leadTitle: '主导', leadChoose: '选择主导', leadChooseHelp: '从已导入的主导和检测到的工具中选择', leadAfterChoose: '选择主导后显示',
+    leadTitle: '主导', leadChoose: '选择主导', leadChooseHelp: '只列出已启用、勾选了“可担任 主导”并且能交互启动的 Agent。', leadNoCandidates: '还没有可担任主导的 Agent：在下方列表里点一个 Agent 的“编辑”，在“可担任”里勾选“主导”并保存，再回来选择。', leadRolesFailed: (reason: string) => `读取 Agent 的角色设置失败，无法列出主导候选：${reason}`, leadRolesRetry: '重新读取', leadAfterChoose: '选择主导后显示',
     leadDetected: '检测到：', leadImport: '导入', leadClear: '清除',
     leadInteractive: '交互启动', leadModelCapability: '模型参数', leadEffortCapability: '强度参数',
     leadVerified: '已验证', leadUnverified: '未验证', leadSupported: '支持', leadUnsupported: '不支持',

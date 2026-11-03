@@ -116,3 +116,23 @@ test('开工包第一行写明本机核心命令，ar 被挡住时改用 agr', a
   assert.equal(normal.text.split('\n')[0], '本机核心命令：ar');
   assert.equal(blocked.ack.token, normal.ack.token);
 });
+
+
+test('超长交接文件裁剪时仍保留会话中断任务', async t => {
+  const f = fixture(t); f.put('.agent-router/project.json', '{}'); f.put('handoff.md', '交'.repeat(25000));
+  const commit = spawnSync('git', ['-C', f.root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-qm', 'initial']);
+  assert.equal(commit.status, 0, commit.stderr?.toString());
+  const gitRoot = spawnSync('git', ['-C', f.root, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+  assert.equal(gitRoot.status, 0, gitRoot.stderr);
+  const dir = join(f.root, '.agent-runs', '测试任务'); mkdirSync(dir, { recursive: true });
+  const started = Date.now();
+  const start = { v: 2, event: 'start', id: 'one', repo: gitRoot.stdout.trim(), name: '测试任务', dir, project: 'repo', profile: 'fake', adapter: 'fake', label: '假执行者', spec: null, title: '测试任务', role: null, pid: process.pid, started, progress: join(dir, 'progress.md'), report: join(dir, 'report.md'), raw: join(dir, 'raw.jsonl'), model: null, effort: null, tier: null, agent: 'fake', agentVersion: null, sandbox: null, events: join(dir, 'events.jsonl'), dispatcher: 'cli', managed: true, launch: 'detached' };
+  writeFileSync(join(f.home, 'runs.jsonl'), JSON.stringify(start) + '\n');
+  const result = await run(f);
+  assert.match(result.text, /可能随会话中断的任务[\s\S]*测试任务[\s\S]*自行后台/);
+  assert.match(result.text, /关闭当前会话前，先等这些任务结束/);
+  assert.ok(result.text.indexOf('可能随会话中断的任务') < result.text.indexOf('交接文件'));
+  writeFileSync(join(f.home, 'runs.jsonl'), [start, { v: 2, event: 'end', id: 'one', exit: 0, at: Date.now() }].map(JSON.stringify).join('\n') + '\n');
+  const ended = await run(f);
+  assert.doesNotMatch(ended.text, /可能随会话中断的任务/);
+});

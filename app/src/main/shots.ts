@@ -1,3 +1,4 @@
+import { captureControlContrast } from './shots-contrast';
 import { UI_BASELINE } from './shots-baseline';
 import { captureWizard, capturePreferences } from './shots-preferences';
 import { captureProjects } from './shots-projects';
@@ -256,6 +257,17 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     console.log('验收开始时的 CPU（1 秒采样）：' + await cpuNow());
     await captureWizard(h);
     await wait('!!document.querySelector("[data-task=t1]")');
+    // 454：只运行门禁进行中的轨道检查。
+    if (process.env.AR_SHOTS_FOCUS === 'gate-track') {
+        await captureGate(h, registry, out, save, true);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'gate-track', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
+    if (process.env.AR_SHOTS_FOCUS === 'control-contrast') {
+        await captureControlContrast(h);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'control-contrast', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 244：沿用 UI30 原 captureReview 的完整隔离夹具与检查，只聚焦审查界面。
     if (process.env.AR_SHOTS_FOCUS === 'review-ui') {
         await captureReview(h, registry, out, save, win);

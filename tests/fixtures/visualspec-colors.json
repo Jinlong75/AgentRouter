@@ -5,6 +5,7 @@
   { "name": "surface-2", "dark": "#24282D", "light": "#FFFFFF", "min": "—" },
   { "name": "selected", "dark": "#1D2024", "light": "#EAEAE6", "min": "—" },
   { "name": "border", "dark": "#262A30", "light": "#E4E4E0", "min": "—" },
+  { "name": "control-border", "dark": "#747A84", "light": "#82868D", "min": "—" },
   { "name": "divider", "dark": "#1C1F23", "light": "#EDEDEA", "min": "—" },
   { "name": "chip", "dark": "#2E333A", "light": "#D9DADD", "min": "—" },
   { "name": "text", "dark": "#ECEEF1", "light": "#141518", "min": "12.8 / 15.1" },

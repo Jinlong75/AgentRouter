@@ -1,6 +1,6 @@
 // 任务状态查询（协议 15.11）：ar status <记录名>。只读清单，不等待、不碰进程。零依赖。
-import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { readFileSync, realpathSync } from 'node:fs';
 import { readJson } from './json.mjs';
 import { activeLimits, clockText } from './limits-state.mjs';
 import { parseNeedsScope, readNeedsScope } from './needs-scope.mjs';
@@ -139,6 +139,8 @@ export function taskStatus({ homes, root, name }) {
   const { file, start } = found;
   const rows = taskRows(file, start.id);
   const recent = sinceLastStart(rows);
+  const latestLaunch = rows.find(row => row.event === 'start' || row.event === 'resume');
+  const launch = latestLaunch?.launch ?? (latestLaunch?.managed === true ? 'managed' : 'unknown');
   const state = taskState(file, start, rows);
   const attempts = rows.reduce((max, row) => (row.event === 'attempt' && Number.isSafeInteger(row.n) ? Math.max(max, row.n) : max), 0)
     || rows.find(row => row.event === 'end')?.attempts || 0;
@@ -160,6 +162,7 @@ export function taskStatus({ homes, root, name }) {
   const limited = Object.fromEntries(Object.entries(activeLimits([homes].flat()[0])).map(([profile, entry]) => [profile, { kind: entry.kind, until: entry.until, since: entry.since }]));
   return {
     ok: true, id: start.id, name: start.name, state, attempts,
+    ...(['queued', 'preparing', 'running', 'gating'].includes(state) ? { launch, started: start.started } : {}),
     ...(route?.rule?.scope === 'implicit' ? { route: { source: 'implicit', profile: route.profile } } : {}),
     gate: gate ? { ok: gate.ok === true, summary: gate.summary ?? null } : null,
     needsScope: end ? readNeedsScope(end.needsScope) : null,
@@ -198,6 +201,7 @@ const localStamp = ms => {
 // 不加 --json 时给人看的几行。
 export function statusLines(status) {
   const lines = [`状态：${status.name}（${status.state}）`, `尝试次数：${status.attempts}`];
+  if (status.launch) lines.push(`启动方式：${launchLabel(status.launch)}`);
   if (status.route?.source === 'implicit') lines.push(`路由：预设默认规则 → ${status.route.profile}`);
   if (status.gate) lines.push(status.gate.ok ? '门禁：通过' : `门禁：未通过（${status.gate.summary ?? '无说明'}）`);
   if (status.worktree) lines.push(`worktree：${status.worktree.dir}（分支 ${status.worktree.branch}）`);
@@ -222,4 +226,22 @@ export function statusLines(status) {
   if (status.outsideWrites) lines.push(`工作区外新文件：${status.outsideWrites.added.map(item => item.name).join('、')}`);
   for (const [profile, entry] of Object.entries(status.limits ?? {})) lines.push(`${profile}：额度到 ${clockText(entry.until)} 恢复`);
   return lines;
+}
+
+export const launchLabel = launch => ({ managed: '托管', detached: '自行后台', foreground: '随当前会话', unknown: '未知' }[launch] ?? '未知');
+
+// 与单任务状态共用记录定位和状态判断，兼容新旧公共目录。
+export function sessionBoundTasks({ homes, root }) {
+  const names = new Map();
+  // 记录里的 repo 可能是 Windows 8.3 短路径（用户名被缩写成带 ~1 的形式），开工包的 root 来自 git 是长路径：先取真实路径再比较。
+  const real = value => { try { return realpathSync.native(value); } catch { return resolve(value); } };
+  const key = value => process.platform === 'win32' ? real(value).toLowerCase() : real(value);
+  for (const home of new Set([homes].flat())) {
+    for (const row of reverseRows(join(home, 'runs.jsonl'))) {
+      if (row.event === 'start' && typeof row.repo === 'string' && key(row.repo) === key(root) && typeof row.name === 'string' && !names.has(row.name)) names.set(row.name, row.repo);
+    }
+  }
+  // 用记录里原样的 repo 查状态（locateStart 按原路径比较）；单个任务读不到时跳过，开工包不能因此整体失败。
+  return [...names].flatMap(([name, repo]) => { try { return [taskStatus({ homes, root: repo, name })]; } catch { return []; } })
+    .filter(task => ['queued', 'preparing', 'running', 'gating'].includes(task.state) && task.launch !== 'managed');
 }

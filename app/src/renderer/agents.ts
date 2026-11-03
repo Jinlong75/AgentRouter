@@ -280,6 +280,7 @@ export class AgentsView {
     private lead: LeadView | null = null;
     private leadRoles: RolesView['lead'] | null = null;
     private leadError = '';
+    private leadRolesError = '';
     private ar: { installed: boolean; path: string; shadow?: { shadowed: boolean | null; by?: string } | null } | null = null;
     private arError = '';
     private detected: DetectedTool[] = [];
@@ -335,30 +336,43 @@ export class AgentsView {
         this.render();
     }
     // 读取进行中又被要求刷新（例如"重新检测"之后）：排一次后续读取，不能丢掉，否则界面停在旧数据上。
+    private async readLeadRoles() {
+        try {
+            const roles: RolesView = await window.dock.console('roles:list');
+            this.roles = new Map(roles.profiles.map(item => [item.name, item]));
+            this.leadRoles = roles.lead;
+            this.leadRolesError = '';
+        } catch (e) {
+            this.leadRoles = null;
+            this.leadRolesError = String((e as Error).message || e);
+        }
+    }
     async refresh(keepResult = false) {
         if (this.refreshing) { this.again = true; this.detected = []; this.render(); return; }
         this.refreshing = true;
         this.detected = [];
         this.render();
         if (!keepResult) this.testResult = null;
+        let rolesRead: Promise<void> = Promise.resolve();
         try {
             // 角色 / 家族和限流只是行里的附加信息：读不到时不挡着列表（沿用上次读到的）。
             // 主导卡的当前选择（lead:get）读不到时也不挡着列表，按没选处理。
-            const [list, settings, roles, route, lead, config] = await Promise.all([
+            // 角色读取单独起、不让它的失败或别的读取失败互相截断（Promise.all 一处失败就提前返回）。
+            rolesRead = this.readLeadRoles();
+            // 角色与列表同时读（451 之前就是并行）：先读角色再读列表会拉开两者的时间差，新导入的执行者可能已在列表里、角色却还是旧的。
+            const [list, settings, route, lead, config] = await Promise.all([
                 window.dock.console('agents:list', { detect: true }),
                 window.dock.preferences('settings'),
-                window.dock.console('roles:list').catch(() => null) as Promise<RolesView | null>,
                 window.dock.console('route:config').catch(() => null) as Promise<RouteConfig | null>,
                 window.dock.console('lead:get').catch(() => null) as Promise<LeadView | null>,
                 window.dock.console('stats:config').catch(() => null) as Promise<CoreConfigView | null>,
+                rolesRead,
             ]);
             this.agents = list.agents;
             this.profiles = settings.profiles;
             // 通用适配器声明读不到就当没有：引用式 generic 配置不认成任何工具、也不列进主导下拉（配置本身读不了，别处已有提示）。
             const generics = config?.config?.generics;
             this.generics = generics && typeof generics === 'object' && !Array.isArray(generics) ? generics as Record<string, unknown> : {};
-            if (roles && Array.isArray(roles.profiles)) this.roles = new Map(roles.profiles.map(item => [item.name, item]));
-            if (roles?.lead && Array.isArray(roles.lead.profiles)) this.leadRoles = roles.lead;
             if (route && Array.isArray(route.profiles)) this.limits = new Map(route.profiles.flatMap(item => item.limited ? [[item.name, item.limited] as const] : []));
             this.lead = lead;
             try { this.ar = await window.dock.console('ar:status'); this.arError = ''; } catch (e) { this.arError = String((e as Error).message || e); }
@@ -369,6 +383,8 @@ export class AgentsView {
         }
         catch (e) { this.error = String((e as Error).message || e); }
         finally {
+            // 列表读取失败时 Promise.all 提前返回：等角色读取结束再画，读取失败的原因与"重新读取"按钮才会出现。
+            await rolesRead;
             this.refreshing = false;
             if (this.again) { this.again = false; void this.refresh(true); }
             else this.render();
@@ -480,6 +496,9 @@ export class AgentsView {
         // 已选配置失效时（lead 为 null 但带问题）也要能清除 config.json 里残留的 lead。
         const clear = current || problem ? `<button type="button" class="btn sm quiet" data-lead-clear ${this.busy ? 'disabled' : ''}>${esc(ag.leadClear)}</button>` : '';
         const row = `<div class="set-r"><div class="l">${esc(ag.leadTitle)}<span>${esc(ag.leadChooseHelp)}</span></div><div class="ctl">${pick}${clear}</div></div>`;
+        const rolesNote = this.leadRolesError
+            ? `<div class="set-r"><div class="l"><span data-lead-roles-error>${esc(ag.leadRolesFailed(this.leadRolesError))}</span></div><div class="ctl"><button type="button" class="btn sm" data-lead-roles-retry>${esc(ag.leadRolesRetry)}</button></div></div>`
+            : this.leadRoles && !candidates.length ? `<div class="set-r"><div class="l"><span data-lead-empty>${esc(ag.leadNoCandidates)}</span></div></div>` : '';
         // 能力行（界面稿 leadCard）：没选时三行都是"—"；程序找不到时按"未验证 / 不支持"写。
         const cap = (label: string, state: string, why = '') => `<div class="set-r"><div class="l">${esc(label)}${why ? `<span>${esc(why)}</span>` : ''}</div><div class="ctl"><span class="${state === ag.leadSupported || state === ag.leadVerified ? 'ok-t' : 'muted'}">${esc(state)}</span></div></div>`;
         const caps = !current
@@ -496,7 +515,7 @@ export class AgentsView {
         const shadow = installed && this.ar?.shadow?.shadowed === true && this.ar.shadow.by ? this.ar.shadow : null;
         const ar = `<div class="set-r" data-ar-row><div class="l">${esc(p.arTitle)}<span>${esc(installed ? p.arInstalled(this.ar!.path) : p.arMissing)}</span>${installed ? `<span class="muted" data-ar-alias>${esc(p.arAlias)}</span>` : ''}</div><div class="ctl"><button type="button" class="btn sm" data-ar-action ${!this.ar || this.busy ? 'disabled' : ''}>${esc(installed ? p.arUninstall : p.arInstall)}</button></div></div>`;
         const arShadow = shadow ? warnBanner(p.arShadowTitle, p.arShadowBody(shadow.by!)) : '';
-        return `<div data-lead-card><div data-lead-error>${banner(this.leadError)}</div><div class="card"><div class="card-b"><div class="set">${row}${caps}${ar}</div>${arShadow}</div></div>${banner(this.arError)}${failed}${detected ? `<div class="card lead-detected"><div class="card-b"><div class="set">${detected}</div></div></div>` : ''}</div>`;
+        return `<div data-lead-card><div data-lead-error>${banner(this.leadError)}</div><div class="card"><div class="card-b"><div class="set">${row}${rolesNote}${caps}${ar}</div>${arShadow}</div></div>${banner(this.arError)}${failed}${detected ? `<div class="card lead-detected"><div class="card-b"><div class="set">${detected}</div></div></div>` : ''}</div>`;
     }
     private async changeAr(trigger: HTMLElement) {
         const removing = !!this.ar?.installed;
@@ -637,6 +656,7 @@ export class AgentsView {
         if (!b || b.disabled || this.busy) return;
         // 主导卡：下拉选择 / 清除 / 重新检测 / 检测到但未导入的工具打开导入向导（预选对应预设）。
         if (b.hasAttribute('data-ar-action')) { await this.changeAr(b); return; }
+        if (b.hasAttribute('data-lead-roles-retry')) { await this.refresh(true); return; }
         if (b.hasAttribute('data-lead-open')) { this.openLeadPicker(b); return; }
         if (b.hasAttribute('data-lead-clear')) { await this.clearLead(); return; }
         if (b.hasAttribute('data-lead-detect')) { this.leadError = ''; await this.refresh(true); return; }

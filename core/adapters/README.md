@@ -201,7 +201,7 @@ export function makeAdapter(executable) {
 
 ## 公共行为与 Codex 配置
 
-- profile 选择：派发时由路由器选（任务说明 `worker` → 项目规则 → 全局规则 → 兜底 → 默认执行者，见 `core/lib/router.mjs`）；`--profile` 直接指定则不经路由。路由没有结果时才按 `AR_PROFILE` > `config.json` 的 `defaultProfile` > 唯一启用的 profile 兜底；都没有时报"还没有可用的执行者"。没有配置文件时内置一个 `codex` profile。
+- 执行者选择顺序：命令行 `--profile`、环境变量 `AR_PROFILE`、任务说明的 `worker`、项目规则、全局规则、预设默认规则、路由兜底、默认执行者、唯一启用的执行者。显式指定的执行者不可用时直接报错，不换人。没有配置文件时内置一个 `codex` profile。
 - Codex：`profiles.codex.path` 有值时直接使用，不查 PATH；Node 入口（`.js` / `.mjs` / `.cjs`）优先用系统 Node，找不到时按运行环境回退自带运行时，可执行文件直接启动，`.cmd` / `.bat` 按 npm 包装解析；文件不存在或包装不支持则报错。未设置时在 PATH 中查找 `codex.exe` 或 npm `codex.cmd`。不经过 shell，因此空格和中文参数不会被拆开。
 - Codex 的主导启动（Stage09）：`interactiveLaunch` 在启动器参数后按需追加 `-m <模型>`、`-c model_reasoning_effort=<JSON 字符串>`，返回 `capabilities: { model: true, effort: true }`；只算参数，不启动进程，也不带沙箱设置（完全访问要在 Codex 界面里选）。
 - 参数优先级：命令行 > 环境变量（`CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_TIER` / `CODEX_SANDBOX`，只作用于 codex 执行者）> 任务说明（仅模型、推理强度）> 命中的路由规则（仅推理强度）> `config.json` 里该执行者的设置 > 内置默认，见 `core/lib/config.mjs` 的 `resolveSettings`。模型、强度、档位默认 `null`，沙箱默认 `workspace-write`，窗口默认 `auto`。

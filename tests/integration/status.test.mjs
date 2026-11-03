@@ -151,7 +151,10 @@ test('1 worktree 任务的十种状态各一例：排队、准备、运行、门
   for (const [name, , expected] of fab) {
     const value = await f.status(name);
     assert.equal(value.state, expected, `${name} 应为 ${expected}`);
-    assert.deepEqual(Object.keys(value), legacyKeys, name);
+    // 453：进行中（排队、准备、运行、门禁中）的任务在 attempts 之后多 launch 与 started；夹具的 start 没写 launch，按 unknown。
+    const active = ['queued', 'preparing', 'running', 'gating'].includes(expected);
+    assert.deepEqual(Object.keys(value), active ? [...legacyKeys.slice(0, 5), 'launch', 'started', ...legacyKeys.slice(5)] : legacyKeys, name);
+    if (active) assert.equal(value.launch, 'unknown', name);
     assert.equal(value.ok, true);
     assert.equal(value.name, name);
   }

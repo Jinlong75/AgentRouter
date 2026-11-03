@@ -324,7 +324,7 @@ test('5 ar retry：没有用到任务说明 / 规则 effort 的任务，resume �
   const r = f.ar(['retry', 'plain', '--note', '再来']);
   assert.equal(r.status, 0, r.stdout + r.stderr);
   const resume = f.rows('plain').find(row => row.event === 'resume');
-  assert.deepEqual(Object.keys(resume), ['v', 'event', 'id', 'pid', 'n', 'at', 'model', 'effort', 'settingSources']);
+  assert.deepEqual(Object.keys(resume), ['v', 'event', 'launch', 'id', 'pid', 'n', 'at', 'model', 'effort', 'settingSources']);
   assert.deepEqual(resume.settingSources, { model: '内置默认', effort: 'config.json' });
   assert.deepEqual(f.agentArgs().slice(-2), ['--effort', 'low']);
   // 换执行者配置：没有任何一项来自任务说明 / 路由规则 / 命令行，没有丢掉什么，进度里不写"不沿用"那一行（来源现在每个任务都有，不能因此多写）。

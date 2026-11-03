@@ -7,6 +7,8 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { git } from './git.mjs';
 import { nextLines, nextTasks } from './next.mjs';
 import { parseJson } from './json.mjs';
+import { legacyHomeDirectory } from './compat.mjs';
+import { sessionBoundTasks, launchLabel } from './status.mjs';
 
 const reminder = '你是本项目的主导。上面的交接文件每条都要遵守。开工先核对在跑任务（ar status、git worktree list），不要重复派发；\n每次任务结束：看 ar wait 输出的资源、待验收与可派发，先派满再验收；遇到绕路当场记成任务。\n读长日志、审查初筛、文档核对、按既定脚本出候选或打包，先用 ar dispatch "<任务文字>" --type research|chore 交给便宜的执行者，主导只读结论。\n按文件分批调研用 ar research "<问题>" --files <glob…>。';
 
@@ -72,6 +74,8 @@ export async function leadBrief({ root, home, env = process.env, coreDir }) {
   const sections = [];
   const skills = checkSkills({ env, root, coreVersion: installedCoreVersion(coreDir) });
   if (!skills.ok) sections.push({ title: '技能版本', text: [...skills.issues.map(issue => issue.text), '更新技能：在软件 Agent 页"技能"里更新，或运行 node installer/install.mjs --yes（开发 AgentRouter 时用仓库里的安装器）'].join('\n'), path: 'ar lead brief' });
+  const tasks = sessionBoundTasks({ homes: [home, legacyHomeDirectory(env)], root });
+  if (tasks.length) sections.push({ title: '可能随会话中断的任务', text: [...tasks.map(task => `- ${task.name}（${task.state}，${launchLabel(task.launch)}，开始时间：${new Date(task.started).toLocaleString('zh-CN')}）`), '关闭当前会话前，先等这些任务结束；或在 AgentRouter 软件的任务页点"重试"（由软件启动，不随主导窗口关闭）。'].join('\n'), path: 'ar status' });
   const paths = resolveBriefFiles(root, coreDir, project);
   const { handoff, invalid, configured, practice, role } = paths;
   const files = ackFiles(root, coreDir, paths);
@@ -87,7 +91,7 @@ export async function leadBrief({ root, home, env = process.env, coreDir }) {
   // 先预留每节的提示行，再按优先级替换成完整内容。
   if (render(sections).length > 24000) {
     const chosen = sections.map(item => ({ ...item, text: `（${item.title} 太长未放入，用 Read 读 ${item.path}）` }));
-    for (const title of ['技能版本', '当前任务', '固定提醒', '交接文件', '角色文档', '主导经验清单']) {
+    for (const title of ['可能随会话中断的任务', '技能版本', '当前任务', '固定提醒', '交接文件', '角色文档', '主导经验清单']) {
       const index = sections.findIndex(item => item.title === title);
       if (index < 0) continue;
       const previous = chosen[index];

@@ -22,7 +22,7 @@ const git = (cwd: string, args: string[]) => {
 // UI22：Stage04 门禁界面。演示任务 t20～t22、t24 默认写在 tasks.json 的 hidden 里（原有列表计数不变），
 // 这里临时显示、检查完恢复；门禁进行中的任务（t23）用真的假派发进程造出来，避免在演示清单里放一个一直跑的任务。
 // 056：t24 演示受保护路径越界与删除的文件；t21 保留旧式 gate.json（没有 protected / deleted 字段）。
-export async function captureGate(h: Harness, registry: Registry, out: string, save: (name: string) => Promise<void>) {
+export async function captureGate(h: Harness, registry: Registry, out: string, save: (name: string) => Promise<void>, trackOnly = false) {
     const { evaluate, wait, check, verify, press, key, type, tabTo, focusRing, pause, wheel, audit } = h;
     const tasksFile = path.join(registry.data, 'tasks.json');
     // 记下恢复时要加回去的 hidden 键（演示生成器写入的是 "<id>:<started>"）。
@@ -69,13 +69,16 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
     const outsideStray = 'stray-outside.txt';
     const originalOutsideConfig = await readFile(outsideConfig, 'utf8').catch(() => null);
     let outsideRepo = '', outsideId = '', outsideStarted = 0;
+    // 454 把前半段包进 if (!trackOnly)，这三份门禁结果后面的 verify 也要用：在外层声明。
+    let file21: any, file20: any, file24: any;
     try {
+        if (!trackOnly) {
         await reveal(GATE_IDS);
         await wait('!!document.querySelector("[data-task=t21]")', 'UI22 显示门禁演示任务');
         const t20 = registry.tasks.find(t => t.id === 't20')!, t21 = registry.tasks.find(t => t.id === 't21')!;
         assert.ok(t20 && t21, '门禁演示任务应出现在快照里');
-        const file21 = JSON.parse(await readFile(path.join(path.dirname(t21.progress), 'gate.json'), 'utf8'));
-        const file20 = JSON.parse(await readFile(path.join(path.dirname(t20.progress), 'gate.json'), 'utf8'));
+        file21 = JSON.parse(await readFile(path.join(path.dirname(t21.progress), 'gate.json'), 'utf8'));
+        file20 = JSON.parse(await readFile(path.join(path.dirname(t20.progress), 'gate.json'), 'utf8'));
         // ---- 门禁未通过：列表徽标 → 轨道 → 门禁标签 ----
         await check('UI22 门禁未通过的列表行显示"门禁未通过"徽标并使用失败色', `(() => { const b = document.querySelector("[data-task=t21] .gbadge"); return !!b && b.classList.contains('fail') && b.textContent.trim() === ${JSON.stringify(gt.badge.fail)} && getComputedStyle(b).color === ${failColor}; })()`);
         await pair('gate-fail-list');
@@ -113,7 +116,7 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
         // ---- 056：受保护的路径与删除的文件（t24）；旧式记录（t21）没有"删除的文件"一块 ----
         const t24 = registry.tasks.find(t => t.id === 't24')!;
         assert.ok(t24, '受保护路径演示任务应出现在快照里');
-        const file24 = JSON.parse(await readFile(path.join(path.dirname(t24.progress), 'gate.json'), 'utf8'));
+        file24 = JSON.parse(await readFile(path.join(path.dirname(t24.progress), 'gate.json'), 'utf8'));
         await press('[data-task=t24]');
         await press('.dtabs [data-tab=gate]');
         await wait(`document.querySelector(".tab-body .banner.fail .rt span")?.textContent === ${JSON.stringify(file24.summary)}`, 'UI22 受保护路径演示任务的门禁标签');
@@ -151,6 +154,7 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
         await press('[data-task=t5]');
         await wait('!!document.querySelector(".track")', 'UI22 执行者失败任务的轨道');
         await check('UI22 执行者失败但启用门禁的任务执行节点为失败、门禁节点为"未运行"', `(() => { const n = document.querySelectorAll(".track .node"); return n[1].classList.contains("failed") && n[1].querySelector(".sub").textContent.includes("exit 1") && n[2].querySelector(".sub").textContent === '未运行'; })()`);
+        }
 
         // ---- 门禁进行中：造一条真的假派发进程 + gating 事件 ----
         const repo = path.join(appEnv.AGENT_ROUTER_HOME!, 'projects', 'reader-app');
@@ -177,6 +181,8 @@ export async function captureGate(h: Harness, registry: Registry, out: string, s
         await press('[data-task=t23]');
         await wait('document.querySelector(".track .node:last-of-type .sub")?.textContent === "检查中"', 'UI22 门禁进行中任务的门禁节点');
         await check('UI22 门禁进行中任务的门禁节点为"检查中"、门禁标签可用', `document.querySelector(".track .node:last-of-type .sub")?.textContent === '检查中' && !!document.querySelector(".dtabs [data-tab=gate]")`);
+        await check('454 门禁进行中时执行节点显示完成', `(() => { const n = document.querySelectorAll('.track .node'); const running = document.querySelectorAll('.track .node.running'); return n.length === 3 && n[1].classList.contains('done') && n[1].querySelector('.sub')?.textContent !== ${JSON.stringify(gt.trackRun)} && running.length === 1 && running[0] === n[2]; })()`);
+        if (trackOnly) return;
         await press('.dtabs [data-tab=gate]');
         await wait(`document.querySelector(".tab-body .banner.info .rt b")?.textContent === ${JSON.stringify(gt.runningTitle)}`, 'UI22 门禁进行中的门禁标签');
         await check('UI22 门禁进行中的门禁标签显示进行中说明', `document.querySelector(".tab-body .banner.info .rt b")?.textContent === ${JSON.stringify(gt.runningTitle)} && !!document.querySelector(".tab-body .empty")`);

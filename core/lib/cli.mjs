@@ -433,6 +433,9 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
             dispatched.push(name);
             (result.specCheck ??= []).push({ spec: candidate.rel, ...specCheck });
             if (!json) out(params ? `已派发：${name}（${params.label}，模型 ${params.model ?? '执行者默认'}，强度 ${effortSupported ? (params.effort ?? '执行者默认') : '不支持'}）` : `已派发：${name}`);
+            // 453：run 的输出被截获了，会话中断警告要原样转出，并进 --json 结果（每个派出的任务一条）。
+            const warning = output.flatMap(line => line.split(/\r?\n/)).find(line => line.startsWith('这个任务不是托管启动'));
+            if (warning) { if (!json) out(warning); (result.sessionBound ??= []).push({ name, warning, reason: warning.match(/原因：(.*)。$/)?.[1] ?? null }); }
           }
           result.dispatched = dispatched;
           if (!json) out(nextVerifyLine(result.fullVerify));
@@ -595,7 +598,8 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         const name = lines.find(l => l.startsWith('记录名：'))?.slice(4), progress = lines.find(l => l.startsWith('进度：'))?.slice(3);
         const needsScope = json && name && !detach ? scopeOf(name) : null;
         const outsideWrites = json && name && !detach ? outsideOf(name) : null;
-        emit({ ok: code === 0, exit: code, name: name ?? null, progress: progress ?? null, ...(detach ? { id: detach, detached: true } : {}), ...(gate ? { gate } : {}), ...(specCheck ? { specCheck } : {}), ...(params ? { params } : {}), ...(watch ? { watch } : {}), ...(needsScope ? { needsScope } : {}), ...(outsideWrites ? { outsideWrites } : {}), lines, ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '派发失败' }) });
+        const sessionBoundReason = lines.find(l => l.startsWith('这个任务不是托管启动'))?.match(/原因：(.*)。$/)?.[1];
+        emit({ ...(sessionBoundReason ? { sessionBound: true, sessionBoundReason } : {}), ok: code === 0, exit: code, name: name ?? null, progress: progress ?? null, ...(detach ? { id: detach, detached: true } : {}), ...(gate ? { gate } : {}), ...(specCheck ? { specCheck } : {}), ...(params ? { params } : {}), ...(watch ? { watch } : {}), ...(needsScope ? { needsScope } : {}), ...(outsideWrites ? { outsideWrites } : {}), lines, ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '派发失败' }) });
         return code;
       }
       case 'scope': {
@@ -634,7 +638,8 @@ export async function main(argv, { scriptPath, env = process.env, cwd = process.
         const outsideWrites = json && recordName && !detached ? outsideOf(recordName) : null;
         const hints = code === 0 ? ['重试前自查：ar lead practices 3（补充说明要自包含）、ar lead practices 5（门禁失败）'] : [];
         if (!json) for (const hint of hints) out(hint);
-        emit({ ok: code === 0, exit: code, hints, id: retried?.id ?? detached ?? null, name: recordName, n: retried?.n ?? null, progress,
+        const sessionBoundReason = lines.find(l => l.startsWith('这个任务不是托管启动'))?.match(/原因：(.*)。$/)?.[1];
+        emit({ ...(sessionBoundReason ? { sessionBound: true, sessionBoundReason } : {}), ok: code === 0, exit: code, hints, id: retried?.id ?? detached ?? null, name: recordName, n: retried?.n ?? null, progress,
           ...(detached ? { detached: true } : {}), ...(gate ? { gate } : {}), ...(needsScope ? { needsScope } : {}), ...(outsideWrites ? { outsideWrites } : {}), lines,
           ...(code === 0 ? {} : { error: lines.findLast(l => l.startsWith('出错：'))?.slice(3) ?? lines.at(-1) ?? '重试失败' }) });
         return code;

@@ -53,7 +53,7 @@ function fixture(t, script) {
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   const git = (...args) => spawnSync('git', args, { cwd: root, encoding: 'utf8' });
   git('init'); git('config', 'user.email', 'test@example.invalid'); git('config', 'user.name', 'Test');
-  writeFileSync(join(root, '.agent-router', 'project.json'), JSON.stringify({ verify: [script] }));
+  writeFileSync(join(root, '.agent-router', 'project.json'), JSON.stringify({ verify: [typeof script === 'function' ? script(root) : script] }));
   git('add', '.agent-router/project.json'); git('commit', '-m', 'init');
   const env = { ...process.env, AGENT_ROUTER_HOME: home };
   const run = (...args) => spawnSync(process.execPath, [ar, 'verify', ...args], { cwd: root, env, encoding: 'utf8' });
@@ -61,26 +61,44 @@ function fixture(t, script) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn) { for (let i = 0; i < 100; i++) { const value = fn(); if (value) return value; await pause(200); } throw new Error('等待验收状态超时'); }
+function waitingCommand(root) {
+  const started = JSON.stringify(join(root, 'verify-started'));
+  const release = JSON.stringify(join(root, 'verify-release'));
+  return `node -e 'const fs=require("fs");fs.writeFileSync(${started},"1");const timer=setInterval(()=>{if(fs.existsSync(${release})){clearInterval(timer);clearTimeout(limit)}},100);const limit=setTimeout(()=>process.exit(1),60000)'`;
+}
 
 test('后台运行可查询并拒绝重复运行', async (t) => {
-  const f = fixture(t, 'node -e "setTimeout(()=>{},3000)"');
+  const f = fixture(t, waitingCommand);
   const start = f.run('--detach'); assert.equal(start.status, 0); assert.match(start.stdout, /已在后台开始/);
-  const running = f.run('--last'); assert.match(running.stdout, /正在运行/);
-  assert.equal(f.run().status, 2);
-  const last = await until(() => { const v = JSON.parse(f.run('--last', '--json').stdout); return v.last && !v.running && v; });
+  let last;
+  try {
+    await until(() => existsSync(join(f.root, 'verify-started')));
+    const running = f.run('--last'); assert.match(running.stdout, /正在运行/);
+    assert.equal(f.run().status, 2);
+  } finally {
+    writeFileSync(join(f.root, 'verify-release'), '');
+    last = await until(() => { const v = JSON.parse(f.run('--last', '--json').stdout); return v.last && !v.running && v; });
+  }
   assert.equal(last.last.ok, true); assert.match(f.run('--last').stdout, /通过/);
 });
 
 test('运行中提交变化使结果作废', async (t) => {
-  const f = fixture(t, 'node -e "require(\'fs\').writeFileSync(\'verify-started\',\'1\');setTimeout(()=>{},3000)"');
+  const f = fixture(t, waitingCommand);
   const before = f.git('rev-parse', 'HEAD').stdout.trim();
   const child = spawn(process.execPath, [ar, 'verify'], { cwd: f.root, env: f.env });
+  const closed = new Promise(resolve => child.on('close', resolve));
   let stdout = '', stderr = ''; child.stdout.on('data', x => { stdout += x; }); child.stderr.on('data', x => { stderr += x; });
-  // 等验收命令真正开始（标记文件落地）再提交：取得门禁名额后的第二次工作区检查已经过去，提交一定落在命令运行期间。
-  await until(() => existsSync(join(f.root, 'verify-started')));
-  writeFileSync(join(f.root, 'change'), 'change'); f.git('add', 'change'); f.git('commit', '-m', 'change');
-  const after = f.git('rev-parse', 'HEAD').stdout.trim();
-  const code = await new Promise(resolve => child.on('close', resolve)); assert.equal(code, 3, stderr);
+  let after, code;
+  try {
+    // 等验收命令真正开始后提交，确保提交落在命令运行期间。
+    await until(() => existsSync(join(f.root, 'verify-started')));
+    writeFileSync(join(f.root, 'change'), 'change'); f.git('add', 'change'); f.git('commit', '-m', 'change');
+    after = f.git('rev-parse', 'HEAD').stdout.trim();
+  } finally {
+    writeFileSync(join(f.root, 'verify-release'), '');
+    code = await closed;
+  }
+  assert.equal(code, 3, stderr);
   assert.ok(stdout.includes(`全量验收作废：验收期间分支或提交变了（${before.slice(0,7)} → ${after.slice(0,7)}），请在不提交、不合入时重跑`));
   const row = JSON.parse(readFileSync(join(f.home, 'runs.jsonl'), 'utf8').trim().split('\n').at(-1));
   assert.equal(row.failed, `验收期间分支或提交变了：${before.slice(0,7)} → ${after.slice(0,7)}`); assert.equal(row.ok, false);

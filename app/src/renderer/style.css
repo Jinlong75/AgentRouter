@@ -66,8 +66,8 @@ button { font: inherit; color: inherit; }
 .sel .ph { color: var(--text-2); }
 .inp { height: var(--ctl); padding: 0 12px; border: 1px solid var(--border); border-radius: var(--r-ctl); background: var(--surface); color: var(--text); font: 13px var(--font-ui); }
 .inp::placeholder { color: var(--text-3); }
-.toggle { position: relative; width: 34px; height: 20px; border-radius: var(--r-pill); background: var(--surface-2); border: 1px solid var(--border); flex: 0 0 auto; cursor: default; transition: background-color var(--dur-3) var(--ease-move); }
-.toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text-3); transition: transform var(--dur-3) var(--ease-move), background-color var(--dur-3); }
+.toggle { position: relative; width: 34px; height: 20px; border-radius: var(--r-pill); background: var(--surface-2); border: 1px solid var(--control-border); flex: 0 0 auto; cursor: default; transition: background-color var(--dur-3) var(--ease-move); }
+.toggle::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%; background: var(--text-3); transition: transform var(--dur-3) var(--ease-move), background-color var(--dur-3); }
 .toggle.on { background: var(--toggle-on); border-color: var(--toggle-on); }
 .toggle.on::after { transform: translateX(14px); background: var(--toggle-knob-on); }
 .mk { width: var(--mark); height: var(--mark); flex: 0 0 auto; display: inline-grid; place-items: center; font-size: var(--mark); }
@@ -119,7 +119,7 @@ body.dragging, body.dragging * { user-select: none !important; }
 .trow.on { background: var(--selected); }
 .trow > .mk { margin-top: 2px; }
 /* 017 批量删除：选择模式下行首复选框（沿用 .choice .cb 的样式）；进行中的行禁用。 */
-.trow .cb { width: 16px; height: 16px; margin-top: 2px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
+.trow .cb { width: 16px; height: 16px; margin-top: 2px; border-radius: 4px; border: 1px solid var(--control-border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
 .trow .cb.on { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); font-size: 12px; }
 .trow:disabled { opacity: .6; }
 .trow .tm { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -386,7 +386,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .plan-compact progress{max-width:160px;}
 .plan progress::-webkit-progress-bar,.plan-compact progress::-webkit-progress-bar{background:var(--surface-2);border-radius:4px;}
 .plan progress::-webkit-progress-value,.plan-compact progress::-webkit-progress-value{background:var(--text-2);border-radius:4px;}
-.toggle{padding:0;border:0;cursor:default;flex-shrink:0;}
+.toggle{padding:0;cursor:default;flex-shrink:0;}
 .ctx{max-height:calc(100vh - 80px);overflow:auto;}.ctx button:focus-visible{outline:2px solid var(--focus);outline-offset:-2px;}
 .tip{position:fixed;z-index:70;max-width:360px;padding:6px 10px;border-radius:var(--r-inner);background:var(--surface-2);color:var(--text);box-shadow:var(--shadow-pop);font-size:var(--fs-small);pointer-events:none;}
 /* 底部留出 .actbar（60px）加 16px：验收页的"批准并合并"那一排按钮不被盖住；背景用 --surface 垫底，--brand-soft 只是色调，整体不透明（走查 W3）。 */
@@ -451,7 +451,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .hstep .hstep-bytes { white-space: nowrap; }
 .choice { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface); }
 .choice + .choice { margin-top: 8px; }
-.choice .cb { width: 16px; height: 16px; margin-top: 2px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
+.choice .cb { width: 16px; height: 16px; margin-top: 2px; border-radius: 4px; border: 1px solid var(--control-border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
 .choice .cb.on { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); font-size: 12px; }
 .choice .ct { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .choice .ct span { color: var(--text-3); font-size: var(--fs-small); line-height: var(--lh-small); }
@@ -590,7 +590,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .pick, .preset { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: var(--r-ctl); background: transparent; text-align: left; cursor: default; }
 .pick:hover { background: var(--surface-2); }
 .pick.on { background: var(--selected); }
-.rd { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--border); background: var(--bg); flex: 0 0 auto; }
+.rd { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--control-border); background: var(--bg); flex: 0 0 auto; }
 .rd.on { border: 4px solid var(--brand-fill); }
 .pk { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .pk b { font-weight: 500; display: flex; align-items: center; gap: 6px; }
@@ -638,7 +638,7 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .filepick .fp-r + .fp-r { border-top: 1px solid var(--divider); }
 .filepick .fp-r:hover { background: var(--surface-2); }
 .filepick .fp-r .mono { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-.filepick .cb { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
+.filepick .cb { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--control-border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
 .filepick .cb.on { background: var(--brand-fill); border-color: var(--brand-fill); color: var(--on-brand); font-size: 12px; }
 .pd .dbody { margin-top: 12px; }
 .inline-f { display: flex; align-items: center; gap: 8px; padding: 14px 0 4px; }

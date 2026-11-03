@@ -55,12 +55,14 @@ export function trackParts(t: Task, file: GateFile | null, state: GateState) {
     const exit = t.agentExit ?? t.exit ?? null;
     // Stage05：有多次尝试（当前尝试 total > 1）时，运行中写"第 n/N 次"，完成且不是第 1 次写"第 n 次完成"。
     const attempt = t.attempt, many = attempt && attempt.total && attempt.total > 1 ? attempt : null;
+    const execDone = attempt && attempt.n > 1 ? ['done', icon('check-line'), rt.trackDone(attempt.n), rt.nodeDone(attempt.n)]
+        : ['done', icon('check-line'), '完成', '执行者正常结束'];
     const exec = t.status === 'stop' ? ['stopped', icon('stop-fill'), gt.trackStopped, '已中断']
+        : t.status === 'run' && state === 'running' ? execDone
         : t.status === 'run' ? ['running', '', many ? rt.trackRun(many.n, many.total!) : gt.trackRun, many ? rt.nodeRun(many.n, many.total!) : `运行中，已运行 ${elapsed(t)}`]
             : (state === 'notrun' || (t.agentExit !== undefined && t.agentExit !== 0) || (t.agentExit === undefined && t.exit !== 0))
                 ? ['failed', icon('close-line'), gt.trackExit(exit), `异常退出（exit=${exit ?? '—'}）`]
-                : attempt && attempt.n > 1 ? ['done', icon('check-line'), rt.trackDone(attempt.n), rt.nodeDone(attempt.n)]
-                    : ['done', icon('check-line'), '完成', '执行者正常结束'];
+                : execDone;
     const commands = file?.commands ?? [], passed = commands.filter(command => command.exit === 0 && !command.timedOut && command.error == null).length;
     const summary = t.gateSummary ?? file?.summary ?? '';
     const gate = state === 'pending' ? ['todo', '', gt.trackGateWait, '执行者结束后运行', '等待']

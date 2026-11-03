@@ -25,6 +25,8 @@ import { redactPaths } from './process.mjs';
 import { tracing } from './trace.mjs';
 import { checkDispatch, recordProcessGone } from './stop.mjs';
 
+const sessionWarning = reason => console.log(`这个任务不是托管启动，关闭当前会话（主导窗口）可能会中断它。原因：${reason}。`);
+
 // 托管执行者进程脱离启动、标准错误没人看：认领请求文件失败时留一行痕迹（只记文件名）。写日志失败一律吞掉。
 function claimFailure(env, reason, requestFile) {
   try {
@@ -252,7 +254,11 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   if (request) progress(managedMessage(request.app));
   const id = request?.id ?? `${paths.name}-${started}-${process.pid}`;
   const source = request?.dispatcher ?? dispatcher(parsed.opts.host, env);
+  let sessionReason = config.managed === true ? '软件没有在运行' : '托管未开启';
   if (!request && parsed.opts.detach) {
+    // --detach 不经过软件托管握手：托管开着且软件在运行时，原因要如实写成 --detach。
+    if (config.managed === true && acceptsManaged(home, true)) sessionReason = '使用了 --detach，由 ar 自行后台启动，没有交给软件托管';
+    sessionWarning(sessionReason);
     // 脱离派发：占好记录名、选好执行者之后，直接写成"已认领"请求并交给独立进程运行，不握手、不等待。
     // 执行者进程沿用 --run-request 流程，所以停止、等待、看板显示与托管任务完全一致。
     const detachRequest = { v: 1, id, app: 'AgentRouter', at: started, script: scriptPath, node: process.execPath, repo: root, name: paths.name, profile: profileName, adapter: adapter.id,
@@ -288,7 +294,9 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
       return printCompletion(result.exit, paths, console.log, result.gate ?? null);
     }
     announce(fallbackMessage(result.reason, app));
+    sessionReason = `软件没有接手（${result.reason}）`;
   }
+  if (!request) sessionWarning(sessionReason);
   // 执行者环境：白名单、profile.env、密钥、隔离项（见 env.mjs）。缺密钥等问题在下面记为启动失败，检测版本也只用白名单环境。
   const sources = secretSources(config);
   let childEnv, envError = null;
@@ -301,7 +309,7 @@ export async function run({ adapter: adapterOverride, scriptPath, args = process
   // 路由说明（trace 最后一句）也记进 start，界面的进展 / 参数标签读它。托管 / 脱离的执行者进程自己没有路由结果，从派发进程写好的 dispatch.json 取。
   const savedRoute = request ? readDispatch(root, paths.name)?.route : routeRecord;
   const routeLine = Array.isArray(savedRoute?.trace) && typeof savedRoute.trace.at(-1) === 'string' ? savedRoute.trace.at(-1) : null;
-  registry({ event: 'start', v: 2, id, repo: root, name: paths.name, dir: paths.dir, project: basename(root), profile: profileName, adapter: adapter.id, label, spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
+  registry({ event: 'start', launch: request ? (request.detached ? 'detached' : 'managed') : 'foreground', v: 2, id, repo: root, name: paths.name, dir: paths.dir, project: basename(root), profile: profileName, adapter: adapter.id, label, spec: details.spec ? relative(root, resolvePath(root, details.spec)).replaceAll('\\', '/') : null,
     title: details.title, role: details.role?.name ?? null, pid: process.pid, started,
     ...(textType ? { type: textType } : {}),
     progress: paths.progress, report: paths.report, raw: paths.raw, model: settings.model ?? adapter.modelName?.({ settings, profile }) ?? null, effort: settings.effort, tier: settings.tier,
@@ -715,6 +723,7 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
     writeFileSync(join(dir, 'note.md'), opts.note, 'utf8');
   }
   // ——脱离重试——只写"已认领"请求并交给独立进程，不握手、不等待（同 dispatch --detach）。
+  if (!request) sessionWarning('重试暂不支持托管');
   if (opts.detach && !request) {
     const watch = watchPlan({ platform: process.platform, interactive, policy: settings.watchWindow, viewer: viewerState(home) });
     if (watch.reason === 'viewer') console.log(`AgentRouter 软件在运行（进程 ${watch.pid}），进度在软件的任务页，没有弹出只读窗口；想要窗口可以在设置里把"进度窗口"改为总是弹出`);
@@ -754,7 +763,7 @@ async function runRetry({ adapterOverride, scriptPath, env, root, request, opts,
   const resumeSettings = settingSources || plan.start.settingSources
     ? { model: settings.model ?? adapter.modelName?.({ settings, profile }) ?? null, effort: settings.effort, settingSources } : {};
   // 合并后的自动重跑门禁（154）：resume 另记原因 after-merge 和刚合并的任务 id。
-  registry({ event: 'resume', id, pid: process.pid, n, at: Date.now(), ...resumeSettings, ...(rebase?.afterMerge ? { reason: 'after-merge', after: rebase.afterMerge.id } : {}) });
+  registry({ event: 'resume', launch: request ? (request.detached ? 'detached' : 'managed') : 'foreground', id, pid: process.pid, n, at: Date.now(), ...resumeSettings, ...(rebase?.afterMerge ? { reason: 'after-merge', after: rebase.afterMerge.id } : {}) });
   // 之后与协议 14.2 相同，只是只跑这一次（retry），收尾写 attempt-end 与 end（end.attempts === n）。
   return pipeline({
     root, paths, id, registry, progress, started, interactive, home,

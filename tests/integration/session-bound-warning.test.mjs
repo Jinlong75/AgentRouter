@@ -1,0 +1,56 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { cleanupProcesses } from '../fixtures/identity.mjs';
+
+const cli = resolve('core/ar.mjs');
+test('未托管派发和重试警告并记录启动方式', async t => {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'ar-session-warning-'))), repo = join(base, 'repo'), home = join(base, 'home');
+  mkdirSync(repo); mkdirSync(home); mkdirSync(join(repo, '.agent-router'));
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, AR_NO_WATCH: '1', CLAUDE_CONFIG_DIR: join(base, 'claude') };
+  delete env.AR_TEST_AGENT; delete env.NODE_OPTIONS; delete env.ELECTRON_RUN_AS_NODE;
+  t.after(async () => { await cleanupProcesses(base, { diagnostic: message => t.diagnostic(message) }); rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  spawnSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, '.agent-router/project.json'), '{}');
+  for (const args of [['add', '.'], ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'init']]) spawnSync('git', args, { cwd: repo });
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake', profiles: { fake: { adapter: 'fake', enabled: true, releaseFile: join(base, 'release'), label: '假执行者', events: [{ kind: 'say', text: '测试' }], delayMs: 3000, report: '完成', exit: 0 } } }));
+  const ar = args => { const result = spawnSync(process.execPath, [cli, ...args], { cwd: repo, env, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr + result.stdout); return result.stdout; };
+  const rows = () => { try { return readFileSync(join(home, 'runs.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
+  const until = async fn => { const end = Date.now() + 30000; while (Date.now() < end) { const value = fn(); if (value) return value; await delay(50); } throw Error('等待任务记录超时'); };
+  const result = JSON.parse(ar(['dispatch', '测试任务', '--name', '测试任务', '--profile', 'fake', '--detach', '--json']));
+  assert.equal(result.sessionBound, true); assert.equal(result.sessionBoundReason, '托管未开启');
+  assert.ok(result.lines.includes('这个任务不是托管启动，关闭当前会话（主导窗口）可能会中断它。原因：托管未开启。'));
+  const start = await until(() => rows().find(row => row.event === 'start')); assert.equal(start.launch, 'detached');
+  await until(() => rows().find(row => row.event === 'spawned'));
+  const brief = ar(['lead', 'brief']); assert.match(brief, /可能随会话中断的任务[\s\S]*测试任务/); assert.match(brief, /关闭当前会话前，先等这些任务结束/);
+  writeFileSync(join(base, 'release'), '');
+  await until(() => rows().find(row => row.event === 'end'));
+  const retry = ar(['retry', '测试任务', '--note', 'x', '--detach']); assert.match(retry, /这个任务不是托管启动，关闭当前会话（主导窗口）可能会中断它。原因：重试暂不支持托管。/);
+  const resumed = await until(() => rows().find(row => row.event === 'resume')); assert.equal(resumed.launch, 'detached');
+  await until(() => rows().filter(row => row.event === 'end').length === 2);
+});
+
+test('next --dispatch 转出会话中断警告并写进 JSON', async t => {
+  const { main } = await import('../../core/lib/cli.mjs');
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'ar-session-next-'))), root = join(dir, 'repo'), home = join(dir, 'home');
+  t.after(async () => { await cleanupProcesses(dir, { diagnostic: message => t.diagnostic(message) }); rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  mkdirSync(join(root, 'docs', 'specs'), { recursive: true }); mkdirSync(join(root, '.agent-router')); mkdirSync(home);
+  const git = (...args) => { const r = spawnSync('git', args, { cwd: root, encoding: 'utf8', shell: false }); assert.equal(r.status, 0, r.stderr); };
+  git('init', '-q', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+  writeFileSync(join(root, '.agent-router', 'project.json'), JSON.stringify({ v: 1, baseBranch: 'main', specsDir: 'docs/specs', worktree: true }));
+  writeFileSync(join(root, '.gitignore'), '.agent-runs/\n');
+  writeFileSync(join(root, 'docs', 'specs', '100-test.md'), '---\ntitle: 任务100\ntype: code\nexpect_commit: false\nallowed_paths:\n  - src/a\n---\n');
+  git('add', '.gitignore', '.agent-router/project.json', 'docs/specs'); git('commit', '-qm', 'fixtures');
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ v: 2, concurrency: 1, managed: false, watchWindow: 'never', defaultProfile: 'fake', profiles: { fake: { adapter: 'fake', enabled: true, events: [], report: '完成', exit: 0 } } }));
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, CLAUDE_CONFIG_DIR: join(dir, 'claude'), AR_WORKTREE_ROOT: join(dir, 'worktrees'), AR_NO_WATCH: '1' };
+  delete env.AR_TEST_AGENT;
+  const script = resolve('core/ar.mjs');
+  const text = []; assert.equal(await main(['next', '--dispatch'], { cwd: root, env, scriptPath: script, out: line => text.push(line) }), 0, text.join('\n'));
+  assert.ok(text.some(line => line === '这个任务不是托管启动，关闭当前会话（主导窗口）可能会中断它。原因：托管未开启。'), text.join('\n'));
+  const name = text.find(line => line.startsWith('已派发：')).slice(4).split('（')[0];
+  spawnSync(process.execPath, [script, 'wait', name, '--timeout', '60'], { cwd: root, env, encoding: 'utf8', shell: false, timeout: 70000 });
+});
