@@ -6,7 +6,7 @@ import path from 'node:path';
 
 // 允许清单：目录前缀（含 / 结尾）、整名文件、改名导出。每一项至少要匹配一个文件，否则报错（防止清单过期）。
 export const ALLOW_DIRS = [
-  'app/src/', 'app/design/icons/', 'core/', 'skills/agent-router/', 'skills/lead-workflow/',
+  'app/src/', 'app/design/icons/', 'core/', 'skills/agent-router/', 'skills/lead-workflow/', 'skills/lead-practices/',
   'installer/', 'tools/', 'tests/', '.github/',
 ];
 export const ALLOW_FILES = [
@@ -28,8 +28,18 @@ export const ALLOW_DOC_FILES = [
   'core/templates/roles/reviewer.md',
   'core/templates/roles/worker.md',
   'core/templates/spec.md',
+  // v1.0（用户 11-03 批准公开）：ar init 装进用户项目的交接、暂离、目标与主导经验清单模板。
+  'core/templates/autonomy.md',
+  'core/templates/handoff.md',
+  'core/templates/target.md',
+  'core/templates/lead-practices/checklist.md',
+  'core/templates/lead-practices/closeout.md',
+  'core/templates/lead-practices/examples.md',
   'skills/agent-router/SKILL.md',
   'skills/lead-workflow/SKILL.md',
+  'skills/lead-practices/SKILL.md',
+  'skills/lead-practices/references/examples.md',
+  'skills/lead-practices/references/closeout.md',
   'tests/fixtures/README.md',
   'tests/fixtures/expected-progress.txt',
   'tests/fixtures/fake-agent.txt',
@@ -41,6 +51,8 @@ export const isDocFile = file => DOC_EXTS.includes(path.posix.extname(file).toLo
 
 // 源路径会不会导出：返回导出路径名，不导出返回 null。
 export function exportPathOf(file) {
+  if (file.startsWith('tools/candidate/') || file === 'tools/dev-home.mjs' || file.startsWith('tools/dev-home/')
+      || file === 'tests/unit/dev-home.test.mjs' || file === 'tests/unit/release-tools.test.mjs') return null;
   if (ALLOW_DIRS.some(dir => file.startsWith(dir)) || ALLOW_FILES.includes(file)) return file;
   if (file in ALLOW_RENAMES) return ALLOW_RENAMES[file];
   return null;

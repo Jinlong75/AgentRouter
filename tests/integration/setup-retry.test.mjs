@@ -66,7 +66,7 @@ function fixture(t) {
   const f = { base, repo, home, wtRoot, env, marker, count: 0 };
   write(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改 a.js' } },
+    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改 a.js' } },
   }));
   f.ar = args => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [script, ...args], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false });

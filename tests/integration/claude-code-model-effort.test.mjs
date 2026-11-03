@@ -50,7 +50,7 @@ test('claude-code 派发：profile 里的 effort 在命令行没给时生效', t
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(s.args(), [...BASE, '--effort', 'medium']);
   assert.equal(s.start().effort, 'medium');
-  assert.equal(s.start().model, 'deepseek-v4-pro', '没给 --model 时仍取 ANTHROPIC_MODEL');
+  assert.equal(s.start().model, 'deepseek-v4-flash', '没给 --model 时仍取 ANTHROPIC_MODEL');
 });
 
 test('claude-code 派发：--tier 不传入参数，进度里只有一行提示', t => {
@@ -65,6 +65,6 @@ test('claude-code 派发：什么都不给时参数与原来相同，start.model
   const s = setup(t), r = s.dispatch();
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(s.args(), BASE);
-  assert.equal(s.start().model, 'deepseek-v4-pro'); assert.equal(s.start().effort, null);
+  assert.equal(s.start().model, 'deepseek-v4-flash'); assert.equal(s.start().effort, null);
   assert.ok(!s.progress().includes('不支持 tier'));
 });

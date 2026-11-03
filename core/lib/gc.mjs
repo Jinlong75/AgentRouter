@@ -4,6 +4,7 @@
 // 逐项删除，某一项失败记进 errors，不中断其他项；git 一律参数数组、shell: false（git.mjs）。
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { configInvalid, readConfig, sessionRetention } from './config.mjs';
 import { git } from './git.mjs';
 import { CREATED_TOLERANCE_MS, pidAlive, processCreated } from './process.mjs';
@@ -16,6 +17,8 @@ const UNKNOWN_TASK_GRACE_MS = 10 * 60 * 1000;
 // worktree 目录名：<项目根哈希前 6 位>-<短名>（协议 15.2）；根目录里不符合的条目不是我们建的，不碰。
 const WORKTREE_ENTRY = /^[0-9a-f]{6}-./;
 const SLOT_FILE = /^(?:slot|gate)-\d+\.json(?:\.stale-[0-9a-f]+)?$/;
+const PROMPT_FILE = /^ar-prompt-[0-9a-f]{16}\.txt$/;
+const PROMPT_GRACE_MS = 60 * 60 * 1000;
 
 const pathKey = value => (process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value));
 const realPath = value => { try { return realpathSync.native(value); } catch { return null; } };
@@ -187,7 +190,9 @@ async function findSlots({ home, isAlive, createdOf }) {
     let orphan = !(await isAlive(info.pid));
     if (!orphan && Number.isFinite(info.created)) {
       const actual = await createdOf(info.pid);
-      orphan = Number.isFinite(actual) && Math.abs(actual - info.created) > CREATED_TOLERANCE_MS;
+      // 查不到创建时间：可能是复用这个 PID 的短命进程在两次查询之间退出了，再看一次是否存活；
+      // 仍存活（只是查询失败）才保守地不动。
+      orphan = Number.isFinite(actual) ? Math.abs(actual - info.created) > CREATED_TOLERANCE_MS : !(await isAlive(info.pid));
     }
     if (orphan) found.push({ file, id: typeof info.id === 'string' ? info.id : null, pid: info.pid, text });
   }
@@ -213,6 +218,22 @@ function findSessions({ home, days, now, busy }) {
       const age = now - stat.mtimeMs;
       if (age > days * DAY_MS) found.push({ worker: worker.name, dir, ageDays: Math.floor(age / DAY_MS) });
     }
+  }
+  return found;
+}
+
+// 只检查系统临时目录的直接子项，不跟随链接。
+function findPromptFiles(now) {
+  const dir = os.tmpdir();
+  let names;
+  try { names = readdirSync(dir); } catch { return []; }
+  const found = [];
+  for (const name of names) {
+    if (!PROMPT_FILE.test(name)) continue;
+    const file = path.join(dir, name);
+    let stat;
+    try { stat = lstatSync(file); } catch { continue; }
+    if (stat.isFile() && now - stat.mtimeMs > PROMPT_GRACE_MS) found.push({ file, size: stat.size });
   }
   return found;
 }
@@ -252,6 +273,7 @@ export async function gc({
   const busy = new Set();
   for (const task of tasks.values()) if (running(task)) for (const name of profilesOf(task)) busy.add(name);
   const sessions = findSessions({ home, days, now, busy });
+  const promptFiles = findPromptFiles(now);
 
   const errors = [];
   let bytes = 0;
@@ -283,12 +305,17 @@ export async function gc({
     });
   }
   for (const item of sessions) attempt('session', item.dir, sizeOf(item.dir), () => removeDirectory(item.dir));
+  for (const item of promptFiles) attempt('promptFile', item.file, item.size, () => {
+    const stat = lstatSync(item.file);
+    if (stat.isFile() && now - stat.mtimeMs > PROMPT_GRACE_MS) rmSync(item.file);
+  });
 
   return {
     ok: true,
     worktrees: [...dirs, ...prunable].map(item => ({ dir: item.dir, reason: item.reason })),
     slots: slots.map(item => ({ file: item.file, id: item.id, pid: item.pid })),
     sessions,
+    promptFiles: promptFiles.map(item => ({ file: item.file })),
     bytes,
     errors,
   };
@@ -353,7 +380,8 @@ const sizeText = bytes => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} M
 
 // 不加 --json 时给人看的文字。
 export function gcLines(result, { dryRun = false } = {}) {
-  const total = result.worktrees.length + result.slots.length + result.sessions.length;
+  const promptFiles = result.promptFiles ?? [];
+  const total = result.worktrees.length + result.slots.length + result.sessions.length + promptFiles.length;
   if (!total) return ['没有需要清理的内容'];
   const lines = [dryRun ? '可以清理（--dry-run 只列出，没有删除）：' : '已清理：'];
   if (result.worktrees.length) {
@@ -367,6 +395,10 @@ export function gcLines(result, { dryRun = false } = {}) {
   if (result.sessions.length) {
     lines.push(`  过期的执行者会话记录（${result.sessions.length} 个）：`);
     for (const item of result.sessions) lines.push(`    ${item.worker}　${item.dir}　${item.ageDays} 天没有改动`);
+  }
+  if (promptFiles.length) {
+    lines.push(`  残留的任务文字临时文件（${promptFiles.length} 个）：`);
+    for (const item of promptFiles) lines.push(`    ${item.file}`);
   }
   lines.push(`${dryRun ? '预计可释放' : '共释放'}约 ${sizeText(result.bytes)}`);
   for (const error of result.errors) lines.push(`清理失败：${error.path}（${error.error}）`);

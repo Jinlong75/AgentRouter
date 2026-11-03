@@ -144,6 +144,18 @@ test('reviewPrompt：没有差异、没有门禁信息也能组装', () => {
   assert.ok(prompt.includes('（没有运行门禁）'));
 });
 
+test('reviewPrompt：重试说明按尝试顺序插在任务说明之后，空数组不改变指令，过长时截断', () => {
+  const args = { specText: '任务正文', report: '汇报正文' };
+  assert.equal(reviewPrompt(args), reviewPrompt({ ...args, notes: [] }));
+  const prompt = reviewPrompt({ ...args, notes: [{ attempt: 2, text: '决定甲' }, { attempt: 5, text: '决定乙' }] });
+  assert.match(prompt, /任务正文\n\n## 主导在重试时的补充说明（与任务说明冲突时以这里为准）\n\n第 2 次尝试：决定甲\n第 5 次尝试：决定乙/);
+  assert.ok(prompt.indexOf('决定乙') < prompt.indexOf('汇报正文'));
+  const long = '补'.repeat(10000);
+  const capped = reviewPrompt({ ...args, notes: [{ attempt: 2, text: long }] });
+  assert.ok(!capped.includes(long));
+  assert.match(capped, /补充说明超过 8 KB，已截断/);
+});
+
 test('parseReview：JSON 里的非法反斜杠转义（正则、Windows 路径）按字面反斜杠处理并记 warning', () => {
   const r = parseReview(block(String.raw`{"verdict":"concerns","summary":"s","reviewed":["src/a.js"],"issues":[{"severity":"low","file":"src/a.js","title":"t","detail":"正则 /^[\w.-]+$/ 与 \d，路径 src\main.mjs"}]}`));
   assert.equal(r.ok, true);

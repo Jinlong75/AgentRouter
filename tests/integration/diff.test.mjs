@@ -55,7 +55,7 @@ function fixture(t) {
   const f = { base, repo, home, env, count: 0 };
   f.setProfile = value => write(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...value } },
   }));
   f.ar = (args, { cwd = repo } = {}) => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [script, ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false });
@@ -190,6 +190,8 @@ test('4 合并之后 worktree 与分支都删了仍然能算：--no-ff 与 --squ
   const merged = await f.task('合并后查看');
   write(path.join(merged.wt.dir, 'src/new.txt'), '新增\n');
   f.commitIn(merged, '多一个文件');
+  const regate = await f.ar(['retry', '合并后查看', '--regate', '--json']);
+  assert.equal(regate.code, 0, regate.stdout + regate.stderr);
   const before = await f.diff('合并后查看');
   assert.equal(before.code, 0);
   assert.equal((await f.ar(['accept', '合并后查看', '--json'])).code, 0);

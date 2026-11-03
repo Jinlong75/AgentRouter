@@ -117,6 +117,20 @@ test('孤立名额的判定：占用者不存活、或存活但创建时间不�
   for (const name of ['slot-2.json', 'gate-1.json', 'gate-2.json', 'slot-4.json', 'slot-9.json.stale-zz']) assert.equal(existsSync(path.join(slots, name)), true, name);
 });
 
+test('孤立名额：PID 第一次查还活着、查创建时间时已退出（短命进程复用 PID）也算孤立；仍活着只是查不到的不动', async t => {
+  const { home, env } = temp(t);
+  const slots = path.join(home, 'slots');
+  put(path.join(slots, 'slot-1.json'), JSON.stringify({ id: 'a', pid: 201, created: 1000, at: 1 }));          // 两次查询之间退出
+  put(path.join(slots, 'slot-2.json'), JSON.stringify({ id: 'b', pid: 202, created: 1000, at: 1 }));          // 一直活着，只是查不到创建时间
+  const seen = new Map();
+  const isAlive = pid => { const n = (seen.get(pid) ?? 0) + 1; seen.set(pid, n); return pid === 202 || n === 1; };
+  const createdOf = async () => null;
+  const real = await gc({ homes: [home], env, isAlive, createdOf });
+  assert.deepEqual(real.errors, []);
+  assert.equal(existsSync(path.join(slots, 'slot-1.json')), false, '已退出的删掉');
+  assert.equal(existsSync(path.join(slots, 'slot-2.json')), true, '活着但查不到创建时间的不动');
+});
+
 test('清单里找不到任务的 worktree 目录有 10 分钟保护期：刚建的不列出，修改时间在 11 分钟前才列出', async t => {
   const { home, env } = temp(t);
   const dir = path.join(env.AR_WORKTREE_ROOT, 'abcdef-手工');

@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const script = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+test('派发、重试和 next 输出提醒，模型来源随配置和任务说明变化', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'ar-hints-')), root = join(dir, 'repo'), home = join(dir, 'home');
+  mkdirSync(root); mkdirSync(home);
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  const git = (...args) => { const r = spawnSync('git', args, { cwd: root, encoding: 'utf8', shell: false }); assert.equal(r.status, 0, r.stderr); };
+  git('init', '-q', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+  mkdirSync(join(root, 'docs', 'specs'), { recursive: true });
+  mkdirSync(join(root, '.agent-router'));
+  writeFileSync(join(root, '.agent-router', 'project.json'), JSON.stringify({ v: 1, baseBranch: 'main', worktree: false, verify: [], allowedPaths: ['**'] }));
+  writeFileSync(join(root, 'docs', 'specs', '900-test.md'), '---\nid: 900\ntitle: test\nmodel: spec-model\neffort: high\nexpect_commit: false\nallowed_paths:\n  - "**"\n---\n测试\n');
+  git('add', '.agent-router/project.json', 'docs/specs/900-test.md'); git('commit', '-qm', 'fixture');
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'fake', watchWindow: 'never', profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, model: 'config-model', effort: 'low', events: [], exit: 0 } } }));
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, AR_NO_WATCH: '1', CLAUDE_CONFIG_DIR: join(dir, 'claude') };
+  delete env.AR_DRY_RUN; delete env.AR_TEST_AGENT; delete env.CLAUDECODE;
+  const ar = (...args) => { const r = spawnSync(process.execPath, [script, ...args], { cwd: root, env, encoding: 'utf8', shell: false, timeout: 60000 }); assert.equal(r.status, 0, r.stderr + r.stdout); return r.stdout; };
+  assert.match(ar('next'), /全量验收：还没有通过的全量验收，已合入 0 个任务/);
+  const plain = ar('dispatch', '普通任务', '--name', 'plain', '--profile', 'fake');
+  assert.ok(plain.includes('执行者：假执行者（fake）；模型：config-model（config.json）；强度：low（config.json）'));
+  const spec = JSON.parse(ar('dispatch', 'docs/specs/900-test.md', '--name', 'spec', '--profile', 'fake', '--json'));
+  assert.equal(spec.params.model, 'spec-model'); assert.equal(spec.params.sources.model, '任务说明');
+  assert.equal(spec.params.effort, 'high'); assert.equal(spec.params.sources.effort, '任务说明');
+  assert.ok(ar('retry', 'spec', '--note', '再次检查').includes('重试前自查：ar lead practices 3（补充说明要自包含）、ar lead practices 5（门禁失败）'));
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', shell: false }).stdout.trim();
+  appendFileSync(join(home, 'runs.jsonl'), `${JSON.stringify({ event: 'full-verify', repo: root, branch: 'main', head, ok: false, at: Date.now() })}\n`);
+  assert.match(ar('next'), /全量验收：还没有通过的全量验收，已合入 0 个任务/);
+});

@@ -21,6 +21,18 @@ export async function preferenceFixture(home, { install = true } = {}) {
     AR_WORKTREE_ROOT: path.join(home,'wt'),
     // git 的全局配置也放进隔离目录：验收绝不读写用户真实的 ~/.gitconfig，"没有提交身份"也能稳定复现。
     GIT_CONFIG_GLOBAL: path.join(home,'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' });
+  // Qoder 按程序名查找时命中隔离目录中的假程序，自定义 CLI 保持原有行为。
+  delete env.AR_TEST_GENERIC_PROGRAM;
+  const fakeBin = path.join(home, 'fake-bin');
+  await mkdir(fakeBin, { recursive: true });
+  const fakeStream = path.join(home, 'fake-claude.cjs');
+  for (const name of ['qoderclicn', 'qodercli']) {
+    const windows = process.platform === 'win32';
+    const script = windows ? `@node "${fakeStream}" %*\r\n` : `#!/bin/sh\nexec node '${fakeStream.replace(/'/g, "'\\''")}' "$@"\n`;
+    await writeFile(path.join(fakeBin, name + (windows ? '.cmd' : '')), script, { mode: 0o755 });
+  }
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') || 'PATH';
+  env[pathKey] = fakeBin + path.delimiter + (env[pathKey] || '');
   // 所有检测与安装都在同一个隔离目录，绝不回落到真实 PATH 或宿主。
   env.CODEX_TIER='priority';
   for(const dir of [env.CLAUDE_CONFIG_DIR,env.CODEX_HOME,temp]) await mkdir(dir,{recursive:true});
@@ -31,7 +43,7 @@ export async function preferenceFixture(home, { install = true } = {}) {
   // 假 Claude Code（037 第 4 项）：AR_TEST_AGENT 这个假脚本对所有适配器跑同一份、版本是 codex 的，
   // claude-code 执行者的版本会串成 codex-cli。真实安装没有这个问题（detect 跑的是真 claude --version）。
   // 给 claude-code 的 profile 配上 path 指向这里（path 优先于 AR_TEST_AGENT，见 core/adapters 的 resolveLauncher），版本就是 Claude Code 风格。
-  await writeFile(path.join(home,'fake-claude.cjs'),`const VERSION='2.1.302 (Claude Code)';if(process.argv.includes('--version')){console.log(VERSION);process.exit(0);}if(process.argv.includes('-p')&&process.argv.includes('stream-json')){process.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'OK'}));process.exit(0);});return;}process.exit(2);\n`);
+  await writeFile(path.join(home,'fake-claude.cjs'),`const fs=require('node:fs');const path=require('node:path');const VERSION='2.1.302 (Claude Code)';if(process.argv.includes('--version')){console.log(VERSION);process.exit(0);}if(process.argv.includes('-p')&&process.argv.includes('stream-json')){fs.writeFileSync(path.join(__dirname,'fake-stream-invoked'),'yes');process.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'OK'}));process.exit(0);});return;}if(/[/\\\\]ok-cli\\.mjs$/.test(process.argv[2]||'')){const r=require('node:child_process').spawnSync(process.execPath,process.argv.slice(2),{stdio:'inherit',shell:false});process.exit(r.status??2);}process.exit(2);\n`);
   if (install === true) executePlan(createPlan({env,host:'claude-code'}),{env});
   else if (Array.isArray(install)) for (const skill of install.filter(s => skills.includes(s))) executePlan(createPlan({env,host:'claude-code',skill}),{env});
   return env;

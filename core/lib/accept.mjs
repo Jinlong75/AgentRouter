@@ -1,8 +1,11 @@
+import { sectionHasContent } from './spec.mjs';
 // 验收合并与驳回（协议 15.6、15.7）：ar accept / ar reject。零依赖。
 // 只写清单事件（accepted / conflict / rejected / cleanup），不碰任务的记录目录；git 一律参数数组、shell: false（git.mjs）。
-import { appendFileSync, existsSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { git, uncommittedFiles } from './git.mjs';
+import { attemptReportFile } from './gate.mjs';
+import { changedFiles, git, uncommittedFiles } from './git.mjs';
+import { matchesAny } from './glob.mjs';
 import { readJson } from './json.mjs';
 import { pushBranch } from './push.mjs';
 import { registryWriter, taskPaths } from './records.mjs';
@@ -65,18 +68,88 @@ function cleanUp({ root, registry, id, worktree, force, deleteBranch, forceBranc
   }
 }
 
+// 合入前核对证据；旧证据缺少 HEAD 时只能提醒。
+function acceptanceChecks({ root, file, start, worktree, ack, force, reason, by }) {
+  if (ack !== null && (typeof ack !== 'string' || !ack.trim())) throw new Error('--ack 不能为空');
+  if (reason !== null && (typeof reason !== 'string' || !reason.trim())) throw new Error('--reason 不能为空');
+  if (force && !reason) throw new Error('--force 必须同时给非空 --reason');
+  if (!force && reason !== null) throw new Error('--reason 必须与 --force 一起使用');
+  const paths = taskPaths(root, start.name), scope = taskScope(paths.dir);
+  const failures = [], warnings = [];
+  const read = path => { try { return readJson(path); } catch { return null; } };
+  const dispatch = read(join(paths.dir, 'dispatch.json'));
+  const reviewFile = join(paths.dir, 'review.json');
+  const reviewRecorded = [...reverseRows(file)].some(row => row.id === start.id && ['reviewing', 'review', 'review-needs-human'].includes(row.event));
+  const reviewRequired = existsSync(reviewFile) || dispatch?.review === true || dispatch?.review?.enabled === true || reviewRecorded;
+  const current = worktree?.branch ? git(root, ['rev-parse', `refs/heads/${worktree.branch}`]) : null;
+  const head = current?.status === 0 ? current.stdout.trim() : null;
+  let stale = false;
+  const checkHead = (evidence, label) => {
+    if (!evidence.head) warnings.push(`${label}：无法核对证据对应的提交`);
+    else if (head && evidence.head !== head) { failures.push(`${label}对应的提交已过期`); stale = true; }
+  };
+  const gate = read(join(paths.dir, 'gate.json'));
+  if (scope.gate) {
+    if (!gate || gate.ok !== true) failures.push('缺少有效门禁');
+    else checkHead(gate, '门禁');
+  }
+  const review = read(reviewFile);
+  if (reviewRequired) {
+    if (!review || !['pass', 'concerns', 'fail'].includes(review.verdict)) failures.push('缺少有效审查');
+    else {
+      checkHead(review, '审查');
+      for (const issue of review.issues ?? []) if (!['valid', 'invalid'].includes(issue.confirmation?.result)) failures.push(`审查问题 ${issue.id} 未确认`);
+    }
+  }
+  let attempt = null;
+  for (const row of reverseRows(file)) if (row.id === start.id && row.event === 'attempt' && Number.isInteger(row.n)) { attempt = row.n; break; }
+  const reportFile = attempt ? attemptReportFile(join(paths.dir, 'attempts', String(attempt))) : paths.report;
+  let report = '';
+  try { report = readFileSync(reportFile, 'utf8'); } catch { /* 缺汇报等同缺节。 */ }
+  const sections = new Map([['已知问题', []], ['需要越界', []]]);
+  let fence = null, active = null;
+  for (const line of report.split(/\r?\n/)) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) {
+      if (!fence) fence = marker[1];
+      else if (marker[1][0] === fence[0] && marker[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const heading = line.match(/^#{1,2}\s+(.+?)\s*$/);
+    if (heading) {
+      active = /^##\s/.test(line) && sections.has(heading[1]) ? [] : null;
+      if (active) sections.get(heading[1]).push(active);
+    } else if (active) active.push(line);
+  }
+  for (const [section, bodies] of sections) {
+    const hasContent = bodies.some(sectionHasContent);
+    if (!ack && (hasContent || (!bodies.length && section === '已知问题'))) failures.push(bodies.length ? `汇报的 ${section} 需要确认` : `汇报缺少 ${section} 节，需要确认`);
+  }
+  if (stale) failures.push(`请运行 ar retry ${start.name} --regate`);
+  const override = force && failures.length ? { reason: reason.trim(), failures: [...failures], ack: ack?.trim() ?? null } : null;
+  if (failures.length && by !== 'human' && !override) throw new Error(`验收检查未通过：${failures.join('；')}`);
+  if (by === 'human') warnings.push(...failures);
+  return { failures, warnings, ack: ack?.trim() ?? null, override };
+}
+
 // ar accept：检查 → 合并 → accepted 事件 → 清理。任务分支没有新提交时不合并，改为确认（merge 为 null，mode 为 confirm）。
 // 返回 { ok: true, merge, mode, cleanup[, push] } 或冲突时 { ok: false, conflict: true, files }；检查不通过时抛出中文原因（退出码 2）。
 // push：true 合并后推送，false 不推送，null 按项目配置 push.afterAccept；只读任务的"确认"没有合并，不推送。
-export function accept({ homes, root, name, squash = false, push = null, by = null, env = process.env } = {}) {
+export function accept({ homes, root, name, squash = false, push = null, by = null, ack = null, force = false, reason = null, env = process.env } = {}) {
   const { file, home, start, worktree } = locateWorktreeTask(homes, root, name, '验收');
   const id = start.id;
   const registry = registryWriter(home);
   // 检查 1：待验收（end.exit === 0，之后没有验收事件；冲突解决后的再次待验收也是这个状态）。
   if (worktreeOutcome(file, id) !== 'awaiting') throw new Error(`任务不在待验收状态：${start.name}`);
-  // 任务分支相对基线没有新提交（调研 / 审查类任务）：没有东西可合并，改为确认（Stage07 105）。
-  if (noNewCommits({ root, file, start, worktree })) return confirm({ root, registry, id, worktree, by, env });
   const config = projectConfig(root);
+  const rules = config.acceptHints === undefined ? [] : config.acceptHints;
+  if (!Array.isArray(rules) || !rules.every(rule => rule && typeof rule === 'object' && !Array.isArray(rule)
+    && Array.isArray(rule.paths) && rule.paths.length > 0 && rule.paths.every(value => typeof value === 'string' && value.trim() !== '')
+    && typeof rule.text === 'string' && rule.text.trim() !== '')) throw new Error('项目配置无效：acceptHints');
+  const checks = acceptanceChecks({ root, file, start, worktree, ack, force, reason, by });
+  // 任务分支相对基线没有新提交时确认，也必须先校验配置。
+  if (noNewCommits({ root, file, start, worktree })) return confirm({ root, registry, id, worktree, by, env, checks });
   // 这个任务的基线分支：派发时用 --base 指定的，否则项目配置的 baseBranch（136）。
   const baseBranch = taskBaseBranch(start, config.baseBranch);
   if (typeof baseBranch !== 'string' || baseBranch.trim() === '') throw new Error('项目配置没有写 baseBranch，不知道该合并到哪个分支');
@@ -102,6 +175,8 @@ export function accept({ homes, root, name, squash = false, push = null, by = nu
 
   const mode = squash || config.mergeMode === 'squash' ? 'squash' : 'no-ff';
   const message = `[执行] 合并 ${start.name}：${taskTitle(root, start)}`;
+  const before = git(root, ['rev-parse', 'HEAD']);
+  if (before.status !== 0) throw new Error(`无法读取合并前 HEAD：${gitFailure(before, 'git rev-parse ')}`);
   const merged = git(root, mode === 'squash' ? ['merge', '--squash', worktree.branch] : ['merge', '--no-ff', '-m', message, worktree.branch]);
   let failure = merged.status === 0 ? null : merged;
   if (!failure && mode === 'squash') {
@@ -123,7 +198,12 @@ export function accept({ homes, root, name, squash = false, push = null, by = nu
   const head = git(root, ['rev-parse', 'HEAD']);
   if (head.status !== 0) throw new Error(`合并已完成，但读不到合并提交：${gitFailure(head, 'git rev-parse ')}`);
   const merge = head.stdout.trim();
-  registry({ event: 'accepted', id, merge, mode, by: actor({ by, env }), at: Date.now() });
+  const files = changedFiles(root, before.stdout.trim(), merge).sort();
+  const acceptHints = rules.flatMap(rule => {
+    const file = files.find(item => matchesAny(item, rule.paths));
+    return file === undefined ? [] : [{ text: rule.text, file }];
+  });
+  registry({ event: 'accepted', id, merge, mode, by: actor({ by, env }), ...(checks.override ? { override: checks.override } : {}), ...(by === 'human' ? { warnings: checks.warnings, ack: checks.ack } : {}), at: Date.now() });
   const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: mode === 'squash' });
   // 合并后推送（Stage07b 128）：--push，或没写 --push / --no-push 且项目配置 push.afterAccept 为 true。没有推送时结果里不出现 push 键。
   // 推送只认项目配置的 baseBranch：这次派发指定了别的基线分支时不推送（包括显式的 --push），合并照常完成（136）。
@@ -133,7 +213,7 @@ export function accept({ homes, root, name, squash = false, push = null, by = nu
       : pushAfterMerge({ root, home: homes[0], registry, id, by: actor({ by, env }), env });
   // 合并后要自动按新基线重跑门禁的任务（Stage07c 154，D86）：由调用方（cli.mjs）去启动，这里只算出名单。
   const targets = rerunTargets({ home, root, start, baseBranch, projectBaseBranch: config.baseBranch });
-  return { ok: true, merge, mode, cleanup, ...(pushed ? { push: pushed } : {}), ...(targets.length ? { rerun: { after: { id, name: start.name }, targets } } : {}) };
+  return { ok: true, merge, mode, cleanup, acceptHints, checks, ...(pushed ? { push: pushed } : {}), ...(targets.length ? { rerun: { after: { id, name: start.name }, targets } } : {}) };
 }
 
 // 同项目、同一基线分支、仍是待验收、用 worktree 且启用了门禁（只读任务没有改动，不需要）、改动范围和刚合并的 X 重叠的任务：[{ id, name }]。
@@ -183,15 +263,15 @@ function noNewCommits({ root, file, start, worktree }) {
 
 // 确认（没有新提交的待验收任务）：不合并，不看主工作区在哪个分支、是否干净；worktree 里有门禁之后的未提交改动时同样拒绝；
 // 写 accepted 事件（merge 为 null，mode 为 confirm），删除 worktree 与分支（分支上没有新提交，直接 -D）。
-function confirm({ root, registry, id, worktree, by, env }) {
+function confirm({ root, registry, id, worktree, by, env, checks }) {
   if (typeof worktree.dir !== 'string' || !existsSync(worktree.dir)) throw new Error(`worktree 已经不在了：${worktree.dir ?? '（清单里没有记录）'}`);
   let dirtyWorktree;
   try { dirtyWorktree = uncommittedFiles(worktree.dir); }
   catch (error) { throw new Error(`无法检查 worktree 是否干净：${error.message}`); }
   if (dirtyWorktree.length) throw new Error(`worktree 里有门禁之后的未提交改动，请先检查：${firstFive(dirtyWorktree)}`);
-  registry({ event: 'accepted', id, merge: null, mode: 'confirm', by: actor({ by, env }), at: Date.now() });
+  registry({ event: 'accepted', id, merge: null, mode: 'confirm', by: actor({ by, env }), ...(checks.override ? { override: checks.override } : {}), ...(by === 'human' ? { warnings: checks.warnings, ack: checks.ack } : {}), at: Date.now() });
   const cleanup = cleanUp({ root, registry, id, worktree, force: null, deleteBranch: true, forceBranch: true });
-  return { ok: true, merge: null, mode: 'confirm', cleanup };
+  return { ok: true, merge: null, mode: 'confirm', cleanup, acceptHints: [], checks };
 }
 
 // 撤销没做完的合并：--no-ff 用 merge --abort，squash 用 reset --merge（并删掉 squash 留下的提交信息草稿）。

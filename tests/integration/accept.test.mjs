@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -85,7 +85,7 @@ function fixture(t, { setup = [], project = {} } = {}) {
   f.setProfile = value => {
     writeFileSync(path.join(home, 'config.json'), JSON.stringify({
       v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n## 需要越界\n无\n', exit: 0, ...value } },
     }));
   };
   f.setProfile({});
@@ -151,7 +151,35 @@ test('0 worktreeOutcome：accepted / rejected / conflict 之后的状态，clean
   assert.equal(worktreeOutcome(file, '别的任务'), null);
 });
 
+test('门禁后的新提交拒绝验收，regate 后重新核对通过', async t => {
+  const f = fixture(t);
+  const task = await f.task('门禁后提交', { writes: [{ path: 'src/a.js', content: '第一次\n' }], commit: '第一次' });
+  write(path.join(task.wt.dir, 'src/a.js'), '第二次\n');
+  git(task.wt.dir, ['add', 'src/a.js']);
+  git(task.wt.dir, ['commit', '-qm', '第二次']);
+  const refused = await f.ar(['accept', task.name, '--json']);
+  assert.equal(refused.code, 2, refused.stdout + refused.stderr);
+  assert.match(refused.stdout, /门禁.*过期/);
+  assert.match(refused.stdout, /--regate/);
+  assert.ok(existsSync(task.wt.dir));
+  const retried = await f.ar(['retry', task.name, '--regate', '--json']);
+  assert.equal(retried.code, 0, retried.stdout + retried.stderr);
+  const accepted = await f.ar(['accept', task.name, '--json']);
+  assert.equal(accepted.code, 0, accepted.stdout + accepted.stderr);
+});
+
 const change = { writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改 src/a.js' };
+
+test('accept 达到全量验收间隔时提示验收和说明路径', async t => {
+  const f = fixture(t, { project: { fullVerifyEvery: 1 } });
+  const task = await f.task('提醒', change);
+  const result = await f.ar(['accept', '提醒']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  assert.match(result.stdout, /还没有通过的全量验收，已合入 1 个任务/);
+  assert.match(result.stdout, /建议现在跑一次全量验收：ar verify --detach/);
+  assert.ok(result.stdout.includes(`ar spec impact ${task.start.spec} --docs`));
+  assert.match(result.stdout, /验收与文档核对的自查：ar lead practices 4、ar lead practices 8/);
+});
 
 test('1 默认 --no-ff：一个合并提交、提交信息原文、worktree 与分支已删除、accepted 字段齐、被忽略的文件不挡路', async t => {
   const f = fixture(t, { setup: ['node scripts/setup.mjs'] });
@@ -163,7 +191,7 @@ test('1 默认 --no-ff：一个合并提交、提交信息原文、worktree 与�
   const result = await f.ar(['accept', '正常合并', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);
   const value = JSON.parse(result.stdout);
-  assert.deepEqual(Object.keys(value), ['ok', 'merge', 'mode', 'cleanup']);
+  assert.deepEqual(Object.keys(value), ['ok', 'merge', 'mode', 'cleanup', 'fullVerify', 'hints', 'acceptHints', 'checks']);
   assert.equal(value.ok, true);
   assert.equal(value.mode, 'no-ff');
   assert.equal(value.cleanup, true);
@@ -378,6 +406,14 @@ test('6 reject：原因必填；删除 worktree 与分支；主分支不受影�
   assert.match(JSON.parse(twice.stdout).error, /^任务的状态不能驳回：驳回任务/);
 });
 
+test('reject 的原因可以以双横线开头', async t => {
+  const f = fixture(t);
+  const task = await f.task('自由文字原因', change);
+  const result = await f.ar(['reject', '自由文字原因', '--reason', '--先别合', '--json']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  assert.equal(f.events(task.id).find(row => row.event === 'rejected').reason, '--先别合');
+});
+
 test('7 reject --keep-branch：保留分支，worktree 照常删除', async t => {
   const f = fixture(t);
   const task = await f.task('保留分支', change);
@@ -425,7 +461,11 @@ test('9 没有新提交的待验收任务：ar accept 是确认——不合并�
 
   const result = await f.ar(['accept', '只看不改', '--squash', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { ok: true, merge: null, mode: 'confirm', cleanup: true }, '--squash 对确认没有意义，被忽略');
+  const confirmed = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(confirmed), ['ok', 'merge', 'mode', 'cleanup', 'fullVerify', 'hints', 'acceptHints', 'checks']);
+  assert.deepEqual({ ok: confirmed.ok, merge: confirmed.merge, mode: confirmed.mode, cleanup: confirmed.cleanup }, { ok: true, merge: null, mode: 'confirm', cleanup: true }, '--squash 对确认没有意义，被忽略');
+  assert.deepEqual(confirmed.fullVerify, { last: null, mergedSince: 0, every: 5 });
+  assert.ok(confirmed.hints.some(line => line.includes('ar lead practices 4')));
   assert.deepEqual(f.snapshot(), before, '主分支没有任何变化，没有合并提交');
   assert.equal(git(f.repo, ['rev-list', '--count', 'HEAD']), '2');
   assert.ok(!existsSync(task.wt.dir), 'worktree 目录已删除');
@@ -511,4 +551,41 @@ test('11 确认的边界：worktree 里有门禁之后的未提交改动时拒�
   assert.equal(value.mode, 'no-ff');
   assert.equal(value.merge, git(f.repo, ['rev-parse', 'HEAD']));
   assert.ok(!existsSync(merged.wt.dir));
+});
+
+
+test('全量验收通过后合入任务再失败，提醒仍按上次通过计数', async t => {
+  const f = fixture(t, { project: { fullVerifyEvery: 1 } });
+  const task = await f.task('计数提醒', change);
+  const head = git(f.repo, ['rev-parse', 'HEAD']);
+  const record = row => appendFileSync(path.join(f.home, 'runs.jsonl'), `${JSON.stringify({ v: 1, event: 'full-verify', repo: f.repo, branch: 'main', head, ...row })}\n`);
+  record({ ok: true, at: Date.now() - 10000 });
+  const accepted = await f.ar(['accept', task.name, '--json']);
+  assert.equal(accepted.code, 0, accepted.stderr + accepted.stdout);
+  const result = JSON.parse(accepted.stdout);
+  assert.equal(result.fullVerify.mergedSince, 1);
+  assert.ok(result.hints.includes('自上次通过的全量验收以来已合入 1 个任务'));
+  assert.ok(result.hints.includes('建议现在跑一次全量验收：ar verify --detach'));
+  assert.ok(result.hints.includes(`合入改了行为的任务后核对文档：ar spec impact ${task.start.spec} --docs`));
+  record({ ok: false, at: Date.now() + 1000 });
+  const next = await f.ar(['next']);
+  assert.equal(next.code, 0, next.stderr + next.stdout);
+  assert.match(next.stdout, /全量验收：上次 .* 失败（[0-9a-f]{7}）；自上次通过以来已合入 1 个任务；建议 ar verify --detach/);
+});
+
+test('提醒读取失败不改变合并和确认的成功结果', async t => {
+  const f = fixture(t, { project: { fullVerifyEvery: 0 } });
+  const task = await f.task('提醒失败合并', change);
+  const accepted = await f.ar(['accept', task.name, '--json']);
+  assert.equal(accepted.code, 0, accepted.stderr + accepted.stdout);
+  const result = JSON.parse(accepted.stdout);
+  assert.equal(result.ok, true);
+  assert.equal(result.fullVerify, null);
+  assert.ok(result.hints.includes('提醒读取失败：项目配置无效：fullVerifyEvery'));
+  assert.equal(git(f.repo, ['rev-parse', 'HEAD']), result.merge);
+  const confirm = await f.task('提醒失败确认', {});
+  const text = await f.ar(['accept', confirm.name]);
+  assert.equal(text.code, 0, text.stderr + text.stdout);
+  assert.match(text.stdout, /已确认：提醒失败确认/);
+  assert.match(text.stdout, /提醒读取失败：项目配置无效：fullVerifyEvery/);
 });

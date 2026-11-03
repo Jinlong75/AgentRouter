@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { appEnvironment } from './app-env.mjs';
 import { effects } from './effects';
+import { killProcessTree } from '../../../core/lib/process.mjs';
 
 // timedOut：超过 timeoutMs 被结束（这时输出里一般没有 JSON，json 是兜底的 { ok:false }）。
 export interface CoreResult { code: number; json: any; stderr: string; timedOut?: boolean }
@@ -52,5 +53,32 @@ export function coreRun(args: string[], opts: { input?: string; timeoutMs?: numb
             catch { resolve({ code: code ?? 1, json: { ok: false, error: err.trim() || '核心没有返回结果' }, stderr: err, timedOut }); }
         });
         child.stdin.end(opts.input ?? '', 'utf8');
+    });
+}
+
+// 逐行交付输出，取消时等待进程树退出。
+export function coreStream(args: string[], onLine: (value: any) => void, opts: { signal?: AbortSignal } = {}): Promise<{ code: number; last: any }> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [coreScript(), ...args, '--json'], {
+            env: { ...appEnvironment(process.env), ELECTRON_RUN_AS_NODE: '1' }, shell: false, windowsHide: true,
+        });
+        let rest = '', last: any = null, kill: Promise<void> | undefined;
+        const line = (text: string) => { let value: any; try { value = JSON.parse(text); } catch { return; } last = value; onLine(value); };
+        const abort = () => { if (!kill && child.pid) { kill = killProcessTree(child.pid); void kill.catch(() => {}); } };
+        opts.signal?.addEventListener('abort', abort, { once: true });
+        child.once('spawn', () => { if (opts.signal?.aborted) abort(); });
+        if (opts.signal?.aborted) abort();
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+            const lines = (rest + chunk).split(/\r?\n/); rest = lines.pop() ?? '';
+            for (const text of lines) line(text);
+        });
+        child.stderr.resume();
+        child.stdin.end();
+        child.once('error', error => { opts.signal?.removeEventListener('abort', abort); reject(error); });
+        child.once('close', code => {
+            opts.signal?.removeEventListener('abort', abort);
+            if (rest) line(rest);
+            Promise.resolve(kill).then(() => resolve({ code: code ?? 1, last }), reject);
+        });
     });
 }

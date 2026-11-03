@@ -4,9 +4,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homeDirectory, userDirectory } from '../../core/lib/config.mjs';
 import { composeSkill } from './compose.mjs';
+import { planHook, applyHook, removeHook, writeSettings } from './claude-hook.mjs';
 
 // 技能目录 = skills/<技能>/SKILL.md；agent-router 另外带上完整的 core/（核心引擎副本）。
-export const skills = ['agent-router', 'lead-workflow'];
+export const skills = ['agent-router', 'lead-workflow', 'lead-practices'];
 // 旧版 DispatchDock 装的技能：只识别并显示，安装器不替换、不卸载（用户可手动删除）。
 export const legacySkills = ['codex-dispatch', 'dual-role-workflow'];
 export const hosts = ['claude-code'];
@@ -181,10 +182,17 @@ export function createPlan(options = {}) {
     files.delete(marker);
     item.files = files;
   }
-  return { version, statuses, items, warnings, reason: options.uninstall ? 'uninstall' : 'install' };
+  let hookItem;
+  const agent = items.find(i => i.host === 'claude-code' && i.skill === 'agent-router' && i.action !== 'skip');
+  if (agent && !options.noHook) {
+    const hook = planHook({ claudeDir: dirname(dirname(agent.target)), coreDir: join(agent.target, 'core') });
+    if (hook.error || (!options.uninstall && hook.warning)) warnings.push({ message: hook.error || hook.warning });
+    else hookItem = { action: options.uninstall ? 'uninstall' : 'install', target: hook.path, hook };
+  }
+  return { version, statuses, items, warnings, reason: options.uninstall ? 'uninstall' : 'install', ...(hookItem ? { hook: hookItem } : {}) };
 }
 
-function backupBatch(items, home, reason) {
+function backupBatch(items, home, reason, claudeSettings) {
   if (!items.length) return null;
   const at = Date.now(), root = join(home, 'backups');
   fs.mkdirSync(root, { recursive: true });
@@ -192,13 +200,16 @@ function backupBatch(items, home, reason) {
   while (exists(join(root, String(stamp)))) stamp++;
   const target = join(root, String(stamp)), temp = join(root, `.pending-${randomUUID()}`);
   try {
-    fs.mkdirSync(temp);
+    fs.mkdirSync(temp, { mode: 0o700 });
+    if (process.platform !== 'win32') fs.chmodSync(temp, 0o700);
     const records = items.map(i => ({ host: i.host, skill: i.skill, from: i.target, version: i.version, existed: exists(i.target) }));
     for (const item of records) {
       if (item.existed) writeTree(join(temp, item.host, item.skill), readTree(item.from));
     }
-    fs.writeFileSync(join(temp, 'backup.json'), JSON.stringify({ v: 1, at, reason,
-      items: records }, null, 2) + '\n');
+    const backupFile = join(temp, 'backup.json');
+    fs.writeFileSync(backupFile, JSON.stringify({ v: 1, at, reason,
+      items: records, ...(claudeSettings ? { claudeSettings } : {}) }, null, 2) + '\n', { mode: 0o600 });
+    if (process.platform !== 'win32') fs.chmodSync(backupFile, 0o600);
     fs.renameSync(temp, target);
     return target;
   } catch (error) { attemptRecovery(error, temp, () => removeWithin(root, temp)); throw error; }
@@ -210,10 +221,29 @@ function backups(home) {
   return fs.readdirSync(root).filter(name => /^\d+$/.test(name) && exists(join(root, name, 'backup.json'))).sort((a, b) => Number(b) - Number(a)).map(name => join(root, name));
 }
 
+export function listBackups(options = {}) {
+  select(options);
+  const result = [];
+  for (const candidate of backups(homeDirectory(options.env, options.platform))) {
+    try {
+      const record = json(join(candidate, 'backup.json'));
+      if (record.v !== 1 || !Number.isFinite(record.at) || !Number.isFinite(new Date(record.at).getTime()) || typeof record.reason !== 'string' || !Array.isArray(record.items)
+        || !record.items.every(item => item && hosts.includes(item.host)
+          && (skills.includes(item.skill) || (['removeLegacy', 'rollback'].includes(record.reason) && legacySkills.includes(item.skill)))
+          && typeof item.from === 'string' && isAbsolute(item.from) && (item.existed === undefined || typeof item.existed === 'boolean'))) continue;
+      const items = record.items.filter(item => (!options.host || options.host === 'all' || options.host === item.host)
+        && (!options.skill || options.skill === 'all' || options.skill === item.skill));
+      if (items.length) result.push({ id: candidate.split(/[\\/]/).at(-1), at: record.at, reason: record.reason, items: items.map(({ host, skill }) => ({ host, skill })) });
+    } catch { /* 损坏或无法读取的备份不出现在列表中。 */ }
+  }
+  return result.sort((a, b) => b.at - a.at);
+}
+
 export function executePlan(plan, { env = process.env, platform = process.platform, onWrite, onCommit } = {}) {
   const home = homeDirectory(env, platform), staging = join(home, 'staging');
   cleanStaleStaging(staging);
   const active = plan.items.filter(i => i.action !== 'skip');
+  const hookItem = active.some(i => i.host === 'claude-code' && i.skill === 'agent-router') ? plan.hook : undefined;
   if (!active.length) return { changed: [], backup: null, leftovers: [] };
   const targets = active.map(i => resolve(i.target));
   if (new Set(targets.map(s => platform === 'win32' ? s.toLowerCase() : s)).size !== targets.length) throw new Error('技能目标目录重复');
@@ -236,7 +266,12 @@ export function executePlan(plan, { env = process.env, platform = process.platfo
         writeTree(stage.temp, files, onWrite);
       }
     }
-    backup = backupBatch(active, home, plan.reason || 'install');
+    let claudeSettings;
+    if (hookItem) {
+      const path = hookItem.target, existed = exists(path);
+      claudeSettings = { path, existed, text: existed ? fs.readFileSync(path, 'utf8') : '' };
+    }
+    backup = backupBatch(active, home, plan.reason || 'install', claudeSettings);
     // 替换前确定待清理的旧批次，残留提示只列具体批次，不列整个备份根目录。
     obsolete = backups(home).slice(5);
     // 保留原样内容，替换过程中失败时仍可恢复整个批次。
@@ -254,6 +289,16 @@ export function executePlan(plan, { env = process.env, platform = process.platfo
           replaceTree(stage.item.target, new Map());
           removeWithin(stage.parent, stage.item.target);
         } else replaceTree(stage.item.target, readTree(stage.temp));
+      }
+    }
+    if (hookItem) {
+      if (hookItem.action === 'restore') {
+        if (hookItem.saved.existed) writeSettings(hookItem.target, hookItem.saved.text);
+        else fs.rmSync(hookItem.target, { force: true });
+      } else {
+        const current = planHook({ claudeDir: dirname(hookItem.target), coreDir: hookItem.hook.coreDir });
+        if (current.error) throw new Error(current.error);
+        if (hookItem.action === 'install') applyHook(current); else removeHook(current);
       }
     }
   } catch (error) {
@@ -302,7 +347,13 @@ export function rollbackPlan(options = {}) {
   // 卡片按宿主操作：从保留批次里找该宿主（及所选技能）最近的一次操作。
   // 未指定范围时仍撤销全局最新批，备份文件格式和全局命令行为不变。
   let latest, record;
-  for (const candidate of backups(homeDirectory(options.env, options.platform))) {
+  if (options.backup !== undefined) {
+    const selected = listBackups(options).find(item => item.id === options.backup);
+    if (!selected) throw new Error(`没有这个备份：${options.backup}`);
+    latest = join(homeDirectory(options.env, options.platform), 'backups', selected.id);
+    record = json(join(latest, 'backup.json'));
+  }
+  for (const candidate of latest ? [] : backups(homeDirectory(options.env, options.platform))) {
     const saved = json(join(candidate, 'backup.json'));
     if (saved.v !== 1 || !Array.isArray(saved.items)) throw new Error('备份说明无效');
     if (saved.items.some(item => (!options.host || options.host === 'all' || options.host === item.host)
@@ -325,6 +376,12 @@ export function rollbackPlan(options = {}) {
     items.push({ host: item.host, skill: item.skill, target, ...installationStatus(target, item.host, item.skill),
       action: existed ? 'restore' : 'uninstall', ...(existed ? { files: readTree(source) } : {}) });
   }
-  return { version, statuses: getStatus(options), items, warnings: [], reason: 'rollback', backupAt: record.at };
+  let hook;
+  if (record.claudeSettings && items.some(i => i.host === 'claude-code' && i.skill === 'agent-router')) {
+    const saved = record.claudeSettings, h = detectHosts(options).find(h => h.host === 'claude-code');
+    if (!saved || typeof saved.path !== 'string' || resolve(saved.path) !== resolve(dirname(h.root), 'settings.json') || typeof saved.existed !== 'boolean' || typeof saved.text !== 'string') throw new Error('Invalid Claude Code settings backup');
+    hook = { action: 'restore', target: saved.path, saved };
+  }
+  return { version, statuses: getStatus(options), items, warnings: [], reason: 'rollback', backupAt: record.at, ...(hook ? { hook } : {}) };
 }
 export function rollback(options = {}) { return executePlan(rollbackPlan(options), options); }

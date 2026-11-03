@@ -300,24 +300,44 @@ export function statusOf(t: Task, ps: ProcessInfo[]): Task['status'] { return t.
 export function validRecordName(name: unknown): name is string {
     return typeof name === 'string' && name !== '' && name !== '.' && name !== '..' && name !== '.agent-runs' && !name.includes('..') && !/[\\/]/.test(name) && !name.includes('\0') && !/^[A-Za-z]:/.test(name);
 }
+// 续读核对用：记住上次读到位置之前最多 256 字节（295）。只查换行不够——文件被截断后再写回，
+// 新内容在同一偏移恰好也是换行时会被误当成没变过。
+const TAIL_BYTES = 256;
+function keepTail(prev: Buffer, chunk: Buffer) {
+    if (chunk.length >= TAIL_BYTES)
+        return Buffer.from(chunk.subarray(chunk.length - TAIL_BYTES));
+    if (prev.length + chunk.length <= TAIL_BYTES)
+        return Buffer.concat([prev, chunk]);
+    return Buffer.concat([prev.subarray(prev.length - (TAIL_BYTES - chunk.length)), chunk]);
+}
 export class RegistryReader {
     rows = new Map<string, Task>();
     private offset = 0;
     private identity = '';
+    // 已读内容末尾的字节（≤ 256）：续读前逐字节比对，不一致或长度不够就从头重读。
+    private tail = Buffer.alloc(0);
     async read(file: string) {
         const h = await open(file, 'r').catch((e: NodeJS.ErrnoException) => { if (e.code !== 'ENOENT')
             throw e; return null; });
         if (!h) {
             this.rows.clear();
             this.offset = 0;
+            this.tail = Buffer.alloc(0);
             return [];
         }
         try {
             const s = await h.stat(), identity = `${s.ino}:${s.birthtimeMs}`;
-            if (identity !== this.identity || s.size < this.offset) {
+            let rewritten = false;
+            if (identity === this.identity && this.offset > 0 && s.size >= this.offset) {
+                const len = Math.min(TAIL_BYTES, this.offset), prev = Buffer.alloc(len);
+                const { bytesRead } = await h.read(prev, 0, len, this.offset - len);
+                rewritten = bytesRead !== len || this.tail.length < len || !prev.equals(this.tail.subarray(this.tail.length - len));
+            }
+            if (rewritten || identity !== this.identity || s.size < this.offset) {
                 this.rows.clear();
                 this.offset = 0;
                 this.identity = identity;
+                this.tail = Buffer.alloc(0);
             }
             // 每次只保留尾部未完成的偏移，不缓存已读清单文本。
             while (this.offset < s.size) {
@@ -328,6 +348,7 @@ export class RegistryReader {
                     break;
                 for (const line of b.subarray(0, end).toString('utf8').split('\n'))
                     mergeLine(this.rows, line);
+                this.tail = keepTail(this.tail, b.subarray(0, end));
                 this.offset += end;
             }
             // worktree 任务的 wt 对象也复制一份：Registry 之后会往上写 ahead / baseBranch，不能改到读取缓存里的那份。
@@ -394,6 +415,7 @@ export class Registry {
     private signature = '';
     private timer?: ReturnType<typeof setTimeout>;
     private fallback?: ReturnType<typeof setInterval>;
+    private heartbeat?: ReturnType<typeof setInterval>;
     private work?: Promise<void>;
     private again?: Promise<void>;
     private ready = false;
@@ -490,6 +512,8 @@ export class Registry {
         await this.refresh();
         this.ready = true;
         await this.viewer();
+        // 软件心跳（428）：每 30 秒重写 viewer.json 的 updated，其余字段不变；核心据此区分"软件在运行"与"旧进程号被复用"。
+        this.heartbeat = setInterval(() => void this.touchViewer(), 30000);
         this.fallback = setInterval(() => void this.refresh().catch(this.error), 2000);
     }
     // 正在读取时又有新的刷新请求：排一次后续读取，保证调用之后写入的行一定会被读到。
@@ -594,6 +618,19 @@ export class Registry {
         }
     }
     async viewer() { await writeFile(path.join(this.home, 'viewer.json'), JSON.stringify({ app: 'AgentRouter', pid: process.pid, suppressWatchWindow: true, acceptsManaged: true, updated: Date.now() })); }
+    // 心跳只更新 updated，其余字段照文件里的原样保留；读不了或写不了都忽略（不影响软件本身）。
+    // 与 close() 的删除放进同一个串行队列（this.mutations），close 之后心跳不会再写回 viewer.json。
+    private touchViewer() {
+        return this.serial(async () => {
+            if (this.closed) return;
+            try {
+                const viewer = parseJson(await readFile(path.join(this.home, 'viewer.json'), 'utf8'));
+                if (!viewer || typeof viewer !== 'object' || this.closed) return;
+                await writeFile(path.join(this.home, 'viewer.json'), JSON.stringify({ ...viewer, updated: Date.now() }));
+            }
+            catch { /* 心跳写失败不重要。 */ }
+        }).catch(() => { });
+    }
     // 诊断钩子：验收时由主进程接上，记录串行队列与 refresh 的耗时；平时为空，不影响行为。
     onPhase?: (label: string) => void;
     private serial<T>(fn: () => Promise<T>, label = '串行操作'): Promise<T> {
@@ -749,12 +786,12 @@ export class Registry {
             await this.refresh();
         });
     }
-    async close() { this.closed = true; clearTimeout(this.timer); clearInterval(this.fallback); this.watchers.forEach(w => w.close()); await this.work?.catch(() => { }); await this.mutations; const file = path.join(this.home, 'viewer.json'); try {
+    async close() { this.closed = true; clearTimeout(this.timer); clearInterval(this.fallback); clearInterval(this.heartbeat); this.watchers.forEach(w => w.close()); await this.work?.catch(() => { }); await this.serial(async () => { const file = path.join(this.home, 'viewer.json'); try {
         if (parseJson(await readFile(file, 'utf8')).pid === process.pid)
             await unlink(file);
     }
     catch (e) {
         if ((e as NodeJS.ErrnoException).code !== 'ENOENT')
             this.error(e);
-    } }
+    } }).catch(() => { }); }
 }

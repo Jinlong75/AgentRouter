@@ -128,7 +128,7 @@ test('--json：成功与失败都只输出一个 JSON 对象，失败退出码�
   const version = JSON.parse((await call(['version', '--json'])).out[0]);
   assert.equal(version.version, JSON.parse(fs.readFileSync('package.json', 'utf8')).version); assert.equal(version.node, process.versions.node);
   const agents = JSON.parse((await call(['agents', 'list', '--json'])).out[0]).agents;
-  assert.deepEqual(agents, [{ name: 'codex', adapter: 'codex', label: 'Codex', enabled: true, supported: true, default: true, auth: 'login', secrets: {}, login: 'unknown', model: null, lastTest: null }]);
+  assert.deepEqual(agents, [{ name: 'codex', adapter: 'codex', label: 'Codex', enabled: true, supported: true, default: true, auth: 'login', secrets: {}, login: 'unknown', model: null, lastTest: null, fit: { good: ['逻辑代码、修复、重构与补测试', '只读审查'], avoid: ['在 Windows 上大段中文文本编辑（易出编码错误）'] } }]);
   assert.ok(!fs.existsSync(path.join(home, 'config.json')), 'agents list 只读');
   assert.match(JSON.parse((await call(['wait', '没有这个', '--json'])).out[0]).error, /找不到记录 没有这个/);
   assert.match(JSON.parse((await call(['init', '--json'])).out[0]).error, /不是 git 仓库/);

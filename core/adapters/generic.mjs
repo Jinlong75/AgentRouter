@@ -5,8 +5,9 @@ import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { launcherFor, findOnPath } from '../lib/launcher.mjs';
+import { systemNodeSearch } from '../lib/command.mjs';
 import { limitOutput } from '../lib/output.mjs';
 import { getPath, placeholdersIn } from '../lib/generic-schema.mjs';
 import { createMapper as createStreamMapper, finalResultOf, relPath } from './claude-code.mjs';
@@ -46,8 +47,17 @@ function viaCmd(file, args, env, label) {
   return { executable: env.ComSpec || process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], verbatim: true };
 }
 
-// 找程序：绝对路径直接用，否则在 PATH 里按 PATHEXT 查。返回 { executable, args } 或 { batch: 文件 }（.cmd / .bat 且不是 npm 的包装）。
-function resolveLauncher(decl, env) {
+// 声明了 requiresSystemNode 的执行者（例如检查运行时指纹的预设）不能使用自带运行时。
+const searchedText = list => [...new Set(list)].slice(0, 6).join('、');
+function checkRuntime(launcher, env, dir, label, decl) {
+  if (launcher.runtime !== 'bundled' || !(decl.requiresSystemNode === true)) return launcher;
+  const { searched } = systemNodeSearch({ wrapperDir: dir, env });
+  const shown = searchedText(searched);
+  throw new Error(`找不到 Node.js：${label} 需要系统里装有 Node.js（用 npm 安装它时就需要）${shown ? `；已找过：${shown}` : ''}`);
+}
+
+// 找程序：绝对路径直接用，否则在 PATH 里按 PATHEXT 查。返回 { launcher } / { batch: 文件 }。
+function resolveLauncherFile(decl, env) {
   const name = decl.executable;
   const missing = `找不到 ${decl.label} 的程序：${name}。确认它在 PATH 里，或在声明的 executable 里写绝对路径。`;
   let file = name;
@@ -58,11 +68,24 @@ function resolveLauncher(decl, env) {
     if (!file) throw new Error(missing);
   }
   try {
-    return launcherFor(file, { missing, unwrapError: found => { throw Object.assign(new Error('batch'), { batch: found }); } });
+    return { launcher: launcherFor(file, { missing, env, unwrapError: found => { throw Object.assign(new Error('batch'), { batch: found }); } }), dir: dirname(file) };
   } catch (error) {
     if (error.batch) return { batch: error.batch };
     throw error;
   }
+}
+
+// 解析启动方式，并按声明检查运行时。
+function resolveLauncher(decl, env) {
+  const resolved = resolveLauncherFile(decl, env);
+  return resolved.batch ? resolved : checkRuntime(resolved.launcher, env, resolved.dir, decl.label, decl);
+}
+
+// 解析启动方式但不做运行时检查（不运行程序）：ar agents list / test 显示 runtime 用，
+// 即使声明要求系统 Node，也能显示 bundled，而不是直接抛错。
+export function declarationLauncher(decl, env = process.env) {
+  const resolved = resolveLauncherFile(decl, env);
+  return resolved.batch ? null : resolved.launcher;
 }
 
 function build(launcher, args, env, label) {
@@ -140,6 +163,16 @@ function createMapper_(output) {
   return line => line.trim() ? [{ kind: 'text', text: line }] : [];
 }
 
+// 模板中包含占位符的一项支持子串替换；替换后的整项仍是一个参数。
+export function interactiveLaunch(profile = {}, { model, effort, env = process.env, name = null } = {}) {
+  const decl = profile.genericDecl ?? (typeof profile.generic === 'object' ? profile.generic : null);
+  if (!decl?.interactive) return null;
+  const spec = decl.interactive, args = [...(spec.args ?? [])];
+  for (const [key, value] of Object.entries({ model, effort })) if (value && spec[key]) args.push(...spec[key].map(item => item.replaceAll(`{${key}}`, () => value)));
+  const launcher = resolveLauncher(decl, env, name);
+  return { ...build(launcher, args, env, decl.label), capabilities: { model: !!spec.model, effort: !!spec.effort } };
+}
+
 export function makeGeneric(decl, { name = null } = {}) {
   const label = decl.label;
   const format = decl.output?.format ?? 'text';
@@ -156,13 +189,14 @@ export function makeGeneric(decl, { name = null } = {}) {
     // 托管 / 脱离派发的请求带上声明（见 run.mjs 的 profileConfig），执行者进程不再读配置。
     snapshotKeys: ['generic', 'genericDecl', 'genericError'],
     capabilities: { readOnly: supportsReadOnly, usage: format !== 'text', cost: false, reportFile: report === 'file' },
+    interactiveLaunch: (profile, options) => interactiveLaunch({ ...profile, genericDecl: decl }, { ...options, name }),
     declaration: decl,
     declarationName: name,
     // 声明里写了 kind（limit / unavailable）的失败提示：命中就按限流 / 服务不可用处理（Stage07c T7，见 limits-state.mjs 的 classifyFailure）。
     limitHints: (decl.failureHints ?? []).filter(hint => hint.kind === 'limit' || hint.kind === 'unavailable'),
     detect({ env = process.env } = {}) {
       try {
-        const launcher = resolveLauncher(decl, env);
+        const launcher = resolveLauncher(decl, env, name);
         const args = (decl.detect ?? ['--version']).map(item => fill(item, {}));
         const spec = build(launcher, args, env, label);
         const r = spawnSync(spec.executable, spec.args, { env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 15000, windowsVerbatimArguments: spec.verbatim === true });
@@ -192,7 +226,7 @@ export function makeGeneric(decl, { name = null } = {}) {
       const stdinTemplate = typeof decl.stdin === 'string' ? decl.stdin : null;
       const used = new Set([...argTemplate, ...(stdinTemplate === null ? [] : [stdinTemplate])].flatMap(item => placeholdersIn(item)));
       const promptInArgs = argTemplate.some(item => placeholdersIn(item).includes('prompt'));
-      const launcher = detection?.launcher ?? resolveLauncher(decl, env);
+      const launcher = detection?.launcher ?? resolveLauncher(decl, env, name);
       if (launcher.batch && promptInArgs) {
         throw new Error(`${label} 是批处理程序，任务文字不能通过参数传递，请改用 stdin 或 {promptFile}`);
       }

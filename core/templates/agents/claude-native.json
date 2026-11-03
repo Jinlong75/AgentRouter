@@ -15,5 +15,6 @@
   "types": ["code", "fix", "refactor"],
   "card": { "id": "claude-code", "title": "Claude Code", "description": "用 Claude API Key 或订阅令牌" },
   "variant": { "label": "认证方式", "option": "API Key", "help": "用 Claude API Key，变量 ANTHROPIC_API_KEY" },
-  "order": 4
+  "order": 4,
+  "fit": {"good": ["代码、修复、重构", "大段中文文本与文档编辑"], "avoid": []}
 }

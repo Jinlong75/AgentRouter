@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "limits": {
+    "status": 600,
+    "projects_list": 770,
+    "manifest_read": 560,
+    "dispatch_first_progress": 800,
+    "gate_overhead": 410
+  }
+}

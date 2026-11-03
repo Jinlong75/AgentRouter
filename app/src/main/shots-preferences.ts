@@ -7,13 +7,20 @@ import { spawnSync } from 'node:child_process';
 import { app, nativeTheme } from 'electron';
 import type { Harness } from './shots-input';
 import { effects } from './effects';
-import { appEnvironment } from './app-env.mjs';
+import { appEnvironment, isolatedEnvKey } from './app-env.mjs';
 import { fakeCodexModels } from './shots-agents';
-import { fileDialogs } from './console.mjs';
+import { fileDialogs, arShots } from './console.mjs';
+import * as consoleRuntime from './console.mjs';
 import { ag, c, gx, p, px, ro, s6, sc } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读（演示与截图把隔离覆盖放在 AR_ISOLATED_ENV 里，主进程 process.env 是用户原样）。
 const appEnv = appEnvironment(process.env);
+// 界面验收的 DeepSeek Harness 桩由 console.mjs 导出（声明文件不在本任务改动范围，这里按已知形状取）。
+type HarnessStepEvent = { step: string; message: string; percent?: number; approx?: boolean; bytes?: number; total?: number | null; fallback?: boolean };
+type HarnessScenario = (options: { signal: AbortSignal; version?: string; step: (value: HarnessStepEvent) => void }) => Promise<{ ok: boolean; [key: string]: unknown } | undefined>;
+const harnessShots = (consoleRuntime as unknown as { harnessShots: { check: unknown; deploy: HarnessScenario | null; cleans: number; target: string | null } }).harnessShots;
+// 426：ar 遮挡检测的界面桩（声明文件不在本任务改动范围，这里按已知形状取）。
+const arStub = arShots as typeof arShots & { machinePath?: string; files?: string[] };
 
 // 偏好相关页面的界面验收：UI06 技能、UI07 设置、UI08 关于、UI09 首次引导、UI10 主题。
 // 全部用真实输入操作（见 shots-input.ts），并读文件断言功能真的生效。
@@ -26,7 +33,7 @@ export async function captureWizard(h: Harness) {
     const secretsFile = appEnv.AR_TEST_SECRETS_FILE!;
     assert.ok(path.isAbsolute(secretsFile) && !path.relative(home, secretsFile).startsWith('..'), '密钥文件必须在隔离目录里');
     const readConfig = async () => JSON.parse(await readFile(configFile, 'utf8'));
-    // 第 4 步用桩选择这个临时 git 仓库；只登记，不写仓库文件。
+    // 第 5 步用桩选择这个临时 git 仓库；只登记，不写仓库文件。
     const projectDir = path.join(home, 'shots-wizard', 'first-project');
     await mkdir(projectDir, { recursive: true });
     const git = spawnSync('git', ['init', '-b', 'main'], { cwd: projectDir, encoding: 'utf8', shell: false, windowsHide: true });
@@ -44,49 +51,29 @@ export async function captureWizard(h: Harness) {
         return files.sort();
     };
     const filesBefore = await repoFiles(projectDir);
+    // DeepSeek Harness 的检测与安装在界面验收里走桩（console.mjs 的 harnessShots）：不跑 npm、不联网。
+    harnessShots.check = null;
+    harnessShots.deploy = null;
+    harnessShots.cleans = 0;
+    // 取消时判断"开始前有没有安装"的托管目录替身：默认指向隔离目录里不存在的路径（全新安装）。
+    harnessShots.target = path.join(home, 'shots-harness-target');
 
     await wait('!!document.querySelector(".wiz") && !document.querySelector("[data-pref=next]").disabled');
     await evaluate('document.fonts.ready');
     nativeTheme.themeSource = 'dark';
     await check('UI09 首次引导期间侧栏不可点击', '[...document.querySelectorAll("[data-page]")].every(b=>b.disabled)');
     await audit('首次引导第 1 步', async () => { await wait('!!document.querySelector(".wiz")'); });
+    await check('UI33 第 1 步逐项显示 git（必需）、Claude Code、Codex、Qoder、DeepSeek Harness', `(() => { const t = document.querySelector('.wiz-body .card').textContent; return ['git（必需）','Claude Code','Codex','Qoder','DeepSeek Harness'].every(x => t.includes(x)) && !document.querySelector('[data-wizard-git-missing]'); })()`);
+    await check('UI33 第 1 步不要求必须有 Claude Code，写明可以先导入执行者、之后在 Agent 页选主导', `document.querySelector('.wiz-body').textContent.includes(${JSON.stringify(p.wizardNoLead)})`);
     await save('wizard-1-dark');
     await press('[data-pref=next]');
-
-    // 第 2 步：安装技能 + 托管开关。
-    await check('UI09 第 2 步只默认勾选未安装或可更新的技能', `document.querySelectorAll('[data-choice][aria-checked=true]').length===1 && document.querySelector('[data-choice="claude-code/lead-workflow"]').getAttribute('aria-checked')==='true'`);
-    await tabTo('[data-choice="claude-code/agent-router"]'); await key('Space');
-    await check('UI09 键盘空格勾选技能', `document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='true'`);
-    await key('Space');
-    await check('UI09 再按空格取消勾选', `document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='false'`);
-    await check('UI09 第 2 步同时提供托管开关，默认关闭', 'document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="false"');
-    await press('[data-pref=managed]');
-    await wait('document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="true"');
-    await verify('UI09 第 2 步的托管开关写入 config.json 并保持引导界面', async () => {
-        assert.equal((await readConfig()).managed, true);
-        assert.equal(await evaluate('!!document.querySelector(".wiz") && !document.querySelector(".banner.fail")'), true);
-    });
-    // 验收后续的看板检查按"托管未开启"运行（中断横幅要显示"去设置"），这里再点回默认关闭。
-    await press('[data-pref=managed]');
-    await wait('document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="false"');
-    await verify('UI09 第 2 步的托管开关可以再关掉，config.json 同步恢复', async () => {
-        assert.equal((await readConfig()).managed, false);
-    });
-    await save('wizard-2-dark');
-    await audit('首次引导第 2 步', async () => { await wait('!!document.querySelector("[data-choice]")'); });
-    await press('[data-pref=next]');
-    await wait('!!document.querySelector(".presets .preset.on")', '第 3 步预设加载完成', 30000);
-    await verify('UI09 第 2 步"安装并继续"真的装上勾选的技能（安装记录存在）', async () => {
-        const record = JSON.parse(await readFile(path.join(skills, 'lead-workflow', '.agent-router.json'), 'utf8'));
-        assert.equal(record.skill, 'lead-workflow'); assert.equal(record.version, app.getVersion());
-    });
-
-    // 第 3 步：导入第一个 Agent（推荐预设 + API Key + 自动测试连接）。
-    await check('UI09 第 3 步默认选中推荐预设，API Key 用密码框', 'document.querySelector(".preset.on").getAttribute("aria-checked")==="true" && document.querySelector(".preset.on .tag.brand")?.textContent==="推荐" && document.querySelector("[data-wizard-secret]").type==="password"');
+    // 第 2 步：导入第一个 Agent（推荐预设 + API Key + 自动测试连接）。
+    await wait('!!document.querySelector(".presets .preset.on")', '第 2 步预设加载完成', 30000);
+    await check('UI09 第 2 步默认选中推荐预设，API Key 用密码框', 'document.querySelector(".preset.on").getAttribute("aria-checked")==="true" && document.querySelector(".preset.on .tag.brand")?.textContent==="推荐" && document.querySelector("[data-wizard-secret]").type==="password"');
     // 112：同一服务只放一张卡片；选 Xiaomi MiMo 后表单第一行是"套餐"分段按钮，切换等于改选另一个预设。
     const wizardPresets: any[] = await evaluate(`window.dock.console('agents:presets').then(r => r.presets)`);
     const byName = (name: string) => wizardPresets.find(x => x.name === name);
-    await check('UI09 第 3 步的预设卡片按服务合并：8 张（DeepSeek、Xiaomi MiMo、Claude Code、兼容后端、Codex、Qoder、DeepSeek Harness、OpenAI 兼容接口），合并卡片的标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
+    await check('UI09 第 2 步的预设卡片按服务合并：8 张（DeepSeek、Xiaomi MiMo、Claude Code、兼容后端、Codex、Qoder、DeepSeek Harness、OpenAI 兼容接口），合并卡片的标题与说明来自 presets --json 的 card，推荐标记只在 DeepSeek 上', `(() => {
         const cards = [...document.querySelectorAll(".presets .preset")], names = cards.map(c => c.dataset.wizardPreset);
         const merged = (name, c) => { const el = cards.find(x => x.dataset.wizardPreset === name); return el.dataset.card === c.id && el.querySelector("b").textContent === c.title && el.querySelector(".pk > span").textContent === c.description; };
         return names.join() === "deepseek,mimo,claude-native,compat,codex,qoder-cn,deepseek-harness,openai-compat"
@@ -151,9 +138,9 @@ export async function captureWizard(h: Harness) {
     });
     await press('[data-pref=wizard-agent]');
     await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试连接成功', 90000);
-    await check('UI09 第 3 步导入后自动测试连接并显示成功', 'document.querySelector("[data-wizard-result=ok]").textContent.includes("连接成功")');
+    await check('UI09 第 2 步导入后自动测试连接并显示成功', 'document.querySelector("[data-wizard-result=ok]").textContent.includes("连接成功")');
     // Stage07c 151（T5）：连接成功的说明下面多一行"可以按你的执行者生成建议规则（路由页）"（点了跳到路由页并打开建议弹窗，见 UI08 的第三次引导）。
-    await check('UI09 第 3 步连接成功的说明下面有一行 ro.suggestHint（次按钮、带路由图标），在每日上限问题之前', `(() => { const b = document.querySelector('[data-pref=wizard-suggest]'), ok = document.querySelector('[data-wizard-result=ok]'), limit = document.querySelector('[data-wizard-limit]'); return !!b && b.textContent.trim() === ${JSON.stringify(ro.suggestHint)} && !!b.querySelector('i.ri-route-line') && !b.classList.contains('primary') && !!(ok.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(b.compareDocumentPosition(limit) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
+    await check('UI09 第 2 步连接成功的说明下面有一行 ro.suggestHint（次按钮、带路由图标），在每日上限问题之前', `(() => { const b = document.querySelector('[data-pref=wizard-suggest]'), ok = document.querySelector('[data-wizard-result=ok]'), limit = document.querySelector('[data-wizard-limit]'); return !!b && b.textContent.trim() === ${JSON.stringify(ro.suggestHint)} && !!b.querySelector('i.ri-route-line') && !b.classList.contains('primary') && !!(ok.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) && !!(b.compareDocumentPosition(limit) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
     await verify('UI09 config.json 新增执行者（预设、适配器、密钥变量名），没有密钥值', async () => {
         const config = await readConfig();
         const added = Object.entries(config.profiles).find(([, profile]: [string, any]) => Object.values(profile.secrets ?? {}).includes('DEEPSEEK_API_KEY'));
@@ -161,22 +148,22 @@ export async function captureWizard(h: Harness) {
         assert.equal((added![1] as any).adapter, 'claude-code');
         assert.ok(!JSON.stringify(config).includes(secretValue));
     });
-    await save('wizard-3-dark');
+    await save('wizard-2-dark');
     nativeTheme.themeSource = 'light';
-    await save('wizard-3-light');
+    await save('wizard-2-light');
     nativeTheme.themeSource = 'dark';
-    await audit('首次引导第 3 步', async () => { await wait('!!document.querySelector("[data-wizard-result=ok]")'); });
+    await audit('首次引导第 2 步', async () => { await wait('!!document.querySelector("[data-wizard-result=ok]")'); });
     await check('UI09 已有多个执行者：强执行者是下拉，默认不设，没有只说明一句', `!!document.querySelector('[data-pref=wizard-strong]') && document.querySelector('[data-pref=wizard-strong] span').textContent === ${JSON.stringify(p.wizardStrongNone)} && !document.querySelector('[data-wizard-strong-only]')`);
     await press('[data-pref=wizard-strong]'); await wait('!!document.querySelector(".ctx")');
     const strongLabels = JSON.parse(await evaluate(`JSON.stringify([...document.querySelectorAll('.ctx button')].map(b => b.textContent.trim()))`)) as string[];
     assert.equal(strongLabels[0], p.wizardStrongNone); assert.ok(strongLabels.length >= 3, `选项：${strongLabels.join()}`);
     await press('.ctx button:nth-child(2)'); await wait('!document.querySelector(".ctx")');
     await check('UI09 选了第一个执行者：下拉显示它', `document.querySelector('[data-pref=wizard-strong] span').textContent === ${JSON.stringify(strongLabels[1])}`);
-    await save('wizard-3-strong-dark'); nativeTheme.themeSource = 'light'; await save('wizard-3-strong-light'); nativeTheme.themeSource = 'dark';
+    await save('wizard-2-strong-dark'); nativeTheme.themeSource = 'light'; await save('wizard-2-strong-light'); nativeTheme.themeSource = 'dark';
 
     // 137（D73）：测试成功后可选填"每天最多几个任务"；空着跳过、填 0 报错、填 2 才写 limits.maxTasksPerDay。
     const limitedProfile = async () => Object.entries((await readConfig()).profiles).find(([, profile]: [string, any]) => Object.values(profile.secrets ?? {}).includes('DEEPSEEK_API_KEY'))![1] as any;
-    await check('UI09 第 3 步测试成功后出现"每天最多几个任务"：输入框默认空、占位"不限"，单位"个任务"', `(() => {
+    await check('UI09 第 2 步测试成功后出现"每天最多几个任务"：输入框默认空、占位"不限"，单位"个任务"', `(() => {
         const input = document.querySelector("[data-wizard-limit]");
         return !!input && input.value === "" && input.placeholder === "不限" && input.closest(".statusline").textContent.includes("每天最多") && input.closest(".statusline").textContent.includes("个任务")
             && document.querySelector("[data-wizard-limit-error]").textContent === "" && !input.classList.contains("bad");
@@ -184,29 +171,125 @@ export async function captureWizard(h: Harness) {
     await type('[data-wizard-limit]', '0');
     await press('[data-pref=next]');
     await wait('document.querySelector("[data-wizard-limit-error]")?.textContent.length > 0', '填 0 后出现提示');
-    await check('UI09 填 0 点"下一步"：显示"填 1 以上的整数…"，输入框标红，仍在第 3 步', `document.querySelector("[data-wizard-limit-error]").textContent === "填 1 以上的整数，或者空着（不限）" && document.querySelector("[data-wizard-limit]").classList.contains("bad") && !document.querySelector("[data-wizard-folder]") && document.querySelector("[data-wizard-limit]").value === "0"`);
+    await check('UI09 填 0 点"下一步"：显示"填 1 以上的整数…"，输入框标红，仍在第 2 步', `document.querySelector("[data-wizard-limit-error]").textContent === "填 1 以上的整数，或者空着（不限）" && document.querySelector("[data-wizard-limit]").classList.contains("bad") && !document.querySelector("[data-wizard-folder]") && document.querySelector("[data-wizard-limit]").value === "0"`);
     await verify('UI09 填 0 不写配置：这个执行者没有 limits', async () => { assert.equal((await limitedProfile()).limits, undefined); });
     await press('[data-wizard-limit]');
     await key('Backspace');
     await check('UI09 改动输入框后提示立即消失', 'document.querySelector("[data-wizard-limit]").value === "" && document.querySelector("[data-wizard-limit-error]").textContent === ""');
     await type('[data-wizard-limit]', '2');
     await press('[data-pref=next]');
-    await wait('!!document.querySelector("[data-wizard-folder]")', '填 2 后进入第 4 步');
-    await verify('UI09 填 2 点"下一步"：进第 4 步，config.json 里 limits.maxTasksPerDay === 2', async () => { assert.equal((await limitedProfile()).limits.maxTasksPerDay, 2); });
+    await wait('!!document.querySelector("[data-choice]")', '填 2 后进入第 3 步（技能）');
+    await verify('UI09 填 2 点"下一步"：进第 3 步，config.json 里 limits.maxTasksPerDay === 2', async () => { assert.equal((await limitedProfile()).limits.maxTasksPerDay, 2); });
     await verify('UI09 点下一步：routing.strongExecutor 是所选执行者（已有的名字）', async () => { const c = await readConfig(); assert.ok(c.routing?.strongExecutor && c.profiles[c.routing.strongExecutor], JSON.stringify(c.routing)); });
 
-    // 第 4 步：选择并登记第一个项目，不往仓库里写任何文件。
-    await wait('!!document.querySelector("[data-wizard-folder]")', '第 4 步项目选择');
-    await check('UI09 第 4 步默认勾选"添加后打开初始化预览"', 'document.querySelector("[data-pref=wizard-open-init]").getAttribute("aria-checked")==="true"');
+    // 第 3 步：安装技能 + 托管开关（原第 2 步的检查；五步顺序调整后这里改在 Agent 之后）。
+    await check('UI09 第 3 步只默认勾选未安装或可更新的技能', `document.querySelectorAll('[data-choice][aria-checked=true]').length===2 && document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='false' && document.querySelector('[data-choice="claude-code/lead-workflow"]').getAttribute('aria-checked')==='true' && document.querySelector('[data-choice="claude-code/lead-practices"]').getAttribute('aria-checked')==='true'`);
+    await tabTo('[data-choice="claude-code/agent-router"]'); await key('Space');
+    await check('UI09 键盘空格勾选技能', `document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='true'`);
+    await key('Space');
+    await check('UI09 再按空格取消勾选', `document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='false'`);
+    await press('[data-choice="claude-code/lead-practices"]');
+    await check('UI09 取消第三技能', `document.querySelector('[data-choice="claude-code/lead-practices"]').getAttribute('aria-checked')==='false'`);
+    await press('[data-choice="claude-code/lead-practices"]');
+    await check('UI09 重新选择第三技能', `document.querySelector('[data-choice="claude-code/lead-practices"]').getAttribute('aria-checked')==='true'`);
+    await check('UI09 第 3 步同时提供托管开关，默认关闭', 'document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="false"');
+    await press('[data-pref=managed]');
+    await wait('document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="true"');
+    await verify('UI09 第 3 步的托管开关写入 config.json 并保持引导界面', async () => {
+        assert.equal((await readConfig()).managed, true);
+        assert.equal(await evaluate('!!document.querySelector(".wiz") && !document.querySelector(".banner.fail")'), true);
+    });
+    // 验收后续的看板检查按"托管未开启"运行（中断横幅要显示"去设置"），这里再点回默认关闭。
+    await press('[data-pref=managed]');
+    await wait('document.querySelector("[data-pref=managed]").getAttribute("aria-checked")==="false"');
+    await verify('UI09 第 3 步的托管开关可以再关掉，config.json 同步恢复', async () => {
+        assert.equal((await readConfig()).managed, false);
+    });
+    await save('wizard-3-dark');
+    await audit('首次引导第 3 步', async () => { await wait('!!document.querySelector("[data-choice]")'); });
+    await press('[data-pref=next]');
+    await wait('!!document.querySelector("[data-pref=wizard-harness-install]")', '第 4 步 Harness 确认页', 30000);
+    await verify('UI09 第 3 步"安装并继续"真的装上勾选的技能（安装记录存在）', async () => {
+        const record = JSON.parse(await readFile(path.join(skills, 'lead-workflow', '.agent-router.json'), 'utf8'));
+        assert.equal(record.skill, 'lead-workflow'); assert.equal(record.version, app.getVersion());
+        const third = JSON.parse(await readFile(path.join(skills, 'lead-practices', '.agent-router.json'), 'utf8'));
+        assert.equal(third.skill, 'lead-practices'); assert.equal(third.version, app.getVersion());
+        for (const name of ['references/examples.md', 'references/closeout.md']) assert.ok ( (await readFile(path.join(skills, 'lead-practices', name))).length > 0 );
+    });
+
+    // 第 4 步：DeepSeek Harness（安装走界面验收的桩，不跑 npm、不联网）。
+    await check('UI33 第 4 步先确认再安装：写着下载大小、位置、不改 PATH，安装方式和网络来自设置，默认版本是推荐的验证版', `(() => { const b = document.querySelector('.wiz-body'), sel = document.querySelector('[data-pref=wizard-harness-version]'); return b.textContent.includes('830 MB') && b.textContent.includes('不改 PATH') && b.textContent.includes(${JSON.stringify(p.wizardInstallMethod)}) && b.textContent.includes(${JSON.stringify(p.wizardNetwork)}) && sel.textContent.includes('0.2.1-rc.2') && document.querySelector('.wiz-f [data-pref=wizard-harness-install]').textContent === ${JSON.stringify(p.wizardInstall)}; })()`);
+    await save('wizard-4-harness-dark');
+    nativeTheme.themeSource = 'light'; await save('wizard-4-harness-light'); nativeTheme.themeSource = 'dark';
+    // 安装中的断言要看到界面停在"安装中"：桩分两段挂住，等检查断言并截图后再放行，
+    // 不靠延时和"安装完成"抢时序。
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstPhase = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const secondPhase = new Promise<void>(resolve => { releaseSecond = resolve; });
+    const holdUntil = (signal: AbortSignal) => new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+    harnessShots.deploy = async ({ signal, version, step }) => {
+        step({ step: 'download', message: '正在下载安装包', percent: 37, bytes: 3 * 1024 * 1024, total: 9 * 1024 * 1024 });
+        await Promise.race([firstPhase, holdUntil(signal)]);
+        if (signal.aborted) return undefined;
+        step({ step: 'download', message: '正在下载安装包', percent: 100, bytes: 9 * 1024 * 1024, total: 9 * 1024 * 1024 });
+        step({ step: 'deps', message: '正在安装依赖', percent: 46, approx: true });
+        await Promise.race([secondPhase, holdUntil(signal)]);
+        if (signal.aborted) return undefined;
+        return { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version: version || '0.2.1-rc.2', imported: true, verified: true };
+    };
+    await press('[data-pref=wizard-harness-install]');
+    // 进度区在开始安装时就出现（四行都"等待"），下载的 37% 稍后由 step 事件带来：等到下载行报 37% 再断言。
+    await wait('document.querySelector("[data-harness-step=download]")?.querySelector("[role=progressbar]")?.getAttribute("aria-valuenow") === "37"', '安装进度出现（下载 37%）');
+    await check('UI33 安装中是四行分步进度：下载安装包 / 安装依赖 / 配置环境 / 测试连接；下载行显示 37%', `(() => {
+        const rows = [...document.querySelectorAll('[data-harness-progress] [data-harness-step]')];
+        const names = rows.map(row => row.querySelector('.hstep-name')?.textContent);
+        const download = document.querySelector('[data-harness-step=download]');
+        return rows.length === 4 && names.join('|') === ${JSON.stringify(['下载安装包', '安装依赖', '配置环境', '测试连接'].join('|'))}
+            && download.dataset.state === 'run' && download.querySelector('[role=progressbar]')?.getAttribute('aria-valuenow') === '37'
+            && download.querySelector('.hstep-state')?.textContent === '37%';
+    })()`);
+    // 进度条要真的画出宽度（CSP 拦下行内 style 时 aria 仍是 37，宽度却是 0）：渲染宽度约为整条的 37%。
+    await check('UI33 下载行进度条实际渲染宽度约 37%（不是只有 aria 值）', `(() => {
+        const bar = document.querySelector('[data-harness-step=download] .bar'), fill = bar?.querySelector('span');
+        if (!bar || !fill) return false;
+        const ratio = fill.getBoundingClientRect().width / bar.getBoundingClientRect().width;
+        return ratio > 0.3 && ratio < 0.44;
+    })()`);
+    releaseFirst();
+    await wait('document.querySelector("[data-harness-step=download]")?.dataset.state === "done"', 'UI33 下载完成');
+    await check('UI33 下载完成后进度条 100%、状态"完成"；安装依赖显示"约 46%"，后两步等待；底栏只有"取消"', `(() => {
+        const download = document.querySelector('[data-harness-step=download]');
+        const deps = document.querySelector('[data-harness-step=deps]');
+        const config = document.querySelector('[data-harness-step=config]');
+        const test = document.querySelector('[data-harness-step=test]');
+        const f = [...document.querySelectorAll('.wiz-f button')];
+        return download.dataset.state === 'done' && download.querySelector('[role=progressbar]')?.getAttribute('aria-valuenow') === '100' && download.querySelector('.hstep-state')?.textContent === ${JSON.stringify(p.harnessStepDone)}
+            && deps.dataset.state === 'run' && deps.querySelector('.hstep-state')?.textContent === ${JSON.stringify(p.harnessStepPercent(46, true))}
+            && config.dataset.state === 'wait' && test.dataset.state === 'wait' && test.querySelector('.hstep-state')?.textContent === ${JSON.stringify(p.harnessStepWait)}
+            && f.length === 1 && f[0].textContent === ${JSON.stringify(p.wizardCancel)};
+    })()`);
+    await save('harness-steps-dark');
+    nativeTheme.themeSource = 'light'; await save('harness-steps-light'); nativeTheme.themeSource = 'dark';
+    releaseSecond();
+    await wait('!!document.querySelector("[data-wizard-harness-done]")', '安装完成', 30000);
+    await check('UI33 安装完成显示真实版本、安装位置和测试连接结果', `(() => { const b = document.querySelector('.wiz-body'); return b.textContent.includes(${JSON.stringify(p.wizardDone)}) && b.textContent.includes('0.2.1-rc.2') && b.textContent.includes('dsh.cmd') && b.textContent.includes(${JSON.stringify(p.wizardTestLabel)}) && b.textContent.includes(${JSON.stringify(p.wizardTestPassed)}); })()`);
+    await check('UI33 安装完成后主按钮是"下一步"', `document.querySelector('.wiz-f [data-pref=next]').textContent === ${JSON.stringify(p.wizardNext)}`);
+    await save('wizard-4-done-dark');
+    await press('[data-pref=next]');
+
+    // 第 5 步：选择并登记第一个项目，不往仓库里写任何文件。
+    await wait('!!document.querySelector("[data-wizard-folder]")', '第 5 步项目选择');
+    await check('UI09 第 5 步默认勾选"添加后打开初始化预览"', 'document.querySelector("[data-pref=wizard-open-init]").getAttribute("aria-checked")==="true"');
     effects.folders.push(projectDir);
     await press('[data-pref=wizard-choose-folder]');
     await wait(`document.querySelector("[data-wizard-folder]")?.textContent === ${JSON.stringify(projectDir)}`, '桩选中临时 git 仓库', 30000);
-    await check('UI09 第 4 步显示所选项目文件夹', `document.querySelector("[data-wizard-folder]").textContent === ${JSON.stringify(projectDir)}`);
-    await save('wizard-4-dark');
+    await check('UI09 第 5 步显示所选项目文件夹', `document.querySelector("[data-wizard-folder]").textContent === ${JSON.stringify(projectDir)}`);
+    await save('wizard-5-dark');
     nativeTheme.themeSource = 'light';
-    await save('wizard-4-light');
+    await save('wizard-5-light');
     nativeTheme.themeSource = 'dark';
-    await audit('首次引导第 4 步', async () => { await wait('!!document.querySelector("[data-wizard-folder]")'); });
+    await audit('首次引导第 5 步', async () => { await wait('!!document.querySelector("[data-wizard-folder]")'); });
     // 慢加载（PR #5 CI）：项目列表与详情各人为慢 6 秒（超过原来 5 秒的轮询期限），检查条件与上限不变。
     effects.consoleDelay['projects:list'] = 6000;
     effects.consoleDelay['projects:show'] = 6000;
@@ -216,7 +299,7 @@ export async function captureWizard(h: Harness) {
         await check('UI09 完成引导后停在项目页并选中刚添加的项目', `document.querySelector("[data-page=projects]").getAttribute("aria-current")==="page" && document.querySelector("[data-pj-row].on")?.dataset.pjRow === ${JSON.stringify(projectDir)} && document.querySelector("[data-pj-detail] .dh h2")?.textContent === "first-project"`);
     }
     finally { delete effects.consoleDelay['projects:list']; delete effects.consoleDelay['projects:show']; }
-    await verify('UI09 第 4 步完成时把项目登记进 projects.json', async () => {
+    await verify('UI09 第 5 步完成时把项目登记进 projects.json', async () => {
         const projects = JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string }[];
         assert.ok(projects.some(project => project.path === projectDir));
     });
@@ -226,9 +309,361 @@ export async function captureWizard(h: Harness) {
     await verify('UI09 完成引导：配置存在、记录已完成引导', async () => {
         const settings = await evaluate('window.dock.preferences("settings")');
         assert.equal(settings.exists, true); assert.equal(settings.own.wizardDone, true);
-        // 第 2 步验证过写入 true，随后点回默认关闭；完成时保留用户最后看到的值。
+        // 第 3 步验证过写入 true，随后点回默认关闭；完成时保留用户最后看到的值。
         assert.equal((await readConfig()).managed, false);
     });
+
+    // UI33：DeepSeek Harness 第 4 步的其余状态（全部走桩；不跑 npm、不联网）。
+    const reachHarness = async (label: string) => {
+        await press('[data-page=about]');
+        await press('[data-pref=wizard]');
+        await wait('!!document.querySelector(".wiz")', `${label}：打开引导`);
+        await wait('!document.querySelector("[data-pref=next]").disabled', `${label}：第 1 步检测完成`, 30000);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector(".presets .preset.on")', `${label}：第 2 步预设加载完成`, 30000);
+        await press('[data-pref=skip]');
+        await wait('!!document.querySelector("[data-choice]") || !!document.querySelector("[data-wizard-no-skills]")', `${label}：第 3 步`, 30000);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-install]") || !!document.querySelector("[data-pref=wizard-harness-import]") || !!document.querySelector("[data-wizard-node]") || !!document.querySelector("[data-wizard-installed]")', `${label}：第 4 步`, 30000);
+    };
+    const finishFromStep4 = async (label: string) => { await press('[data-pref=skip]'); await wait('!!document.querySelector("[data-wizard-folder]")', `${label}：进第 5 步`); await press('[data-pref=skip]'); await wait('!document.querySelector(".wiz")', `${label}：结束引导`, 30000); };
+    const leaveWizard = async (label: string) => { await press('[data-pref=skip]'); await wait('!document.querySelector(".wiz")', `${label}：结束引导`, 30000); };
+
+    // 取消：安装中只有"取消"；取消后回到确认页、说明没有写入，并调用一次 --cleanup（这次是全新安装）。
+    {
+        harnessShots.check = null;
+        harnessShots.cleans = 0;
+        harnessShots.target = path.join(home, 'shots-harness-target');
+        harnessShots.deploy = ({ signal, step }) => new Promise(resolve => {
+            step({ step: 'download', message: '正在下载安装包', percent: 0 });
+            signal.addEventListener('abort', () => resolve(undefined), { once: true });
+        });
+        await reachHarness('UI33 取消安装');
+        await press('[data-pref=wizard-harness-install]');
+        await wait('!!document.querySelector("[data-harness-progress]")', 'UI33 取消安装：进度出现');
+        await press('[data-pref=wizard-harness-cancel]');
+        await wait('!!document.querySelector("[data-wizard-cancelled]")', 'UI33 取消安装：回到确认页', 30000);
+        await check('UI33 取消安装：回到确认页并说明没有写入任何文件', `document.querySelector('[data-wizard-cancelled]').textContent.includes(${JSON.stringify(p.wizardCancelled)}) && !!document.querySelector('[data-pref=wizard-harness-install]')`);
+        await verify('UI33 取消全新安装后调用一次清理（--cleanup）', async () => { assert.equal(harnessShots.cleans, 1); });
+        await finishFromStep4('UI33 取消安装');
+    }
+
+    // R2-1：已有托管安装时"直接导入"后取消，不清理任何文件（安装目录与 .agent-router-dsh.json 都还在）。
+    {
+        const importDir = path.join(home, 'shots-harness-import', 'tools', 'dsh');
+        await mkdir(importDir, { recursive: true });
+        await writeFile(path.join(importDir, '.agent-router-dsh.json'), JSON.stringify({ version: '0.2.1-rc.2' }));
+        harnessShots.target = importDir;
+        harnessShots.cleans = 0;
+        harnessShots.check = {
+            ok: true, verified: '0.2.1-rc.2', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2'],
+            installed: '0.2.1-rc.2', path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), updateAvailable: false,
+        };
+        harnessShots.deploy = ({ signal, step }) => new Promise(resolve => {
+            step({ step: 'config', message: '正在导入执行者', percent: 0 });
+            signal.addEventListener('abort', () => resolve(undefined), { once: true });
+        });
+        await reachHarness('UI33 导入已有安装时取消');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-import]")', 'UI33 导入已有安装：直接导入', 30000);
+        await press('[data-pref=wizard-harness-import]');
+        await wait('!!document.querySelector("[data-harness-progress]")', 'UI33 导入已有安装：进度出现');
+        await press('[data-pref=wizard-harness-cancel]');
+        await wait('!!document.querySelector("[data-wizard-cancelled]")', 'UI33 导入已有安装：取消后回到确认页', 30000);
+        await check('UI33 取消导入后仍可直接导入', `!!document.querySelector('[data-pref=wizard-harness-import]')`);
+        await press('[data-pref=wizard-harness-import]');
+        await wait('!!document.querySelector("[data-harness-progress]")', 'UI33 再次导入');
+        await press('[data-pref=wizard-harness-cancel]');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-import]")', 'UI33 再次取消后仍可导入');
+        await verify('UI33 取消导入已有安装：不执行清理，安装目录与 .agent-router-dsh.json 仍在', async () => {
+            assert.equal(harnessShots.cleans, 0);
+            assert.equal(await exists(importDir), true);
+            assert.equal(await exists(path.join(importDir, '.agent-router-dsh.json')), true);
+        });
+        await finishFromStep4('UI33 导入已有安装时取消');
+        await rm(path.join(home, 'shots-harness-import'), { recursive: true, force: true });
+        harnessShots.target = path.join(home, 'shots-harness-target');
+    }
+
+    // 失败 → 重试：失败原因留在第 4 步，点"重试"真的再装一次。
+    {
+        harnessShots.check = null;
+        harnessShots.cleans = 0;
+        let calls = 0;
+        harnessShots.deploy = async ({ version, step }) => {
+            if (++calls > 1) return { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version: version || '0.2.1-rc.2', imported: true, verified: true };
+            step({ step: 'download', message: '正在下载安装包', percent: 100 });
+            step({ step: 'deps', message: '正在安装依赖', percent: 100 });
+            step({ step: 'config', message: '正在导入执行者', percent: 0 });
+            return { ok: false, error: '下载未完成：连接超时' };
+        };
+        await reachHarness('UI33 失败重试');
+        await press('[data-pref=wizard-harness-install]');
+        await wait('!!document.querySelector("[data-wizard-harness-fail]")', 'UI33 失败页', 30000);
+        await check('UI33 安装失败留在第 4 步，显示核心原因并给出"重试"', `document.querySelector('[data-wizard-harness-fail]').textContent.includes('连接超时') && document.querySelector('.wiz-f [data-pref=wizard-harness-retry]').textContent === ${JSON.stringify(p.wizardRetry)}`);
+        await check('UI33 配置环境失败：四行进度保留，失败行是"配置环境"，"测试连接"仍是等待', `(() => {
+            const rows = [...document.querySelectorAll('[data-harness-progress] [data-harness-step]')];
+            const config = document.querySelector('[data-harness-step=config]');
+            const test = document.querySelector('[data-harness-step=test]');
+            return rows.length === 4 && config?.dataset.state === 'fail' && test?.dataset.state === 'wait'
+                && config.querySelector('.hstep-state')?.textContent === ${JSON.stringify(p.harnessStepFail)}
+                && test.querySelector('.hstep-state')?.textContent === ${JSON.stringify(p.harnessStepWait)};
+        })()`);
+        await press('[data-pref=wizard-harness-retry]');
+        await wait('!!document.querySelector("[data-wizard-harness-done]")', 'UI33 重试后安装完成', 30000);
+        await verify('UI33 失败后重试真的重新安装（两次部署调用）', async () => { assert.equal(calls, 2); });
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 失败重试：进第 5 步');
+        await leaveWizard('UI33 失败重试');
+    }
+
+    // 兜底下载：没有百分比时下载行显示不定长进度与"已用 N 秒"，用时每秒刷新（R2-3）。
+    {
+        harnessShots.check = null;
+        harnessShots.cleans = 0;
+        harnessShots.deploy = ({ signal, step }) => new Promise(resolve => {
+            step({ step: 'download', message: '正在下载安装包', fallback: true });
+            signal.addEventListener('abort', () => resolve(undefined), { once: true });
+        });
+        await reachHarness('UI33 兜底下载计时');
+        await press('[data-pref=wizard-harness-install]');
+        await wait('document.querySelector("[data-harness-step=download]")?.dataset.state === "run"', 'UI33 兜底下载进度出现');
+        await check('UI33 兜底下载显示不定长进度与已用时间', `(() => {
+            const download = document.querySelector('[data-harness-step=download]');
+            return !!download.querySelector('.wiz-prog') && !download.querySelector('[aria-valuenow]')
+                && !!download.querySelector('[data-wizard-elapsed]') && /^已用 \\d+ 秒$/.test(download.querySelector('.hstep-state')?.textContent ?? '');
+        })()`);
+        const before = await evaluate('document.querySelector("[data-harness-step=download] .hstep-state").textContent');
+        await wait(`document.querySelector("[data-harness-step=download] .hstep-state").textContent !== ${JSON.stringify(before)}`, 'UI33 兜底下载的已用时间每秒刷新', 5000);
+        await check('UI33 兜底下载 2 秒内状态文字按秒变化', `(() => {
+            const matched = (document.querySelector('[data-harness-step=download] .hstep-state')?.textContent ?? '').match(/^已用 (\\d+) 秒$/);
+            return !!matched && Number(matched[1]) >= 1;
+        })()`);
+        await press('[data-pref=wizard-harness-cancel]');
+        await wait('!!document.querySelector("[data-wizard-cancelled]")', 'UI33 兜底下载：取消后回到确认页', 30000);
+        await finishFromStep4('UI33 兜底下载计时');
+    }
+
+    // 不兼容：默认装推荐版时测试失败，核心给"已退回"；两个按钮都在，改装验证过的版本能完成。
+    {
+        harnessShots.check = {
+            ok: true, verified: '0.2.0', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2', '0.2.0'],
+            installed: null, path: null, updateAvailable: false,
+        };
+        harnessShots.deploy = async ({ version }) => version === '0.2.0'
+            ? { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version, imported: true, verified: true }
+            : { ok: false, error: '新版本测试失败，已退回 0.2.0', incompatible: true, fallback: '0.2.0' };
+        await reachHarness('UI33 不兼容');
+        await press('[data-pref=wizard-harness-install]');
+        await wait('!!document.querySelector("[data-wizard-incompatible]")', 'UI33 不兼容页', 30000);
+        await check('UI33 不兼容时原因原样显示（含"已退回"），给出"改装验证过的版本"与"保留这个版本"', `document.querySelector('[data-wizard-incompatible]').textContent.includes('已退回') && document.querySelector('.wiz-f [data-pref=wizard-harness-fallback]').textContent === ${JSON.stringify(p.wizardFallbackInstall)} && document.querySelector('.wiz-f [data-pref=wizard-harness-keep]').textContent === ${JSON.stringify(p.wizardKeepVersion)}`);
+        await press('[data-pref=wizard-harness-fallback]');
+        await wait('!!document.querySelector("[data-wizard-harness-done]")', 'UI33 改装验证版后完成', 30000);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 不兼容：进第 5 步');
+        await leaveWizard('UI33 不兼容');
+    }
+
+    // R2-2：手动输入版本——输入事件同步更新"安装"按钮；真实输入后点安装，桩收到的就是输入的值。
+    {
+        let seenVersion: string | undefined = 'unset';
+        harnessShots.check = {
+            ok: true, verified: '0.2.1-rc.2', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2'],
+            installed: null, path: null, updateAvailable: false,
+        };
+        harnessShots.target = path.join(home, 'shots-harness-target');
+        harnessShots.deploy = async ({ version }) => {
+            seenVersion = version;
+            return { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version: version || '0.2.1-rc.2', imported: true, verified: true };
+        };
+        await reachHarness('UI33 手动输入版本');
+        await press('[data-pref=wizard-harness-version]');
+        await wait('!!document.querySelector(".ctx")', 'UI33 手动输入版本：版本下拉');
+        await press('.ctx button:last-child');
+        await wait('!!document.querySelector("[data-wizard-version]")', 'UI33 手动输入版本：出现输入框');
+        await check('UI33 手动输入：空值时安装按钮不可点', `document.querySelector('[data-wizard-version]').value === '' && document.querySelector('.wiz-f [data-pref=wizard-harness-install]').disabled === true`);
+        await type('[data-wizard-version]', '0.2.9');
+        await check('UI33 手动输入合法版本后安装按钮立即可点', `document.querySelector('.wiz-f [data-pref=wizard-harness-install]').disabled === false`);
+        await type('[data-wizard-version]', '/');
+        await check('UI33 手动输入变成非法值后安装按钮立即不可点', `document.querySelector('.wiz-f [data-pref=wizard-harness-install]').disabled === true`);
+        await key('Backspace');
+        await check('UI33 改回合法版本后安装按钮又恢复可点', `document.querySelector('.wiz-f [data-pref=wizard-harness-install]').disabled === false`);
+        await press('[data-pref=wizard-harness-install]');
+        await wait('!!document.querySelector("[data-wizard-harness-done]")', 'UI33 手动输入版本：安装完成', 30000);
+        await verify('UI33 手动输入的版本原样交给部署（0.2.9）', async () => { assert.equal(seenVersion, '0.2.9'); });
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 手动输入版本：进第 5 步');
+        await leaveWizard('UI33 手动输入版本');
+    }
+
+    // 没有 npm：说明原因、给 nodejs.org，不替用户装 Node。
+    {
+        harnessShots.check = { ok: false, noNpm: true, error: '没有找到 npm，请先安装 Node.js 后重试', verified: '', installed: null, path: null, updateAvailable: false };
+        harnessShots.deploy = null;
+        await reachHarness('UI33 没有 npm');
+        await wait('!!document.querySelector("[data-wizard-node]")', 'UI33 没有 npm 页面');
+        await check('UI33 没有 npm：说明原因并给 nodejs.org 下载链接，不提供安装按钮', `document.querySelector('[data-wizard-node]').getAttribute('href') === 'https://nodejs.org/' && document.querySelector('.wiz-body').textContent.includes(${JSON.stringify(p.wizardNoNpm('DeepSeek Harness'))}) && !document.querySelector('[data-pref=wizard-harness-install]')`);
+        await finishFromStep4('UI33 没有 npm');
+    }
+
+    // R2-4：没有 npm 但已经装好 dsh 时，不能把它说成没装；保留版本与路径，只说明不能安装 / 更新。
+    {
+        harnessShots.check = {
+            ok: false, noNpm: true, error: '没有找到 npm，请先安装 Node.js 后重试', verified: '',
+            installed: '0.2.1-rc.2', path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), updateAvailable: false,
+        };
+        harnessShots.deploy = null;
+        await reachHarness('UI33 没有 npm 但已装 dsh');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-import]")', 'UI33 没有 npm 但已装 dsh：直接导入', 30000);
+        await check('UI33 没有 npm 但已装 dsh：仍显示版本与位置，主按钮是"直接导入"，并说明不能安装 / 更新', `(() => {
+            const b = document.querySelector('.wiz-body');
+            return b.textContent.includes('0.2.1-rc.2') && b.textContent.includes('dsh.cmd')
+                && document.querySelector('.wiz-f [data-pref=wizard-harness-import]').textContent === ${JSON.stringify(p.wizardDirectImport)}
+                && !!document.querySelector('[data-wizard-harness-nonpm]') && b.textContent.includes(${JSON.stringify(p.wizardNoNpm('DeepSeek Harness'))})
+                && !document.querySelector('[data-pref=wizard-harness-install]');
+        })()`);
+        await finishFromStep4('UI33 没有 npm 但已装 dsh');
+    }
+
+    // 跳过第 4 步之后重新运行，仍然可以安装：真实点"安装"，部署桩被调用一次。
+    {
+        let calls = 0;
+        harnessShots.check = null;
+        harnessShots.target = path.join(home, 'shots-harness-target');
+        harnessShots.deploy = async ({ version }) => {
+            calls += 1;
+            return { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version: version || '0.2.1-rc.2', imported: true, verified: true };
+        };
+        await reachHarness('UI33 跳过后再装');
+        await check('UI33 跳过第 4 步之后重新运行，仍能安装', `!!document.querySelector('[data-pref=wizard-harness-install]')`);
+        await press('[data-pref=wizard-harness-install]');
+        await wait('!!document.querySelector("[data-wizard-harness-done]")', 'UI33 跳过后再装：安装完成', 30000);
+        await verify('UI33 跳过后再装：真实点"安装"会调用部署桩（一次）', async () => { assert.equal(calls, 1); });
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 跳过后再装：进第 5 步');
+        await leaveWizard('UI33 跳过后再装');
+    }
+
+    // 检测到已安装但预设还没导入：显示版本与位置，主按钮是"直接导入"，导入时不重新下载（不带版本）。
+    {
+        let calls = 0;
+        let seenVersion: string | undefined = 'unset';
+        harnessShots.check = {
+            ok: true, verified: '0.2.1-rc.2', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2'],
+            installed: '0.2.1-rc.2', path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), updateAvailable: false,
+        };
+        harnessShots.deploy = async ({ version }) => {
+            calls += 1;
+            seenVersion = version;
+            return { ok: true, path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), version: '0.2.1-rc.2', imported: true, verified: true };
+        };
+        await reachHarness('UI33 已检测到 dsh');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-import]")', 'UI33 已检测到 dsh：直接导入', 30000);
+        await check('UI33 检测到已安装但预设没导入：显示版本与位置，主按钮是"直接导入"', `(() => { const b = document.querySelector('.wiz-body'); return b.textContent.includes('0.2.1-rc.2') && b.textContent.includes('dsh.cmd') && document.querySelector('.wiz-f [data-pref=wizard-harness-import]').textContent === ${JSON.stringify(p.wizardDirectImport)}; })()`);
+        await press('[data-pref=wizard-harness-import]');
+        await wait('!!document.querySelector("[data-wizard-harness-done]")', 'UI33 直接导入后完成', 30000);
+        await verify('UI33 直接导入不重新下载：部署不带版本，只导入并测试', async () => { assert.equal(calls, 1); assert.equal(seenVersion, undefined); });
+        // 部署走桩，不改配置；这里没有导入任何 Agent，后面的"已安装重跑"自己再导入一次。
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 已检测到 dsh：进第 5 步');
+        await leaveWizard('UI33 已检测到 dsh');
+    }
+
+    // 已安装（预设已导入）后重新运行：显示"已安装：<版本>"，直接下一步。
+    {
+        await evaluate(`window.dock.console('agents:add', { preset: 'deepseek-harness', name: 'deepseek-harness' })`);
+        harnessShots.check = {
+            ok: true, verified: '0.2.1-rc.2', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2'],
+            installed: '0.2.1-rc.2', path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), updateAvailable: false,
+        };
+        await reachHarness('UI33 已安装重跑');
+        await wait('!!document.querySelector("[data-wizard-installed]")', 'UI33 已安装状态');
+        await check('UI33 已安装后重新运行显示"已安装：<版本>"，主按钮是"下一步"', `document.querySelector('[data-wizard-installed]').textContent.includes(${JSON.stringify(p.wizardInstalledVersion('0.2.1-rc.2'))}) && document.querySelector('.wiz-f [data-pref=next]').textContent === ${JSON.stringify(p.wizardNext)}`);
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', 'UI33 已安装重跑：进第 5 步');
+        await leaveWizard('UI33 已安装重跑');
+    }
+
+    // Agent 页的 Harness 卡片：显示版本、有新版本时给"更新"，更新失败时显示核心的"已退回"原文。
+    {
+        harnessShots.check = {
+            ok: true, verified: '0.2.1-rc.2', recommended: '0.2.2', tags: { next: '0.2.2' }, versions: ['0.2.2', '0.2.1-rc.2'],
+            installed: '0.2.1-rc.2', path: path.join(home, 'tools', 'dsh', 'bin', 'dsh.cmd'), updateAvailable: true,
+        };
+        let updateVersion: string | undefined = 'unset';
+        harnessShots.deploy = async ({ version }) => {
+            updateVersion = version;
+            return { ok: false, error: '安装 DeepSeek Harness 失败：测试连接失败，已退回 0.2.1-rc.2', incompatible: true, fallback: '0.2.1-rc.2' };
+        };
+        await press('[data-page=connect]');
+        await wait('!!document.querySelector("[data-harness-card]") && !!document.querySelector("[data-agent=deepseek-harness]")', 'UI33 Agent 页 Harness 卡片', 30000);
+        await press('[data-harness-check]');
+        await wait('!!document.querySelector("[data-harness-update]")', 'UI33 Agent 页显示更新按钮', 30000);
+        await check('UI33 Agent 页 Harness 卡片显示已装版本与新版本', `document.querySelector('[data-harness-version]').textContent === '0.2.1-rc.2' && document.querySelector('[data-harness-card]').textContent.includes('0.2.2')`);
+        await press('[data-harness-update]');
+        await wait('!!document.querySelector(".confirm-actions .primary")', 'UI33 更新前确认');
+        await press('.confirm-actions .primary');
+        await wait('!!document.querySelector("[data-harness-card] .banner.fail")', 'UI33 更新失败横幅', 30000);
+        await check('UI33 Agent 页更新失败显示核心的"已退回"原文', `document.querySelector('[data-harness-card] .banner.fail').textContent.includes('已退回 0.2.1-rc.2')`);
+        await verify('UI33 Agent 页更新带的版本是推荐版本（0.2.2）', async () => { assert.equal(updateVersion, '0.2.2'); });
+        const upgradeDir = path.join(home, 'shots-harness-upgrade', 'tools', 'dsh');
+        await mkdir(upgradeDir, { recursive: true });
+        await writeFile(path.join(upgradeDir, '.agent-router-dsh.json'), '{}');
+        harnessShots.target = upgradeDir;
+        harnessShots.cleans = 0;
+        harnessShots.deploy = ({ signal }) => new Promise(resolve => {
+            signal.addEventListener('abort', () => resolve(undefined), { once: true });
+        });
+        await press('[data-harness-update]');
+        await wait('!!document.querySelector(".confirm-actions .primary")', 'UI33 零步骤升级确认');
+        await press('.confirm-actions .primary');
+        await wait('!!document.querySelector("[data-harness-cancel]")', 'UI33 零步骤升级');
+        await press('[data-harness-cancel]');
+        await wait('!!document.querySelector("[data-harness-note]") && !document.querySelector("[data-harness-cancel]")', 'UI33 零步骤取消完成');
+        await verify('UI33 升级零步骤取消调用安全清理', async () => { assert.equal(harnessShots.cleans, 1); });
+        harnessShots.cleans = 0;
+        harnessShots.deploy = ({ signal, step }) => new Promise(resolve => {
+            step({ step: 'deps', message: '正在安装依赖', percent: 88, approx: true });
+            step({ step: 'test', message: '正在测试连接' });
+            signal.addEventListener('abort', () => resolve(undefined), { once: true });
+        });
+        await press('[data-harness-update]');
+        await wait('!!document.querySelector(".confirm-actions .primary")', 'UI33 升级确认');
+        await press('.confirm-actions .primary');
+        await wait('!!document.querySelector("[data-harness-cancel]") && document.querySelector("[data-harness-step=test]")?.dataset.state === "run"', 'UI33 升级进度');
+        await check('UI33 Agent 页显示四行进度、当前步骤和计时', `(() => {
+            const rows = document.querySelectorAll('[data-harness-card] [data-harness-progress] [data-harness-step]');
+            return rows.length === 4 && document.querySelector('[data-harness-step=deps]').dataset.state === 'done'
+                && document.querySelector('[data-harness-step=test]').dataset.state === 'run'
+                && !!document.querySelector('[data-harness-card] [role=progressbar]') && !!document.querySelector('[data-harness-card] [data-wizard-elapsed]');
+        })()`);
+        await tabTo('[data-harness-cancel]');
+        await wait('Number(document.querySelector("[data-wizard-elapsed]").textContent.match(/\\d+/)?.[0]) >= 1', 'UI33 等待计时更新');
+        await check('UI33 计时更新后取消按钮保留键盘焦点', 'document.activeElement === document.querySelector("[data-harness-cancel]")');
+        await key('Enter');
+        await wait('!!document.querySelector("[data-harness-note]") && !document.querySelector("[data-harness-cancel]")', 'UI33 升级取消完成');
+        await verify('UI33 升级取消恢复一次', async () => { assert.equal(harnessShots.cleans, 1); });
+        harnessShots.check = { ok: false, noNpm: true, error: '<npm missing>', verified: '', installed: null, path: null, updateAvailable: false };
+        await press('[data-harness-check]');
+        await wait('!!document.querySelector("[data-harness-install]:disabled")', 'UI33 无 npm 禁止安装');
+        await check('UI33 无 npm 显示转义原因和 Node 下载', `document.querySelector('[data-harness-card]').textContent.includes('<npm missing>') && !document.querySelector('[data-harness-card] npm') && !!document.querySelector('[data-harness-card] a[href="https://nodejs.org/"]')`);
+        harnessShots.check = { ok: false, noNpm: true, error: '<npm missing>', verified: '', installed: '0.2.1-rc.2', path: 'dsh', updateAvailable: false };
+        await press('[data-harness-check]');
+        await wait('!!document.querySelector("[data-harness-install]:not(:disabled)")', 'UI33 无 npm 已导入时可重新导入');
+        let importedVersion: string | undefined = 'unset';
+        harnessShots.deploy = async ({ version }) => { importedVersion = version; return { ok: true, version: '0.2.1-rc.2', imported: true, verified: true }; };
+        await press('[data-harness-install]');
+        await press('.confirm-actions .primary');
+        await wait('!!document.querySelector("[data-harness-note]")', 'UI33 重新导入完成');
+        await verify('UI33 重新导入不指定安装版本', async () => { assert.equal(importedVersion, undefined); });
+        await evaluate(`window.dock.console('agents:remove', { name: 'deepseek-harness' })`);
+        // 卡片上的失败横幅会留在 Agent 页上（后面的 UI06 检查会断言这里没有失败横幅）：点"重新检测"清掉。
+        harnessShots.check = null;
+        await press('[data-harness-check]');
+        await wait('!document.querySelector("[data-harness-card] .banner.fail")', 'UI33 清掉 Agent 页的更新失败横幅');
+    }
+    harnessShots.check = null;
+    harnessShots.deploy = null;
+    harnessShots.target = null;
     await press('[data-page=tasks]');
     await wait('!!document.querySelector("[data-task=t1]")');
 }
@@ -272,6 +707,56 @@ export async function capturePreferences(h: Harness) {
 
     // UI06 技能：检测、更新、版本提示、较新版本保护、自改版本替换与回退。
     await press('[data-page=connect]'); await wait('!!document.querySelector("[data-host-card]") && !document.querySelector("[data-pref=detect]").disabled && !!document.querySelector("[data-agent=codex]")');
+    const arTarget = path.join(home, 'ar-local', 'AgentRouter', 'bin', 'ar.cmd');
+    const agrTarget = path.join(home, 'ar-local', 'AgentRouter', 'bin', 'agr.cmd');
+    await wait('!!document.querySelector("[data-ar-action]:not(:disabled)")');
+    await tabTo('[data-ar-action]'); await key('Enter');
+    await check('UI06 ar 安装确认默认焦点在取消', `document.activeElement.textContent === ${JSON.stringify(p.arCancel)} && document.querySelector('.confirm-card').textContent.includes(${JSON.stringify(p.arInstallBody)})`);
+    await key('Escape');
+    await verify('UI06 ar 取消不写文件和 PATH', async () => { assert.equal(await exists(arTarget), false); assert.deepEqual(arShots.writes, []); });
+    await press('[data-ar-action]'); await press('.confirm-actions .primary');
+    await wait(`document.querySelector('[data-ar-action]').textContent === ${JSON.stringify(p.arUninstall)}`);
+    await wait('!!document.querySelector("[data-ar-alias]")');
+    await verify('UI06 ar 安装写入 ar.cmd 与 agr.cmd 文件和 PATH 桩', async () => { assert.match(await readFile(arTarget, 'utf8'), /^rem AgentRouter ar 命令\r?\n/); assert.equal(await readFile(agrTarget, 'utf8'), await readFile(arTarget, 'utf8')); assert.equal(arShots.writes.length, 1); assert.equal(arShots.value, path.dirname(arTarget)); });
+    // 426：注入"系统 PATH 里的 msys64 ar.exe 排在我们前面"，刷新后出现警告横幅；清掉注入后横幅消失。
+    arStub.machinePath = 'C:\\msys64\\ucrt64\\bin';
+    arStub.files = [path.join(arStub.machinePath, 'ar.exe')];
+    await agentsPage();
+    await wait('!!document.querySelector("[data-ar-shadow]")');
+    await check('UI06 ar 遮挡横幅写明挡在前面的程序', `(() => { const text = document.querySelector('[data-ar-shadow]').textContent; return text.includes(${JSON.stringify(p.arShadowTitle)}) && text.includes(${JSON.stringify(path.join('C:\\msys64\\ucrt64\\bin', 'ar.exe'))}); })()`);
+    await save('ar-shadow-dark'); nativeTheme.themeSource = 'light'; await save('ar-shadow-light'); nativeTheme.themeSource = 'dark';
+    arStub.machinePath = '';
+    arStub.files = [];
+    await agentsPage();
+    await wait('!document.querySelector("[data-ar-shadow]")');
+    await check('UI06 ar 没有遮挡时不显示警告横幅', '!document.querySelector("[data-ar-shadow]")');
+    await press('[data-ar-action]');
+    await check('UI06 ar 卸载确认默认焦点在取消', `document.activeElement.textContent === ${JSON.stringify(p.arCancel)} && document.querySelector('.confirm-card').textContent.includes(${JSON.stringify(p.arRemoveBody)})`);
+    await press('.confirm-actions .danger');
+    await wait(`document.querySelector('[data-ar-action]').textContent === ${JSON.stringify(p.arInstall)}`);
+    await verify('UI06 ar 卸载移除文件和 PATH 桩', async () => { assert.equal(await exists(arTarget), false); assert.equal(await exists(agrTarget), false); assert.equal(arShots.value, ''); assert.equal(arShots.writes.length, 2); });
+    await writeFile(arTarget, 'other');
+    await press('[data-ar-action]'); await press('.confirm-actions .primary');
+    await wait(`document.querySelector('[data-lead-card]').textContent.includes(${JSON.stringify(p.arConflict)})`);
+    await verify('UI06 ar 冲突保留文件和 PATH', async () => { assert.equal(await readFile(arTarget, 'utf8'), 'other'); assert.equal(arShots.writes.length, 2); });
+    await rm(arTarget);
+    await check('UI06 显示三个技能及版本', `(() => { const card = document.querySelector('[data-host-card=claude-code]'); return ['agent-router','lead-workflow','lead-practices'].every(name => card.textContent.includes(name)) && card.textContent.includes(${JSON.stringify(app.getVersion())}); })()`);
+    const thirdDir = path.join(claude, 'skills', 'lead-practices');
+    const thirdMarker = path.join(thirdDir, '.agent-router.json'), thirdRef = path.join(thirdDir, 'references', 'examples.md');
+    const thirdOriginal = await readFile(thirdMarker, 'utf8'), thirdContent = await readFile(thirdRef, 'utf8');
+    await writeFile(thirdMarker, JSON.stringify({ ...JSON.parse(thirdOriginal), version: '0.0.0' }));
+    await refresh(); await wait('!!document.querySelector("[data-operation=update][data-host=claude-code]")');
+    await press('[data-operation=update][data-host=claude-code]'); await wait('!!document.querySelector("[data-operation=reinstall][data-host=claude-code]")');
+    await verify('UI06 第三技能更新文件和版本', async () => { assert.equal(JSON.parse(await readFile(thirdMarker, 'utf8')).version, app.getVersion()); assert.equal(await readFile(thirdRef, 'utf8'), thirdContent); });
+    await writeFile(thirdRef, '用户修改'); await refresh();
+    await wait('!!document.querySelector("[data-operation=replace][data-host=claude-code]")');
+    await press('[data-operation=replace][data-host=claude-code]'); await press('.confirm-actions .danger');
+    await wait('!!document.querySelector("[data-operation=reinstall][data-host=claude-code]")');
+    await verify('UI06 第三技能替换后 references 恢复', async () => { assert.equal(await readFile(thirdRef, 'utf8'), thirdContent); });
+    await press('[data-operation=rollback][data-host=claude-code]'); await press('.confirm-actions .primary');
+    await wait('!!document.querySelector("[data-operation=replace][data-host=claude-code]")');
+    await verify('UI06 第三技能回退恢复自改文件', async () => { assert.equal(await readFile(thirdRef, 'utf8'), '用户修改'); });
+    await writeFile(thirdRef, thirdContent); await writeFile(thirdMarker, thirdOriginal); await refresh();
     await save('connect-normal-dark'); nativeTheme.themeSource = 'light'; await save('connect-normal-light'); nativeTheme.themeSource = 'dark';
     await check('UI06 Agent 页执行者区的 Codex 行通过假 Codex 检测版本和登录状态', 'document.querySelector("[data-agent=codex]").textContent.includes("codex-cli 0.156.1") && document.querySelector("[data-agent=codex]").textContent.includes("已登录")');
     // 037 第 4 项：claude-code 执行者（deepseek）行的版本不能是 codex-cli，必须是 Claude Code 风格；codex 行仍含 codex-cli。
@@ -280,6 +765,147 @@ export async function capturePreferences(h: Harness) {
     await wait('!!document.querySelector("[data-agent=deepseek] .xresult") && !document.querySelector("[data-test=deepseek]").disabled', '重新测试 deepseek 连接', 60000);
     await check('UI06 Agent 页 claude-code 执行者（deepseek）行的版本是 Claude Code 风格、不含 codex-cli', 'document.querySelector("[data-agent=deepseek]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=deepseek]").textContent.includes("codex-cli")');
     await check('UI06 Agent 页 Codex 行的版本含 codex-cli（claude-code 行串版本不波及它）', 'document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
+    // 294：Agent 页主导卡。检测用临时目录里的假 claude / qodercli，结束后还原环境。
+    // 已导入按适配器与通用声明识别（294 审查 R1-1）：夹具里不放 claude-code 配置（否则 Claude Code 算已导入），
+    // 放 codex 与一个程序为 dsh 的通用配置——DeepSeek Harness 不能把 Qoder 挡掉。
+    const leadEnvPath = process.env.PATH;
+    const leadIsolatedEnv = process.env[isolatedEnvKey];
+    const leadBin = path.join(home, 'lead-bin');
+    await mkdir(leadBin, { recursive: true });
+    const leadStubs: [string, string][] = [['claude', '2.1.999 (Claude Code)'], ['qodercli', 'Qoder CLI 9.9.9']];
+    for (const [name, version] of leadStubs) await writeFile(path.join(leadBin, `${name}.cmd`), `@echo off\r\necho ${version}\r\n`);
+    const leadBefore = await readConfig();
+    // 通用适配器声明的最小合法形状（内嵌在配置里时，渲染层能直接读到 executable）。
+    const dshDecl = { label: 'DeepSeek Harness', executable: 'dsh', args: [] as string[], stdin: '{prompt}', output: { format: 'text' as const } };
+    // 以假 Claude Code 检测的 claude-code 配置（改名后的配置仍按适配器认得）。
+    const claudeLike = (label: string) => ({ adapter: 'claude-code', label, enabled: true, auth: 'login' as const, env: {}, path: path.join(home, 'fake-claude.cjs') });
+    try {
+        if (leadIsolatedEnv !== undefined) {
+            const overrides = JSON.parse(leadIsolatedEnv);
+            const pathKey = Object.keys(overrides).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
+            const effectiveEnv = appEnvironment(process.env);
+            const effectivePathKey = Object.keys(effectiveEnv).find(key => key.toUpperCase() === 'PATH');
+            overrides[pathKey] = `${leadBin}${path.delimiter}${effectivePathKey ? effectiveEnv[effectivePathKey] ?? '' : ''}`;
+            process.env[isolatedEnvKey] = JSON.stringify(overrides);
+        } else {
+            process.env.PATH = `${leadBin}${path.delimiter}${leadEnvPath ?? ''}`;
+        }
+        const leadConfig = {
+            ...leadBefore, lead: undefined, defaultProfile: 'codex',
+            profiles: {
+                codex: { ...leadBefore.profiles.codex, roles: ['executor', 'reviewer', 'lead'] },
+                'deepseek-harness': { adapter: 'generic', generic: dshDecl, label: 'DeepSeek Harness', enabled: true, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'DEEPSEEK_API_KEY' } },
+            },
+        };
+        await writeFile(config, JSON.stringify(leadConfig));
+        await refresh();
+        await wait('!!document.querySelector("[data-lead-card]") && !document.querySelector("[data-lead-open]").disabled && !!document.querySelector("[data-lead-detected=claude]") && !!document.querySelector("[data-lead-detected=qoder]")');
+        // R2-1：主导卡在"主导"小节内、技能卡上方（界面稿 connect 页），执行者列表不在这个小节里。
+        await check('UI06 主导卡在"主导"小节内、技能卡上方', `(() => { const card = document.querySelector('[data-lead-card]'); const sect = card?.closest('.sect'); const cards = sect?.querySelector('.cards2'); return !!card && !!sect && sect.querySelector('h2')?.textContent === ${JSON.stringify(p.dispatchers)} && !!cards && !!(card.compareDocumentPosition(cards) & Node.DOCUMENT_POSITION_FOLLOWING) && !sect.contains(document.querySelector('[data-agents]')); })()`);
+        await check('UI06 主导卡未选择时显示"选择主导"与三行"—（选择主导后显示）"，也不把"还没有选主导"显示成错误', 'document.querySelector("[data-lead-open]").textContent.includes("选择主导") && document.querySelector("[data-lead-card]").textContent.includes("选择主导后显示") && !document.querySelector("[data-lead-problem]")');
+        await check('UI06 主导卡列出检测到但未导入的 Claude Code、Qoder（含版本），已导入的 Codex 与 DeepSeek Harness 不列', '(() => { const card = document.querySelector("[data-lead-card]").textContent; const claude = document.querySelector("[data-lead-detected=claude]")?.textContent ?? ""; const qoder = document.querySelector("[data-lead-detected=qoder]")?.textContent ?? ""; return claude.includes("检测到：Claude Code 2.1.999 (Claude Code)") && qoder.includes("检测到：Qoder Qoder CLI 9.9.9") && !document.querySelector("[data-lead-detected=codex]") && !card.includes("DeepSeek Harness"); })()');
+        await check('UI06 主导卡检测版本文字精确等于隔离桩', 'document.querySelector("[data-lead-detected=claude] .l span")?.textContent === "检测到：Claude Code 2.1.999 (Claude Code)" && document.querySelector("[data-lead-detected=qoder] .l span")?.textContent === "检测到：Qoder Qoder CLI 9.9.9"');
+        await save('lead-none-dark');
+        // 导入按钮：打开现有导入向导，并预选对应的预设卡片（Claude Code 的卡片默认预设是 claude-native）。
+        await press('[data-lead-import="claude-native"]');
+        await wait('!!document.querySelector(".sheet") && !!document.querySelector(".preset.on[data-preset=claude-native]")');
+        await check('UI06 检测到工具的"导入"按钮打开导入向导并预选对应预设', 'document.querySelector(".preset.on").dataset.preset === "claude-native" && document.querySelector(".preset.on").textContent.includes("Claude Code")');
+        await press('[data-w-act="cancel"]'); await wait('!document.querySelector(".sheet")');
+        // 已选主导失效（R1-3）：config.json 里的 lead 指向不存在的配置时，显示核心错误原文并提供"清除"，
+        // 不能误显示成未选择；清除后残留的 lead 从配置里删掉，回到正常的未选择状态。
+        await writeFile(config, JSON.stringify({ ...leadConfig, lead: 'gone-profile' }));
+        await refresh();
+        await wait('!!document.querySelector("[data-lead-problem]") && !!document.querySelector("[data-lead-clear]")');
+        await check('UI06 已选主导失效时显示核心错误原文与"清除"', '(() => { const text = document.querySelector("[data-lead-problem]")?.textContent ?? ""; return text.includes("主导 gone-profile 不存在或已停用") && !!document.querySelector("[data-lead-clear]") && document.querySelector("[data-lead-open]").textContent.includes("选择主导"); })()');
+        await press('[data-lead-clear]');
+        await wait('!document.querySelector("[data-lead-problem]") && !document.querySelector("[data-lead-clear]") && document.querySelector("[data-lead-open]").textContent.includes("选择主导")');
+        await verify('UI06 失效主导的"清除"删掉 config.json 里残留的 lead', async () => { assert.equal((await readConfig()).lead, undefined); });
+        await check('UI06 清除失效主导后回到未选择状态（不显示错误）', '!document.querySelector("[data-lead-problem]") && document.querySelector("[data-lead-card]").textContent.includes("选择主导后显示")');
+        // 改名后的配置仍认得（R1-1）：只改配置名（键），适配器与通用声明不变，三样工具都算已导入，不再显示"检测到"。
+        const renamed = {
+            ...leadConfig, lead: undefined, defaultProfile: 'my-codex',
+            profiles: {
+                'my-claude': claudeLike('我的 Claude'),
+                'my-codex': { ...leadBefore.profiles.codex, label: '我的 Codex', roles: ['executor', 'reviewer', 'lead'] },
+                // 通用适配器的声明引用名仍是导入时的 qoder（声明名），配置名与密钥变量名都改掉：按被引用声明的 executable 认，
+                // 不按密钥变量名猜（294 审查 R2-2）。
+                'my-qoder': { adapter: 'generic', generic: 'qoder', label: '我的 Qoder', enabled: true, auth: 'token', secrets: { QODER_MY_TOKEN: 'QODER_MY_TOKEN' } },
+            },
+            generics: { qoder: { label: 'Qoder（国际版）', executable: 'qodercli', args: [] as string[], stdin: '{prompt}', output: { format: 'text' as const } } },
+        };
+        await writeFile(config, JSON.stringify(renamed));
+        await refresh();
+        await wait('!document.querySelector("[data-lead-detected=claude]") && !document.querySelector("[data-lead-detected=codex]") && !document.querySelector("[data-lead-detected=qoder]")');
+        await check('UI06 改名后的配置仍按适配器与声明认得（Claude Code / Codex / Qoder 不再显示"检测到"）', '!document.querySelector("[data-lead-detected]")');
+        // 名字与预设相同但不是该工具（通用适配器、程序是 dsh）：按适配器与声明程序判断，不能把它当成已导入而藏掉检测。
+        // codex 那行故意用 QODER_* 的密钥变量名：别的程序用了同名密钥变量也不能被误判成 Qoder（294 审查 R2-2）。
+        const lookalikes = {
+            ...leadConfig, lead: undefined, defaultProfile: 'my-claude',
+            profiles: {
+                'my-claude': claudeLike('我的 Claude'),
+                codex: { adapter: 'generic', generic: { ...dshDecl, label: '别的工具' }, label: '别的工具', enabled: true, auth: 'token', secrets: { QODER_PERSONAL_ACCESS_TOKEN: 'QODER_PERSONAL_ACCESS_TOKEN' } },
+                qoder: { adapter: 'generic', generic: { ...dshDecl, label: '别的工具' }, label: '别的工具', enabled: true, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'DEEPSEEK_API_KEY' } },
+            },
+        };
+        await writeFile(config, JSON.stringify(lookalikes));
+        await refresh();
+        await wait('!!document.querySelector("[data-lead-detected=codex]") && !!document.querySelector("[data-lead-detected=qoder]") && !document.querySelector("[data-lead-detected=claude]")');
+        await check('UI06 名字与预设相同但不是该工具时不误判（Codex / Qoder 照常显示"检测到"，共用 QODER_* 密钥变量也不算 Qoder）', '!!document.querySelector("[data-lead-detected=codex]") && !!document.querySelector("[data-lead-detected=qoder]") && !document.querySelector("[data-lead-detected=claude]")');
+        // 回到本段夹具：codex 可担任主导。
+        await writeFile(config, JSON.stringify(leadConfig));
+        await refresh();
+        await wait('!!document.querySelector("[data-lead-detected=qoder]") && !document.querySelector("[data-lead-detected=codex]")');
+        // R2-3：核心 lead set 还要求配置能交互启动。没有 interactive 声明的通用配置即使显式设了 lead 角色也不进下拉，
+        // 有 interactive 声明的照列（按被引用声明判断）。
+        const interactiveQoder = { label: 'Qoder（国际版）', executable: 'qodercli', interactive: { args: [] as string[], model: ['-m', '{model}'], effort: ['--reasoning-effort', '{effort}'] }, args: [] as string[], stdin: '{prompt}', output: { format: 'text' as const } };
+        const leadCapability = {
+            ...leadConfig, lead: undefined, defaultProfile: 'codex',
+            profiles: {
+                codex: { ...leadBefore.profiles.codex, roles: ['executor', 'reviewer', 'lead'] },
+                'deepseek-harness': { ...leadConfig.profiles['deepseek-harness'], roles: ['executor', 'reviewer', 'lead'] },
+                'my-qoder': { adapter: 'generic', generic: 'qoder', label: '我的 Qoder', enabled: true, auth: 'token', secrets: { QODER_MY_TOKEN: 'QODER_MY_TOKEN' }, roles: ['executor', 'reviewer', 'lead'] },
+            },
+            generics: { qoder: interactiveQoder },
+        };
+        await writeFile(config, JSON.stringify(leadCapability));
+        await refresh();
+        // 等 Agent 页按新配置重画完（执行者列表里出现新加的"我的 Qoder"）再打开下拉，免得读到旧数据（主导接手 294）。
+        await wait('!!document.querySelector("[data-agent=my-qoder]") && !!document.querySelector("[data-lead-open]") && !document.querySelector("[data-lead-open]").disabled');
+        await press('[data-lead-open]'); await wait('!!document.querySelector(".ctx")');
+        await check('UI06 主导下拉只列能交互启动的通用配置（有 interactive 的 Qoder 在、没有的 DeepSeek Harness 不在）', '(() => { const labels = [...document.querySelectorAll(".ctx button")].map(b => b.textContent.trim()); return labels.includes("Codex") && labels.includes("我的 Qoder") && !labels.some(t => t.includes("DeepSeek Harness")); })()');
+        await key('Escape'); await wait('!document.querySelector(".ctx")');
+        // 回到本段夹具：codex 可担任主导。
+        await writeFile(config, JSON.stringify(leadConfig));
+        await refresh();
+        await wait('!!document.querySelector("[data-lead-detected=qoder]") && !document.querySelector("[data-lead-detected=codex]")');
+        // 下拉只列已导入、可担任主导的配置（codex）；选它写入 config.json 的 lead。
+        await press('[data-lead-open]'); await wait('!!document.querySelector(".ctx")');
+        await check('UI06 主导下拉只列已导入且可担任主导的配置', '(() => { const labels = [...document.querySelectorAll(".ctx button")].map(b => b.textContent.trim()); return labels.includes("Codex") && !labels.some(t => t.includes("Claude Code") || t.includes("Qoder") || t.includes("DeepSeek Harness")); })()');
+        await press('.ctx button[data-option="0"]');
+        await wait('document.querySelector("[data-lead-open]").textContent.includes("Codex") && !!document.querySelector("[data-lead-clear]")');
+        await verify('UI06 选择主导写入 config.json 的 lead', async () => { assert.equal((await readConfig()).lead, 'codex'); });
+        await check('UI06 选择主导后能力行显示已验证 / 支持 / 支持', '(() => { const text = document.querySelector("[data-lead-card]").textContent; return text.includes("交互启动") && text.includes("已验证") && (text.match(/支持/g) ?? []).length === 2 && !text.includes("未验证") && !text.includes("不支持") && !text.includes("选择主导后显示"); })()');
+        await save('lead-codex-dark');
+        // 清除：调 lead:clear，config.json 里的 lead 删掉，能力行回到"—"。
+        await press('[data-lead-clear]');
+        await wait('document.querySelector("[data-lead-open]").textContent.includes("选择主导") && !document.querySelector("[data-lead-clear]")');
+        await verify('UI06 清除主导后 config.json 里没有 lead', async () => { assert.equal((await readConfig()).lead, undefined); });
+        await check('UI06 清除主导后能力行回到"—（选择主导后显示）"', 'document.querySelector("[data-lead-card]").textContent.includes("选择主导后显示")');
+        // R2-3：选择失败时显示核心错误原文。下拉打开后把候选从配置里删掉，点选项时 lead:set 报错，卡片显示原文、配置不写入。
+        await press('[data-lead-open]'); await wait('!!document.querySelector(".ctx")');
+        const { codex: _removedCodex, ...profilesWithoutCodex } = leadConfig.profiles;
+        await writeFile(config, JSON.stringify({ ...leadConfig, profiles: profilesWithoutCodex }));
+        await press('.ctx button[data-option="0"]');
+        await wait('!!document.querySelector("[data-lead-error] .banner")');
+        await check('UI06 选择主导失败时显示核心错误原文', '(() => { const text = document.querySelector("[data-lead-error]")?.textContent ?? ""; return text.includes("没有这个执行者：codex"); })()');
+        await verify('UI06 选择主导失败时不写入 config.json 的 lead', async () => { assert.equal((await readConfig()).lead, undefined); });
+    }
+    finally {
+        if (leadEnvPath === undefined) delete process.env.PATH; else process.env.PATH = leadEnvPath;
+        if (leadIsolatedEnv === undefined) delete process.env[isolatedEnvKey]; else process.env[isolatedEnvKey] = leadIsolatedEnv;
+        await writeFile(config, JSON.stringify(leadBefore));
+        try { await refresh(); } catch { /* 上面的检查已经失败时，不掩盖原来的原因 */ }
+    }
     // 旧版技能在隔离宿主目录中验证删除与回退。
     const legacyNames = ['codex-dispatch', 'dual-role-workflow'];
     const legacyRoot = path.join(claude, 'skills');
@@ -329,9 +955,18 @@ export async function capturePreferences(h: Harness) {
     await press('.confirm-actions .btn');
     await verify('UI06 取消替换：自改版本原样保留（没有安装记录）', async () => { assert.equal(await exists(marker), false); });
     await press('[data-page=about]'); await press('[data-pref=wizard]'); await wait('!!document.querySelector(".wiz") && !document.querySelector("[data-pref=next]").disabled'); await press('[data-pref=next]');
+    // 302：第 2 步是 Agent；跳过到第 3 步技能，再检查自改版本与默认勾选。
+    await wait('!!document.querySelector(".presets .preset.on")', 'UI06 引导第 2 步预设加载完成', 30000);
+    await press('[data-pref=skip]');
+    await wait('!!document.querySelector("[data-choice]")', 'UI06 引导第 3 步技能');
     await check('UI06 自己改过的版本在引导里默认不勾选', `document.querySelector('[data-choice="claude-code/agent-router"]').getAttribute('aria-checked')==='false'`);
-    await check('UI06 引导第二步显示最新、自改状态与备份说明', `document.querySelector('[data-choice="claude-code/agent-router"]').textContent.includes("已有自己改过的版本，勾选后会先备份再替换") && document.querySelector('[data-choice="claude-code/agent-router"] .tag').textContent==="自己改过的版本" && [...document.querySelectorAll("[data-choice] .tag")].some(t=>t.textContent==="已是最新")`);
-    await save('wizard-2-custom-dark');
+    await check('UI06 引导第三步显示最新、自改状态与备份说明', `document.querySelector('[data-choice="claude-code/agent-router"]').textContent.includes("已有自己改过的版本，勾选后会先备份再替换") && document.querySelector('[data-choice="claude-code/agent-router"] .tag').textContent==="自己改过的版本" && [...document.querySelectorAll("[data-choice] .tag")].some(t=>t.textContent==="已是最新")`);
+    await save('wizard-3-custom-dark');
+    // 五步引导：技能之后是 DeepSeek Harness、项目，各跳过一步才结束。
+    await press('[data-pref=skip]');
+    await wait('document.querySelector(".wiz-steps .on")?.textContent.includes("DeepSeek Harness")', 'UI06 引导第 4 步');
+    await press('[data-pref=skip]');
+    await wait('!!document.querySelector("[data-wizard-folder]")', 'UI06 引导第 5 步');
     await press('[data-pref=skip]'); await wait('!document.querySelector(".wiz")'); await press('[data-page=connect]'); await wait('!!document.querySelector("[data-operation=replace]")');
     await press('[data-operation=replace]'); await press('.confirm-actions .danger'); await wait('!!document.querySelector("[data-operation=reinstall][data-host=claude-code]")');
     await verify('UI06 确认替换：先备份自改版本再装上新版本（安装记录恢复）', async () => { assert.equal(JSON.parse(await readFile(marker, 'utf8')).version, app.getVersion()); });
@@ -355,7 +990,18 @@ export async function capturePreferences(h: Harness) {
         // 确认这次确实构造出了竞态（回退完成时检测在途、结束后补做），否则这条检查等于没测。
         assert.ok(detectEvents.some(e => e.startsWith('detect-skip')) && detectEvents.some(e => e.startsWith('detect-again')), `没有构造出"检测在途时完成回退"的竞态：${detectEvents.join(' → ') || '无'}`);
     });
-    await check('UI06 回退还原自用版，不在该批次的技能保持最新', 'document.querySelectorAll("[data-host-card=claude-code] .tag.ok").length===1 && document.querySelectorAll("[data-host-card=claude-code] .tag.brand").length===1');
+    await check('UI06 回退还原自用版，不在该批次的技能保持最新', `(() => {
+        const rows = [...document.querySelectorAll('[data-host-card=claude-code] .kv')];
+        const row = name => rows.find(r => r.querySelector('.lb')?.textContent === name);
+        const custom = row('agent-router');
+        return rows.length === 3 && custom?.querySelector('.val')?.textContent === ${JSON.stringify(p.custom)}
+            && custom.querySelector('.tag.brand')?.textContent === ${JSON.stringify(p.protected)}
+            && ['lead-workflow', 'lead-practices'].every(name => {
+                const item = row(name);
+                return item?.querySelector('.val')?.textContent === ${JSON.stringify(app.getVersion())}
+                    && item.querySelector('.tag.ok')?.textContent === ${JSON.stringify(p.latest)};
+            });
+    })()`);
     await verify('UI06 回退真的还原自用版（安装记录又不存在）', async () => { assert.equal(await exists(marker), false); });
     await writeFile(marker, originalMarker);
     await rename(claude, claude + '-hidden');
@@ -592,29 +1238,37 @@ export async function capturePreferences(h: Harness) {
     // UI08 关于页。
     await press('[data-page=about]'); await save('about-dark');
     await check('UI08 关于页品牌标记 48px、字标、版本与协议版本', `document.querySelector(".about-mark").getBoundingClientRect().width===48 && document.querySelector(".about .wordmark").textContent==="AgentRouter" && getComputedStyle(document.querySelector(".about .wordmark")).textTransform==="uppercase" && document.querySelector(".about").textContent.includes(${JSON.stringify(app.getVersion())}) && document.querySelector(".about").textContent.includes("文件协议 v2")`);
+    // 引导打开时会检测技能状态，先在隔离目录中制造缺失状态。
+    await rm(thirdDir, { recursive: true, force: true });
+    assert.equal(await exists(thirdDir), false, '第三技能的隔离目录应已删除');
     await press('[data-pref=wizard]');
     await wait('!!document.querySelector(".wiz")');
     await check('UI08 "重新运行首次引导"打开引导第 1 步', '!!document.querySelector(".wiz") && [...document.querySelectorAll("[data-page]")].every(b=>b.disabled)');
-    // 137：空着"不限"再走一遍第 3 步（UI08 重新运行首次引导 → 第 2 步 → 第 3 步导入 DeepSeek 并测试）。
+    // 137：空着"不限"再走一遍 Agent 步骤（UI08 重新运行首次引导 → 第 2 步导入 DeepSeek 并测试）。
     // 空着点"下一步"不写 limits，已有的上限也不被清掉。此处 config.json 可能还不存在（UI07 之前重置过），所以读不到按"没有执行者"算；
-    // 导入成功后用 route:limit 给这个执行者预先设上限 5（与填 2 那条路径互不相干），空着进第 4 步后它必须还是 5。
+    // 导入成功后用 route:limit 给这个执行者预先设上限 5（与填 2 那条路径互不相干），空着走到项目步骤后它必须还是 5。
     {
         const readAll = async () => (await readFile(config, 'utf8').then(JSON.parse, () => ({ profiles: {} }))).profiles ?? {};
         const existed = await exists(config);
         const profilesBefore = Object.keys(await readAll());
         await wait('!document.querySelector("[data-pref=next]").disabled', '第 1 步检测完成', 30000);
         await press('[data-pref=next]');
-        await wait('!!document.querySelector("[data-choice]")', '第 2 步');
-        await press('[data-pref=next]');
-        await wait('!!document.querySelector(".presets .preset.on")', '第 3 步预设加载完成', 30000);
+        await wait('!!document.querySelector(".presets .preset.on")', 'UI08 第 2 步预设加载完成', 30000);
         await press('[data-pref=wizard-agent]');
         await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试成功', 90000);
-        await check('UI08 重新走到第 3 步：每日上限输入框默认空（不沿用上一次填的 2）', 'document.querySelector("[data-wizard-limit]")?.value === ""');
+        await check('UI08 重新走到第 2 步：每日上限输入框默认空（不沿用上一次填的 2）', 'document.querySelector("[data-wizard-limit]")?.value === ""');
         const added = Object.keys(await readAll()).filter(name => !profilesBefore.includes(name))[0];
         assert.ok(added, '导入后配置里有新执行者');
         await evaluate(`window.dock.console('route:limit', { name: ${JSON.stringify(added)}, tasks: 5 })`);
         await press('[data-pref=next]');
-        await wait('!!document.querySelector("[data-wizard-folder]")', '空着点下一步进第 4 步');
+        await wait('!!document.querySelector("[data-choice]")', '空着点下一步进第 3 步技能');
+        await check('UI09 缺失的第三技能默认勾选', `document.querySelector('[data-choice="claude-code/lead-practices"]').getAttribute('aria-checked')==='true'`);
+        await press('[data-choice="claude-code/lead-practices"]');
+        await press('[data-pref=next]');
+        await wait('!!document.querySelector("[data-pref=wizard-harness-install]")', '装完技能进第 4 步 Harness', 30000);
+        await verify('UI09 取消第三技能后没有安装', async () => { assert.equal(await exists(thirdDir), false); });
+        await press('[data-pref=skip]');
+        await wait('!!document.querySelector("[data-wizard-folder]")', '跳过 Harness 进第 5 步');
         await verify('UI08 空着点"下一步"不写 limits：预先设的上限 5 没被清掉，也没有多出别的执行者的上限', async () => {
             const after = await readAll();
             assert.equal(after[added].limits.maxTasksPerDay, 5);
@@ -626,7 +1280,7 @@ export async function capturePreferences(h: Harness) {
     await press('[data-pref=skip]');
     await wait('!document.querySelector(".wiz")');
     await check('UI08 跳过引导回到软件，侧栏恢复可用', '[...document.querySelectorAll("[data-page]")].every(b=>!b.disabled)');
-    // Stage07c 151（T5）：第三次走到第 3 步，点"可以按你的执行者生成建议规则"：引导结束，跳到路由页并打开建议弹窗（内容与核心的建议一致）。
+    // Stage07c 151（T5）：第三次运行引导，在 Agent 步骤点"可以按你的执行者生成建议规则"：引导结束，跳到路由页并打开建议弹窗（内容与核心的建议一致）。
     {
         const readAll = async () => (await readFile(config, 'utf8').then(JSON.parse, () => ({ profiles: {} }))).profiles ?? {};
         const existed = await exists(config);
@@ -635,9 +1289,7 @@ export async function capturePreferences(h: Harness) {
         await wait('!!document.querySelector(".wiz")', 'UI08 再次打开引导');
         await wait('!document.querySelector("[data-pref=next]").disabled', '第 1 步检测完成', 30000);
         await press('[data-pref=next]');
-        await wait('!!document.querySelector("[data-choice]")', '第 2 步');
-        await press('[data-pref=next]');
-        await wait('!!document.querySelector(".presets .preset.on")', '第 3 步预设加载完成', 30000);
+        await wait('!!document.querySelector(".presets .preset.on")', 'UI08 第 2 步预设加载完成', 30000);
         await press('[data-pref=wizard-agent]');
         await wait('!!document.querySelector("[data-wizard-result=ok]")', '导入并测试成功', 90000);
         await press('[data-pref=wizard-suggest]');
@@ -756,7 +1408,7 @@ async function captureExecutors(h: Harness, { config, home, settings }: { config
         await press('[data-page=tasks]'); await press('[data-page=connect]'); await wait('!!document.querySelector("[data-agent=bad]")');
         await check('UI06 执行者区每行：标签、默认、认证状态（隔离密钥文件）', 'document.querySelector("[data-agent=ok] .x1").textContent.includes("默认") && document.querySelector("[data-agent=example] .xtag").textContent==="EX" && document.querySelector("[data-agent=example] .x2").textContent.includes("已设置") && !document.querySelector("[data-agent=codex] .x1").textContent.includes("只在指定时使用")');
         // 180（D111）：执行者区说明改成按路由分配，Codex 行不再有"只在指定时使用"标签。
-        await check('UI06 执行者区说明文字是按路由分配的新文案', '[...document.querySelectorAll(".sect h2")].some(h => h.textContent === "执行者" && h.nextElementSibling.textContent === "实际执行任务的 Agent。任务按路由页的规则分配给它们；没有规则命中时派给\\"默认\\"那一个。")');
+        await check('UI06 执行者区说明文字是按路由分配的新文案', '[...document.querySelectorAll(".sect h2")].some(h => h.textContent === "执行者" && h.nextElementSibling.textContent === "实际执行任务的 Agent。任务依次按任务说明指定、项目规则、全局规则、预设默认规则（可关闭）、兜底和默认执行者分配。")');
         // 037 第 4 项：claude-code 执行者（example）行版本是 Claude Code 风格、不含 codex-cli；codex 行含 codex-cli。
         await check('UI06 claude-code 执行者（example）行的版本不含 codex-cli，codex 行含', 'document.querySelector("[data-agent=example]").textContent.includes("2.1.302 (Claude Code)") && !document.querySelector("[data-agent=example]").textContent.includes("codex-cli") && document.querySelector("[data-agent=codex]").textContent.includes("codex-cli")');
         await save('connect-executors-dark'); nativeTheme.themeSource = 'light'; await save('connect-executors-light'); nativeTheme.themeSource = 'dark';

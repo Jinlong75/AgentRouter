@@ -1,6 +1,7 @@
 // 任务改动（协议 15.9）：ar diff <记录名> --json。零依赖。
 // 范围 base..分支；解析 git diff --numstat -z 与 --name-status -z -M，再逐文件取 patch。
-import { git, parseNameStatusEntriesZ } from './git.mjs';
+import { existsSync } from 'node:fs';
+import { git, parseNameStatusEntriesZ, uncommittedFiles } from './git.mjs';
 import { latestEvent, locateStart, reverseRows } from './wait.mjs';
 import { branchExists } from './worktree.mjs';
 
@@ -73,8 +74,9 @@ function rangeFor({ root, file, start, branch }) {
   return second.status === 0 && base ? { base, head: second.stdout.trim() } : null;
 }
 
-// ar diff：返回 { ok: true, base, head, files, totalBytes, truncated }；不是 worktree 任务或找不到记录时抛出，
+// ar diff：返回 { ok: true, base, head, files, totalBytes, truncated, uncommitted }；不是 worktree 任务或找不到记录时抛出，
 // worktree 与分支都删了算不出时返回 { ok: false, error }。
+// uncommitted 是 worktree 里还没提交的路径（协议 15.9 之外的新字段，见 429）；门禁只看提交。
 // limits 只给测试用（单文件与整体上限）。
 export function diffTask({ homes, root, name, limits = {} } = {}) {
   const fileLimit = limits.file ?? FILE_LIMIT, totalLimit = limits.total ?? TOTAL_LIMIT;
@@ -121,5 +123,11 @@ export function diffTask({ homes, root, name, limits = {} } = {}) {
     } else entry.truncated = false;
     files.push(entry);
   }
-  return { ok: true, base, head, files, totalBytes, truncated };
+  return { ok: true, base, head, files, totalBytes, truncated, uncommitted: uncommittedIn(worktree.dir) };
+}
+
+// worktree 里还没提交的已跟踪改动与未跟踪文件（排除 .agent-runs/）；worktree 不在了或读不到时为空。
+function uncommittedIn(dir) {
+  if (typeof dir !== 'string' || dir === '' || !existsSync(dir)) return [];
+  try { return uncommittedFiles(dir); } catch { return []; }
 }

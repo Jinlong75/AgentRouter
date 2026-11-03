@@ -11,14 +11,23 @@ const subprocessOutcome = r => r.error
   : r.signal ? `signal=${r.signal}` : `status=${r.status}`;
 
 const missing = '找不到 Codex CLI。确认 codex --version 能运行；非标准安装可在 config.json 的 profiles.codex.path 写 Codex 的绝对路径（或运行 ar config path=<路径>）。';
-const launcherFor = file => resolveFile(file, { missing,
+const launcherFor = (file, env) => resolveFile(file, { missing, env,
   unwrapError: file => `无法解析 Codex 的启动包装：${file}。可在 config.json 的 profiles.codex.path 写 codex.exe 或 Codex 的 Node 入口（codex.js）的绝对路径。` });
+export function interactiveLaunch(profile = {}, { model, effort, env = process.env } = {}) {
+  const launcher = resolveLauncher(env, process.platform, profile.path);
+  const args = [...launcher.args];
+  if (model) args.push('-m', model);
+  // codex 的 -c 值按 TOML 解析、解析不了就当原文：low / high 这类单词不加引号，免得经 cmd.exe 打开主导时被当成不安全参数拒绝（295 实测）。
+  if (effort) args.push('-c', 'model_reasoning_effort=' + (/^[A-Za-z0-9._-]+$/.test(effort) ? effort : JSON.stringify(effort)));
+  return { executable: launcher.executable, args, capabilities: { model: true, effort: true } };
+}
+
 export function resolveLauncher(env = process.env, platform = process.platform, configuredPath = null) {
-  if (configuredPath) return launcherFor(configuredPath);
+  if (configuredPath) return launcherFor(configuredPath, env);
   // 测试可指定一个 Node 假 agent；不改变真实安装或 PATH。
   if (testAgent(env)) return { executable: process.execPath, args: [resolve(testAgent(env))] };
   const file = findOnPath(platform === 'win32' ? ['codex.exe', 'codex.cmd'] : ['codex'], env);
-  if (file) return launcherFor(file);
+  if (file) return launcherFor(file, env);
   throw new Error(missing);
 }
 
@@ -92,6 +101,8 @@ export const codex = {
   id: 'codex',
   label: 'Codex',
   writesReport: true,
+  // D181：Codex 执行者在沙箱里写不了 worktree 的 git 锁文件，默认由 AgentRouter 在门禁前代为提交。
+  autoCommitDefault: true,
   // 执行者环境是白名单（../lib/env.mjs）；Codex 还要读自己的配置目录与自定义接口地址（都不是密钥）。
   // 064：执行者的用户目录是沙箱，Codex 的登录在用户真实的 ~/.codex：没设 CODEX_HOME 时指向它（与以前行为一致）。
   // 有 provider（OpenAI 兼容接口）的执行者同样用用户的 ~/.codex：Windows 上可写沙箱按 CODEX_HOME 做初始化，换目录会让沙箱失效；
@@ -112,6 +123,7 @@ export const codex = {
       return { installed: !r.error && r.status === 0, version: r.status === 0 ? r.stdout.trim() || null : null, launcher };
     } catch (error) { return { installed: false, version: null, error: error.message }; }
   },
+  interactiveLaunch,
   command({ root, report, prompt, settings, detection, env = process.env, profile, profileName, readOnly = false }) {
     const launcher = detection?.launcher ?? resolveLauncher(env, process.platform, settings.path);
     const args = [...launcher.args, 'exec', '--json', '-C', root];

@@ -1,6 +1,6 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp as makeTemp,rm,writeFile,readFile,appendFile,mkdir,symlink,readdir } from 'node:fs/promises';
+import { mkdtemp as makeTemp,rm,writeFile,readFile,appendFile,mkdir,stat,symlink,readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 // 186：本文件建的临时目录都登记下来，所有测试跑完后统一删掉（被占用删不掉就重试几次，仍不行就忽略）。
@@ -26,6 +26,57 @@ test('清单合并、半行、坏行、未知字段，end 始终优先于 interr
 });
 test('进程核对拒绝复用 PID、错误进程、未来创建时间与超过 60 秒',()=>{const t=parseRegistry(lines(row()))[0];assert.equal(statusOf(t,[ps]),'run');for(const p of [{...ps,name:'cmd.exe'},{...ps,command:'node unrelated.mjs'},{...ps,created:100001},{...ps,created:40000},{...ps,pid:43}])assert.equal(statusOf(t,[p]),'stop');assert.equal(dispatchMatches(ps,100000),true);});
 test('清单增量与截断恢复',async()=>{const {home,entry}=await fixture(),file=path.join(home,'runs.jsonl'),reader=new RegistryReader();assert.equal((await reader.read(file)).length,1);await appendFile(file,JSON.stringify({v:1,event:'end',id:'sample',exit:0,at:2}));assert.equal((await reader.read(file))[0].status,'run');await appendFile(file,'\n');assert.equal((await reader.read(file))[0].status,'done');await writeFile(file,lines({...entry,id:'new'}));assert.equal((await reader.read(file))[0].id,'new');});
+
+// ---- 319 审查 R11-2：清单续读的 256 字节尾巴核对（295），三条针对性回归 ----
+// 同一文件被截断重写、新大小不小于旧偏移、旧偏移处恰好仍是换行：只按"大小 + 换行"会当成没变过，
+// 必须靠尾巴逐字节比对发现重写，清掉旧记录、把新记录全部读入。
+test('清单被截断重写且新大小不小于旧偏移、旧偏移处仍是换行时，尾巴核对发现重写，旧记录清除、新记录全部读入',async()=>{
+  const {home}=await fixture(),file=path.join(home,'runs.jsonl'),reader=new RegistryReader();
+  // 两行长度相同，只有 id / report 的值不同：重写后总大小不变、最后一个字节仍换行——正是只查换行会漏掉的情形。
+  const oldText=lines(row({id:'old-a'}),row({id:'old-b',report:path.resolve('/demo/project/old-b.md')}));
+  const newText=lines(row({id:'new-a'}),row({id:'new-b',report:path.resolve('/demo/project/new-b.md')}));
+  assert.equal(Buffer.byteLength(newText),Buffer.byteLength(oldText),'前提：新旧内容一样长');
+  assert.equal(oldText.at(-1),'\n');assert.equal(newText.at(-1),'\n');
+  await writeFile(file,oldText);
+  assert.deepEqual((await reader.read(file)).map(t=>t.id).sort(),['old-a','old-b']);
+  const before=await stat(file);
+  await writeFile(file,newText);
+  const after=await stat(file);
+  // 前提：重写后文件身份（ino:birthtimeMs）没变、大小没变小——只可能是尾巴核对这一条发现的重写。
+  assert.equal(`${after.ino}:${after.birthtimeMs}`,`${before.ino}:${before.birthtimeMs}`,'前提：文件身份不变，走尾巴核对而不是身份变化分支');
+  assert.ok(after.size>=before.size,'前提：新大小不小于旧偏移');
+  assert.deepEqual((await reader.read(file)).map(t=>t.id).sort(),['new-a','new-b']);
+});
+// 正常追加多次：其中一次追加超过 2 MB 读取块（读取要分两块）；不能误判重写，前面的记录都还在，记录数正确。
+test('清单正常多次追加（一次跨越 2 MB 读取块）不误判重写，记录数正确',async()=>{
+  const {home}=await fixture(),file=path.join(home,'runs.jsonl'),reader=new RegistryReader();
+  const record=(id:string)=>JSON.stringify(row({id,title:'x'.repeat(1200)}));
+  await writeFile(file,`${record('bulk-0')}\n`);
+  assert.deepEqual((await reader.read(file)).map(t=>t.id),['bulk-0']);
+  const batch=Array.from({length:2000},(_,i)=>record(`bulk-1-${i}`)).join('\n')+'\n';
+  assert.ok(Buffer.byteLength(batch)>2*1024*1024,`前提：这次追加超过 2 MB（${Buffer.byteLength(batch)}）`);
+  await appendFile(file,batch);
+  const second=await reader.read(file);
+  assert.equal(second.length,2001);
+  assert.deepEqual([second.some(t=>t.id==='bulk-0'),second.some(t=>t.id==='bulk-1-1999')],[true,true]);
+  // 之后每次只追一行：尾巴比对仍以已读位置为准，续读不乱。
+  await appendFile(file,`${record('bulk-2')}\n`);
+  await appendFile(file,`${record('bulk-3')}\n`);
+  const third=await reader.read(file);
+  assert.equal(third.length,2003);
+  assert.deepEqual(third.filter(t=>t.id==='bulk-2'||t.id==='bulk-3').map(t=>t.id).sort(),['bulk-2','bulk-3']);
+});
+// 半行写入后再补齐：半行不解析、已读位置不动，补齐后从半行开头照常续读（不重复、不丢）。
+test('清单半行写入后再补齐，照常续读',async()=>{
+  const {home}=await fixture(),file=path.join(home,'runs.jsonl'),reader=new RegistryReader();
+  await writeFile(file,lines(row({id:'half-a'})));
+  assert.deepEqual((await reader.read(file)).map(t=>t.id),['half-a']);
+  const second=JSON.stringify(row({id:'half-b'})),cut=Math.floor(second.length/2);
+  await appendFile(file,second.slice(0,cut));
+  assert.deepEqual((await reader.read(file)).map(t=>t.id),['half-a']);
+  await appendFile(file,`${second.slice(cut)}\n`);
+  assert.deepEqual((await reader.read(file)).map(t=>t.id).sort(),['half-a','half-b']);
+});
 test('事件尾页、增量半行与前向翻页按字节限制，未知事件忽略',async()=>{const {task}=await fixture();const make=(seq:number)=>({v:1,seq,at:seq,kind:'say',text:'中文'.repeat(60)});const source=Array.from({length:9000},(_,i)=>make(i+1));await writeFile(task.events!,lines(...source));const page=await readEvents(task);assert.ok(page.cursor.start>0);assert.ok(page.cursor.end-page.cursor.start<=PAGE_BYTES);assert.equal(page.events.at(-1)?.seq,9000);const before=await readEvents(task,page.cursor,true);assert.ok(before.events.length>0);assert.ok(before.events.at(-1)!.seq<page.events[0].seq);assert.equal(before.cursor.end,page.cursor.end);const next=make(9001);await appendFile(task.events!,JSON.stringify(next));assert.equal((await readEvents(task,page.cursor)).events.length,0);await appendFile(task.events!,'\n'+lines({v:1,seq:9002,at:0,kind:'future'}));const update=await readEvents(task,page.cursor);assert.equal(update.events.length,1);assert.equal(update.events[0].text,next.text);await writeFile(task.events!,lines(make(1)));assert.equal((await readEvents(task,update.cursor)).reset,true);});
 test('旧进度解析包括错误、计划、命令失败与统一文件事件；不读取原始 log',async()=>{assert.equal(parseEvent('[12:00:00] 错误：失败',0,true)?.kind,'error');assert.equal(parseEvent('[12:00:00] 出错：失败',0,true)?.kind,'error');assert.deepEqual(parseEvent('[12:00:00] 计划：[x] 第一步 [ ] 第二步',0,true)?.items,[{text:'第一步',done:true},{text:'第二步',done:false}]);assert.equal(parseEvent('[12:00:00]   命令失败（exit 1）：npm test',0,true)?.exit,1);assert.equal(parseEvent('[12:00:00] 新增文件：src/demo.ts',0,true)?.files?.[0].kind,'add');const {task}=await fixture();task.raw=task.progress.replace('.progress.log','.log');await writeFile(task.raw,'private raw');await writeFile(task.progress,'[12:00:00] 说：进度\n');assert.equal((await readEvents(task)).events[0].text,'进度');});
 test('提交号与安全 Markdown，只允许 http(s) 链接，无 HTML 执行',()=>{assert.equal(commitFrom('`123456` `4f2a9c1` `b81e0d2`'),'4f2a9c1');assert.equal(commitFrom('`1234567890123`'),undefined);const html=markdown('# 汇报\n<script>alert(1)</script>\n[bad](javascript:alert)\n[ok](https://example.org/)\n## TODO(design) 1 条\n- 待定\n## 推断清单\n1. 一项\n```html\n<img src=x onerror=alert(1)>\n```');assert.ok(!html.includes('<script>'));assert.ok(!html.includes('<img'));assert.ok(!html.includes('href="javascript:'));assert.ok(html.includes('href="https://example.org/"'));assert.equal((html.match(/class="hl brand"/g)??[]).length,2);assert.equal((markdown('## TODO(lead) 1 条\n- 待定').match(/class="hl brand"/g)??[]).length,1);});

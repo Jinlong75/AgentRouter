@@ -36,6 +36,14 @@ const PATH_SHOWN = 5;
 const failure = (error: unknown) => String((error as Error)?.message || error);
 // 核心错误码（console 通道失败时随错误带出）：用来识别"没有提交身份"并在失败横幅里给出设置按钮。
 const errorCode = (error: unknown) => (error as Error & { code?: unknown })?.code;
+// 424：任务说明只提交在当前分支上（核心的 SPEC_BASE）。错误里带 current / base 时，失败横幅改成可以
+// "以当前分支为基线派发"；游离 HEAD 的那条没有 current，仍显示核心原文。
+const specBase = (error: unknown) => {
+    if (errorCode(error) !== 'SPEC_BASE') return null;
+    const value = error as { current?: unknown; base?: unknown };
+    if (typeof value.current !== 'string' || !value.current) return null;
+    return { current: value.current, base: typeof value.base === 'string' ? value.base : '' };
+};
 const lines = (value: unknown) => Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string' && !!x.trim()) : [];
 const requiredHint = (name: string) => `<span class="fhint fail" data-nt-required role="alert">${esc(nt.required(name))}</span>`;
 const emptyForm = (): FormState => ({ title: '', goal: '', type: 'code', allowed: '', verify: '', nonGoals: '', refs: '', questions: '', text: '' });
@@ -74,6 +82,9 @@ export class NewTaskView {
     // 派发因缺少提交身份失败：失败横幅里带"设置提交身份…"；文件已写好时记下相对路径与表单指纹，重试直接派发它。
     private identityFailure = false;
     private pendingSpec: { rel: string; key: string } | null = null;
+    // 424：派发因"任务说明只在当前分支上"失败（SPEC_BASE）；横幅里给"以当前分支为基线派发"与"取消"。
+    // spec / key 记下失败时已经写好的说明与表单指纹，重派时不再创建第二份说明。
+    private baseFailure: { current: string; base: string; spec: string; key: string } | null = null;
     private dry: { rel: string; content: string } | null = null;
     private busy = false;
     private loaded = false;
@@ -106,6 +117,7 @@ export class NewTaskView {
         this.failure = '';
         this.error = '';
         this.invalid = '';
+        this.baseFailure = null;
         container.onclick = e => this.click(e);
         container.onkeydown = e => this.keys(e);
         container.oninput = e => this.input(e);
@@ -378,7 +390,7 @@ export class NewTaskView {
         if (!this.enabledAgents().length) return '';
         const label = this.workerLabel();
         if (!label) return '';
-        if (this.source === 'text') return nt.conseqText(label);
+        if (this.source === 'text') return this.show?.config?.worktree === true ? nt.conseqText(label) : nt.conseqTextDirect(label);
         if (this.source === 'existing') return this.selectedSpec ? nt.conseqExisting(this.selectedSpec, label) : '';
         const plan = this.gatePlan(), text = nt.conseqNew(this.dry?.rel || FALLBACK_SPEC, label, this.commit || plan.gate);
         // 会跑门禁时说明后果：结束时由核心跑验收命令，条数用合并后的结果（后缀文案在 copy.ts 的 nt.conseqGate）。
@@ -548,6 +560,11 @@ export class NewTaskView {
     }
 
     private banner() {
+        // 424：说明只在当前分支上——写出原因，并给"以当前分支为基线派发"；取消只关横幅。
+        if (this.baseFailure) {
+            const { current, base } = this.baseFailure, disabled = this.busy ? 'disabled' : '';
+            return `<div class="banner fail" role="alert" data-nt-base-banner><span class="mk fail">${icon('close-circle-line')}</span><div class="rt"><b>${esc(nt.baseTitle(current))}</b><span>${esc(nt.baseBody(current, base))}</span></div><button class="btn primary sm" data-nt-base-current ${disabled}>${esc(nt.baseUseCurrent(current))}</button><button class="btn sm" data-nt-base-dismiss ${disabled}>${esc(nt.baseDismiss)}</button></div>`;
+        }
         if (this.failure)
             return `<div class="banner fail" role="alert"><span class="mk fail">${icon('close-circle-line')}</span><div class="rt"><b>${esc(nt.failed)}</b><span>${esc(this.failure)}</span></div>${this.identityFailure ? this.identityButton() : ''}</div>`;
         if (this.error)
@@ -631,6 +648,8 @@ export class NewTaskView {
         if (d.ntCommit !== undefined) return '[data-nt-commit]';
         if (d.ntPreview !== undefined) return '[data-nt-preview]';
         if (d.ntDispatch !== undefined) return '[data-nt-dispatch]';
+        if (d.ntBaseCurrent !== undefined) return '[data-nt-base-current]';
+        if (d.ntBaseDismiss !== undefined) return '[data-nt-base-dismiss]';
         if (d.ntIdentity !== undefined) return '[data-nt-identity]';
         if (d.ntSource) return `[data-nt-source="${d.ntSource}"]`;
         if (d.ntType) return `[data-nt-type="${d.ntType}"]`;
@@ -679,6 +698,19 @@ export class NewTaskView {
         if (d.ntCommit !== undefined) { this.commit = !this.commit; this.render(); this.updateNote(); return; }
         if (d.ntPreview !== undefined) { void this.preview(button); return; }
         if (d.ntDispatch !== undefined) { void this.dispatch(); return; }
+        if (d.ntBaseCurrent !== undefined) {
+            const failed = this.baseFailure;
+            if (!failed) return;
+            this.baseFailure = null;
+            void this.dispatch(failed.current, failed.spec ? { spec: failed.spec, key: failed.key } : undefined);
+            return;
+        }
+        if (d.ntBaseDismiss !== undefined) {
+            this.baseFailure = null;
+            this.render();
+            this.container?.querySelector<HTMLElement>('[data-nt-dispatch]')?.focus({ preventScroll: true });
+            return;
+        }
         if (d.ntIdentity !== undefined) { this.editIdentity(button); return; }
     }
 
@@ -712,6 +744,7 @@ export class NewTaskView {
                 this.error = '';
                 this.identityFailure = false;
                 this.pendingSpec = null;
+                this.baseFailure = null;
                 this.render();
                 void this.loadProject(p.path);
             },
@@ -905,13 +938,16 @@ export class NewTaskView {
         this.pathCheck = null;
         this.pathSeq++;
         this.pendingSpec = null;
+        this.baseFailure = null;
         this.invalid = '';
         this.failure = '';
         this.error = '';
         this.identityFailure = false;
     }
 
-    private async dispatch() {
+    // base / retry：424 从"以当前分支为基线派发"进来时，base 是那条分支；retry 是上一次失败时用的参数
+    // （表单指纹没变才沿用，新建说明时不再创建第二份文件）。
+    private async dispatch(base?: string, retry?: { spec: string; key: string }) {
         if (!this.canDispatch()) return;
         const missing = this.missing();
         if (missing) { this.failValidation(missing.key, missing.name); return; }
@@ -919,20 +955,31 @@ export class NewTaskView {
         const project = this.project, source = this.source, form = this.formPayload(), commit = this.commit || this.gatePlan().gate;
         // 表单指纹：只有内容没变时才沿用上次已经写好的任务说明，避免派发到旧文件。
         const key = JSON.stringify([form, commit]);
+        const reused = retry && retry.key === key ? retry.spec : '';
         let planned = '';
         this.busy = true;
         this.invalid = '';
         this.failure = '';
         this.error = '';
         this.identityFailure = false;
+        this.baseFailure = null;
         this.render();
         try {
             let id = '';
             if (source === 'new') {
                 let rel = '', content = '';
+                // 424：以当前分支为基线重派时，上次已经写好了说明（表单没变）：直接派发这一份，不重复编号。
+                if (reused) {
+                    try {
+                        const read = await window.dock.console('specs:read', { project, rel: reused });
+                        rel = reused;
+                        content = String(read?.content ?? '');
+                    }
+                    catch { /* 文件不在了就按新说明重新创建。 */ }
+                }
                 // 上次因缺少提交身份失败：任务说明文件已经写好了，直接派发这一份，不重复编号。
                 const pending = this.pendingSpec;
-                if (pending && pending.key === key) {
+                if (!rel && pending && pending.key === key) {
                     try {
                         const read = await window.dock.console('specs:read', { project, rel: pending.rel });
                         rel = pending.rel;
@@ -952,10 +999,10 @@ export class NewTaskView {
                 this.pendingSpec = null;
                 this.selectedSpec = rel;
                 this.dry = { rel, content };
-                id = await this.send(project, { source: 'spec', spec: rel });
+                id = await this.send(project, { source: 'spec', spec: rel, ...(base ? { base } : {}) });
             }
             else if (source === 'existing')
-                id = await this.send(project, { source: 'spec', spec: this.selectedSpec });
+                id = await this.send(project, { source: 'spec', spec: reused || this.selectedSpec, ...(base ? { base } : {}) });
             else
                 id = await this.send(project, { source: 'text', text: this.form.text });
             this.busy = false;
@@ -965,12 +1012,20 @@ export class NewTaskView {
         }
         catch (error) {
             this.busy = false;
-            // 文件已写好但提交失败：横幅里给设置按钮；补好身份后再点派发，直接派发这份文件。
-            if (source === 'new' && errorCode(error) === 'NEED_GIT_IDENTITY') {
-                this.identityFailure = true;
-                if (planned) this.pendingSpec = { rel: planned, key };
+            const alt = specBase(error);
+            if (alt) {
+                // 424：说明只在当前分支上——记下当前分支与失败时用的说明（新建说明已写好，重派直接沿用）。
+                this.baseFailure = { ...alt, spec: source === 'text' ? '' : this.selectedSpec, key };
+                this.failure = '';
             }
-            this.failure = failure(error);
+            else {
+                // 文件已写好但提交失败：横幅里给设置按钮；补好身份后再点派发，直接派发这份文件。
+                if (source === 'new' && errorCode(error) === 'NEED_GIT_IDENTITY') {
+                    this.identityFailure = true;
+                    if (planned) this.pendingSpec = { rel: planned, key };
+                }
+                this.failure = failure(error);
+            }
             this.render();
         }
     }

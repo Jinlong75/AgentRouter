@@ -92,7 +92,7 @@ test('presets --json：带 effortOptions / modelOptions / listModels / types；�
     assert.deepEqual(by(name).effortOptions, ['low', 'medium', 'high', 'xhigh', 'max'], name);
   }
   assert.deepEqual(by('codex').effortOptions, ['minimal', 'low', 'medium', 'high', 'xhigh']);
-  assert.deepEqual(by('deepseek').modelOptions, ['deepseek-v4-pro', 'deepseek-v4-flash']);
+  assert.deepEqual(by('deepseek').modelOptions, ['deepseek-v4-flash', 'deepseek-v4-pro']);
   assert.ok(!('listModels' in by('deepseek')), '没有的字段不输出');
   assert.deepEqual(by('deepseek').types, ['test', 'docs']);
   const qoder = by('qoder-cn');
@@ -198,7 +198,7 @@ test('models：有 listModels 就运行程序（带密钥与沙箱用户目录�
   assert.match(text.text, /^模型（来自程序的列表）：\n {2}A\n {2}B\n/);
 
   // 预设来源。
-  assert.deepEqual((await call(['agents', 'models', 'deepseek', '--json'])).json, { ok: true, models: ['deepseek-v4-pro', 'deepseek-v4-flash'], source: 'preset' });
+  assert.deepEqual((await call(['agents', 'models', 'deepseek', '--json'])).json, { ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'], source: 'preset' });
   assert.deepEqual((await call(['agents', 'models', 'claude-native', '--json'])).json, { ok: true, models: [], source: 'preset' });
   assert.match((await call(['agents', 'models', 'claude-native'])).text, /没有可选的模型列表/);
   assert.match((await call(['agents', 'models', 'nope', '--json'])).json.error, /找不到执行者：nope/);
@@ -606,18 +606,17 @@ test('update --escalate：必须是已有执行者且不是自己；空串删除
   assert.ok(!('escalate' in config().profiles.deepseek));
 });
 
-test('qoder-cn 预设默认模型 DeepSeek-Flash、推理强度 ultracode；国际版不变', async t => {
+test('qoder-cn 和国际版预设默认模型、推理强度均为 null', async t => {
   const { call, config } = setup(t);
   await call(['agents', 'add', '--preset', 'qoder-cn']); await call(['agents', 'add', '--preset', 'qoder']);
-  assert.deepEqual([config().profiles['qoder-cn'].model, config().profiles['qoder-cn'].effort], ['DeepSeek-Flash', 'ultracode']);
+  assert.deepEqual([config().profiles['qoder-cn'].model, config().profiles['qoder-cn'].effort], [null, null]);
   assert.deepEqual([config().profiles.qoder.model, config().profiles.qoder.effort], [null, null]);
   assert.ok(loadPreset('qoder-cn').profile.modelOptions.includes('DeepSeek-Flash') && loadPreset('qoder-cn').profile.effortOptions.includes('ultracode'));
 });
-test('presets --json：预设给了默认模型 / 推理强度（Qoder 国内版）时带 model / effort，没给的不带', async t => {
+test('presets --json：没有默认模型 / 推理强度时不带 model / effort', async t => {
   const { call } = setup(t);
   const by = Object.fromEntries((await call(['agents', 'presets', '--json'])).json.presets.map(p => [p.name, p]));
-  assert.deepEqual([by['qoder-cn'].model, by['qoder-cn'].effort], ['DeepSeek-Flash', 'ultracode']);
-  for (const name of ['qoder', 'deepseek', 'codex', 'openai-compat']) assert.ok(!('model' in by[name]) && !('effort' in by[name]), name);
+  for (const name of ['qoder-cn', 'qoder', 'deepseek', 'codex', 'openai-compat']) assert.ok(!('model' in by[name]) && !('effort' in by[name]), name);
 });
 test('import：单独的声明加 --name 导入，结果与 add --generic 逐字段相同；同名拒绝；不合法什么都不写；无 --name 提示加 --name', async t => {
   const a = setup(t), b = setup(t);

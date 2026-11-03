@@ -81,7 +81,7 @@ function recordDir(start) {
 const marksFile = start => path.join(recordDir(start), 'marks.json');
 
 // 归因标记：{ v: 1, blame: { "<n>": "spec" | "environment" } }。读不了、格式不对、未知值都当作没有。返回 Map<尝试编号, 'spec' | 'environment'>。
-const readMarks = start => readMarksAt(marksFile(start));
+export const readMarks = start => readMarksAt(marksFile(start));
 function readMarksAt(file) {
   try {
     const value = readJson(file);
@@ -101,7 +101,7 @@ function readGateFile(file) {
 }
 
 // 清单里的尝试：attempt 事件加对应的 attempt-end；Stage04 及更早的任务没有 attempt 事件，按一次尝试合成。
-function readAttempts({ start, rows, dir, blamed }) {
+export function readAttempts({ start, rows, dir, blamed }) {
   const ends = new Map();
   for (const row of rows) if (row.event === 'attempt-end' && Number.isSafeInteger(row.n)) ends.set(row.n, row);
   let list = rows.filter(row => row.event === 'attempt' && Number.isSafeInteger(row.n)).map(row => ({ n: row.n, reason: row.reason ?? null, profile: row.profile ?? start.profile ?? null, end: ends.get(row.n) ?? null }));
@@ -373,6 +373,23 @@ function reviewerGroup({ rows, dir, weights }) {
   };
 }
 
+// 找到同项目派发时刻之前最近的一条主导启动记录。
+function leadLaunch(home, project, at) {
+  // Windows 下项目路径不区分大小写（与项目登记表的比较规则一致，273 审查）。
+  const samePath = (a, b) => process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+  if (!Number.isFinite(at) || typeof project !== 'string') return null;
+  let text;
+  try { text = readFileSync(path.join(home, 'leads.jsonl'), 'utf8'); } catch { return null; }
+  let latest = null;
+  for (const line of text.split('\n')) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row?.v !== 1 || row.event !== 'lead-launch' || typeof row.project !== 'string' || !samePath(row.project, project) || !Number.isFinite(row.at) || row.at > at || typeof row.label !== 'string' || !(row.model === null || typeof row.model === 'string') || !(row.effort === null || typeof row.effort === 'string')) continue;
+    if (!latest || row.at >= latest.at) latest = row;
+  }
+  return latest ? { label: latest.label, model: latest.model, effort: latest.effort, at: latest.at } : null;
+}
+
 // 只读：返回报告对象。home 可以是公共目录，也可以是 [新目录, 旧目录]。任务还在进行、不是用任务说明派发的任务抛出中文原因（退出码 2）。
 export function buildReport({ home, root, name, env = process.env }) {
   const homes = homesOf(home);
@@ -416,7 +433,7 @@ export function buildReport({ home, root, name, env = process.env }) {
   return {
     ok: true, id: start.id, name: start.name, state: taskStateName,
     executor: { score: executor.score, cap, items: executor.items, perf: executorPerf({ attempts, counts, start, prices: priceSetting.prices }) },
-    lead: { score: lead.score, items: lead.items, perf: { ms: startedAt !== null && lastEnd && Number.isFinite(lastEnd.at) ? lastEnd.at - startedAt : null, awaitMs, usage, usageState } },
+    lead: { score: lead.score, items: lead.items, launch: leadLaunch(homes[0], start.repo, Number.isFinite(start.at) ? start.at : start.started), perf: { ms: startedAt !== null && lastEnd && Number.isFinite(lastEnd.at) ? lastEnd.at - startedAt : null, awaitMs, usage, usageState } },
     ...(reviewer ? { reviewer } : {}),
     attempts: attempts.map(item => ({ n: item.n, reason: item.reason, profile: item.profile, exit: Number.isFinite(item.end?.exit) ? item.end.exit : null, gate: item.gate, summary: item.summary, blame: item.blame })),
     weights: reviewer ? weights : (({ reviewer: _, ...rest }) => rest)(weights),
@@ -481,6 +498,8 @@ export function reportLines(report) {
     ...(lead.awaitMs === null ? [] : [`等待验收 ${durationText(lead.awaitMs)}`]),
     lead.usageState === 'off' ? 'token 没有读取（config.json 的 leadUsage 为 false）' : lead.usage ? tokenText(lead.usage) : 'token 读取不到会话记录',
   ]);
+  const launch = report.lead.launch;
+  lines.push(launch ? `  主导：${launch.label}，启动参数 模型 ${launch.model ?? '工具默认'}、强度 ${launch.effort ?? '工具默认'}（会话里后来是否换过模型，AgentRouter 无法得知）` : '  主导：没有启动记录（不是从 AgentRouter 打开的主导）');
   if (report.reviewer) {
     const review = report.reviewer, perf = review.perf;
     section('审查者', review, 'reviewer', [

@@ -77,7 +77,7 @@ function fixture(t, { project = {} } = {}) {
   f.rows = () => readLines(path.join(home, 'push.jsonl'));
   f.setProfile = value => writeFileSync(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n## 需要越界\n无\n', exit: 0, ...value } },
   }));
   f.setProfile({});
   f.config = () => JSON.parse(readFileSync(path.join(repo, '.agent-router/project.json'), 'utf8'));
@@ -450,7 +450,7 @@ test('16 批准后推送：afterAccept 为 true 时合并后远程出现合并�
   const run = f.ar(['accept', task.name, '--json']);
   assert.equal(run.code, 0, run.stderr + run.stdout);
   const value = run.json();
-  assert.deepEqual(Object.keys(value), ['ok', 'merge', 'mode', 'cleanup', 'push']);
+  assert.deepEqual(Object.keys(value), ['ok', 'merge', 'mode', 'cleanup', 'fullVerify', 'hints', 'acceptHints', 'checks', 'push']);
   assert.deepEqual(value.push, { ok: true, pushed: true });
   assert.equal(f.remoteHead(), value.merge, '远程出现合并提交');
   assert.equal(git(f.repo, ['rev-parse', 'HEAD']), value.merge);
@@ -495,7 +495,7 @@ test('18 批准后推送：--no-push 覆盖配置；没配置也没传 --push �
   const remoteBefore = f.remoteHead();
   const skipped = f.ar(['accept', first.name, '--no-push', '--json']);
   assert.equal(skipped.code, 0, skipped.stderr + skipped.stdout);
-  assert.deepEqual(Object.keys(skipped.json()), ['ok', 'merge', 'mode', 'cleanup']);
+  assert.deepEqual(Object.keys(skipped.json()), ['ok', 'merge', 'mode', 'cleanup', 'fullVerify', 'hints', 'acceptHints', 'checks']);
   assert.equal(f.remoteHead(), remoteBefore);
   assert.ok(!f.runs().some(row => row.id === first.id && row.event === 'push'));
   assert.deepEqual(f.rows(), []);
@@ -505,7 +505,7 @@ test('18 批准后推送：--no-push 覆盖配置；没配置也没传 --push �
   git(f.repo, ['commit', '-q', '-am', '提交配置']);
   const second = f.task('没配置');
   const plain = f.ar(['accept', second.name, '--json']);
-  assert.deepEqual(Object.keys(plain.json()), ['ok', 'merge', 'mode', 'cleanup'], '没推送时与以前逐字相同');
+  assert.deepEqual(Object.keys(plain.json()), ['ok', 'merge', 'mode', 'cleanup', 'fullVerify', 'hints', 'acceptHints', 'checks'], '没推送时不包含 push');
   assert.equal(f.remoteHead(), remoteBefore);
 
   const third = f.task('显式推送');

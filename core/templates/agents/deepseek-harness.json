@@ -1,5 +1,6 @@
 {
   "name": "deepseek-harness",
+  "deploy": { "package": "@deepseek-ai/dsh" },
   "adapter": "generic",
   "label": "DeepSeek Harness",
   "enabled": true,
@@ -10,6 +11,7 @@
   "generic": {
     "label": "DeepSeek Harness",
     "executable": "dsh",
+    "requiresSystemNode": true,
     "detect": ["--version"],
     "args": ["headless", "--json", "-"],
     "readOnlyEnv": { "DSH_PERMISSION_MODE": "read-only" },
@@ -23,14 +25,15 @@
     "report": "lastSay",
     "failureHints": [
       { "match": "unauthorized|authentication|\\b401\\b|DEEPSEEK_API_KEY", "text": "DeepSeek Harness 没拿到 DeepSeek 的 API Key：设为用户环境变量 DEEPSEEK_API_KEY" },
-      { "match": "找不到 DeepSeek Harness 的程序|ENOENT|dsh.*(not found|不是内部或外部命令)|command not found", "text": "没有找到 dsh：用 npm 安装 @deepseek-ai/dsh（需要 Node.js），装好后重新检测" },
+      { "match": "找不到 DeepSeek Harness 的程序|ENOENT|dsh.*(not found|不是内部或外部命令)|command not found", "text": "没有找到 dsh：可在 AgentRouter 中安装，或自行用 npm 安装 @deepseek-ai/dsh（需要 Node.js）；安装后重新检测" },
       { "match": "\\b429\\b|rate[ _-]?limit|too many requests|quota|insufficient[ _-]?balance|余额不足", "text": "DeepSeek 的接口被限流或余额不足：等一会儿再试，或到 DeepSeek 平台充值，或换别的执行者", "kind": "limit" }
     ]
   },
   "supportsEffort": false,
   "types": ["docs", "test", "research"],
   "title": "DeepSeek Harness",
-  "description": "DeepSeek 官方的开源 Agent（开发者预览），用 DeepSeek 的 API Key；没有 Claude、Codex 订阅时可以用它。需要自己用 npm 安装 @deepseek-ai/dsh",
+  "description": "DeepSeek 官方的开源 Agent（开发者预览），用 DeepSeek 的 API Key；没有 Claude、Codex 订阅时可以用它。可由 AgentRouter 安装，也可自行用 npm 安装 @deepseek-ai/dsh",
   "recommended": false,
-  "order": 8.5
+  "order": 8.5,
+  "fit": {"good": ["适合文档、测试、调研"], "avoid": []}
 }

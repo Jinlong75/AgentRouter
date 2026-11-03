@@ -1,0 +1,42 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative, isAbsolute } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { main } from '../../core/lib/cli.mjs';
+
+test('开工包和 next 提示技能问题，无问题时输出保持原样', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'ar-skills-cli-'));
+  assert.ok(!relative(tmpdir(), dir).startsWith('..') && !isAbsolute(relative(tmpdir(), dir)));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = join(dir, 'repo'), home = join(dir, 'home'), claude = join(dir, 'claude');
+  for (const p of [root, home, claude, join(root, '.agent-router')]) mkdirSync(p, { recursive: true });
+  const git = (...args) => { const r = spawnSync('git', args, { cwd: root, shell: false, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); };
+  git('init', '-q'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+  writeFileSync(join(root, '.agent-router', 'project.json'), '{}'); git('add', '.agent-router/project.json'); git('commit', '-qm', 'fixture');
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ v: 2, concurrency: 1 }));
+  const env = { ...process.env, AGENT_ROUTER_HOME: home, CLAUDE_CONFIG_DIR: claude };
+  const scriptPath = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
+  const call = async args => { const out = []; assert.equal(await main(args, { cwd: root, env, scriptPath, out: x => out.push(x) }), 0); return out.join('\n'); };
+  for (const skill of ['agent-router', 'lead-workflow']) mkdirSync(join(claude, 'skills', skill), { recursive: true });
+  const bad = JSON.parse(await call(['next', '--json']));
+  assert.deepEqual(bad.skills.issues.map(i => i.kind), ['missing']);
+  assert.match(await call(['next']), /名额：[^\n]*\n技能需要更新：没有安装技能 lead-practices（ar lead brief 看详情）/);
+  // 开工包第一行是"本机核心命令：…"（431），技能版本一节紧随其后。
+  assert.match(await call(['lead', 'brief']), /^本机核心命令：[^\n]*\n\n## 技能版本\n没有安装技能 lead-practices\n更新技能：/);
+  const dispatchBad = await call(['next', '--dispatch']);
+  assert.match(dispatchBad, /^基线：[^\n]+\n技能需要更新：没有安装技能 lead-practices（ar lead brief 看详情）/);
+  assert.doesNotMatch(dispatchBad, /名额：/);
+  assert.deepEqual(JSON.parse(await call(['next', '--dispatch', '--json'])).skills, bad.skills);
+  mkdirSync(join(claude, 'skills', 'lead-practices'));
+  assert.equal(await call(['next', '--dispatch']), dispatchBad.split('\n').filter(line => !line.startsWith('技能需要更新：')).join('\n'));
+  assert.equal(Object.hasOwn(JSON.parse(await call(['next', '--dispatch', '--json'])), 'skills'), false);
+  const clean = JSON.parse(await call(['next', '--json']));
+  assert.equal(Object.hasOwn(clean, 'skills'), false);
+  assert.doesNotMatch(await call(['next']), /技能需要更新/);
+  delete bad.skills;
+  clean.slots = bad.slots;
+  assert.deepEqual(clean, bad);
+});

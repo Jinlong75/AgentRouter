@@ -106,8 +106,8 @@ export async function acquireSlot({
 }
 
 // ---- 独占标记（并行调度 140）----
-// slots/exclusive.json：独占门禁（验收命令在项目配置 exclusiveCommands 里）运行期间存在，内容 { id, pid, created, at, name, command }。
-// 回收规则同名额文件：占用者不存活（或 PID 被复用）就回收。标记存在时不开始新任务、不开始别的门禁。
+// slots/exclusive.json：独占门禁运行期间存在，内容 { id, pid, created, at, name, command, scope }。
+// 回收规则同名额文件；任何标记都阻挡其他门禁，full 或旧标记还阻挡新任务。
 const exclusiveFile = home => join(slotsDir(home), 'exclusive.json');
 // 读不了内容的标记（可能正在写）按"还在"处理；超过这么久还读不了说明写到一半进程就没了，按孤立回收。
 const UNREADABLE_EXCLUSIVE_MS = 10000;
@@ -131,11 +131,11 @@ export async function readExclusive({ home, isAlive = pidAlive, createdOf = proc
 
 // 建标记；别的任务的标记还在（占用者存活）返回 null，成功返回释放函数（可重复调用，只删自己写的那份）。
 export async function acquireExclusive({
-  home, id, name, command, pid = process.pid, created, now = Date.now, isAlive = pidAlive, createdOf = processCreated,
+  home, id, name, command, scope = 'full', pid = process.pid, created, now = Date.now, isAlive = pidAlive, createdOf = processCreated,
 }) {
   mkdirSync(slotsDir(home), { recursive: true });
   const own = created === undefined ? await createdOf(pid) : created;
-  const content = JSON.stringify({ id, pid, created: Number.isFinite(own) ? own : null, at: now(), name, command });
+  const content = JSON.stringify({ id, pid, created: Number.isFinite(own) ? own : null, at: now(), name, command, scope });
   const file = exclusiveFile(home);
   for (let tries = 0; tries < 2; tries++) {
     try {

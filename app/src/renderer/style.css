@@ -432,6 +432,23 @@ button{cursor:default;} :focus-visible{outline:2px solid var(--focus);outline-of
 .wiz-body h1 { margin: 0 0 6px; font-size: var(--fs-page); line-height: 28px; font-weight: 500; }
 .wiz-body > p { margin: 0 0 20px; color: var(--text-2); }
 .wiz-f { width: 100%; max-width: 560px; display: flex; align-items: center; gap: 8px; padding-top: 16px; }
+/* 302：安装进度不知道总量（npm 下载），只表示"还在进行"，不写百分比。 */
+.wiz-prog { height: 8px; margin: 16px 0 8px; border-radius: var(--r-pill); background: var(--surface-2); overflow: hidden; }
+.wiz-prog > span { display: block; width: 40%; height: 100%; border-radius: var(--r-pill); background: var(--run); animation: wiz-prog 1.4s ease-in-out infinite; }
+@keyframes wiz-prog { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .wiz-prog > span { animation: none; width: 100%; opacity: .5; } }
+/* 安装中的"当前步骤 · 已用 N 秒"一行：左边步骤名可很长，右边时间不换行。 */
+[data-wizard-progress] { display: flex; align-items: baseline; gap: 8px; }
+[data-wizard-progress] [data-wizard-elapsed] { margin-left: auto; white-space: nowrap; }
+/* 423（D180）：Harness 安装的四步分进度：步骤名、进度条、状态文字，下载 / 依赖行再带大小。 */
+.hsteps { display: grid; gap: 10px; margin: 16px 0 8px; }
+.hstep { display: grid; grid-template-columns: var(--mark) 84px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; font-size: var(--fs-small); line-height: var(--lh-small); }
+.hstep .hstep-name { color: var(--text-3); white-space: nowrap; }
+.hstep[data-state=run] .hstep-name, .hstep[data-state=done] .hstep-name { color: var(--text-2); }
+.hstep .bar { height: 4px; }
+.hstep .wiz-prog { flex: none; height: 4px; margin: 0; }
+.hstep .hstep-state { color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.hstep .hstep-bytes { white-space: nowrap; }
 .choice { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface); }
 .choice + .choice { margin-top: 8px; }
 .choice .cb { width: 16px; height: 16px; margin-top: 2px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); display: grid; place-items: center; flex: 0 0 auto; }
@@ -974,3 +991,64 @@ mark.hit { background: var(--brand-soft); color: var(--text); border-radius: 2px
 .ovg-h { display: flex; flex-direction: column; gap: 2px; padding: 4px 10px 6px; font-size: var(--fs-small); line-height: var(--lh-small); color: var(--text-3); min-width: 0; }
 .ovg-h > * { min-width: 0; overflow-wrap: anywhere; }
 .ovg-h b { font-weight: 500; color: var(--text-2); }
+.kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; padding: 14px 16px; }
+.kpi { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.kpi .lb { color: var(--text-3); font-size: var(--fs-small); line-height: var(--lh-small); }
+.kpi .v { color: var(--text); font-size: 20px; line-height: 24px; }
+.kpi .sub { color: var(--text-3); font-size: 11px; line-height: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stat-miss { color: var(--text-3); cursor: help; border-bottom: 1px dashed var(--border); }
+.stat-tw { overflow-x: auto; }
+.stat-tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-small); }
+.stat-tbl th, .stat-tbl td { padding: 8px; border-bottom: 1px solid var(--divider); text-align: left; white-space: nowrap; }
+.stat-tbl th { color: var(--text-3); font-weight: 400; background: var(--surface-2); }
+.stat-tbl tbody tr:last-child td { border-bottom: 0; }
+.stat-tbl td { color: var(--text-2); }
+.stat-tbl .al-r { text-align: right; }
+.stat-name { display: flex; align-items: center; gap: 8px; }
+.stat-name > span { color: var(--text); }
+.stat-ratio { display: inline-flex; align-items: baseline; gap: 6px; }
+.stat-ratio b { font-weight: 400; color: var(--text); }
+.stat-ratio .ci { color: var(--text-3); font-size: 11px; }
+.stat-ratio.weak b { color: var(--text-3); }
+/* 427：列头说明、方向箭头与来源行 */
+.stat-help { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; margin-left: 4px; padding: 0; border: 0; background: transparent; color: var(--text-3); cursor: help; vertical-align: middle; }
+.stat-help:hover, .stat-help:focus-visible { color: var(--text); }
+.stat-help .ri { font-size: 14px; }
+.stat-dir { display: inline-flex; align-items: center; margin-left: 3px; color: var(--text-3); vertical-align: middle; }
+.stat-dir .ri { font-size: 12px; }
+.stat-help-text { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.stat-source { margin: 0 0 12px; font-size: var(--fs-small); }
+.stat-source button { margin-left: 6px; }
+.stat-hint { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; color: var(--text-3); font-size: var(--fs-small); }
+.stat-hint i { font-size: 14px; }
+.stat-chart { padding: 8px 16px 10px; }
+.stat-chart svg { display: block; width: 100%; height: auto; }
+.stat-review-empty { color: var(--text-3); font-size: var(--fs-small); }
+.tr-bar { fill: var(--text-3); }
+.tr-bar:hover { fill: var(--text-2); }
+.tr-line { fill: none; stroke: var(--ok); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.tr-dot { fill: var(--ok); }
+.tr-date { fill: var(--text-3); font-family: var(--font-mono); font-size: 11px; }
+.stat-legend { display: flex; align-items: center; gap: 16px; padding: 10px 16px 0; color: var(--text-3); font-size: var(--fs-small); }
+.stat-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.stat-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.stat-legend .tr-bar-sw { background: var(--text-3); }
+.stat-legend .tr-line-sw { height: 2px; background: var(--ok); border-radius: var(--r-pill); }
+.chart-tip { position: fixed; z-index: 40; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r-inner); background: var(--surface-2); color: var(--text); font-size: var(--fs-small); line-height: var(--lh-small); box-shadow: var(--shadow-pop); pointer-events: none; }
+.price-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(0, 1.6fr) auto auto; align-items: center; gap: 12px; min-height: 48px; padding: 6px 0; border-bottom: 1px solid var(--divider); }
+.price-row:last-child { border-bottom: 0; }
+.px-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.px-name b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.px-vals { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; color: var(--text-2); font-size: var(--fs-small); }
+.px-vals .inp { width: 72px; height: var(--ctl-sm); }
+.px-act { display: flex; align-items: center; gap: 6px; justify-self: end; }
+.price-row .sel { width: 84px; }
+.win.min .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.win.min .price-row { grid-template-columns: minmax(110px, 1fr) minmax(0, 1.4fr) auto; }
+.win.min .price-row .px-act { grid-column: 2 / -1; justify-self: start; }
+/* 294：Agent 页主导卡——检测到但未导入的工具（灰字 + 导入按钮）与缺程序时的重新检测。 */
+[data-lead-card] [data-lead-error] > .banner.fail { margin: 8px 0; }
+[data-lead-card] > .lead-redetect { display: flex; justify-content: flex-end; padding: 8px 0; }
+.card.lead-detected { margin-top: 8px; }
+.lead-detected .set-r { min-height: 48px; }
+.lead-detected .set-r:last-child { border-bottom: 0; }

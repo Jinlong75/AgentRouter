@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 // 125：不用命令行的提交（ar projects changes / commit / commit-init --with-existing，show 的 globalIdentity）。
 // 临时仓库；git 的全局与系统配置隔离到临时目录（GIT_CONFIG_GLOBAL），绝不读写用户真实的 ~/.gitconfig。
 const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
-const initFiles = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', '.gitignore'];
+const initFiles = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', 'docs/autonomy/README.md', 'handoff.md', '.gitignore'];
 
 function fixture(t, { identity = true } = {}) {
   const base = fs.mkdtempSync(path.join(tmpdir(), '提交 测试 '));

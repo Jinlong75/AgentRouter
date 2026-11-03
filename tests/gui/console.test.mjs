@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { createConsole, claudeLaunch, specGoal } from '../../app/src/main/console.mjs';
+import { builtinConfig } from '../../core/lib/config.mjs';
 import { dayGroup } from '../../app/src/shared/types.ts';
 
 // 与 app/src/shared/copy.ts 的 cx 同形的假文案（.mjs 不能直接导入 TS）。
@@ -19,6 +21,23 @@ const messages = {
 const proj = path.resolve('demo-project');
 const other = path.resolve('other-project');
 
+test('ar 操作通过注入的隔离路径和 PATH 桩接线', async () => {
+  const localAppData = await mkdtemp(path.join(tmpdir(), 'ar-console-'));
+  let value = 'existing';
+  const writes = [];
+  const deps = { readUserPath: async () => value, writeUserPath: async next => { value = next; writes.push(next); } };
+  const service = createConsole({ coreRun: async () => { throw Error('unexpected core call'); }, chooseFolder: async () => null, messages, arOptions: { localAppData, appExe: path.join(localAppData, 'app.exe'), coreEntry: path.join(localAppData, 'core', 'ar.mjs'), deps } });
+  try {
+    assert.equal((await service.call('ar:status')).installed, false);
+    const installed = await service.call('ar:install');
+    assert.equal((await service.call('ar:status')).installed, true);
+    assert.equal(value, `existing;${path.dirname(installed.path)}`);
+    assert.deepEqual((await service.call('ar:uninstall')).kept, []);
+    assert.equal(value, 'existing');
+    assert.equal(writes.length, 2);
+  } finally { await rm(localAppData, { recursive: true, force: true }); }
+});
+
 // 记录调用的假 coreRun：按队列顺序返回（resolves）或拒绝（rejects）。
 function fakeCore(responses = []) {
   const calls = [];
@@ -32,6 +51,7 @@ function fakeCore(responses = []) {
 }
 
 // 已登记项目之后跟着一条目标命令的两段响应。
+const leadPlan = (extra = {}) => ({ resolve: { code: 0, json: { ok: true, profile: 'demo', executable: 'claude', args: [], cwd: proj, envNames: [], ...extra }, stderr: '' } });
 const registered = resolve => [{ resolve: { code: 0, json: { ok: true, projects: [{ path: proj }] }, stderr: '' } }, resolve];
 
 test('agents:list 传 --detect，参数与超时正确', async () => {
@@ -535,14 +555,14 @@ test('claudeLaunch：有 Windows Terminal 用 wt.exe -d，否则 cmd.exe start�
 
 test('shell:open-folder / shell:open-claude：只接受已登记项目，交给注入的函数，不调用核心命令', async () => {
   const opened = [], launched = [];
-  const core = fakeCore([...registered(undefined).slice(0, 1), ...registered(undefined).slice(0, 1)]);
+  const core = fakeCore([...registered(undefined).slice(0, 1), ...registered(undefined).slice(0, 1), leadPlan()]);
   const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, openFolder: async dir => { opened.push(dir); }, launch: async (exe, args, opts) => { launched.push({ exe, args, cwd: opts.cwd }); }, findWt: async () => null });
   assert.deepEqual(await s.call('shell:open-folder', { path: proj }), { ok: true });
   assert.deepEqual(opened, [proj]);
   assert.deepEqual(await s.call('shell:open-claude', { path: proj }), { ok: true, executable: 'cmd.exe' });
   assert.deepEqual(launched, [{ exe: 'cmd.exe', args: ['/c', 'start', `AgentRouter · ${path.basename(proj)}`, '/D', proj, 'cmd.exe', '/k', 'claude'], cwd: proj }]);
-  // 099：打开 Claude Code 前多一条只读的 ar proxy resolve（算这一刻的代理）；除此之外只查了登记。
-  assert.deepEqual(core.calls.map(c => c.args), [['projects', 'list', '--registry-only'], ['projects', 'list', '--registry-only'], ['proxy', 'resolve']], '只查了登记和代理，没有其他核心命令');
+  // 启动前读取核心的主导计划和代理。
+  assert.deepEqual(core.calls.map(c => c.args), [['projects', 'list', '--registry-only'], ['projects', 'list', '--registry-only'], ['lead', 'open', '--project', proj], ['proxy', 'resolve']]);
   const unregistered = fakeCore(registered(undefined).slice(0, 1));
   const s2 = createConsole({ coreRun: unregistered.coreRun, chooseFolder: async () => null, messages, launch: async () => assert.fail('不应启动') });
   await assert.rejects(s2.call('shell:open-claude', { path: other }), /这个项目没有登记/);
@@ -553,14 +573,14 @@ test('shell:open-folder / shell:open-claude：只接受已登记项目，交给�
 test('shell:open-claude：代理有地址时 launch 收到的 env 带 HTTP_PROXY / HTTPS_PROXY / NO_PROXY（覆盖继承来的值、去掉小写同名），其余变量原样', async () => {
   const launched = [];
   const resolved = { code: 0, json: { ok: true, mode: 'manual', url: 'http://127.0.0.1:7890', source: 'manual', reason: 'manual', env: { HTTP_PROXY: 'http://127.0.0.1:7890', HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: 'localhost,127.0.0.1,::1' } }, stderr: '' };
-  const core = fakeCore([...registered(undefined).slice(0, 1), { resolve: resolved }]);
+  const core = fakeCore([...registered(undefined).slice(0, 1), leadPlan(), { resolve: resolved }]);
   const saved = { HTTPS_PROXY: process.env.HTTPS_PROXY, https_proxy: process.env.https_proxy, NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy, AR_TEST_MARK: process.env.AR_TEST_MARK };
   for (const key of Object.keys(saved)) delete process.env[key];
   Object.assign(process.env, { HTTPS_PROXY: 'http://inherited.invalid:1', AR_TEST_MARK: 'kept' });
   try {
     const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, launch: async (exe, args, opts) => { launched.push({ exe, args, ...opts }); }, findWt: async () => null });
     assert.deepEqual(await s.call('shell:open-claude', { path: proj }), { ok: true, executable: 'cmd.exe' });
-    assert.deepEqual(core.calls.map(c => c.args), [['projects', 'list', '--registry-only'], ['proxy', 'resolve']]);
+    assert.deepEqual(core.calls.map(c => c.args), [['projects', 'list', '--registry-only'], ['lead', 'open', '--project', proj], ['proxy', 'resolve']]);
     assert.equal(launched.length, 1);
     assert.equal(launched[0].cwd, proj);
     const { env } = launched[0];
@@ -584,7 +604,7 @@ test('shell:open-claude：不使用代理（url 为 null）、核心出错、核
   ];
   for (const [label, response] of cases) {
     const launched = [];
-    const core = fakeCore([...registered(undefined).slice(0, 1), response]);
+    const core = fakeCore([...registered(undefined).slice(0, 1), leadPlan(), response]);
     const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, launch: async (exe, args, opts) => { launched.push(opts); }, findWt: async () => null });
     assert.deepEqual(await s.call('shell:open-claude', { path: proj }), { ok: true, executable: 'cmd.exe' }, label);
     assert.deepEqual(launched, [{ cwd: proj }], `${label}：只传 cwd，没有 env`);
@@ -1390,4 +1410,194 @@ test('agents:models preset：导入之前查的参数数组、查到与退回预
   ];
   for (const payload of bad) await assert.rejects(service.call('agents:models', payload), /参数无效/, JSON.stringify(payload));
   assert.equal(calls.length, before, '参数无效时不调用核心');
+});
+
+test('276 统计筛选与单价经参数数组调用核心并校验', async () => {
+  const { calls, coreRun } = fakeCore();
+  const service = createConsole({ coreRun, chooseFolder: async () => null, messages });
+  await service.call('stats:get', { range: '7d' });
+  await service.call('stats:get', { range: '30d', project: proj });
+  await service.call('stats:get', { range: 'all' });
+  await service.call('stats:config');
+  await service.call('agents:update', { name: 'fake', price: '2/8/CNY' });
+  await service.call('agents:update', { name: 'fake', price: '' });
+  assert.deepEqual(calls.map(c => c.args), [['stats', '--range', '7d'], ['stats', '--range', '30d', '--project', proj], ['stats', '--range', 'all'], ['config'], ['agents', 'update', 'fake', '--price', '2/8/CNY'], ['agents', 'update', 'fake', '--price', '']]);
+  for (const p of [{ range: 'bad' }, { range: '7d', project: 'relative' }]) await assert.rejects(service.call('stats:get', p), /参数无效/);
+  for (const price of ['-1/2/CNY', '1/2/EUR', '1/2/CNY\n']) await assert.rejects(service.call('agents:update', { name: 'fake', price }), /参数无效/);
+  assert.equal(calls.length, 6);
+});
+
+
+test('主导 IPC 和项目参数传给核心', async () => {
+  const core = fakeCore([undefined, undefined, undefined, ...registered(undefined)]);
+  const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages });
+  await s.call('lead:get'); await s.call('lead:set', { profile: 'demo' }); await s.call('lead:clear');
+  await s.call('projects:lead-params', { project: proj, model: 'm', effort: '' });
+  assert.deepEqual(core.calls.map(c => c.args), [['lead'], ['lead', 'set', 'demo'], ['lead', 'clear'], ['projects', 'list', '--registry-only'], ['projects', 'config', proj, 'lead.model=m', 'lead.effort=']]);
+  await assert.rejects(s.call('lead:set', { profile: 'bad name' }), /参数无效/);
+  const unregistered = createConsole({ coreRun: fakeCore(registered(undefined).slice(0, 1)).coreRun, chooseFolder: async () => null, messages });
+  await assert.rejects(unregistered.call('projects:lead-params', { project: other, model: '', effort: '' }), /没有登记/);
+});
+
+test('主导启动终端、原样参数、密钥和兼容别名', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ar-lead-console-'));
+  try {
+    const config = builtinConfig();
+    config.profiles.demo = { adapter: 'codex', auth: 'token', env: { LEAD_OPTION: 'value' }, secrets: { TARGET_KEY: 'SOURCE_KEY' } };
+    await writeFile(path.join(dir, 'config.json'), JSON.stringify(config));
+    const appEnv = { AGENT_ROUTER_HOME: dir, SOURCE_KEY: 'sample-secret-value' };
+    for (const wt of [path.resolve('wt.exe'), null]) {
+      const plan = leadPlan({ executable: 'tool.exe', args: ['--model', 'model-a'], envNames: ['LEAD_OPTION', 'TARGET_KEY'] });
+      const core = fakeCore([...registered(plan), undefined]);
+      const launched = [];
+      const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, env: appEnv, findWt: async () => wt,
+        launch: async (exe, args, opts) => { assert.equal(opts.env.TARGET_KEY, 'sample-secret-value'); assert.equal(opts.env.LEAD_OPTION, 'value'); launched.push({ exe, args, cwd: opts.cwd, verbatim: opts.verbatim, envNames: Object.keys(opts.env) }); } });
+      await s.call(wt ? 'shell:open-lead' : 'shell:open-claude', { path: proj });
+      assert.deepEqual(launched[0].args, wt ? ['-d', proj, 'tool.exe', '--model', 'model-a'] : ['/c', 'start', `AgentRouter · ${path.basename(proj)}`, '/D', proj, 'cmd.exe', '/k', 'tool.exe', '--model', 'model-a']);
+      assert.equal(launched[0].verbatim, undefined); assert.ok(launched[0].envNames.includes('TARGET_KEY'));
+      assert.ok(!JSON.stringify(launched).includes('sample-secret-value'));
+      assert.deepEqual(core.calls[1].args, ['lead', 'open', '--project', proj]);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('主导启动保留带空格与中文的路径；批处理包装（verbatim）的计划不替用户启动', async () => {
+  const project = path.resolve('项目 空格');
+  const executable = 'C:\程序 目录\qoder.exe';
+  const args = ['-m', '模型 空格'];
+  for (const wt of [path.resolve('wt.exe'), null]) {
+    const calls = [];
+    const core = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: project }] } } },
+      leadPlan({ cwd: project, executable, args }), undefined]);
+    const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, findWt: async () => wt,
+      launch: async (exe, a, opts) => calls.push({ exe, args: a, ...opts }) });
+    await s.call('shell:open-lead', { path: project });
+    const expected = wt ? ['-d', project, executable, ...args]
+      : ['/c', 'start', `AgentRouter · ${path.basename(project)}`, '/D', project, 'cmd.exe', '/k', executable, ...args];
+    assert.deepEqual(calls[0].args, expected);
+    assert.equal(calls[0].verbatim, undefined);
+    // 真正启动 Node，核对 Node 在 Windows 上构造命令行后子进程收到的参数（含空格与中文的项目路径不被拆开）。
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', '--', ...calls[0].args], { encoding: 'utf8', shell: false });
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), expected);
+  }
+  // 批处理包装：引号链再套一层 wt / cmd 无法可靠保持（293 审查 R2-1），不启动，提示自己在终端运行。
+  for (const wt of [path.resolve('wt.exe'), null]) {
+    const calls = [];
+    const core = fakeCore([{ resolve: { code: 0, json: { ok: true, projects: [{ path: project }] } } },
+      leadPlan({ cwd: project, executable: 'C:\程序 目录\cmd.exe', args: ['/d', '/s', '/c', '""C:\程序 目录\启动.cmd""'], verbatim: true }), undefined]);
+    const s = createConsole({ coreRun: core.coreRun, chooseFolder: async () => null, messages, findWt: async () => wt,
+      launch: async (exe, a, opts) => calls.push({ exe, args: a, ...opts }) });
+    await assert.rejects(s.call('shell:open-lead', { path: project }), /批处理包装，软件暂时不能替你打开/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('未登记、核心失败和不安全的 cmd 参数不启动', async () => {
+  const launched = [];
+  const bad = createConsole({ coreRun: fakeCore(registered(undefined).slice(0, 1)).coreRun, chooseFolder: async () => null, messages, launch: async () => launched.push(1) });
+  await assert.rejects(bad.call('shell:open-lead', { path: other }), /没有登记/);
+  const failure = createConsole({ coreRun: fakeCore(registered({ resolve: { code: 1, json: { ok: false, error: '核心原始错误' }, stderr: '' } })).coreRun, chooseFolder: async () => null, messages, launch: async () => launched.push(1) });
+  await assert.rejects(failure.call('shell:open-lead', { path: proj }), /核心原始错误/);
+  const unsafe = createConsole({ coreRun: fakeCore(registered(leadPlan({ args: ['x&y'] }))).coreRun, chooseFolder: async () => null, messages, launch: async () => launched.push(1) });
+  await assert.rejects(unsafe.call('shell:open-lead', { path: proj }), /无法安全传递/);
+  assert.deepEqual(launched, []);
+});
+
+
+test('部署预设从核心目录延迟读取，缺失时返回中文错误', async t => {
+  const base = await mkdtemp(path.join(tmpdir(), 'ar-console-preset-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'templates', 'agents');
+  const calls = [];
+  const service = createConsole({ arOptions: { coreEntry: path.join(base, 'ar.mjs') }, messages,
+    coreRun: async args => { calls.push(args); return { code: 0, json: { ok: true } }; } });
+  await assert.rejects(service.call('harness:undeploy'), /无法读取部署预设/);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'sample.json'), JSON.stringify({ name: 'sample', title: '示例', deploy: { package: 'example' } }));
+  await service.call('harness:undeploy');
+  assert.deepEqual(calls, [['agents', 'undeploy', 'sample']]);
+});
+
+test('Harness 检测返回部署预设的名称、标题和密钥变量名', async t => {
+  const base = await mkdtemp(path.join(tmpdir(), 'ar-console-check-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'templates', 'agents');
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'sample.json'), JSON.stringify({ name: 'sample', title: '示例', secrets: { KEY: 'SAMPLE_KEY' }, deploy: { package: 'example' } }));
+  const service = createConsole({ arOptions: { coreEntry: path.join(base, 'ar.mjs') }, messages,
+    coreRun: async args => { assert.deepEqual(args, ['agents', 'deploy', 'sample', '--check']); return { code: 0, json: { ok: true, installed: null } }; } });
+  assert.deepEqual(await service.call('harness:check'), { ok: true, installed: null, name: 'sample', title: '示例', secretVar: 'SAMPLE_KEY' });
+});
+
+test('Harness stream and duplicate deployment', async () => {
+  const events = []; let finish;
+  const service = createConsole({ coreRun: async () => { throw Error('unexpected'); }, chooseFolder: async () => null, messages, harnessEvent: event => events.push(event),
+    coreStream: async (args, line) => { assert.deepEqual(args, ['agents', 'deploy', 'deepseek-harness']); line({ event: 'step', step: 'detect', message: 'detecting' }); return new Promise(resolve => { finish = resolve; }); } });
+  const pending = service.call('harness:deploy');
+  await assert.rejects(service.call('harness:deploy'), /已经在部署 DeepSeek Harness/);
+  const failure = { ok: false, error: 'original error', code: 'EXAMPLE' };
+  finish({ code: 1, last: failure });
+  assert.deepEqual(await pending, failure);
+  assert.deepEqual(events, [{ event: 'step', step: 'detect', message: 'detecting' }, failure]);
+});
+
+test('Harness cancellation and window close wait for exit', async () => {
+  for (const close of [false, true]) {
+    const order = [], events = []; let exit;
+    const service = createConsole({ chooseFolder: async () => null, messages, harnessEvent: event => events.push(event),
+      coreRun: async args => { order.push('cleanup'); assert.deepEqual(args, ['agents', 'deploy', 'deepseek-harness', '--cleanup']); return { code: 0, json: { ok: true } }; },
+      coreStream: async (_args, _line, { signal }) => new Promise(resolve => { signal.addEventListener('abort', () => { order.push('abort'); exit = () => { order.push('exit'); resolve({ code: 1, last: null }); }; }); }) });
+    const pending = service.call('harness:deploy');
+    const cancelling = close ? service.close() : service.call('harness:cancel');
+    assert.deepEqual(order, ['abort']);
+    exit(); await cancelling; await pending;
+    assert.deepEqual(order, ['abort', 'exit', 'cleanup']);
+    assert.deepEqual(events, [{ event: 'cancelled' }]);
+    assert.equal(service.deploying, false);
+  }
+});
+
+test('Harness 取消：按操作类型清理，重复取消只清理一次且传播失败', async t => {
+  const base = await mkdtemp(path.join(tmpdir(), 'ar-harness-cancel-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const target = path.join(base, 'agent-router', 'tools', 'dsh');
+  await mkdir(target, { recursive: true });
+  await writeFile(path.join(target, '.agent-router-dsh.json'), '{}');
+  for (const [step, failure, version, clean] of [[null, false, undefined, false], ['import', false, undefined, false], [null, false, '0.2.2', true], ['detect', false, '0.2.2', true], ['install', false, '0.2.2', true], ['npm', true, '0.2.2', true]]) {
+    let exit, cleans = 0;
+    const events = [];
+    const service = createConsole({ env: { LOCALAPPDATA: base }, messages, harnessEvent: event => events.push(event),
+      coreRun: async () => { cleans++; return failure ? { code: 1, json: { ok: false, error: '恢复失败' } } : { code: 0, json: { ok: true } }; },
+      coreStream: async (_args, line, { signal }) => { if (step) line({ event: 'step', step, message: step }); return new Promise(resolve => { signal.addEventListener('abort', () => { exit = () => resolve({ code: 1 }); }); }); } });
+    const pending = service.call('harness:deploy', version ? { version } : {});
+    const first = service.call('harness:cancel'), second = service.call('harness:cancel');
+    exit();
+    const results = await Promise.allSettled([first, second, pending]);
+    assert.equal(cleans, clean ? 1 : 0);
+    assert.equal(results[0].status, failure ? 'rejected' : 'fulfilled');
+    assert.equal(results[1].status, failure ? 'rejected' : 'fulfilled');
+    if (failure) assert.match(results[0].reason.message, /恢复失败/);
+    assert.equal(events.some(event => event.event === 'cancelled'), !failure);
+  }
+});
+
+test('Harness 新安装收到检测步骤后取消仍调用安全清理', async t => {
+  const base = await mkdtemp(path.join(tmpdir(), 'ar-harness-new-cancel-'));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  let exit, cleans = 0;
+  const service = createConsole({ env: { LOCALAPPDATA: base }, messages,
+    coreRun: async args => { assert.deepEqual(args, ['agents', 'deploy', 'deepseek-harness', '--cleanup']); cleans++; return { code: 0, json: { ok: true } }; },
+    coreStream: async (_args, line, { signal }) => { line({ event: 'step', step: 'detect', message: 'detect' }); return new Promise(resolve => { signal.addEventListener('abort', () => { exit = () => resolve({ code: 1 }); }); }); } });
+  const pending = service.call('harness:deploy');
+  const cancelling = service.call('harness:cancel');
+  exit(); await cancelling; await pending;
+  assert.equal(cleans, 1);
+});
+
+test('Harness undeploy', async () => {
+  const calls = [];
+  const service = createConsole({ chooseFolder: async () => null, messages, coreRun: async args => { calls.push(args); return { code: 0, json: { ok: true } }; } });
+  await service.call('harness:undeploy');
+  assert.deepEqual(calls, [['agents', 'undeploy', 'deepseek-harness']]);
 });

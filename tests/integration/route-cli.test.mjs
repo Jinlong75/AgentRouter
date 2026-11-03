@@ -54,6 +54,34 @@ function fixture(t, cfg = config()) {
 }
 const listing = dir => readdirSync(dir, { recursive: true }).sort();
 
+test('预设默认规则显示来源，计算不写配置', t => {
+  const f = fixture(t, config({ profiles: { codex: { adapter: 'codex', enabled: true }, fake: config().profiles.fake }, routing: { rules: [] } }));
+  writeFileSync(path.join(f.home, 'agent-tests.json'), JSON.stringify({ codex: { ok: true, at: Date.now() } }));
+  const before = readFileSync(path.join(f.home, 'config.json'), 'utf8');
+  const route = f.json(['route', '--type', 'code', '--explain']);
+  assert.equal(route.json.rule.scope, 'implicit');
+  assert.match(f.ar(['route', '--type', 'code', '--explain']).stdout, /预设默认规则/);
+  assert.ok(f.json(['route', 'config']).json.implicitRules.some(rule => rule.source === 'implicit' && rule.profile === 'codex'));
+  assert.match(f.ar(['route', 'config']).stdout, /预设默认规则/);
+  assert.match(f.ar(['route', '--type', 'code', '--explain']).stdout, /预设默认规则/);
+  const view = f.json(['route', 'config']);
+  assert.ok(view.json.implicitRules.some(rule => rule.source === 'implicit' && rule.profile === 'codex'));
+  assert.match(f.ar(['route', 'config']).stdout, /预设默认规则/);
+  assert.equal(readFileSync(path.join(f.home, 'config.json'), 'utf8'), before);
+});
+
+test('status 从派发记录显示实际预设默认规则来源', t => {
+  const f = fixture(t);
+  const dir = path.join(f.repo, '.agent-runs', 'example');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'dispatch.json'), JSON.stringify({ route: { profile: 'codex', rule: { scope: 'implicit' }, trace: ['预设默认规则：[code] → codex'] } }));
+  writeFileSync(path.join(f.home, 'runs.jsonl'), JSON.stringify({ v: 2, event: 'start', id: 'example-id', repo: f.repo, name: 'example', dir, profile: 'codex', started: Date.now() }) + '\n');
+  const result = f.json(['status', 'example']);
+  assert.equal(result.status, 0, JSON.stringify(result.json));
+  assert.deepEqual(result.json.route, { source: 'implicit', profile: 'codex' });
+  assert.match(f.ar(['status', 'example']).stdout, /预设默认规则/);
+});
+
 test('ar route --type research --json：命中全局规则，输出路由器的返回值；不写任何文件', t => {
   const f = fixture(t);
   const before = [listing(f.home), listing(f.repo)];
@@ -301,7 +329,7 @@ test('ar route rules set 校验：退出码 2、中文原因、config.json 一�
   reject([null], /第 1 条规则必须是对象/);
   reject([{ types: [], profile: 'fake' }], /types 至少要有一个任务类型/);
   reject([{ profile: 'fake' }], /types 至少要有一个任务类型/);
-  reject([{ types: ['code', 'nope'], profile: 'fake' }], /任务类型只能是 code、test、fix、refactor、research、docs、review（当前：nope）/);
+  reject([{ types: ['code', 'nope'], profile: 'fake' }], /任务类型只能是 code、test、fix、refactor、research、docs、review、chore（当前：nope）/);
   reject([{ types: ['code'], profile: 'ghost' }], /执行者 ghost 不存在/);
   reject([{ types: ['code'] }], /执行者 undefined 不存在/);
   reject([{ types: ['code'], profile: 'fake', escalate: 'ghost' }], /升级执行者 ghost 不存在/);

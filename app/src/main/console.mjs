@@ -3,10 +3,29 @@
 // 只做参数校验与结果映射：参数一律用数组传给 coreRun（绝不拼命令字符串），
 // 密钥值只经 input 传入，绝不进参数数组，也绝不写进日志或错误信息。
 import os from 'node:os';
+import { arStatus, installAr, uninstallAr } from './ar-install.mjs';
 import path from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import { parseJson } from '../../../core/lib/json.mjs';
 import { applyProxyEnv } from '../../../core/lib/proxy.mjs';
+import { readEffectiveConfig } from '../../../core/lib/config.mjs';
+import { homeDirectory, userDirectory } from '../../../core/lib/compat.mjs';
+import { findOnPath } from '../../../core/lib/launcher.mjs';
+import { resolveProfile } from '../../../core/adapters/index.mjs';
+import { authOf, secretSources } from '../../../core/lib/env.mjs';
+import { resolveSecret } from '../../../core/lib/secrets.mjs';
+// 随用随读核心自带的预设，避免打包后的主进程加载依赖 import.meta.url 的模块。
+function deployPreset(coreEntry) {
+  try {
+    const dir = path.join(path.dirname(coreEntry ?? path.resolve('core/ar.mjs')), 'templates', 'agents');
+    for (const file of readdirSync(dir).filter(name => name.endsWith('.json')).sort()) {
+      const preset = parseJson(readFileSync(path.join(dir, file), 'utf8'));
+      if (preset.deploy?.package && typeof preset.name === 'string' && typeof preset.title === 'string') return { name: preset.name, title: preset.title, secretVar: Object.values(preset.secrets ?? {}).find(value => typeof value === 'string') ?? '' };
+    }
+  } catch { throw new Error('无法读取部署预设'); }
+  throw new Error('没有可部署的预设');
+}
 
 // 执行者名 / 预设名：字母、数字、下划线、连字符，1～40 个字符。
 const validName = v => typeof v === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(v);
@@ -26,7 +45,7 @@ const AUTH = ['login', 'token'];
 const ROLE_NAMES = ['executor', 'reviewer', 'lead'];
 const validFamily = v => typeof v === 'string' && /^[a-z0-9-]{1,40}$/.test(v);
 // 任务类型（与核心 spec.mjs 的 SPEC_TYPES 一致；路由规则与试算只认这些）。
-const ROUTE_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review'];
+const ROUTE_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review', 'chore'];
 // 任务记录名：核心 taskDetails 的规则（可含中文与空格；不含 <>:"/\|?* 与控制字符；不以点或空格结尾；不是保留设备名）。
 // 再派一次只读取已有记录，这里再挡一次目录穿越与非法文件名。
 const validRecord = v => typeof v === 'string' && v.length > 0 && v.length <= 200 && !/[<>:"/\\|?*\x00-\x1f]/.test(v) && !/[. ]$/.test(v) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(v);
@@ -77,7 +96,22 @@ export async function sizeOf(target) {
 
 // 文件对话框（导入声明、导出声明、浏览程序）：默认在主进程里用 Electron 的 dialog；测试注入桩，
 // 界面验收（AR_SHOTS）把 stub 打开，对话框不弹出，改取检查预先放进 open / save 的路径（用完返回 null，相当于取消）。
+// 界面验收专用的用户 PATH 与广播记录。
+export const arShots = { value: '', writes: [], deps: { readUserPath: async () => arShots.value, writeUserPath: async value => { arShots.value = value; arShots.writes.push(value); } } };
 export const fileDialogs = { stub: false, open: [], save: [], openRequests: [], saveRequests: [] };
+// 界面验收（AR_SHOTS）的 Harness 桩：检测与部署都不跑 npm / 网络。
+// check 是检测结果（对象或函数）；deploy 是场景函数 ({ signal, step, version }) => 最后结果，取消时在 signal 中止后返回；
+// cleans 记录取消后的 cleanup 调用次数；target 是"托管目录"的替身（取消时据此判断开始前有没有安装，测试里指到临时目录）。
+export const harnessShots = { check: null, deploy: null, cleans: 0, target: null };
+const shotsStub = () => !!process.env.AR_SHOTS;
+// 界面验收默认不跑 npm、不联网：检测给一份"没装、有可用版本"的固定结果，部署没准备桩时直接失败（免得误触发 830 MB 下载）。
+const shotsCheck = () => ({ ok: true, verified: '0.2.1-rc.2', recommended: '0.2.1-rc.2', tags: { next: '0.2.1-rc.2' }, versions: ['0.2.1-rc.2', '0.2.0'], installed: null, path: null, updateAvailable: false });
+// Harness 的托管目录（与 core/lib/deploy-dsh.mjs 的 locations 一致；只读地看开始前有没有安装）。
+function dshTarget(env = process.env) {
+  const base = env.LOCALAPPDATA || (process.platform === 'win32'
+    ? path.join(userDirectory(env), 'AppData', 'Local') : path.join(userDirectory(env), '.local', 'share'));
+  return path.join(path.resolve(base, 'agent-router', 'tools'), 'dsh');
+}
 async function electronFile(kind, options) {
   if (fileDialogs.stub) {
     (kind === 'open' ? fileDialogs.openRequests : fileDialogs.saveRequests).push(options);
@@ -98,7 +132,27 @@ async function electronFile(kind, options) {
 // 声明 JSON 走命令行参数：Windows 整条命令行最多 32767 个字符，留出余量。
 const MAX_DECL_CHARS = 24000;
 
-export function createConsole({ coreRun, chooseFolder, chooseFile = options => electronFile('open', options), saveFile = options => electronFile('save', options), messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false, knownTask = () => false }) {
+export function createConsole({ arOptions, coreRun, coreStream, harnessEvent = () => {}, chooseFolder, chooseFile = options => electronFile('open', options), saveFile = options => electronFile('save', options), messages, testTimeout = 180, openFolder = async () => {}, launch = async () => {}, findWt = async () => null, knownRunDir = () => false, knownTask = () => false, env: appEnv = process.env }) {
+  let deployment = null;
+  const cancelDeployment = async () => {
+    const current = deployment;
+    if (!current) return;
+    if (!current.cancel) {
+      current.controller.abort();
+      current.cancel = (async () => {
+        // 结束进程树失败也继续清理（核心子进程多半已退出）；约 830 MB 的目录删除给 10 分钟（301 审查 R1-1、R1-2）。
+        await current.done.catch(() => {});
+        // 核心按事务决定是否清理或恢复，不能依赖可能尚未送达的步骤事件。
+        if (current.cleanupAllowed) {
+          // 界面验收的部署是桩，没有写真实文件：只记一次清理，不碰用户真实的托管目录。
+          if (shotsStub() && harnessShots.deploy) harnessShots.cleans += 1;
+          else await run(['agents', 'deploy', current.deployInfo.name, '--cleanup'], { timeoutMs: 600000 });
+        }
+        harnessEvent({ event: 'cancelled' });
+      })().finally(() => { if (deployment === current) deployment = null; });
+    }
+    return current.cancel;
+  };
   const invalid = () => { throw new Error(messages.invalid); };
   // 组装参数数组并调用核心，按约定整理结果。
   // soft：核心的 ok:false 结果带着逐条的 errors / 原始输出时原样交给界面（校验、预览），不当作异常。
@@ -121,6 +175,12 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       const error = new Error(json.error || messages.noResult);
       // 核心的错误码（如 NEED_GIT_IDENTITY）原样带给渲染层，界面据此显示对应的指引。
       if (typeof json.code === 'string' && json.code) error.code = json.code;
+      // 派发时"任务说明只在当前分支上"（SPEC_BASE）带当前分支与项目基线，界面据此给出"以当前分支为基线派发"。
+      if (json.code === 'SPEC_BASE') {
+        const first = Array.isArray(json.specCheck?.errors) ? json.specCheck.errors[0] : null;
+        if (typeof first?.current === 'string' && first.current) error.current = first.current;
+        if (typeof first?.base === 'string' && first.base) error.base = first.base;
+      }
       // 推送 / 拉取的取远程状态失败（FETCH_FAILED）带 cause（NO_CREDENTIAL / NETWORK / OTHER）：没有登录多半在这一步暴露。
       // 主进程到渲染层只转交 code，所以 cause 是 NO_CREDENTIAL 时把 code 也换成 NO_CREDENTIAL，界面据此显示登录指引（中文原因不变）。
       if (json.code === 'FETCH_FAILED' && json.cause === 'NO_CREDENTIAL') error.code = 'NO_CREDENTIAL';
@@ -129,6 +189,22 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       throw error;
     }
     throw new Error(messages.noResult);
+  };
+  // 托管目录里已装好的 dsh（npm 缺失时核心 --check 整个失败，这里单独检测；R2-4）。
+  // 只看"装没装、版本、路径"，能不能安装 / 更新由调用方按 noNpm 标出。
+  const detectDsh = async env => {
+    const managed = path.join(dshTarget(env), 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh');
+    const onPath = findOnPath(process.platform === 'win32' ? ['dsh.exe', 'dsh.cmd'] : ['dsh'], env);
+    for (const file of [...new Set([managed, onPath].filter(Boolean))]) {
+      try {
+        const found = await run(['agents', 'detect', '--decl', JSON.stringify({ executable: file, detect: ['--version'] })], { timeoutMs: 60000 });
+        if (found?.installed !== true) continue;
+        // 程序可能输出 "dsh 0.2.1-rc.2" 这样的行：只取版本号本身，与核心 --check 的写法一致。
+        const version = String(found.version ?? '').match(/\b\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/)?.[0];
+        if (version) return { path: file, version };
+      } catch { /* 这个候选检测失败：试下一个 */ }
+    }
+    return null;
   };
   // "已登记项目"的判断：调用一次 projects list --registry-only（只读登记表，不对每个项目跑 git），
   // 路径按 Windows 不区分大小写匹配；不在列表里抛 unknownProject。语义与原来调用完整 projects list 相同。
@@ -151,8 +227,49 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
   const proxyLaunchEnv = async () => {
     try {
       const resolved = await run(['proxy', 'resolve'], { timeoutMs: 15000 });
-      return typeof resolved?.url === 'string' && resolved.url ? applyProxyEnv(process.env, resolved) : null;
+      return typeof resolved?.url === 'string' && resolved.url ? applyProxyEnv(appEnv, resolved) : null;
     } catch { return null; }
+  };
+  const openLead = async p => {
+    if (!validAbsPath(p?.path) || /["\r\n]/.test(p.path)) invalid();
+    await registeredProject(p.path);
+    const plan = await run(['lead', 'open', '--project', p.path], { timeoutMs: 60000 });
+    if (!validAbsPath(plan.cwd) || /["\r\n]/.test(plan.cwd) || !samePath(plan.cwd, p.path) ||
+        typeof plan.executable !== 'string' || !plan.executable || !Array.isArray(plan.args) ||
+        plan.args.some(arg => typeof arg !== 'string') || !Array.isArray(plan.envNames) ||
+        plan.envNames.some(name => !validVarName(name)) || !validName(plan.profile)) invalid();
+    const wt = await findWt();
+    // cmd 会解释特殊字符，无法安全传递时拒绝启动。
+    if (!wt && [plan.cwd, plan.executable, ...plan.args].some(arg => /[&|<>^%!\r\n]/.test(arg) || (plan.verbatim !== true && /"/.test(arg)))) throw new Error('启动参数无法安全传递给 cmd.exe');
+    // 核心的 verbatim 计划（批处理包装，参数已按 cmd 规则拼好）再套一层 wt / cmd 时引号链无法可靠保持（293 审查 R2-1 实测失败），
+    // 软件不替用户启动，提示在终端里自己运行；普通程序照常启动。
+    if (plan.verbatim === true) throw new Error(`${plan.label ?? '这个主导'} 的程序是批处理包装，软件暂时不能替你打开；请在项目目录的终端里自己运行它`);
+    const command = wt
+      ? { executable: wt, args: ['-d', plan.cwd, plan.executable, ...plan.args] }
+      : { executable: 'cmd.exe', args: ['/c', 'start', `AgentRouter · ${path.basename(plan.cwd).replace(/["\r\n]/g, '')}`, '/D', plan.cwd, 'cmd.exe', '/k', plan.executable, ...plan.args] };
+    const proxyEnv = await proxyLaunchEnv();
+    let env = proxyEnv;
+    if (plan.envNames.length) {
+      const config = readEffectiveConfig(homeDirectory(appEnv));
+      const raw = config.profiles?.[plan.profile];
+      if (!raw) throw new Error('主导配置不存在');
+      const profile = resolveProfile(raw, config);
+      const names = new Set(plan.envNames);
+      env = { ...(proxyEnv ?? appEnv) };
+      for (const source of secretSources(config)) for (const existing of Object.keys(env)) {
+        if (existing.toLowerCase() === source.toLowerCase()) delete env[existing];
+      }
+      const put = (key, value) => {
+        for (const existing of Object.keys(env)) if (existing.toLowerCase() === key.toLowerCase()) delete env[existing];
+        env[key] = value;
+      };
+      for (const [key, value] of Object.entries(profile.env ?? {})) if (names.has(key)) put(key, String(value));
+      if (authOf(profile) === 'token') for (const [key, source] of Object.entries(profile.secrets ?? {})) {
+        if (names.has(key)) put(key, resolveSecret(source, { env: appEnv }));
+      }
+    }
+    await launch(command.executable, command.args, { cwd: plan.cwd, ...(env ? { env } : {}) });
+    return { ok: true, executable: path.basename(command.executable) };
   };
   const oneName = p => { if (!validName(p?.name)) invalid(); return p.name; };
   // 声明对象 → 命令行参数里的 JSON 文本（对象、单行 JSON、不超过命令行长度的余量）。
@@ -171,6 +288,95 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     return { name: user, email: mail };
   };
   const actions = {
+    'ar:status': () => arStatus(arOptions),
+    'ar:install': () => installAr(arOptions),
+    'ar:uninstall': () => uninstallAr(arOptions),
+    async 'stats:get'(p) {
+      if (!['7d', '30d', 'all'].includes(p?.range) || (p.project !== undefined && !validAbsPath(p.project))) invalid();
+      return run(['stats', '--range', p.range, ...(p.project === undefined ? [] : ['--project', p.project])], { timeoutMs: 60000 });
+    },
+    async 'stats:config'() { return run(['config'], { timeoutMs: 60000 }); },
+    async 'lead:get'() { return run(['lead'], { timeoutMs: 60000 }); },
+    async 'lead:set'(p) { if (!validName(p?.profile)) invalid(); return run(['lead', 'set', p.profile], { timeoutMs: 60000 }); },
+    async 'lead:clear'() { return run(['lead', 'clear'], { timeoutMs: 60000 }); },
+    async 'projects:lead-params'(p) {
+      if (!validAbsPath(p?.project) || typeof p.model !== 'string' || typeof p.effort !== 'string') invalid();
+      await registeredProject(p.project);
+      return run(['projects', 'config', p.project, `lead.model=${p.model}`, `lead.effort=${p.effort}`], { timeoutMs: 60000 });
+    },
+    // 可选 version（302）：安装指定版本，参数照核心的 --version <版本>，校验规则与核心一致。
+    async 'harness:deploy'(p) {
+      let version;
+      if (p?.version !== undefined) {
+        if (typeof p.version !== 'string' || !/^[0-9A-Za-z.+-]+$/.test(p.version)) invalid();
+        version = p.version;
+      }
+      const deployInfo = deployPreset(arOptions?.coreEntry);
+      if (deployment) throw new Error(`已经在部署 ${deployInfo.title}`);
+      // 指定版本会安装或升级；已有托管安装且未指定版本则是直接导入。
+      const target = shotsStub() && typeof harnessShots.target === 'string' && harnessShots.target ? harnessShots.target : dshTarget(appEnv);
+      const cleanupAllowed = version !== undefined || !(existsSync(target) && existsSync(path.join(target, '.agent-router-dsh.json')));
+      const current = { controller: new AbortController(), done: null, cancel: null, cleanupAllowed, deployInfo };
+      deployment = current;
+      current.done = (async () => {
+        try {
+          if (shotsStub()) {
+            const scenario = harnessShots.deploy;
+            if (!scenario) {
+              const skipped = { ok: false, error: `界面验收没有准备 ${deployInfo.title} 安装桩` };
+              harnessEvent(skipped);
+              return skipped;
+            }
+            const result = await scenario({
+              signal: current.controller.signal,
+              version,
+              step: value => { if (!current.controller.signal.aborted) harnessEvent({ event: 'step', ...value }); },
+            });
+            if (!current.controller.signal.aborted) {
+              const last = result && typeof result.ok === 'boolean' ? result : { ok: false, error: messages.noResult };
+              harnessEvent(last);
+              return last;
+            }
+            return;
+          }
+          const args = ['agents', 'deploy', deployInfo.name, ...(version === undefined ? [] : ['--version', version])];
+          const result = await coreStream(args, value => {
+            if (!current.controller.signal.aborted && value?.event === 'step') harnessEvent(value);
+          }, { signal: current.controller.signal });
+          if (!current.controller.signal.aborted) {
+            // 只有带布尔 ok 的最后一行才是结果；核心中途退出、最后一行还是 step 时按失败处理（301 审查 R2-2）。
+            const last = typeof result.last?.ok === 'boolean' && result.last.event !== 'step' ? result.last : { ok: false, error: result.code ? `${messages.noResult}（退出码 ${result.code}）` : messages.noResult };
+            harnessEvent(last);
+            return last;
+          }
+        } finally { if (!current.controller.signal.aborted && deployment === current) deployment = null; }
+      })();
+      return current.done;
+    },
+    async 'harness:cancel'() { return cancelDeployment(); },
+    // 检测已安装版本、可用版本与推荐版本（302，部署步骤与 Agent 页卡片共用）。
+    // 没有 npm 是正常结果之一（界面给下载 Node.js 的说明），不当作通道错误。
+    async 'harness:check'() {
+      const deployInfo = deployPreset(arOptions?.coreEntry);
+      if (shotsStub()) {
+        const check = harnessShots.check === null ? shotsCheck() : (typeof harnessShots.check === 'function' ? harnessShots.check() : harnessShots.check);
+        return { ...check, name: deployInfo.name, title: deployInfo.title, secretVar: deployInfo.secretVar };
+      }
+      try {
+        const check = await run(['agents', 'deploy', deployInfo.name, '--check'], { timeoutMs: 120000 });
+        return { ...check, name: deployInfo.name, title: deployInfo.title, secretVar: deployInfo.secretVar };
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error);
+        // 没有 npm 时核心的 --check 整个失败，连已装好的 dsh 也读不到（R2-4）：单独检测，保留版本与路径；
+        // noNpm 表示"可以安装 / 更新"这一步不可用，原因就是这条错误原文。
+        if (message.includes('没有找到 npm')) {
+          const found = await detectDsh(appEnv);
+          return { name: deployInfo.name, title: deployInfo.title, secretVar: deployInfo.secretVar, ok: false, noNpm: true, error: message, verified: '', installed: found?.version ?? null, path: found?.path ?? null, updateAvailable: false };
+        }
+        throw error;
+      }
+    },
+    async 'harness:undeploy'() { return run(['agents', 'undeploy', deployPreset(arOptions?.coreEntry).name], { timeoutMs: 600000 }); },
     async 'agents:list'(p) {
       const args = ['agents', 'list'];
       if (p?.detect === true) args.push('--detect');
@@ -248,8 +454,9 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     },
     async 'agents:update'(p) {
       if (!validName(p?.name)) invalid();
-      if (!['label', 'model', 'effort', 'escalate', 'baseUrl', 'secretVar', 'maxTurns'].some(k => p[k] !== undefined)) invalid();
+      if (!['label', 'model', 'effort', 'escalate', 'baseUrl', 'secretVar', 'maxTurns', 'price'].some(k => p[k] !== undefined)) invalid();
       const args = ['agents', 'update', p.name];
+      if (p.price !== undefined) { if (typeof p.price !== 'string' || (p.price !== '' && !/^(?:\d+(?:\.\d*)?|\.\d+)\/(?:\d+(?:\.\d*)?|\.\d+)\/(?:CNY|USD)$/.test(p.price))) invalid(); args.push('--price', p.price); }
       if (p.label !== undefined) { if (!validSingle(p.label)) invalid(); args.push('--label', p.label); }
       if (p.model !== undefined) { if (!validSingle(p.model)) invalid(); args.push('--model', p.model); }
       // 推理强度：空串表示"默认"（核心删掉 effort）；升级目标：空串表示不升级。
@@ -523,15 +730,8 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     },
     // 打开文件夹 / 在此项目打开 Claude Code：只接受已登记的项目；启动交给注入的函数（验收时是记录参数的桩）。
     async 'shell:open-folder'(p) { if (!validAbsPath(p?.path)) invalid(); await registeredProject(p.path); await openFolder(p.path); return { ok: true }; },
-    async 'shell:open-claude'(p) {
-      if (!validAbsPath(p?.path) || /"/.test(p.path)) invalid();
-      await registeredProject(p.path);
-      const command = claudeLaunch({ dir: p.path, name: path.basename(p.path), wt: await findWt() });
-      // 网络代理（099）：有地址时终端带上代理变量；没有（不使用 / 读不到）时不传 env，终端照旧继承软件的环境。
-      const env = await proxyLaunchEnv();
-      await launch(command.executable, command.args, { cwd: p.path, ...(env ? { env } : {}) });
-      return { ok: true, executable: path.basename(command.executable) };
-    },
+    'shell:open-lead': openLead,
+    'shell:open-claude': openLead,
     async 'tasks:dispatch'(p) {
       if (!validAbsPath(p?.project)) invalid();
       const source = p?.source, target = source === 'spec' ? p?.spec : source === 'text' ? p?.text : undefined;
@@ -541,6 +741,8 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
       const args = ['dispatch', target];
       // profile 可省略（自动）；给了就必须是非空、不含空白与换行的字符串（核心再校验它是否存在）。
       if (p.profile !== undefined) { if (typeof p.profile !== 'string' || !p.profile || /[\r\n\s]/.test(p.profile)) invalid(); args.push('--profile', p.profile); }
+      // 这次派发用的基线分支（424）：只对任务说明派发有效，必须是单行非空字符串（分支名是否存在由核心校验）。
+      if (p.base !== undefined) { if (source !== 'spec' || typeof p.base !== 'string' || !p.base || !validSingle(p.base)) invalid(); args.push('--base', p.base); }
       // 软件发起的派发都记为 AgentRouter（软件）；托管任务保持请求里原来的派活方，不走这里。
       args.push('--host', 'agentrouter');
       args.push('--detach');
@@ -746,6 +948,8 @@ export function createConsole({ coreRun, chooseFolder, chooseFile = options => e
     },
   };
   return {
+    get deploying() { return deployment !== null; },
+    close: cancelDeployment,
     async call(action, payload) {
       if (!Object.hasOwn(actions, action)) throw new Error('Invalid console action');
       if (payload !== undefined && (!payload || typeof payload !== 'object' || Array.isArray(payload))) throw new Error(messages.invalid);

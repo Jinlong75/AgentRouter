@@ -14,8 +14,8 @@ import { windowsPlatform } from './platform';
 import { readEvents, validCursor } from './events';
 import { worktreeState, type Task, type Snapshot, type GateResult } from '../shared/types';
 import { c, cx, p, wt } from '../shared/copy';
-import { coreRun } from './core';
-import { createConsole } from './console.mjs';
+import { coreRun, coreScript, coreStream } from './core';
+import { createConsole, arShots } from './console.mjs';
 import { runClearCache, secretNames, writeResetMarker, cleanupScript } from './reset.mjs';
 import { homeDirectory, legacyHomeDirectory, homeEnv, unsafeHome } from '../../../core/lib/compat.mjs';
 import { parseJson } from '../../../core/lib/json.mjs';
@@ -374,13 +374,29 @@ app.whenReady().then(async () => {
     } return t; };
     handle('preferences', async (action, payload) => {
       const operation = async () => {
-        if (typeof action !== 'string' || !['settings','detect','save','own','finish','ack','ackLeftover','install','choosePath','openConfig','clearCache','clearTasks','reset'].includes(action)) throw Error('Invalid preference action');
+        if (typeof action !== 'string' || !['settings','detect','save','own','finish','ack','ackLeftover','install','choosePath','openConfig','clearCache','clearTasks','reset','statsSources','statsSourcesAdd','statsSourcesRemove'].includes(action)) throw Error('Invalid preference action');
         if (payload !== undefined && (!payload || typeof payload !== 'object' || Array.isArray(payload))) throw Error('Invalid payload');
         if (action === 'openConfig') { await mkdir(home, { recursive: true }); const error = await effects.open(home); if (error) throw Error(error); return; }
         if (action === 'clearCache') return clearCacheNow();
         // 清空任务列表（018）：registry 一次把已结束任务的键加入 hidden，返回实际移除数。
         if (action === 'clearTasks') return registry.hideFinished();
         if (action === 'reset') return resetNow(payload);
+        // 427：额外的统计数据目录（只读并入统计页）。增删都经核心写 config.json，错误原样带回界面。
+        if (action === 'statsSources' || action === 'statsSourcesAdd' || action === 'statsSourcesRemove') {
+            let directory = '';
+            if (action === 'statsSourcesAdd') {
+                directory = await effects.chooseFolder(async () => { const selected = await dialog.showOpenDialog(win, { properties: ['openDirectory'] }); return selected.canceled || !selected.filePaths[0] ? null : selected.filePaths[0]; }) ?? '';
+                if (!directory) return null;
+            }
+            if (action === 'statsSourcesRemove') {
+                if (typeof payload?.directory !== 'string' || !payload.directory) throw Error('Invalid payload');
+                directory = payload.directory;
+            }
+            // coreRun 已经自动加 --json，这里不再重复（重复会按参数错误拒绝）。
+            const result = action === 'statsSources' ? await coreRun(['stats', 'sources'], { env, timeoutMs: 20000 }) : await coreRun(['stats', 'sources', action === 'statsSourcesAdd' ? 'add' : 'remove', directory], { env, timeoutMs: 20000 });
+            if (result.code !== 0 || !result.json?.ok) throw Error(result.json?.error || result.stderr.trim() || cx.noResult);
+            return Array.isArray(result.json.sources) ? result.json.sources : [];
+        }
         if (action === 'choosePath') {
             const selected = await dialog.showOpenDialog(win, { properties: ['openFile'], filters: [{ name: 'Codex', extensions: ['exe','cmd','js'] }] });
             if (selected.canceled) return null;
@@ -408,14 +424,19 @@ app.whenReady().then(async () => {
       }
       catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
     });
+    // 界面验收的 ar 遮挡检测桩（426）：不读真实注册表、不碰真实文件；shots 里改 machinePath / files 控制结果。
+    const arShadowShots = arShots as typeof arShots & { machinePath?: string; files?: string[] };
+    const arDeps = { ...arShots.deps, readMachinePath: async () => arShadowShots.machinePath ?? '', exists: async (file: string) => (arShadowShots.files ?? []).some(item => item.toLowerCase() === file.toLowerCase()) };
     // console 通道：界面上的每个写操作都经这里翻译成一条核心命令（见 console.mjs）。
     // testTimeout 平时是 180 秒；只有验收模式（AR_SHOTS 且隔离环境）下 AR_SHOTS_AGENT_TIMEOUT 为正整数时用其值，方便测"超时"不必等 3 分钟。
     const consoleService = createConsole({
-      coreRun, messages: cx,
+      coreRun, coreStream, messages: cx, env,
+      harnessEvent: event => { if (!win.isDestroyed()) win.webContents.send('harness:event', event); },
+      arOptions: { localAppData: shotMode ? path.join(home, 'ar-local') : env.LOCALAPPDATA, appExe: process.execPath, coreEntry: coreScript(), ...(shotMode ? { deps: arDeps } : {}) },
       knownRunDir: dir => registry.knownRunDir(dir),
       knownTask: (repo, name) => registry.knownTask(repo, name),
       openFolder: async dir => { const error = await effects.open(dir); if (error) throw Error(error); },
-      launch: (executable, args, { cwd, env }) => effects.launch(executable, args, cwd, env),
+      launch: (executable, args, { cwd, env, verbatim }) => effects.launch(executable, args, cwd, env, verbatim),
       // Windows Terminal：用户目录下的应用执行别名（不存在时退回 cmd.exe）。
       findWt: async () => { const wt = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe'); try { await stat(wt); return wt; } catch { return null; } },
       testTimeout: (() => { if (!shotMode) return 180; const v = Number(process.env.AR_SHOTS_AGENT_TIMEOUT); return Number.isInteger(v) && v > 0 ? v : 180; })(),
@@ -431,8 +452,12 @@ app.whenReady().then(async () => {
       }
       catch (error) {
         // 核心错误码随失败结果一起交给渲染层（如 NEED_GIT_IDENTITY），界面据此显示对应的指引。
-        const code = error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : undefined;
-        return { ok: false, error: error instanceof Error ? error.message : String(error), ...(code ? { code } : {}) };
+        const field = (name: string) => {
+          const value = error && typeof error === 'object' ? (error as Record<string, unknown>)[name] : undefined;
+          return typeof value === 'string' && value ? value : undefined;
+        };
+        const code = field('code'), current = field('current'), base = field('base');
+        return { ok: false, error: error instanceof Error ? error.message : String(error), ...(code ? { code } : {}), ...(current ? { current } : {}), ...(base ? { base } : {}) };
       }
     });
     handle('snapshot', () => snapshot());
@@ -503,7 +528,14 @@ app.whenReady().then(async () => {
     // 点 × 或 win.close()：正在退出时照常关闭；否则按偏好询问 / 最小化到托盘 / 直接退出。
     win.on('close', (e) => {
         quitEvent(`窗口 close（quitting=${quitting}，closeAction=${own.closeAction}）`);
+        const closeAfterDeployment = () => {
+            if (!consoleService.deploying) return false;
+            e.preventDefault();
+            void consoleService.close().catch(errors).finally(() => { closeAccepted = true; win.close(); });
+            return true;
+        };
         if (closeAccepted || quitting) {
+            if (closeAfterDeployment()) return;
             closeAccepted = false;
             if (!quitting) windowSave = writeFile(path.join(data, 'window.json'), JSON.stringify(win.getNormalBounds())).catch(errors);
             return;
@@ -516,6 +548,7 @@ app.whenReady().then(async () => {
             return;
         }
         if (action === 'quit') {
+            if (closeAfterDeployment()) return;
             windowSave = writeFile(path.join(data, 'window.json'), JSON.stringify(win.getNormalBounds())).catch(errors);
             return;
         }

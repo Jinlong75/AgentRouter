@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { BEGIN, END } from '../../core/lib/project.mjs';
 
 const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
-const created = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', '.gitignore'];
+const created = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', 'docs/autonomy/README.md', 'handoff.md', '.gitignore'];
 
 function fixture(t) {
   const base = fs.mkdtempSync(join(tmpdir(), '初始化 测试 '));
@@ -40,8 +40,9 @@ test('空仓库：--dry-run 只列计划不写文件；init 生成 8 个文件�
   assert.match(result.stdout, /已改动/); assert.match(result.stdout, /已登记项目/); assert.match(result.stdout, /git commit -m "\[主导\] 接入 AgentRouter" --/);
   assert.deepEqual(Object.keys(f.snapshot()).sort(), [...created].sort());
   const project = JSON.parse(f.read('.agent-router/project.json'));
-  assert.deepEqual(project, { v: 1, name: '我的 项目', baseBranch: f.git('symbolic-ref', '--short', 'HEAD'), specsDir: 'docs/specs', setup: [], verify: [], allowedPaths: ['**'], routing: { rules: [] }, worktree: true });
+  assert.deepEqual(project, { v: 1, name: '我的 项目', baseBranch: f.git('symbolic-ref', '--short', 'HEAD'), specsDir: 'docs/specs', setup: [], verify: [], allowedPaths: ['**'], routing: { rules: [] }, worktree: true, specRequired: { sections: ['受影响的已有测试'], types: ['code', 'fix', 'test', 'refactor'] }, reportRequired: { sections: ['推断清单', 'TODO(lead)', '已知问题'], types: ['code', 'fix', 'test', 'refactor'] } });
   assert.ok(f.read('AGENTS.md').startsWith(`# 我的 项目\n\n${BEGIN}\n## AgentRouter 协作`)); assert.ok(f.read('AGENTS.md').trimEnd().endsWith(END));
+  assert.match(f.read('handoff.md'), /## 开工必做/); assert.match(f.read('handoff.md'), /ar lead brief/);
   assert.equal(f.read('CLAUDE.md'), '@AGENTS.md\n'); assert.equal(f.read('.gitignore'), '.agent-runs/\n');
   assert.match(f.read('docs/roles/worker.md'), /^# 角色：执行者/); assert.match(f.read('docs/roles/reviewer.md'), /^# 角色：审查者/);
   assert.equal(f.git('status', '--porcelain').split('\n').filter(l => l.startsWith('A ')).length, 0, '没有暂存任何文件');
@@ -145,4 +146,11 @@ test('git 低于 2.40（095，AR_TEST_GIT_VERSION）：ar init 退出码 2、GIT
   assert.equal(f.ar(['init', '--dry-run']).status, 0);
   delete f.env.AR_TEST_GIT_VERSION;
   assert.equal(f.ar(['init']).status, 0);
+});
+test('已有交接文件不覆盖', t => {
+  const f = fixture(t); f.git('init', '-q');
+  fs.writeFileSync(join(f.repo, 'handoff.md'), '已有交接内容\n');
+  const result = JSON.parse(f.ar(['init', '--json']).stdout);
+  assert.ok(!result.changes.some(c => c.path === 'handoff.md'));
+  assert.equal(f.read('handoff.md'), '已有交接内容\n');
 });

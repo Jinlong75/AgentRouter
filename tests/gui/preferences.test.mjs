@@ -77,7 +77,7 @@ test('应用偏好独立保存，引导跳过不创建配置、完成创建默�
 test('连接状态、按钮组合、引导默认选择与批次隔离',async t=>{
   const {home,env,service}=await fixture(t);
   let data=await service.run('detect');const cc=data.hosts[0];assert.equal(data.hosts.length,1);
-  assert.deepEqual(cc.skills.map(s=>s.state),['latest','latest']);assert.ok(cc.actions.includes('reinstall'));assert.ok(cc.actions.includes('rollback'));assert.equal(cc.skills[0].checked,false);
+  assert.deepEqual(cc.skills.map(s=>s.state),['latest','latest','latest']);assert.ok(cc.actions.includes('reinstall'));assert.ok(cc.actions.includes('rollback'));assert.equal(cc.skills[0].checked,false);
   uninstall({env,host:'claude-code',skill:'lead-workflow'});
   data=await service.run('detect');assert.ok(data.hosts[0].actions.includes('install'));assert.equal(data.hosts[0].skills[1].state,'missing');assert.equal(data.hosts[0].skills[1].checked,true);
   assert.ok(cc.root.startsWith('~'));assert.equal(data.codex.login,'in');
@@ -99,9 +99,9 @@ test('连接状态、按钮组合、引导默认选择与批次隔离',async t=>
 test('宿主卡片找到该宿主最近备份，撤销后可以重做',async t=>{
   const {service}=await fixture(t);
   await service.run('install',{host:'claude-code',operation:'rollback'});
-  let data=await service.run('detect');assert.deepEqual(data.hosts[0].skills.map(s=>s.state),['missing','missing']);
+  let data=await service.run('detect');assert.deepEqual(data.hosts[0].skills.map(s=>s.state),['missing','missing','missing']);
   await service.run('install',{host:'claude-code',operation:'rollback'});
-  data=await service.run('detect');assert.deepEqual(data.hosts[0].skills.map(s=>s.state),['latest','latest']);
+  data=await service.run('detect');assert.deepEqual(data.hosts[0].skills.map(s=>s.state),['latest','latest','latest']);
 });
 test('按钮组合覆盖混合状态，未知或手装版本受保护',()=>{
   assert.equal(skillState({state:'foreign'},'0.1.0'),'custom');assert.equal(skillState({state:'modified'},'0.1.0'),'custom');
@@ -110,6 +110,24 @@ test('按钮组合覆盖混合状态，未知或手装版本受保护',()=>{
   assert.deepEqual(hostActions([{state:'update'},{state:'missing'}],false),['install','update']);
   assert.deepEqual(['missing','update','custom','latest','newer'].map(defaultChecked),[true,true,false,false,false]);
   assert.deepEqual(hostActions([{state:'newer'},{state:'latest'}],false),[]);
+});
+test('第三技能状态、默认选择、更新、自改保护和回退',async t=>{
+  const {env,service}=await fixture(t), dir=path.join(env.CLAUDE_CONFIG_DIR,'skills','lead-practices');
+  const marker=path.join(dir,'.agent-router.json'), ref=path.join(dir,'references','examples.md');
+  const get=async()=>(await service.run('detect')).hosts[0].skills.find(s=>s.skill==='lead-practices');
+  const original=await readFile(marker,'utf8'), content=await readFile(ref,'utf8');
+  let state=await get(); assert.equal(state.state,'latest'); assert.equal(state.checked,false); assert.equal(state.version,JSON.parse(original).version);
+  await writeFile(marker,JSON.stringify({...JSON.parse(original),version:'0.0.0'}));
+  state=await get(); assert.equal(state.state,'update'); assert.equal(state.checked,true);
+  await service.run('install',{host:'claude-code',operation:'update'}); assert.equal((await get()).state,'latest');
+  await writeFile(ref,'用户修改'); state=await get(); assert.equal(state.state,'custom'); assert.equal(state.checked,false);
+  await service.run('install',{host:'claude-code',operation:'update'}); assert.equal(await readFile(ref,'utf8'),'用户修改');
+  await service.run('install',{host:'claude-code',operation:'replace',skills:['lead-practices']}); assert.equal(await readFile(ref,'utf8'),content);
+  await service.run('install',{host:'claude-code',operation:'rollback'}); assert.equal(await readFile(ref,'utf8'),'用户修改');
+  await writeFile(ref,content); await writeFile(marker,JSON.stringify({...JSON.parse(original),version:'99.0.0'}));
+  state=await get(); assert.equal(state.state,'newer'); assert.equal(state.checked,false);
+  uninstall({env,host:'claude-code',skill:'lead-practices'}); await rm(dir,{recursive:true,force:true});
+  state=await get(); assert.equal(state.state,'missing'); assert.equal(state.checked,true);
 });
 test('Codex 指定入口优先、版本提示持久化、清除后不再提示',async t=>{
   const {home,env,service}=await fixture(t);

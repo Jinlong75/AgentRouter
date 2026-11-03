@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   EXCLUDED_NAMES, HOME_NAMES, MAX_ADDED, OUTSIDE_NOTE, SLOTS_NAME, TEMP_PREFIXES,
-  diffRoots, isExcludedHomeName, isUserTempName, listAdded, outsideField, outsideLine, outsideRecord, outsideSummary,
+  confirmOutsideWrites, diffRoots, isExcludedHomeName, isUserTempName, listAdded, outsideField, outsideLine, outsideRecord, outsideSummary,
   readOutsideWrites, snapshotRoots, uncheckedLine, userTempLine,
 } from '../../core/lib/outside-writes.mjs';
 
@@ -23,11 +23,35 @@ function fixture(t) {
 }
 const touch = (dir, name, text = 'x') => writeFileSync(path.join(dir, name), text);
 
+test('先分类全部新增再截断，保留第 101 个持续条目', async t => {
+  const f = fixture(t);
+  const before = snapshotRoots(f.roots);
+  for (let i = 0; i <= MAX_ADDED; i++) touch(f.userHome, `f${String(i).padStart(3, '0')}`);
+  const result = await confirmOutsideWrites(before, f.roots, { wait: async () => {
+    for (let i = 0; i < MAX_ADDED; i++) rmSync(path.join(f.userHome, `f${String(i).padStart(3, '0')}`));
+  } });
+  assert.deepEqual(result.added, [{ root: 'user', name: 'f100', type: 'file' }]);
+  assert.equal(result.transient.length, MAX_ADDED);
+});
+
+test('二次采样保留持续新增，记录已消失条目；读取失败不当作消失', async t => {
+  const f = fixture(t);
+  const before = snapshotRoots(f.roots);
+  touch(f.userHome, 'persistent');
+  mkdirSync(path.join(f.userHome, '.claude.json.lock'));
+  const result = await confirmOutsideWrites(before, f.roots, { wait: async () => rmSync(path.join(f.userHome, '.claude.json.lock'), { recursive: true }) });
+  assert.deepEqual(result.added, [{ root: 'user', name: 'persistent', type: 'file' }]);
+  assert.deepEqual(result.transient, [{ root: 'user', name: '.claude.json.lock', type: 'dir' }]);
+  assert.deepEqual(readOutsideWrites(outsideField(result)).transient, result.transient);
+  const failed = await confirmOutsideWrites(before, f.roots, { wait: async () => rmSync(f.userHome, { recursive: true }) });
+  assert.equal(failed.checked, false);
+});
+
 test('排除名单：协议第 1 节的表 + slots，写成导出的常量', () => {
-  assert.deepEqual([...HOME_NAMES], ['runs.jsonl', 'config.json', 'projects.json', 'viewer.json', 'managed', 'agent-tests.json', 'backups', 'staging', 'workers', 'monitor']);
+  assert.deepEqual([...HOME_NAMES], ['runs.jsonl', 'leads.jsonl', 'config.json', 'projects.json', 'viewer.json', 'managed', 'agent-tests.json', 'backups', 'staging', 'workers', 'monitor', 'resources.jsonl', 'concurrency-state.json', 'concurrency-state.json.lock']);
   assert.equal(SLOTS_NAME, 'slots');
   assert.deepEqual([...EXCLUDED_NAMES], [...HOME_NAMES, 'slots']);
-  assert.deepEqual([...TEMP_PREFIXES], [...HOME_NAMES, '.config-', '.agent-tests-']);
+  assert.deepEqual([...TEMP_PREFIXES], [...HOME_NAMES, '.config-', '.agent-tests-', 'concurrency-state.']);
 });
 
 test('新文件与新目录算新增，类型正确，用户目录与公共目录分别标 user / home', t => {

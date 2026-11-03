@@ -252,7 +252,14 @@ export async function captureSearch(h: Harness, registry: Registry, win: Browser
     const limit0 = (await config()).concurrency as number ?? 2;
     const rows0 = await sidebarRows(limit0);
     assert.ok(rows0.some(r => r.text === `Codex${s6.loadRow(2, limit0)}`), `侧栏应有 Codex 一行，两个进行中的演示任务：${rows0.map(r => r.text).join('、')}`);
+    const waitSidebar = async (property: 'textContent' | 'title', expected: string[], label: string) => {
+        const actual = `JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.${property}))`;
+        try { await wait(`${actual} === ${jsonStr(jsonStr(expected))}`, label); }
+        catch (error) { throw Error(`${error instanceof Error ? error.message : String(error)}\n实际侧栏${property === 'title' ? '提示' : '文字'}：${await evaluate(actual)}`, { cause: error }); }
+    };
+    await waitSidebar('textContent', rows0.map(r => r.text), '侧栏按配置刷新');
     await check('UI15 侧栏底部：每个启用的执行者一行，文字精确等于“显示名 + 运行数/上限”', `JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.textContent)) === ${jsonStr(jsonStr(rows0.map(r => r.text)))}`);
+    await waitSidebar('title', rows0.map(r => r.tip), '侧栏悬停提示按配置刷新');
     await check('UI15 侧栏底部：悬停提示是“某某 正在运行 n 个任务；同时最多运行 m 个”，上方有分隔线', `JSON.stringify([...document.querySelectorAll('.nav-foot .load-l')].map(r => r.title)) === ${jsonStr(jsonStr(rows0.map(r => r.tip)))} && parseFloat(getComputedStyle(document.querySelector('.nav-foot')).borderTopWidth) > 0 && getComputedStyle(document.querySelector('.nav-foot')).borderTopStyle === 'solid'`);
     await check('UI15 侧栏底部最后一行是托管状态，前面有圆点；原来的单行“某某 n”不再出现', `(() => { const f = document.querySelector('.nav-foot'), last = f.lastElementChild; return last.matches('[data-managed-settings]') && !!last.querySelector('.dot') && last.textContent.trim() === ${jsonStr((await config()).managed ? c.managedOn : c.managedOff)} && ![...f.querySelectorAll('[title]')].some(e => e.title === ${jsonStr(c.loadHelp)}); })()`);
     await save('sidebar-load-dark');

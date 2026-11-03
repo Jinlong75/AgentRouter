@@ -66,7 +66,7 @@ process.stdin.on('end', () => {
   const committed = run(['commit', '-m', '解决冲突：合并双方的改动']);
   if (added.status !== 0 || committed.status !== 0) { process.stderr.write(added.stderr + committed.stderr); process.exit(1); }
   const report = process.argv[process.argv.indexOf('-o') + 1];
-  writeFileSync(report, '已解决冲突，合并了 ' + mergeHead.slice(0, 7) + '\\n');
+  writeFileSync(report, '已解决冲突，合并了 ' + mergeHead.slice(0, 7) + '\\n## 已知问题\\n无\\n');
   console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '已解决冲突' } }));
 });
 `;
@@ -96,7 +96,7 @@ function fixture(t) {
   f.setProfile = value => write(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
     profiles: {
-      fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value },
+      fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...value },
       resolver: { adapter: 'codex', label: '冲突解决者', enabled: true },
     },
   }));

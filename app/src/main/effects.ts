@@ -47,7 +47,7 @@ export const effects = {
     folders: [] as string[],
     folderRequests: 0,
     // 启动外部程序（在项目里打开 Claude Code）：验收时只记录参数。
-    launched: [] as { executable: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }[],
+    launched: [] as { executable: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv; verbatim?: boolean }[],
     // 托盘（012）：验收时由主进程填入状态；打开动作会计数，便于检查"单击托盘恢复窗口"。
     tray: null as StubTray | null,
     async open(file: string) {
@@ -62,10 +62,16 @@ export const effects = {
         if (this.stub) { this.folderRequests++; return this.folders.shift() ?? null; }
         return show();
     },
-    async launch(executable: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv) {
-        if (this.stub) { this.launched.push({ executable, args, cwd, env }); return; }
+    async launch(executable: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, verbatim?: boolean) {
+        // 桩里的环境变量：代理变量不是密钥，照常记录值（代理检查要断言具体地址）；其余只记名字，值记为 undefined，
+        // 防止密钥进入检查记录（293 交接）。
+        if (this.stub) {
+            const proxies = new Set(['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy']);
+            this.launched.push({ executable, args, cwd, ...(env ? { env: Object.fromEntries(Object.keys(env).map(name => [name, proxies.has(name) ? env[name] : undefined])) } : {}), ...(verbatim ? { verbatim } : {}) });
+            return;
+        }
         await new Promise<void>((resolve, reject) => {
-            const child = spawn(executable, args, { cwd, ...(env ? { env } : {}), detached: true, stdio: 'ignore', shell: false, windowsHide: false });
+            const child = spawn(executable, args, { cwd, ...(env ? { env } : {}), windowsVerbatimArguments: verbatim === true, detached: true, stdio: 'ignore', shell: false, windowsHide: false });
             child.once('error', reject); child.once('spawn', () => { child.unref(); resolve(); });
         });
     },

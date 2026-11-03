@@ -174,12 +174,12 @@ test('2 ar status：来自任务说明 / 路由规则时加说明；来源是配
   const plain = f.status('cfg');
   assert.deepEqual(plain.lines, ['状态：cfg（done）', '尝试次数：1'], '来源是配置：文字输出没有参数行（146 的规则不变）');
   // 154（D81）：--json 的 params 总是有，每个值都带来源。
-  assert.deepEqual(plain.json.params, { model: 'deepseek-v4-pro', effort: 'low', sources: { model: '内置默认', effort: 'config.json' } });
-  assert.deepEqual(Object.keys(plain.json), ['ok', 'id', 'name', 'state', 'attempts', 'gate', 'needsScope', 'outsideWrites', 'worktree', 'merge', 'conflict', 'params']);
+  assert.deepEqual(plain.json.params, { model: 'deepseek-v4-flash', effort: 'low', sources: { model: '内置默认', effort: 'config.json' } });
+  assert.deepEqual(Object.keys(plain.json), ['ok', 'id', 'name', 'state', 'attempts', 'gate', 'needsScope', 'outsideWrites', 'worktree', 'merge', 'conflict', 'params', 'report']);
 
   f.config(config => { config.profiles.deepseek.effort = 'low'; withRule('medium')(config); });
   f.dispatch('rule', f.spec('s2'));
-  assert.deepEqual(f.status('rule').lines, ['状态：rule（done）', '尝试次数：1', '参数：模型 deepseek-v4-pro，推理强度 medium（来自路由规则）']);
+  assert.deepEqual(f.status('rule').lines, ['状态：rule（done）', '尝试次数：1', '参数：模型 deepseek-v4-flash，推理强度 medium（来自路由规则）']);
 
   f.dispatch('spec', f.spec('s3', ['effort: high', 'model: m-spec']));
   const spec = f.status('spec');
@@ -188,7 +188,7 @@ test('2 ar status：来自任务说明 / 路由规则时加说明；来源是配
 
   // 只有 effort 来自任务说明：model 照常显示、不加说明。
   f.dispatch('mixed', f.spec('s4', ['effort: high']));
-  assert.deepEqual(f.status('mixed').lines.at(-1), '参数：模型 deepseek-v4-pro，推理强度 high（来自任务说明）');
+  assert.deepEqual(f.status('mixed').lines.at(-1), '参数：模型 deepseek-v4-flash，推理强度 high（来自任务说明）');
 });
 
 test('3 推理强度不在预设的 effortOptions 里：任务说明与路由规则都拒绝派发（退出码 2），列出可选值；没有 effortOptions 不拦，命令行不校验', t => {
@@ -285,7 +285,7 @@ test('5 ar retry：同一执行者沿用规则的 effort 与来源；任务说�
   assert.deepEqual(f.agentArgs().slice(-2), ['--effort', 'medium']);
   assert.deepEqual(resumes().at(-1).settingSources, { model: '内置默认', effort: '路由规则' });
   assert.equal(resumes().at(-1).effort, 'medium');
-  assert.deepEqual(f.status('job').lines.at(-1), '参数：模型 deepseek-v4-pro，推理强度 medium（来自路由规则）');
+  assert.deepEqual(f.status('job').lines.at(-1), '参数：模型 deepseek-v4-flash，推理强度 medium（来自路由规则）');
 
   // 手动重试重新读任务说明：新写的 effort / model 照新值生效，来源变成任务说明；dispatch.json 里第一次的记录不变。
   f.spec('t1', ['effort: high', 'model: m-new']);

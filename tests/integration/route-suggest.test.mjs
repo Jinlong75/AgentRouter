@@ -44,8 +44,8 @@ test('ar route suggest --json：只建议测试通过的执行者，已有规则
   assert.equal(status, 0, stderr);
   assert.equal(json.ok, true);
   assert.deepEqual(json.rules, [
-    { types: ['test', 'docs'], profile: 'ds', why: 'DeepSeek V4 Pro 的预设建议用于测试、文档；测试连接 10-26 10:42 通过' },
-    { types: ['code', 'refactor'], profile: 'claude', why: 'Claude 的预设建议用于代码、修复、重构；测试连接 10-26 10:42 通过' },
+    { types: ['test', 'docs'], profile: 'ds', why: 'DeepSeek V4 Pro 的预设建议用于测试、文档；测试连接 10-26 10:42 通过', fit: { good: ['文档与大段中文文本编辑', '按清单补测试'], avoid: [] } },
+    { types: ['code', 'refactor'], profile: 'claude', why: 'Claude 的预设建议用于代码、修复、重构；测试连接 10-26 10:42 通过', fit: { good: ['代码、修复、重构', '大段中文文本与文档编辑'], avoid: [] } },
   ]);
   assert.deepEqual(json.skipped, [{ profile: 'codex', why: '测试连接没有通过' }, { types: ['fix'], why: '已有规则 1 覆盖修复' }]);
   assert.ok(json.write.startsWith("ar route rules set '"));
@@ -56,8 +56,8 @@ test('ar route suggest 文字输出：每条一行"类型 → 执行者：原因
   const r = f.ar(['route', 'suggest']);
   assert.equal(r.status, 0, r.stderr);
   const lines = r.stdout.trimEnd().split('\n');
-  assert.equal(lines[0], '测试、文档 → ds：DeepSeek V4 Pro 的预设建议用于测试、文档；测试连接 10-26 10:42 通过');
-  assert.equal(lines[1], '代码、重构 → claude：Claude 的预设建议用于代码、修复、重构；测试连接 10-26 10:42 通过');
+  assert.equal(lines[0], '测试、文档 → ds：DeepSeek V4 Pro 的预设建议用于测试、文档；测试连接 10-26 10:42 通过；擅长：文档与大段中文文本编辑、按清单补测试；避免：');
+  assert.equal(lines[1], '代码、重构 → claude：Claude 的预设建议用于代码、修复、重构；测试连接 10-26 10:42 通过；擅长：代码、修复、重构、大段中文文本与文档编辑；避免：');
   assert.ok(lines.includes('跳过 codex：测试连接没有通过'), r.stdout);
   assert.ok(lines.includes('跳过 修复：已有规则 1 覆盖修复'), r.stdout);
   assert.ok(lines.at(-1).startsWith("采用：ar route rules set '"), r.stdout);
@@ -98,4 +98,32 @@ test('用 write 给出的命令真的执行一次：规则写入后 = 已有规�
   ]);
   // 采用后再建议：没有新的了。
   assert.deepEqual(f.json(['route', 'suggest']).json.rules, []);
+});
+
+
+test('别名与未知兼容后端的 fit 回填', t => {
+  const cfg = config();
+  cfg.profiles = {
+    alias: cfg.profiles.ds,
+    unknown: { adapter: 'claude-code', enabled: true, env: { ANTHROPIC_BASE_URL: 'https://example.invalid/anthropic' }, secrets: { ANTHROPIC_AUTH_TOKEN: 'EXAMPLE_KEY' } },
+  };
+  cfg.defaultProfile = 'alias';
+  cfg.routing.rules = [];
+  cfg.prices = { unknown: { input: 1, output: 1, currency: 'CNY' } };
+  const f = fixture(t, cfg, { alias: { at: AT, ok: true }, unknown: { at: AT, ok: true } });
+  const listed = f.json(['agents', 'list']);
+  assert.equal(listed.status, 0, listed.stderr);
+  const agents = listed.json.agents;
+  assert.deepEqual(agents.find(a => a.name === 'alias').fit, { good: ['文档与大段中文文本编辑', '按清单补测试'], avoid: [] });
+  assert.equal(agents.find(a => a.name === 'unknown').fit, undefined);
+  const listText = f.ar(['agents', 'list']);
+  assert.match(listText.stdout, /alias.*擅长：文档与大段中文文本编辑、按清单补测试/);
+  assert.doesNotMatch(listText.stdout.split('\n').find(line => line.includes('unknown')), /擅长：/);
+  const suggested = f.json(['route', 'suggest']);
+  assert.equal(suggested.status, 0, suggested.stderr);
+  assert.deepEqual(suggested.json.rules.find(r => r.profile === 'alias').fit, { good: ['文档与大段中文文本编辑', '按清单补测试'], avoid: [] });
+  assert.equal(suggested.json.rules.find(r => r.profile === 'unknown').fit, undefined);
+  const text = f.ar(['route', 'suggest']).stdout;
+  assert.match(text, /alias.*擅长：文档与大段中文文本编辑、按清单补测试/);
+  assert.doesNotMatch(text.split('\n').find(line => line.includes('→ unknown')), /擅长：/);
 });

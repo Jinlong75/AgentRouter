@@ -124,16 +124,16 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         })()`);
         await shots('wizard-1');
 
-        // ---- Qoder 国内版：默认模型与推理强度（预设的值）、令牌帮助文字 ----
+        // ---- Qoder 国内版：默认模型与推理强度、令牌帮助文字 ----
         await press('[data-preset="qoder-cn"]'); await press('[data-w-act=next]'); await wait('!!document.querySelector(".sheet [data-sel=model]")');
-        await check('UI28 Qoder 国内版第 2 步：模型下拉初始选中预设的 DeepSeek-Flash，推理强度选中 ultracode', 'document.querySelector("[data-sel=model]").textContent.trim()==="DeepSeek-Flash" && document.querySelector("[data-sel=effort]").textContent.trim()==="ultracode"');
+        await check('UI28 Qoder 国内版第 2 步：模型为空，推理强度为默认', `document.querySelector('[data-sel=model]').textContent.trim() === '' && document.querySelector('[data-sel=effort]').textContent.trim() === ${jsonStr(gx.effortDefault)}`);
         // 改写（111）：原断言"第 2 步有一个灰掉的订阅登录按钮（.segm button[disabled]）" → 新断言"没有认证方式这一行，也没有分段开关" → 原因：这个开关只有 Codex 能二选一，其他预设显示它是误导。
         // 改写（112）：111 的新断言"没有任何分段开关（.sheet .segm）" → "没有 Codex 的认证方式开关（[data-w-auth]），唯一的分段按钮是第一行的'版本'" → 原因：Qoder 两个版本合并成一张卡片，第 2 步第一行是版本分段按钮。
         await check('UI28 Qoder 国内版：令牌帮助文字写 qoder.cn 与变量名，没有"认证方式"这一行，唯一的分段按钮是第一行的"版本"', `(() => { const t = document.querySelector('.sheet').textContent; const segs = [...document.querySelectorAll('.sheet .segm')]; return t.includes(${jsonStr(gx.qoderTokenHelp('qoder.cn', 'QODERCN_PERSONAL_ACCESS_TOKEN'))}) && !document.querySelector('.sheet [data-w-auth]') && [...document.querySelectorAll('.sheet .fl b')].every(b => !b.textContent.includes(${jsonStr(ag.auth)})) && segs.length === 1 && segs[0].closest('.fld') === document.querySelector('.sheet .form > .fld') && document.querySelector('.sheet .form > .fld .fl b').textContent === ${jsonStr(presetOf('qoder-cn').variant.label)}; })()`);
         await press('[data-sel=model]'); await wait('!!document.querySelector(".optmenu")');
         await assertMenuVisible('UI28 Qoder 模型下拉');
         await check('UI28 下拉菜单不透明（走查发现的透明菜单）：opacity 为 1、没有缩放、层级盖过普通菜单、在窗口里、中心点命中菜单自己', `(() => { const m = document.querySelector('.optmenu'), s = getComputedStyle(m), r = m.getBoundingClientRect(); return m.classList.contains('menu') && s.opacity === '1' && (s.transform === 'none' || s.transform === 'matrix(1, 0, 0, 1, 0, 0)') && s.zIndex === '60' && r.left >= 0 && r.right <= innerWidth && r.bottom <= innerHeight && m.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)); })()`);
-        await check('UI28 模型下拉：列出预设的可选值，当前项打勾，最后一项是自定义…', `(() => { const items = [...document.querySelectorAll('.optmenu button')]; const labels = items.map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return labels.includes('Qwen3.8-Max') && labels.at(-1) === ${jsonStr(gx.modelCustom)} && items.find(b => b.getAttribute('aria-selected') === 'true').textContent.includes('DeepSeek-Flash') && document.activeElement.closest('.optmenu') !== null; })()`);
+        await check('UI28 模型下拉：列出预设的可选值，空模型没有选中项，最后一项是自定义…', `(() => { const items = [...document.querySelectorAll('.optmenu button')]; const labels = items.map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return labels.includes('Qwen3.8-Max') && labels.at(-1) === ${jsonStr(gx.modelCustom)} && !items.some(b => b.getAttribute('aria-selected') === 'true') && document.activeElement.closest('.optmenu') !== null; })()`);
         for (const theme of ['dark', 'light'] as const) { nativeTheme.themeSource = theme; await pause(350); await save(`agents-wizard-2-model-menu-${theme}`); }
         nativeTheme.themeSource = 'dark';
         await key('Escape');
@@ -143,6 +143,9 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await check('UI28 推理强度下拉：第一项是默认（说明不传参数），后面是预设的可选值', `(() => { const items = [...document.querySelectorAll('.optmenu button')]; return items[0].textContent.includes(${jsonStr(gx.effortDefault)}) && items[0].textContent.includes(${jsonStr(gx.effortDefaultDesc)}) && items.some(b => b.textContent.trim() === 'ultracode') && items.at(-1).textContent.trim() === ${jsonStr(gx.modelCustom)}; })()`);
         await key('Down'); await check('UI28 下拉菜单可用方向键移动焦点', 'document.activeElement.closest(".optmenu") !== null && document.activeElement.getAttribute("aria-selected") !== null');
         await key('Escape');
+
+        await pick('[data-sel=model]', 'DeepSeek-Flash'); await pick('[data-sel=effort]', 'ultracode');
+        await check('UI28 Qoder 国内版：选择 DeepSeek-Flash 与 ultracode 生效', `document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode'`);
 
         // ---- Qoder 国内版 / 国际版（112）：一张卡片，第 2 步第一行"版本"分段按钮；切换后名称、密钥变量、令牌说明里的站点、默认模型与推理强度都跟着变 ----
         const cnPreset = presetOf('qoder-cn'), intlPreset = presetOf('qoder');
@@ -159,7 +162,7 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await check('UI28 Qoder 国际版：模型下拉的选项来自国际版预设的 modelOptions', `(() => { const labels = [...document.querySelectorAll('.optmenu button')].map(b => [...b.querySelectorAll('span')].find(s => !s.classList.contains('ri-sp')).textContent.trim()); return ${jsonStr(intlPreset.modelOptions)}.every(m => labels.includes(m)); })()`);
         await key('Escape');
         await press('[data-w-variant=qoder-cn]'); await wait(`document.querySelector('[data-w=secretVar]')?.value === ${jsonStr(Object.values(cnPreset.secrets)[0])}`);
-        await check('UI28 Qoder 切回国内版：名称、令牌说明（qoder.cn）、默认模型 DeepSeek-Flash 与推理强度 ultracode 都回到国内版的', `(() => { const name = document.querySelector('[data-w=name]').value; return name.startsWith('qoder-cn') && document.querySelector('.sheet').textContent.includes(${jsonStr(gx.qoderTokenHelp('qoder.cn', 'QODERCN_PERSONAL_ACCESS_TOKEN'))}) && document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode' && document.querySelector('.sheet .segm button.on').textContent === ${jsonStr(cnPreset.variant.option)}; })()`);
+        await check('UI28 Qoder 切回国内版：名称、令牌说明（qoder.cn）、模型和推理强度回到国内版的默认', `(() => { const name = document.querySelector('[data-w=name]').value; return name.startsWith('qoder-cn') && document.querySelector('.sheet').textContent.includes(${jsonStr(gx.qoderTokenHelp('qoder.cn', 'QODERCN_PERSONAL_ACCESS_TOKEN'))}) && document.querySelector('[data-sel=model]').textContent.trim() === '' && document.querySelector('[data-sel=effort]').textContent.trim() === ${jsonStr(gx.effortDefault)} && document.querySelector('.sheet .segm button.on').textContent === ${jsonStr(cnPreset.variant.option)}; })()`);
         await shots('wizard-2-variant-qoder');
         // ---- 181：模型查询还没回来就切换版本，旧查询回来不能把表单改回旧版本（D101 全量 shots 发现）----
         // 做法：先保存国内版的密钥（假值），触发一次被拖慢 1.5 秒的模型查询；查询进行中把 secrets:status 也拖慢，点"国际版"，
@@ -535,8 +538,17 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await press('[data-w-act=done]'); await wait('!document.querySelector(".sheet")');
 
         // ---- Qoder 国内版（编辑：模型列表）----
-        const added = await coreRun(['agents', 'add', '--preset', 'qoder-cn'], { timeoutMs: 60000 });
-        assert.equal(added.code, 0, added.stderr || added.json?.error);
+        await openWizard();
+        await press('[data-preset="qoder-cn"]'); await press('[data-w-act=next]'); await wait('!!document.querySelector(".sheet [data-sel=model]")');
+        await pick('[data-sel=model]', 'DeepSeek-Flash'); await pick('[data-sel=effort]', 'ultracode');
+        await check('UI28 导入 Qoder 前选择的模型与推理强度生效', `document.querySelector('[data-sel=model]').textContent.trim() === 'DeepSeek-Flash' && document.querySelector('[data-sel=effort]').textContent.trim() === 'ultracode'`);
+        const marker = path.join(home, 'fake-stream-invoked');
+        await rm(marker, { force: true });
+        await press('[data-w-act=next]');
+        await wait('!!document.querySelector("[data-w-result]")', 'UI28 Qoder 导入测试结果', 60000);
+        await check('UI28 Qoder：测试连接使用假程序并通过', 'document.querySelector("[data-w-result]").dataset.wResult === "ok"');
+        await verify('UI28 Qoder：假流式程序确实被调用', async () => { assert.equal(await readFile(marker, 'utf8'), 'yes'); });
+        await press('[data-w-act=done]'); await wait('!document.querySelector(".sheet")');
         await agentsPage(); await wait('!!document.querySelector("[data-agent=qoder-cn]")', 'UI28 Qoder 执行者行出现');
         await press('[data-more-agent=qoder-cn]'); await press(await ctxItem('编辑'));
         await wait('!!document.querySelector(".sheet [data-sel=model]") && !document.querySelector(".sheet [data-sel=model]").disabled', 'UI28 模型列表读完', 60000);
@@ -625,14 +637,14 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
         await closeSheet();
         await verify('UI28 文件对话框桩被用到：打开 4 次（浏览程序、导入成功、取消、坏文件）、保存 1 次（导出）', () => { assert.equal(fileDialogs.openRequests.length, 4); assert.equal(fileDialogs.saveRequests.length, 1); });
         // ---- 5b. 导入向导第 2 步导入之前就查模型列表（168，D102）----
-        // 假接口在本机（127.0.0.1，随机端口，测完关闭）：/fake/models 返回两个模型（预设里的 deepseek-v4-pro 带推理强度 low / high，另一个是预设里没有的），别的路径 404。
+        // 假接口在本机（127.0.0.1，随机端口，测完关闭）：/fake/models 返回两个模型（预设里的 deepseek-v4-flash 带推理强度 low / high，另一个是预设里没有的），别的路径 404。
         // 查询走 agents:models（payload 带 preset 与 probe: true）→ ar agents models --preset deepseek --base-url … --probe；不访问任何真实接口。
         const asked: { url: string; auth: string }[] = [];
         const fakeApi = http.createServer((request, response) => {
             asked.push({ url: request.url ?? '', auth: String(request.headers.authorization ?? '') });
             if ((request.url ?? '').startsWith('/fake/models')) {
                 response.setHeader('content-type', 'application/json');
-                response.end(JSON.stringify({ data: [{ id: 'deepseek-v4-pro', display_name: 'Fake Pro', effort: { supported_levels: ['low', 'high'], default_level: 'low' } }, { id: 'deepseek-fake-b' }] }));
+                response.end(JSON.stringify({ data: [{ id: 'deepseek-v4-flash', display_name: 'Fake Flash', effort: { supported_levels: ['low', 'high'], default_level: 'low' } }, { id: 'deepseek-fake-b' }] }));
             } else { response.statusCode = 404; response.end('{}'); }
         });
         await new Promise<void>(resolve => fakeApi.listen(0, '127.0.0.1', resolve));
@@ -663,11 +675,11 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
             await type('[data-w=secret]', fakeKey); await press('[data-w-act=save-secret]');
             await wait(`${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]')?.textContent ?? '')`, 'UI28 导入第 2 步：假接口查到的说明', 30000);
             await check('UI28 导入第 2 步：说明是 probeFrom("api", HH:MM)，"刷新列表"可点，密码框已清空', `${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]').textContent) && !document.querySelector('.sheet [data-probe-refresh]').disabled && document.querySelector('.sheet [data-probe-refresh]').textContent === ${jsonStr(ag.refreshList)} && document.querySelector('[data-w=secret]').value === ''`);
-            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-pro', 'deepseek-fake-b']);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-flash', 'deepseek-fake-b']);
             await verify('UI28 假接口收到了请求：地址 /fake/models，带导入向导里保存的密钥（Bearer）', () => { assert.ok(asked.some(r => r.url === '/fake/models' && r.auth === `Bearer ${fakeKey}`), `假接口收到的请求：${asked.map(r => r.url).join()}`); });
             await verify('UI28 导入之前查不写配置：config.json 里还没有 deepseek 执行者', async () => { assert.ok(!Object.keys((await readConfig()).profiles).some(name => name.startsWith('deepseek'))); });
             const found = asked.length;
-            // 当前模型（预设的 deepseek-v4-pro）在接口给的列表里，推理强度的说明与下拉换成接口给的这个模型支持的。
+            // 当前模型（预设的 deepseek-v4-flash）在接口给的列表里，推理强度的说明与下拉换成接口给的这个模型支持的。
             const effortText = `[...document.querySelectorAll('.sheet .fld')].find(f => f.querySelector('.fl b')?.textContent === ${jsonStr(gx.effort)}).querySelector('.fl span').textContent`;
             await check('UI28 查到后：推理强度说明是 effortSupported("low / high", "low")（来自接口）', `${effortText} === ${jsonStr(ag.effortSupported('low / high', 'low'))}`);
             const effortFound = await menuLabels('.sheet [data-sel=effort]');
@@ -684,7 +696,7 @@ export async function captureAgents(h: Harness, win: BrowserWindow) {
             await press('.sheet [data-probe-refresh]');
             await wait(`${timeRegex(ag.probeFrom('api', '00:00')).toString()}.test(document.querySelector('.sheet [data-probe-note]')?.textContent ?? '') && !document.querySelector('.sheet [data-probe-refresh]').disabled`, 'UI28 点"刷新列表"后又是查到的结果', 30000);
             await check('UI28 点"刷新列表"：说明又是 probeFrom("api", HH:MM)，焦点回到按钮，输入过的地址还在', `document.activeElement === document.querySelector('.sheet [data-probe-refresh]') && document.querySelector('[data-w=baseUrl]').value === ${jsonStr(fakeBase)}`);
-            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-pro', 'deepseek-fake-b']);
+            assert.deepEqual(await menuLabels('.sheet [data-sel=model]'), ['deepseek-v4-flash', 'deepseek-fake-b']);
             await verify('UI28 点"刷新列表"重查了一次：假接口又收到 /fake/models', () => { assert.ok(asked.length > found && asked.at(-1)!.url === '/fake/models'); });
             await shots('wizard-2-probe');
             // 退出向导（输入过的内容丢弃）。

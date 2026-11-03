@@ -206,7 +206,7 @@ test('没有审查者候选 / 只有执行者本人且 mustDiffer → unknown，
   const none = fixture(t, { reviewers: [{ name: 'rev-ok', mode: 'ok' }], order: [] });
   const r1 = await runReview(none.ctx());
   assert.equal(r1.verdict, 'unknown');
-  assert.equal(r1.summary, '没有可用的审查者');
+  assert.ok(r1.summary.startsWith('没有可用的审查者'), r1.summary);
   assert.equal(r1.reviewer, null);
   assert.match(r1.reasons[0].why, /没有设置审查者候选/);
   assert.deepEqual(readJson(none.attemptFile('review.json')).verdict, 'unknown');

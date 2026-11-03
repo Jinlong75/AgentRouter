@@ -68,6 +68,7 @@ test('预设能加进配置：generic 声明合法，readOnlyEnv 随声明写入
   assert.deepEqual(JSON.parse(added.stdout), { ok: true, name: 'deepseek-harness', preset: 'deepseek-harness', madeDefault: true, secrets: ['DEEPSEEK_API_KEY'], secretStatus: { DEEPSEEK_API_KEY: 'set' } });
   const config = JSON.parse(fs.readFileSync(path.join(s.home, 'config.json'), 'utf8'));
   const profile = config.profiles['deepseek-harness'], decl = config.generics[profile.generic];
+  assert.equal(decl.requiresSystemNode, true);
   assert.equal(profile.adapter, 'generic'); assert.equal(profile.auth, 'token');
   assert.deepEqual(profile.secrets, { DEEPSEEK_API_KEY: 'DEEPSEEK_API_KEY' });
   assert.deepEqual(decl.readOnlyEnv, { DSH_PERMISSION_MODE: 'read-only' });

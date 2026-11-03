@@ -1,3 +1,5 @@
+import { checkSpec } from './spec-check.mjs';
+import { inspectSpec } from './run.mjs';
 // ar spec：列出、读取、新建任务说明（新建任务页背后的核心命令）。
 // 全部结果走 cli.mjs 的约定：--json 时输出 { ok:true, … }；失败抛中文错误（由 cli.mjs 转成 { ok:false, error }），
 // 或直接返回 { ok:false, error, … }（spec new --commit 提交失败时文件保留）。
@@ -12,6 +14,7 @@ import { matchesAny } from './glob.mjs';
 import { git as runGit } from './git.mjs';
 import { readEffectiveConfig } from './config.mjs';
 import { effortRefusal } from './router.mjs';
+import { specImpact } from './spec-impact.mjs';
 
 const MAX_BYTES = 256 * 1024;
 const DEFAULT_CHECK_LIMIT = 20;
@@ -19,8 +22,9 @@ const DEFAULT_CHECK_LIMIT = 20;
 const LEGACY_TYPES = ['code', 'test', 'fix', 'research', 'docs'];
 const TYPE_TEXT = [...LEGACY_TYPES.filter(t => SPEC_TYPES.includes(t)), ...SPEC_TYPES.filter(t => !LEGACY_TYPES.includes(t))].join('、');
 const ARCHIVE_DIR = 'archive';
-const usageSpec = '用法：ar spec list <项目路径> [--include-archived] | archive <项目路径> <相对路径…> [--commit] | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径> | check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>]';
-const usageCheck = '用法：ar spec check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>] [--json]';
+const usageSpec = '用法：ar spec list <项目路径> [--include-archived] | archive <项目路径> <相对路径…> [--commit] | read <项目路径> <相对路径> | new <项目路径> [--dry-run] [--commit] | commit <项目路径> <相对路径> | check <任务说明> [--project <路径>] [--base <分支>] | check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>] | impact <任务说明> [--docs] [--limit <n>]';
+const usageImpact = '用法：ar spec impact <任务说明> [--docs] [--limit <n>] [--json]';
+const usageCheck = '用法：ar spec check-paths --project <路径> --paths \'<JSON 字符串数组>\' [--limit <n>] [--json] | ar spec check <任务说明> [--project <路径>] [--base <分支>] [--json] | ar spec impact <任务说明> [--docs] [--limit <n>] [--json]';
 
 // 从标准输入读完整内容（spec new 的表单 JSON），与 cli.mjs 里读密钥的 readSecretValue 互不影响。
 export async function readSpecForm({ input = process.stdin } = {}) {
@@ -85,6 +89,44 @@ export async function specCommand(rest, { home, cwd, json, readForm = readSpecFo
         ? (committed.already ? `任务说明已经提交：${rel}` : `已提交任务说明 ${rel}（${committed.commit}）`)
         : `任务说明没有提交：${committed.error}`;
       return { result: committed, text, code: committed.ok ? 0 : 1 };
+    }
+    case 'check': {
+      if (!args[0] || args[0].startsWith('--')) throw new Error(usageCheck);
+      const opts = {};
+      for (let i = 1; i < args.length; i += 2) {
+        const key = args[i], value = args[i + 1];
+        if (!['--project', '--base'].includes(key) || !value || value.startsWith('--') || Object.hasOwn(opts, key)) throw new Error(usageCheck);
+        opts[key] = value;
+      }
+      const root = resolve(cwd, opts['--project'] ?? '.'), base = opts['--base'] ?? null;
+      let result;
+      try { result = inspectSpec(root, args[0], base); }
+      catch (error) {
+        result = error.specCheck ?? { ok: false, errors: [{ code: 'SPEC_INVALID', message: error.message, file: relative(root, resolve(root, args[0])).split(sep).join('/') || null, line: null }], warnings: [] };
+      }
+      if (!result.ok) result.error = result.errors[0].message;
+      return { result, text: [...result.errors, ...result.warnings].map(item => item.message).join('\n') || '任务说明检查通过', code: result.ok ? 0 : 2 };
+    }
+    case 'impact': {
+      if (!args[0] || args[0].startsWith('--')) throw new Error(usageImpact);
+      let docs = false, limit = 200, seenLimit = false;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--docs' && !docs) docs = true;
+        else if (args[i] === '--limit' && !seenLimit && i + 1 < args.length) {
+          seenLimit = true;
+          const value = args[++i];
+          if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('--limit 必须是非负整数');
+          limit = Number(value);
+        } else throw new Error(usageImpact);
+      }
+      const result = specImpact({ root: cwd, specFile: args[0], limit, docs });
+      const lines = [docs ? '## 受影响的文档（ar spec impact --docs 生成，主导逐条核对是否要改）' : '## 受影响的已有测试（ar spec impact 生成，主导核对后保留相关项）', ''];
+      if (!result.total) lines.push(docs ? `没有找到提到这些线索的文档（线索 ${result.clues.length} 条）` : `没有找到引用这些线索的测试或检查（线索 ${result.clues.length} 条）`);
+      for (const group of result.groups) {
+        lines.push(`### ${group.file}`, '', `命中线索：${[...new Set(group.hits.flatMap(hit => hit.clues))].join('、')}`, '', '```', ...group.hits.map(hit => `${group.file}:${hit.line}:${hit.text}${hit.fixedCount ? '（写死的数量，确认是否要改）' : ''}`), '```', '');
+      }
+      if (result.truncated) lines.push(`结果已截断，共 ${result.total} 行。`);
+      return { result, text: lines.join('\n') };
     }
     case 'check-paths': {
       const options = {};

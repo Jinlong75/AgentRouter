@@ -3,6 +3,9 @@ id: 000
 title: 【标题】
 type: code
 worker: auto
+# report_sections:   # 可选：要求汇报小节有内容，例如反向实验
+#   - 反向实验
+# depends: ["012"]   # 依赖的说明编号；未合入前不派发
 allowed_paths:
   - 【允许改动的路径，例如 src/auth/**】
 verify:
@@ -38,6 +41,14 @@ verify_timeout_min: 10
 
 【改行为前先全文搜索依赖旧行为的测试与界面检查（`tests/`、`app/src/main/shots*.ts`、`checks/`）；搜索结果不要截断，完整贴在这里；据此写上面的 allowed_paths。没有受影响的测试时写"无"，并写出搜过的关键词】
 
+## 换环境
+
+【说明换环境后的准备、验证与回退方法；不涉及则写“无”】
+
 ## 汇报要回答的问题
 
 【需要执行者回答的问题】
+
+## 反向实验
+
+需要时在 json 代码块中用数组描述 file、find、replace、command 和可选 expect；frontmatter 可写 `mutations_required: 1`。

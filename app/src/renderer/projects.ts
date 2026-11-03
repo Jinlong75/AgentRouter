@@ -4,7 +4,7 @@
 // 数据都经 window.dock.console 交给核心；会写文件的操作期间按钮忙碌，失败在详情顶部显示核心给的原因。
 import { ag, c, pj, s6 } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { GitVersionInfo, ProjectChange, ProjectFileChange, ProjectPurgePlan, ProjectRemote, ProjectRow, ProjectShow, ProjectSort, Task, UpgradeConfigField, UpgradeItem, UpgradeRoleDiff } from '../shared/types';
+import type { GitVersionInfo, LeadView, ProjectChange, ProjectFileChange, ProjectPurgePlan, ProjectRemote, ProjectRow, ProjectShow, ProjectSort, Task, UpgradeConfigField, UpgradeItem, UpgradeRoleDiff } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, toast, type Sheet } from './ui';
 import { forgetRepoStates, wtState } from './wt';
 import { SearchField, closeSortMenu, foundRow, hit, matches, openSortMenu, paintHeader, sortButton } from './search';
@@ -42,7 +42,7 @@ let pendingSelect = '';
 export function selectProjectNext(path: string) { pendingSelect = path; }
 
 // 编辑配置里的表单值（只提交改过的键）。
-interface ConfigForm { baseBranch: string; setup: string[]; verify: string[]; allowedPaths: string[]; specsDir: string; pushRemote: string; pushAfterAccept: boolean; pushAllowLead: boolean; maxRetries: string; mergeMode: string; verifyTimeoutMin: string; worktree: boolean }
+interface ConfigForm { baseBranch: string; setup: string[]; verify: string[]; allowedPaths: string[]; specsDir: string; pushRemote: string; pushAfterAccept: boolean; pushAllowLead: boolean; maxRetries: string; mergeMode: string; verifyTimeoutMin: string; worktree: boolean; leadModel: string; leadEffort: string }
 const ADV_KEYS = ['maxRetries', 'mergeMode', 'verifyTimeoutMin', 'worktree'] as const;
 // 远程一节的操作：刷新（联网读取）、推送、拉取；失败时记下核心的 code 与中文原因。
 type RemoteOp = 'refresh' | 'push' | 'pull';
@@ -233,6 +233,10 @@ export class ProjectsView {
     private show: ProjectShow | null = null;
     // 核心报告的 git 版本（全局一份）；ok 为 false 时在已初始化项目的详情顶部显示"版本太旧"横幅。
     private git: GitVersionInfo | null = null;
+    // 当前选中的主导（ar lead，Stage09 / 295）：决定"打开主导"按钮的文字与主导启动参数字段是否可用。
+    private lead: LeadView | null = null;
+    // 上一次 lead:get 失败了：this.lead 里是上一次读到的旧结果，不能按它的能力清空主导启动参数（319 审查 R11-1）。
+    private leadStale = false;
     private loaded = false;
     private mode: 'view' | 'plan' | 'upgrade' | 'written' = 'view';
     private plan: ProjectChange[] = [];
@@ -356,7 +360,12 @@ export class ProjectsView {
         }
         // 文件夹已不存在：没有可打开的东西，只留 ⋯（从列表移除）。
         const more = `<button class="btn icon quiet" data-pj="more" data-tip="${esc(c.more)}" aria-label="${esc(c.more)}" aria-haspopup="menu" ${this.busy ? 'disabled' : ''}>${icon('more-2-fill')}</button>`;
-        const acts = !s.exists ? `<span class="acts">${more}</span>` : `<span class="acts">${s.git ? `<button class="btn sm" data-pj="claude" ${this.busy ? 'disabled' : ''}>${icon('terminal-box-line')}${esc(pj.openClaude)}</button>` : ''}<button class="btn sm quiet" data-pj="folder" ${this.busy ? 'disabled' : ''}>${icon('folder-open-line')}${esc(pj.openFolder)}</button><button class="btn icon quiet" data-pj="more" data-tip="${esc(c.more)}" aria-label="${esc(c.more)}" aria-haspopup="menu" ${this.busy ? 'disabled' : ''}>${icon('more-2-fill')}</button></span>`;
+        // Stage09 / 295：按钮写实际主导名；没选主导时禁用，旁边灰字说明去哪里选（界面稿 leadbtn / leadnobtn）。
+        const current = this.lead?.lead ?? null;
+        const leadButton = current
+            ? `<button class="btn sm" data-pj="lead" ${this.busy ? 'disabled' : ''}>${icon('terminal-box-line')}${esc(pj.leadOpen(current.label))}</button>`
+            : `<button class="btn sm" data-pj="lead" disabled title="${esc(pj.leadChooseFirst)}">${icon('terminal-box-line')}${esc(pj.leadOpenNone)}</button><span class="muted">${esc(pj.leadChooseFirst)}</span>`;
+        const acts = !s.exists ? `<span class="acts">${more}</span>` : `<span class="acts">${s.git ? leadButton : ''}<button class="btn sm quiet" data-pj="folder" ${this.busy ? 'disabled' : ''}>${icon('folder-open-line')}${esc(pj.openFolder)}</button><button class="btn icon quiet" data-pj="more" data-tip="${esc(c.more)}" aria-label="${esc(c.more)}" aria-haspopup="menu" ${this.busy ? 'disabled' : ''}>${icon('more-2-fill')}</button></span>`;
         // 状态行：路径、分支、改动数，git 仓库再多一项提交身份（过长截断，悬停看全文）。
         const idText = s.git ? (identityText(s) || pj.identityMissing) : '';
         const ident = s.git ? `<span class="ident" data-pj-ident><span>${icon('account-circle-line')}${esc(pj.identityLabel)}</span><span class="mono" title="${esc(idText)}"${identityComplete(s) ? '' : ' data-pj-ident-missing'}>${esc(idText)}</span></span>` : '';
@@ -544,8 +553,15 @@ export class ProjectsView {
         this.refreshing = true;
         const seq = ++this.seq;
         try {
-            const list = await window.dock.console('projects:list');
+            // 主导状态与项目列表一起读：打开主导按钮的文字、主导启动参数能否填写都取决于它。
+            // 读取失败时不清掉上一次的结果，只标记为过期：编辑配置按已保存的参数显示，不按旧能力清空（319 审查 R11-1）。
+            const [list, lead] = await Promise.all([
+                window.dock.console('projects:list'),
+                window.dock.console('lead:get').then(value => ({ ok: true as const, value })).catch(() => ({ ok: false as const })),
+            ]);
             if (seq !== this.seq) return;
+            if (lead.ok) { this.lead = lead.value as LeadView; this.leadStale = false; }
+            else this.leadStale = true;
             this.rows = Array.isArray(list.projects) ? list.projects : [];
             // 先按原样匹配，再不区分大小写匹配（Windows 路径）；都没有才退回第一个项目。
             if (!this.rows.some(p => p.path === this.selected)) this.selected = this.rows.find(p => this.selected && p.path.toLowerCase() === this.selected.toLowerCase())?.path ?? this.rows[0]?.path ?? '';
@@ -579,7 +595,7 @@ export class ProjectsView {
             if (action === 'sort') this.pickSort(b);
             else if (action === 'search-clear') { this.search.set(''); this.search.focus(); }
             else if (action === 'add') void this.add();
-            else if (action === 'claude') void this.shell('claude');
+            else if (action === 'lead') void this.shell('lead');
             else if (action === 'folder') void this.shell('folder');
             else if (action === 'more') this.more(b);
             else if (action === 'edit') this.editConfig(b);
@@ -650,11 +666,12 @@ export class ProjectsView {
         }
         catch (e) { this.busy = false; this.error = failure(e); this.render(); }
     }
-    private async shell(which: 'claude' | 'folder') {
+    private async shell(which: 'lead' | 'folder') {
         const s = this.show;
         if (!s) return;
         this.busy = true; this.error = ''; this.render();
-        try { await window.dock.console(which === 'claude' ? 'shell:open-claude' : 'shell:open-folder', { path: s.path }); }
+        // 打开主导走主进程的 shell:open-lead（Stage09 / 295）；核心失败时把它的原文显示在详情顶部，不启动任何程序。
+        try { await window.dock.console(which === 'lead' ? 'shell:open-lead' : 'shell:open-folder', { path: s.path }); }
         catch (e) { this.error = failure(e); }
         finally { this.busy = false; this.render(); }
     }
@@ -921,13 +938,26 @@ export class ProjectsView {
         const projectPath = s.path;
         const cfg = (s.config ?? {}) as Record<string, unknown>;
         const push = (cfg.push && typeof cfg.push === 'object' && !Array.isArray(cfg.push) ? cfg.push : {}) as Record<string, unknown>;
+        // 主导启动参数存在 projects.json 的项目条目上，不在 project.json；空串表示没有设置。
         const original: ConfigForm = { baseBranch: text(cfg.baseBranch), setup: lines(cfg.setup), verify: lines(cfg.verify), allowedPaths: lines(cfg.allowedPaths), specsDir: text(cfg.specsDir), pushRemote: text(push.remote), pushAfterAccept: push.afterAccept === true, pushAllowLead: push.allowLead === true,
             maxRetries: typeof cfg.maxRetries === 'number' ? String(cfg.maxRetries) : '', mergeMode: cfg.mergeMode === 'squash' ? 'squash' : 'no-ff',
-            verifyTimeoutMin: typeof cfg.verifyTimeoutMin === 'number' ? String(cfg.verifyTimeoutMin) : '', worktree: cfg.worktree !== false };
+            verifyTimeoutMin: typeof cfg.verifyTimeoutMin === 'number' ? String(cfg.verifyTimeoutMin) : '', worktree: cfg.worktree !== false,
+            leadModel: text(s.lead?.model), leadEffort: text(s.lead?.effort) };
         const input =(key: string, value: string, placeholder = '') => `<input class="inp mono" data-pj-f="${key}" value="${esc(value)}"${placeholder ? ` placeholder="${esc(placeholder)}"` : ''}>`;
         const area = (key: string, value: string[], rows: number) => `<textarea class="inp area mono" data-pj-f="${key}" rows="${rows}">${esc(value.join('\n'))}</textarea>`;
         // 勾选项：和驳回弹窗的"保留分支"同一种控件（role=checkbox 的 .choice）。
         const choice = (key: string, on: boolean, label: string, help: string) => `<button class="choice" role="checkbox" aria-checked="${on}" data-pj-c="${key}"><span class="cb ${on ? 'on' : ''}">${on ? icon('check-line') : ''}</span><span class="ct">${esc(label)}<span>${esc(help)}</span></span></button>`;
+        // 主导启动参数（界面稿 leadparams）：模型与推理强度能否填写取决于当前主导的能力（ar lead 的 capabilities）；
+        // 没选主导时不知道能力，两个字段都可以先填。值只写 projects.json，不写 project.json。
+        // 上一次读取主导失败（leadStale）时能力未知：按已保存的参数显示、可以改，不按旧能力清空，并给一行提示（319 审查 R11-1）。
+        const lead = this.lead?.lead ?? null, caps = this.leadStale ? null : lead?.capabilities ?? null;
+        // 能力不支持时字段禁用并清空：切换主导后，原先保存的模型 / 强度不能继续带进启动参数（295 审查 R9-1）。
+        const leadInput = (key: 'model' | 'effort', label: string, help: string, off: boolean, value: string, extra = '') =>
+            field(label, esc(help), `<input class="inp mono" data-pj-lf="${key}" value="${esc(off ? '' : value)}" placeholder="${esc(pj.leadFollow)}" ${off ? 'disabled' : ''}>${extra}`);
+        // TODO(lead): 模型能力不支持时没有指定文案（277 只给了"不支持在启动时指定强度"），先禁用输入、不加说明。
+        const effortNote = caps && !caps.effort && lead ? `<p class="muted" data-pj-lead-effort-note>${esc(ag.leadEffortUnsupported(lead.label))}</p>` : '';
+        const staleNote = this.leadStale ? `<p class="muted" data-pj-lead-unknown>${esc(pj.leadUnknown)}</p>` : '';
+        const leadFields = `<div data-pj-lead-params><div class="sec-t">${esc(pj.leadParameters)}</div>${leadInput('model', pj.leadModel, pj.leadModelHelp, !!caps && !caps.model, original.leadModel)}${leadInput('effort', pj.leadEffort, pj.leadEffortHelp, !!caps && !caps.effort, original.leadEffort, effortNote)}${staleNote}<p class="muted">${esc(pj.leadParamsNote)}</p><p class="muted" data-pj-lead-save-hint>${esc(pj.leadSaveHint)}</p></div>`;
         // 推送三项：远程名用输入框（核心的 projects show 只给配置的那一个远程，没有 git remote 的列表，做不了下拉），留空 = 默认 origin。
         const pushFields = `<div class="sec-t">${esc(pj.pushSec)}</div>${field(pj.pushRemote, esc(pj.pushRemoteHelp), input('push.remote', original.pushRemote, 'origin'))}${field('', '', choice('afterAccept', original.pushAfterAccept, pj.pushAfterAccept, pj.pushAfterAcceptHelp))}${field('', '', choice('allowLead', original.pushAllowLead, pj.pushAllowLead, pj.pushAllowLeadHelp))}`;
         // 高级四项：默认折叠；项目配置里已有其中任何一个键时默认展开。mergeMode / worktree 没写时界面显示默认（no-ff / 开），不算改动。
@@ -938,16 +968,23 @@ export class ProjectsView {
         const mergeSeg = `<div class="segm" role="group" aria-label="${esc(pj.advFields.mergeMode)}">${Object.keys(pj.mergeModes).map(m => `<button type="button" data-pj-merge="${m}" class="${original.mergeMode === m ? 'on' : ''}" aria-pressed="${original.mergeMode === m}">${esc(pj.mergeModes[m])}</button>`).join('')}</div><span class="fhint fail" data-pj-err="mergeMode" role="alert"></span>`;
         const wtToggle = `<button type="button" class="toggle ${original.worktree ? 'on' : ''}" data-pj-wt role="switch" aria-checked="${original.worktree}" aria-label="${esc(pj.advFields.worktree)}"></button><span class="fhint fail" data-pj-err="worktree" role="alert"></span>`;
         const advanced = `<button type="button" class="fold" data-pj-fold aria-expanded="${advOpen}"><span data-pj-fold-i>${icon(advOpen ? 'arrow-down-s-line' : 'arrow-right-s-line')}</span>${esc(pj.advanced)}</button><div data-pj-adv${advOpen ? '' : ' hidden'}>${field(pj.advFields.maxRetries, advHelp('maxRetries'), numInput('maxRetries', original.maxRetries, '2'))}${field(pj.advFields.mergeMode, advHelp('mergeMode'), mergeSeg)}${field(pj.advFields.verifyTimeoutMin, advHelp('verifyTimeoutMin'), numInput('verifyTimeoutMin', original.verifyTimeoutMin, '10'))}${field(pj.advFields.worktree, advHelp('worktree'), wtToggle)}</div>`;
-        const body = `<div class="form">${field(pj.fields.baseBranch, pj.fieldHelp.baseBranch, input('baseBranch', original.baseBranch))}${field(pj.fields.setup, pj.fieldHelp.setup, area('setup', original.setup, 2))}${field(pj.fields.verify, pj.fieldHelp.verify, area('verify', original.verify, 2))}${field(pj.fields.allowedPaths, pj.fieldHelp.allowedPaths, area('allowedPaths', original.allowedPaths, 3))}${field(pj.fields.specsDir, pj.fieldHelp.specsDir, input('specsDir', original.specsDir))}${pushFields}${advanced}</div>`;
+        const body = `<div class="form">${field(pj.fields.baseBranch, pj.fieldHelp.baseBranch, input('baseBranch', original.baseBranch))}${field(pj.fields.setup, pj.fieldHelp.setup, area('setup', original.setup, 2))}${field(pj.fields.verify, pj.fieldHelp.verify, area('verify', original.verify, 2))}${field(pj.fields.allowedPaths, pj.fieldHelp.allowedPaths, area('allowedPaths', original.allowedPaths, 3))}${field(pj.fields.specsDir, pj.fieldHelp.specsDir, input('specsDir', original.specsDir))}${leadFields}${pushFields}${advanced}</div>`;
         const value =(key: string) => (sheet.root.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-pj-f="${key}"]`)?.value ?? '');
+        const leadValue = (key: 'model' | 'effort') => (sheet.root.querySelector<HTMLInputElement>(`[data-pj-lf="${key}"]`)?.value ?? '');
         const checked = (key: string) => sheet.root.querySelector(`[data-pj-c="${key}"]`)?.getAttribute('aria-checked') === 'true';
         const current = (): ConfigForm => ({ baseBranch: value('baseBranch').trim(), setup: splitLines(value('setup')), verify: splitLines(value('verify')), allowedPaths: splitLines(value('allowedPaths')), specsDir: value('specsDir').trim(), pushRemote: value('push.remote').trim(), pushAfterAccept: checked('afterAccept'), pushAllowLead: checked('allowLead'),
             maxRetries: value('maxRetries').trim(), mergeMode: sheet.root.querySelector('[data-pj-merge].on')?.getAttribute('data-pj-merge') ?? original.mergeMode,
-            verifyTimeoutMin: value('verifyTimeoutMin').trim(), worktree: sheet.root.querySelector('[data-pj-wt]')?.getAttribute('aria-checked') === 'true' });
+            verifyTimeoutMin: value('verifyTimeoutMin').trim(), worktree: sheet.root.querySelector('[data-pj-wt]')?.getAttribute('aria-checked') === 'true',
+            leadModel: leadValue('model').trim(), leadEffort: leadValue('effort').trim() });
+        // 主导不支持某个参数时，输入框渲染为空、保存时会写空值清除；这不是用户的改动，
+        // 判断"是否改过"要按渲染后的值（空）比，不能按上一次保存的值比——否则切到不支持该参数的主导后，
+        // 打开编辑框直接关闭也会被当成有未保存的修改（295 审查 R10-2）。
+        const shownLead = (key: 'leadModel' | 'leadEffort', cap: 'model' | 'effort') => caps && !caps[cap] ? '' : original[key];
         const dirty = () => {
             const now = current();
             return now.baseBranch !== original.baseBranch || now.specsDir !== original.specsDir || !sameLines(now.setup, original.setup) || !sameLines(now.verify, original.verify) || !sameLines(now.allowedPaths, original.allowedPaths)
                 || now.pushRemote !== original.pushRemote || now.pushAfterAccept !== original.pushAfterAccept || now.pushAllowLead !== original.pushAllowLead
+                || now.leadModel !== shownLead('leadModel', 'model') || now.leadEffort !== shownLead('leadEffort', 'effort')
                 || ADV_KEYS.some(k => now[k] !== original[k]);
         };
         const sheet: Sheet = openSheet({
@@ -1003,13 +1040,29 @@ export class ProjectsView {
         if (now.mergeMode !== original.mergeMode) set.mergeMode = now.mergeMode;
         if (now.verifyTimeoutMin !== original.verifyTimeoutMin) set.verifyTimeoutMin = now.verifyTimeoutMin === '' ? null : Number(now.verifyTimeoutMin);
         if (now.worktree !== original.worktree) set.worktree = now.worktree;
-        if (!Object.keys(set).length) { sheet.close(); return; }
+        // 主导启动参数单独存 projects.json 的项目条目：空值清除，只提交改过的项。
+        const leadChanged = now.leadModel !== original.leadModel || now.leadEffort !== original.leadEffort;
+        const lead = { ...(now.leadModel ? { model: now.leadModel } : {}), ...(now.leadEffort ? { effort: now.leadEffort } : {}) };
+        if (!Object.keys(set).length && !leadChanged) { sheet.close(); return; }
         sheet.busy(true);
         for (const el of sheet.root.querySelectorAll('[data-pj-err]')) el.textContent = '';
+        // 295 审查 R9-2：先校验并保存项目配置，成功后再写主导参数。主导参数（projects.json）写失败时，
+        // 项目配置已经生效，必须明确告诉用户哪一半没保存，模态框保持打开以便改了再存。
+        let configSaved = false, paramsSaved = false;
         try {
-            await window.dock.console('projects:config', { path, set });
+            if (Object.keys(set).length) {
+                await window.dock.console('projects:config', { path, set });
+                configSaved = true;
+                // 295 审查 R10-1：项目配置已经写盘，把比较基准（original）更新为刚保存的值。
+                // 同一个弹窗里再改回原来的值时要按最新已保存状态算差异、再次写盘，不能被当成"没改过"而跳过。
+                Object.assign(original, {
+                    baseBranch: now.baseBranch, setup: now.setup, verify: now.verify, allowedPaths: now.allowedPaths, specsDir: now.specsDir,
+                    pushRemote: now.pushRemote, pushAfterAccept: now.pushAfterAccept, pushAllowLead: now.pushAllowLead,
+                    maxRetries: now.maxRetries, mergeMode: now.mergeMode, verifyTimeoutMin: now.verifyTimeoutMin, worktree: now.worktree,
+                });
+            }
             // 刷新返回之前，把刚保存的键合进本地详情：这段时间"编辑配置"用上一份数据打开时看到的就是刚保存的值。
-            if (this.show && samePath(this.show.path, path)) {
+            if (configSaved && this.show && samePath(this.show.path, path)) {
                 const config = { ...(this.show.config ?? {}) } as Record<string, unknown>;
                 for (const [key, v] of Object.entries(set)) {
                     if (!key.startsWith('push.')) { if (v === null) delete config[key]; else config[key] = v; continue; }
@@ -1019,20 +1072,30 @@ export class ProjectsView {
                 }
                 this.show = { ...this.show, config };
             }
+            if (leadChanged) {
+                await window.dock.console('projects:lead-params', { project: path, model: now.leadModel, effort: now.leadEffort });
+                paramsSaved = true;
+                // 主导参数也保存成功：基准一并前移（与项目配置同一条规则）。
+                original.leadModel = now.leadModel; original.leadEffort = now.leadEffort;
+            }
+            if (leadChanged && this.show && samePath(this.show.path, path)) this.show = { ...this.show, lead: Object.keys(lead).length ? lead : null };
             sheet.close();
             await this.refresh();
         }
         catch (e) {
-            // 核心的原因以键名开头：高级四项的原因显示在对应字段下面（并展开"高级"），其余仍在模态框顶部。
             const reason = failure(e);
-            const key = ADV_KEYS.find(k => reason.startsWith(`${k} `));
-            const hint = key ? sheet.root.querySelector<HTMLElement>(`[data-pj-err="${key}"]`) : null;
-            if (hint) {
-                sheet.fail('');
-                hint.textContent = reason;
-                const fold = sheet.root.querySelector<HTMLButtonElement>('[data-pj-fold]');
-                if (fold?.getAttribute('aria-expanded') !== 'true') fold?.click();
-            } else sheet.fail(reason);
+            if (configSaved && leadChanged && !paramsSaved) sheet.fail(pj.leadParamsNotSaved(reason));
+            else {
+                // 核心的原因以键名开头：高级四项的原因显示在对应字段下面（并展开"高级"），其余仍在模态框顶部。
+                const key = ADV_KEYS.find(k => reason.startsWith(`${k} `));
+                const hint = key ? sheet.root.querySelector<HTMLElement>(`[data-pj-err="${key}"]`) : null;
+                if (hint) {
+                    sheet.fail('');
+                    hint.textContent = reason;
+                    const fold = sheet.root.querySelector<HTMLButtonElement>('[data-pj-fold]');
+                    if (fold?.getAttribute('aria-expanded') !== 'true') fold?.click();
+                } else sheet.fail(reason);
+            }
             sheet.busy(false);
         }
     }

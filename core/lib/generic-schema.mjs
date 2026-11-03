@@ -7,7 +7,7 @@ export const REPORTS = ['stdout', 'lastSay', 'file'];
 
 const TOP_FIELDS = [
   'label', 'executable', 'detect', 'args', 'readOnlyArgs', 'readOnlyEnv', 'stdin', 'env', 'secrets',
-  'output', 'report', 'timeoutMin', 'failureHints',
+  'output', 'report', 'timeoutMin', 'failureHints', 'interactive', 'requiresSystemNode',
 ];
 // stream-json：Claude Code 风格的流式 JSON（Claude Code、Qoder 等兼容），由适配器内置映射，不需要 output.map。
 const FORMATS = ['text', 'jsonl', 'stream-json'];
@@ -82,6 +82,23 @@ export function validateGeneric(decl, { path = 'generic' } = {}) {
     if (!TOP_FIELDS.includes(k)) {
       err(`${path}.${k}`, `不认识的字段 "${k}"（可能拼错了）。允许的字段：${TOP_FIELDS.join('、')}。`);
     }
+  }
+
+  if (decl.interactive !== undefined) {
+    if (!isObj(decl.interactive)) err(`${path}.interactive`, 'interactive 必须是对象');
+    else {
+      for (const key of Object.keys(decl.interactive)) if (!['args', 'model', 'effort'].includes(key)) err(`${path}.interactive.${key}`, `不认识的字段 ${key}`);
+      const args = decl.interactive.args;
+      if (args !== undefined && (!Array.isArray(args) || args.some(v => !isStr(v)))) err(`${path}.interactive.args`, 'interactive.args 必须是字符串数组');
+      for (const key of ['model', 'effort']) {
+        const value = decl.interactive[key], marker = `{${key}}`;
+        if (value !== undefined && (!Array.isArray(value) || value.some(v => !isStr(v)) || value.filter(v => v.includes(marker)).length !== 1)) err(`${path}.interactive.${key}`, `interactive.${key} 必须是字符串数组，且恰好一项含 ${marker}`);
+      }
+    }
+  }
+
+  if (decl.requiresSystemNode !== undefined && typeof decl.requiresSystemNode !== 'boolean') {
+    err(`${path}.requiresSystemNode`, 'requiresSystemNode 必须是 true 或 false');
   }
 
   // label / executable

@@ -5,7 +5,7 @@
 
 {{spec}}
 
-## 执行者的汇报
+{{dismissed}}## 执行者的汇报
 
 {{report}}
 

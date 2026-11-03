@@ -3,14 +3,13 @@
 import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { adapters, genericDeclaration } from '../adapters/index.mjs';
-import { makeGeneric } from '../adapters/generic.mjs';
 import { presetObjects } from './agents.mjs';
 import { readJson } from './json.mjs';
 import { readEffectiveConfig, updateConfig } from './config.mjs';
 import { activeLimits, clearLimit, clockText, limitOf as limitStateOf } from './limits-state.mjs';
 import { readProjects } from './project.mjs';
 import { SPEC_TYPES } from './spec.mjs';
-import { suggestCommand } from './suggest.mjs';
+import { suggestCommand, suggestRules, supportsReadOnly, READ_ONLY_TYPES } from './suggest.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => (typeof value === 'string' && value !== '' ? value : null);
@@ -18,22 +17,7 @@ const text = value => (typeof value === 'string' && value !== '' ? value : null)
 // 可担任执行者：roles 没写（或为空）就是两项都有。
 const canExecute = profile => !(Array.isArray(profile?.roles) && profile.roles.length) || profile.roles.includes('executor');
 
-// 需要只读的任务类型（docs 默认要写入）。
-export const READ_ONLY_TYPES = ['research', 'review'];
-
-// 执行者配置是否支持只读运行。单独成函数，其余适配器看注册表里声明的 capabilities.readOnly。
-// generic：执行者配置的 generic 是声明名（声明在 config.generics 里）或直接内嵌的声明（派发时解析好的在 genericDecl）；
-// 以 makeGeneric(声明).capabilities.readOnly 为准（声明里有 readOnlyArgs 才支持）。这里不做完整校验，找不到声明就是不支持。
-export function supportsReadOnly(profile, config = {}) {
-  const kind = profile?.adapter;
-  // fake 不区分读写模式（回放说明照常运行），按现有能力算支持；已有的测试用它派发研究类任务说明。
-  if (kind === 'claude-code' || kind === 'codex' || kind === 'fake') return true;
-  if (kind === 'generic') {
-    const decl = object(profile.genericDecl) ? profile.genericDecl : object(profile.generic) ? profile.generic : config.generics?.[profile.generic];
-    return object(decl) && makeGeneric(decl).capabilities.readOnly === true;
-  }
-  return adapters[kind]?.capabilities?.readOnly === true;
-}
+export { supportsReadOnly, READ_ONLY_TYPES } from './suggest.mjs';
 
 // 推理强度的可选值（Stage07c T6）：取这个执行者对应预设的 effortOptions；预设没有 effortOptions（或找不到预设）返回 null，此时不校验。
 // 找预设的规则与 agents.mjs 的 presetFor 一致：先按名字加适配器，再按适配器（通用适配器再按程序名、OpenAI 兼容接口再按有无 provider）。
@@ -225,6 +209,18 @@ export function route({ spec = null, projectConfig = {}, config = {}, explicit =
     }
   }
 
+  if (type && config.routing?.implicit !== false) {
+    let tests = {};
+    try { tests = readJson(join(home, 'agent-tests.json')); } catch { /* 尚无测试记录。 */ }
+    const eligible = Object.fromEntries(Object.entries(profiles).filter(([name]) => !unavailable(name)));
+    const suggested = suggestRules({ config: { ...config, profiles: eligible, routing: { ...config.routing, rules: [] } }, presets: presetObjects(), tests });
+    const rule = suggested.rules.find(item => item.types.includes(type));
+    if (rule) {
+      trace.push(`预设默认规则：[${type}] → ${rule.profile}`);
+      return done(rule.profile, { scope: 'implicit' });
+    }
+  }
+
   // 5. 兜底：routing.fallback，再 defaultProfile；没有 defaultProfile 时取唯一启用的（与旧的选择一致）。
   const enabled = Object.keys(profiles).filter(name => object(profiles[name]) && profiles[name].enabled !== false);
   const candidates = [text(config.routing?.fallback), text(config.defaultProfile), ...(text(config.defaultProfile) || enabled.length !== 1 ? [] : [enabled[0]])]
@@ -261,6 +257,15 @@ export function reviewerOf(routing) {
   return { profiles, mustDiffer, differFamily, differFromLead: object(value) ? value.differFromLead !== false : true };
 }
 
+function implicitRules(home, config, now) {
+  return SPEC_TYPES.flatMap(type => {
+    try {
+      const result = route({ spec: { type }, config: { ...config, routing: { ...config.routing, rules: [] } }, home, now });
+      return result.rule?.scope === 'implicit' ? [{ types: [type], profile: result.profile, source: 'implicit' }] : [];
+    } catch { return []; }
+  });
+}
+
 // 软件"路由"页要的整份视图（只读）：规则、兜底、审查者候选、默认执行者、每个执行者的只读能力 / 每日上限 / 今天已用、已登记项目各有几条自己的规则。
 export function routeConfigView(home, { now = Date.now() } = {}) {
   const config = readEffectiveConfig(home);
@@ -277,6 +282,8 @@ export function routeConfigView(home, { now = Date.now() } = {}) {
   }
   return {
     rules: Array.isArray(config.routing?.rules) ? config.routing.rules : [],
+    implicit: config.routing?.implicit !== false,
+    implicitRules: config.routing?.implicit === false ? [] : implicitRules(home, config, now),
     fallback: text(config.routing?.fallback),
     strongExecutor: text(config.routing?.strongExecutor),
     reviewer: reviewerOf(config.routing),
@@ -371,6 +378,7 @@ export function routeConfigCommand(rest, { home }) {
     const result = routeConfigView(home);
     const name = profile => `${profile}（${result.profiles.find(item => item.name === profile)?.label ?? '未知'}）`;
     const lines = [`规则：${result.rules.length} 条`, ...result.rules.map((rule, i) => `  ${i + 1}. [${rule.types?.join(', ')}] → ${rule.profile}${rule.escalate ? `，升级到 ${rule.escalate}` : ''}${rule.effort ? `，推理强度 ${rule.effort}` : ''}`),
+      ...result.implicitRules.map(rule => `预设默认规则：[${rule.types.join(', ')}] → ${rule.profile}`),
       `兜底：${result.fallback ? name(result.fallback) : '无（用默认执行者）'}`,
       `审查者候选：${result.reviewer.profiles.length ? result.reviewer.profiles.join('、') : '无'}（必须与执行者不同：${result.reviewer.mustDiffer ? '是' : '否'}；必须与执行者不同家族：${result.reviewer.differFamily ? '是' : '否'}；必须与主导不同：${result.reviewer.differFromLead ? '是' : '否'}）`,
       `强执行者：${result.strongExecutor ? name(result.strongExecutor) : '未设置（最后一次自动重试不换人，全部失败后提示主导接手）'}`,

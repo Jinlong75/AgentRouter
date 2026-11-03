@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { nativeTheme } from 'electron';
 import { clock, pollUntil, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, type Harness } from './shots-input';
 import { coreRun } from './core';
-import { gx, nt, ro } from '../shared/copy';
+import { gx, nt, ro, wt } from '../shared/copy';
 import { appEnvironment } from './app-env.mjs';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
@@ -293,7 +293,7 @@ export async function captureNewtask(h: Harness) {
         await goto('text');
         await check('UI16 直接写文字时隐藏"先提交任务说明"', `!document.querySelector('[data-nt-commit]') && !!document.querySelector('[data-nt-f=text]')`);
         await type('[data-nt-f=text]', 'Update the README title only.');
-        await check('UI16 直接写文字时说明栏写文字与执行者，并说明直接改、不跑门禁、不进验收页', `document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify('直接把这段文字派给 假执行者：在项目里直接改，不跑门禁，也不进验收页')}`);
+        await check('UI16 直接写文字时说明栏写文字与执行者，并说明在单独工作区改、跑验收命令、进验收页', `document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify(nt.conseqText('假执行者'))}`);
         await shot('newtask-text');
         await press('[data-nt-dispatch]');
         await wait('document.querySelector("[data-page=tasks]")?.getAttribute("aria-current") === "page" && !!document.querySelector(".trow.on")', '直接写文字派发后切回任务页并选中', 20000);
@@ -305,7 +305,16 @@ export async function captureNewtask(h: Harness) {
             assert.equal(start.spec, null);
             assert.equal(start.profile, 'fake');
         });
+        await until(async () => (await runs()).some(r => r.event === 'gate' && r.id === textId && r.ok === true), '文字任务门禁通过');
         await until(async () => (await runs()).some(r => r.event === 'end' && r.id === textId), '假执行者结束');
+        // 425：文字任务也走 worktree 与门禁，做完进入待验收（任务行状态、验收页里能找到它）。
+        await wait(`document.querySelector('[data-task="${textId}"] .tm em.attn')?.textContent === ${JSON.stringify(wt.subAwaiting)}`, '文字任务在任务页显示待验收', 30000);
+        await check('UI16 直接写文字派发的任务进入待验收：任务行品牌色标记、第二行"等你验收"', `(() => { const row = document.querySelector('[data-task="${textId}"]'); return row?.querySelector('.mk')?.classList.contains('brand') && row.querySelector('.tm em.attn')?.textContent === ${JSON.stringify(wt.subAwaiting)}; })()`);
+        await press('[data-page=accept]');
+        await wait(`document.querySelector('[data-page=accept]')?.getAttribute('aria-current') === 'page' && !!document.querySelector('.trow[data-acc="${textId}"]')`, '验收页列出文字任务', 20000);
+        await press(`[data-acc="${textId}"]`);
+        await wait(`document.querySelector('.detail.acc h2 .ttl')?.textContent === 'Update the README title only.'`, '选中文字任务的验收详情', 15000);
+        await check('UI16 直接写文字派发的任务出现在验收页：待验收、任务文字作为标题', `document.querySelector('.detail.acc .dh-state')?.textContent.startsWith('待验收') && document.querySelector('.detail.acc h2 .ttl')?.textContent === 'Update the README title only.' && document.querySelector('.detail.acc .specbox .sb-h .mono')?.textContent === '直接给的任务文字'`);
 
         // 提交身份：选没有身份的项目时出现警告横幅；先提交任务说明失败后补身份，再派发不重复编号。
         await goto('new');
@@ -314,6 +323,10 @@ export async function captureNewtask(h: Harness) {
         await press(await menuItem('noidentity'));
         await wait(`document.querySelector('[data-nt-path]')?.textContent.includes('noidentity') && !!document.querySelector('[data-nt-identity]')`, '选到没有提交身份的项目', 20000);
         await check('UI16 没有提交身份的项目：表单上方显示警告横幅与"设置提交身份…"按钮', `document.querySelector('.doc-in.narrow > .banner.brand')?.textContent.includes('还没有设置 git 提交身份') && !!document.querySelector('.doc-in.narrow > .banner.brand [data-nt-identity]') && !document.querySelector('[data-nt-dispatch]').disabled`);
+        // 425：项目没开 worktree（noidentity 没有项目配置）时，文字任务的后果说明照旧。
+        await goto('text');
+        await check('UI16 项目没开 worktree 时文字任务照旧直接改、不跑门禁、不进验收页', `document.querySelector('[data-nt-note]')?.textContent === ${JSON.stringify(nt.conseqTextDirect('假执行者'))}`);
+        await goto('new');
         await shot('newtask-identity');
         await press('[data-nt-f=title]');
         await key('a', ['control']);
@@ -696,7 +709,7 @@ export async function captureNewtask(h: Harness) {
             await key('End', ['control']);
             await key('Enter');
             for (const ch of 'docs/new.md') await key(ch);
-            await wait(`document.querySelector('[data-nt-paths-none]') !== null`, 'UI16 加一行 docs/new.md 后出现"没有匹配到"的提示', 15000);
+            await wait(`(() => { const input = document.querySelector('[data-nt-f=allowed]'); const preview = document.querySelector('[data-nt-paths-none]'); return !!input && !!preview && preview.getAttribute('data-nt-paths-none') === input.value.split(String.fromCharCode(10)).at(-1); })()`, 'UI16 加一行 docs/new.md 后预览跟上输入', 15000);
             await verify('UI16 允许路径预览：docs/new.md → 一行 nt.pathsNone("docs/new.md")（品牌色提示图标），匹配到的 2 个文件不变', async () => {
                 const box = await pathsBox();
                 assert.equal(box.allowed, 'src/**\ndocs/new.md');
@@ -799,6 +812,76 @@ export async function captureNewtask(h: Harness) {
             await press('[data-nt-archived]');
             await wait(`!document.querySelector('[data-nt-spec*="archive/"]')`, 'UI16 收起已归档的');
             await check('UI16 收起后按钮变回"显示已归档的 1 份"', `document.querySelector('[data-nt-archived]')?.textContent === '显示已归档的 1 份'`);
+        }
+
+        // ---- UI16（424）：派发遇到"任务说明只在当前分支上"（SPEC_BASE）时，横幅给"以当前分支为基线派发"与"取消" ----
+        // 演示项目切到只在新分支上提交了说明的状态：main 上没有 005，主工作区停在 005-help。
+        {
+            const branch = '005-help', onlyRel = 'docs/specs/005-分支说明.md';
+            try {
+                git(repo, ['switch', '-q', '-c', branch]);
+                await writeFile(path.join(specs, '005-分支说明.md'), [
+                    '---', 'id: 005', 'title: 分支说明：检查 README 的标题', 'type: docs', 'worker: auto', 'allowed_paths: []', 'verify: []', '---', '',
+                    '## 目标', '', '看一眼 README 的标题。', '',
+                ].join('\n'));
+                git(repo, ['add', '--', onlyRel]);
+                commitAs(repo, '演示：说明只提交在新分支', [onlyRel]);
+
+                await reenter('existing');
+                await wait(`document.querySelector('[data-nt-path]')?.textContent.includes('· ${branch}') && !!document.querySelector('[data-nt-spec="${onlyRel}"]')`, 'UI16 切到只在新分支上有说明的状态', 20000);
+                await press(`[data-nt-spec="${onlyRel}"]`);
+                const startsBefore = (await runs()).filter(r => r.event === 'start').length;
+                const filesBefore = await specFiles();
+                await press('[data-nt-dispatch]');
+                await wait('!!document.querySelector("[data-nt-base-banner]")', 'UI16 任务说明只在当前分支上时的横幅', 20000);
+                await check('UI16 说明只在当前分支上：横幅标题 nt.baseTitle、正文 nt.baseBody，两按钮（主按钮 data-nt-base-current、次按钮"取消"）', `(() => { const b = document.querySelector('[data-nt-base-banner]'); return !!b && b.classList.contains('banner') && b.classList.contains('fail') && b.getAttribute('role') === 'alert' && b.querySelector('.rt b')?.textContent === ${JSON.stringify(nt.baseTitle(branch))} && b.querySelector('.rt span')?.textContent === ${JSON.stringify(nt.baseBody(branch, 'main'))} && b.querySelector('[data-nt-base-current]')?.textContent === ${JSON.stringify(nt.baseUseCurrent(branch))} && b.querySelector('[data-nt-base-dismiss]')?.textContent === ${JSON.stringify(nt.baseDismiss)}; })()`);
+                await verify('UI16 说明只在当前分支上：没有写入任务行，也没生成第二份说明', async () => {
+                    assert.equal((await runs()).filter(r => r.event === 'start').length, startsBefore);
+                    assert.deepEqual(await specFiles(), filesBefore);
+                });
+                await evaluate('document.querySelector("[data-nt-base-banner]").scrollIntoView({ block: "center" })');
+                await pause(300);
+                await shot('newtask-base');
+
+                // 键盘到主按钮按 Enter：用同样的参数加 --base 005-help 重新派发，成功后照常进入任务详情。
+                await tabTo('[data-nt-base-current]');
+                await focusRing('UI16 以当前分支为基线派发');
+                await key('Enter');
+                await wait('document.querySelector("[data-page=tasks]").getAttribute("aria-current") === "page" && !!document.querySelector(".trow.on")', 'UI16 以当前分支为基线重新派发后切回任务页并选中', 20000);
+                const baseId = await selectedId();
+                await verify('UI16 以当前分支为基线重新派发：start 行的 spec 是这份说明，baseBranch 是 005-help（主进程把 --base 005-help 交给了核心）', async () => {
+                    const starts = (await runs()).filter(r => r.event === 'start');
+                    assert.equal(starts.length, startsBefore + 1, '应该只多派发这一次');
+                    const start = starts.find(r => r.id === baseId);
+                    assert.ok(start, `runs.jsonl 里没有 ${baseId} 的 start 行`);
+                    assert.equal(start.spec, onlyRel);
+                    assert.equal(start.baseBranch, branch);
+                });
+                await until(async () => (await runs()).some(r => r.event === 'end' && r.id === baseId), '以当前分支为基线派发的假执行者结束');
+                await verify('UI16 以当前分支为基线重新派发：没有重复创建任务说明', async () => {
+                    assert.deepEqual(await specFiles(), filesBefore);
+                });
+
+                // 取消：再触发一次，横幅只关掉，不派发。
+                await reenter('existing');
+                await press(`[data-nt-spec="${onlyRel}"]`);
+                const startsBeforeCancel = (await runs()).filter(r => r.event === 'start').length;
+                await press('[data-nt-dispatch]');
+                await wait('!!document.querySelector("[data-nt-base-banner]")', 'UI16 第二次出现基线横幅', 20000);
+                await press('[data-nt-base-dismiss]');
+                await wait('!document.querySelector("[data-nt-base-banner]")', 'UI16 点"取消"关掉横幅');
+                await check('UI16 点"取消"后横幅消失、仍在新建任务页、派发按钮可点', `!document.querySelector('[data-nt-base-banner]') && !document.querySelector('.banner.fail') && document.querySelector('[data-page=newtask]')?.getAttribute('aria-current') === 'page' && !document.querySelector('[data-nt-dispatch]').disabled && document.querySelector('[data-nt-spec].on')?.dataset.ntSpec === ${JSON.stringify(onlyRel)}`);
+                await pause(500);
+                await verify('UI16 点"取消"不派发', async () => {
+                    assert.equal((await runs()).filter(r => r.event === 'start').length, startsBeforeCancel);
+                });
+            }
+            finally {
+                try { git(repo, ['switch', '-q', 'main']); }
+                catch (error) { console.log(`UI16 基线分支：没能切回 main：${(error as Error).message}`); }
+                try { await reenter('existing'); }
+                catch { /* 后面的检查自己会重新进入页面。 */ }
+            }
         }
 
         // 每页通用检查：三种来源各走一遍（沿用缓存，不重新加载，避免打断 Tab 检查）。

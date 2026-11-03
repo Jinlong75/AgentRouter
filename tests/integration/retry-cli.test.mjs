@@ -567,10 +567,14 @@ test('--json 与参数错误：找不到记录、缺记录名、无效派活方�
   assert.equal(missing.code, 2, missing.stderr + missing.stdout);
   assert.deepEqual(JSON.parse(missing.stdout), { ok: false, error: '重试：在当前仓库找不到记录 根本没有这条' });
 
+  const freeText = await f.ar(['retry', '根本没有这条', '--note', '--type 文字派发也写路由', '--json']);
+  assert.equal(freeText.code, 2);
+  assert.equal(JSON.parse(freeText.stdout).error, '重试：在当前仓库找不到记录 根本没有这条');
+
   const noName = await f.ar(['retry', '--json']);
   assert.equal(noName.code, 2, noName.stderr + noName.stdout);
   assert.deepEqual(JSON.parse(noName.stdout),
-    { ok: false, error: '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase] [--detach] [--host claude-code|agentrouter]' });
+    { ok: false, error: '用法：ar retry <记录名> [--profile <名>] [--note "<补充说明>"] [--rebase|--regate] [--detach] [--host claude-code|agentrouter]' });
 
   const badHost = await f.ar(['retry', '某记录', '--host', 'bad', '--json']);
   assert.equal(badHost.code, 2, badHost.stderr + badHost.stdout);

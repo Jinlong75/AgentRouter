@@ -54,13 +54,13 @@ test('claude-code 端到端（回放真实样例）：进度、统一事件、�
   const [start, attempt, spawned, attemptEnd, end] = jsonl(path.join(s.home, 'runs.jsonl'));
   assert.deepEqual([start.event, attempt.event, spawned.event, attemptEnd.event, end.event], ['start', 'attempt', 'spawned', 'attempt-end', 'end']);
   assert.equal(start.profile, 'deepseek'); assert.equal(start.adapter, 'claude-code'); assert.equal(start.agent, 'claude-code');
-  assert.equal(start.model, 'deepseek-v4-pro', '模型名取自执行者配置');
+  assert.equal(start.model, 'deepseek-v4-flash', '模型名取自执行者配置');
   assert.equal(start.agentVersion, '2.1.302 (Claude Code)');
   assert.equal(end.exit, 0);
   assert.equal(fs.readFileSync(path.join(s.dir, 'report.md'), 'utf8'), '完成', '汇报正文是 result 文本');
   assert.deepEqual(jsonl(path.join(s.dir, 'events.jsonl')).map(e => e.kind), ['tool', 'think', 'file', 'think', 'cmd', 'tool', 'cmd', 'file', 'say', 'turn']);
   const progress = fs.readFileSync(path.join(s.dir, 'progress.log'), 'utf8');
-  for (const line of ['=== DeepSeek V4 Pro 开始：创建 hello.txt 并报告', '模型：deepseek-v4-pro', '新增文件：hello.txt', '运行：git status --short', '工具：Read hello.txt', '修改文件：hello.txt', '说：完成', '一轮结束（输入 1200，输出 300 tokens）', '=== DeepSeek V4 Pro 结束：exit=0'])
+  for (const line of ['=== DeepSeek V4 Flash 开始：创建 hello.txt 并报告', '模型：deepseek-v4-pro', '新增文件：hello.txt', '运行：git status --short', '工具：Read hello.txt', '修改文件：hello.txt', '说：完成', '一轮结束（输入 1200，输出 300 tokens）', '=== DeepSeek V4 Flash 结束：exit=0'])
     assert.ok(progress.includes(line), `进度缺少：${line}`);
   assert.equal(jsonl(path.join(s.dir, 'raw.log')).length, 18, 'raw.log 原样保存每一行');
   assert.ok(s.assertNoSecret(result) >= 5);
@@ -72,7 +72,7 @@ test('claude-code 执行者环境：清掉主导会话变量、注入密钥、�
   const e = s.evidence();
   assert.deepEqual(e.names, ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CONFIG_DIR'], '只剩执行者自己的变量');
   assert.equal(e.tokenFromSource, true, 'ANTHROPIC_AUTH_TOKEN 来自 DEEPSEEK_API_KEY');
-  assert.equal(e.baseUrl, 'https://api.deepseek.com/anthropic'); assert.equal(e.model, 'deepseek-v4-pro');
+  assert.equal(e.baseUrl, 'https://api.deepseek.com/anthropic'); assert.equal(e.model, 'deepseek-v4-flash');
   assert.equal(e.configDir, path.join(s.home, 'workers', 'deepseek', 'claude')); assert.ok(fs.statSync(e.configDir).isDirectory());
   assert.equal(e.disableAutoupdater, '1');
   assert.deepEqual(e.args, ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', 'bypassPermissions']);
@@ -99,7 +99,7 @@ test('claude-code 缺少密钥：不启动执行者，记录启动失败，提�
   assert.equal(result.status, 1);
   assert.ok(!fs.existsSync(path.join(s.base, 'env.json')), '执行者没有启动');
   const progress = fs.readFileSync(path.join(s.dir, 'progress.log'), 'utf8');
-  assert.match(progress, /出错：启动 DeepSeek V4 Pro 失败：未设置密钥 AR_TEST_SURELY_MISSING_KEY_7Q/);
+  assert.match(progress, /出错：启动 DeepSeek V4 Flash 失败：未设置密钥 AR_TEST_SURELY_MISSING_KEY_7Q/);
   assert.deepEqual(jsonl(path.join(s.home, 'runs.jsonl')).map(r => r.event), ['start', 'attempt', 'attempt-end', 'end']);
   s.assertNoSecret(result);
 });

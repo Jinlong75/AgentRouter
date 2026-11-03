@@ -164,17 +164,38 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.sl
 if (process.argv.includes('--version')) console.log('codex-cli verify-sentinel');
 else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex（不是自己的夹具）\\n'); process.exitCode = 1; }
 `);
+  const cmdNode = process.execPath.replaceAll('%', '%%');
   if (process.platform === 'win32') {
-    // 与 npm 生成的包装同一写法，核心的 resolveLauncher 能解析出 Node 入口（见 core/adapters/codex.mjs）。
-    writeFileSync(path.join(dir, 'codex.cmd'), '@echo off\r\n"%_prog%" "%dp0%\\codex.js" %*\r\n');
+    // 注释供核心的 npm 包装解析器识别；实际运行使用批处理自带的 %~dp0。
+    writeFileSync(path.join(dir, 'codex.cmd'), `@echo off\r\nrem "%dp0%\\codex.js" %*\r\n"${cmdNode}" "%~dp0codex.js" %*\r\n`);
   } else {
     writeFileSync(path.join(dir, 'codex'), `#!/bin/sh\nexec "${process.execPath}" "${path.join(dir, 'codex.js')}" "$@"\n`);
     chmodSync(path.join(dir, 'codex'), 0o755);
   }
 
+  const claudeLog = path.join(dir, 'claude-calls.jsonl');
+  writeFileSync(path.join(dir, 'claude.js'), `const fs = require('node:fs');
+if (process.argv.includes('--version')) console.log('claude verify-sentinel');
+else { fs.appendFileSync(${JSON.stringify(claudeLog)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), at: Date.now() }) + '\\n'); process.stderr.write('verify 哨兵：测试调用了 PATH 里的 claude\\n'); process.exitCode = 1; }
+`);
+  if (process.platform === 'win32') {
+    writeFileSync(path.join(dir, 'claude.cmd'), `@echo off\r\nrem "%dp0%\\claude.js" %*\r\n"${cmdNode}" "%~dp0claude.js" %*\r\n`);
+  } else {
+    writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nexec "${process.execPath}" "${path.join(dir, 'claude.js')}" "$@"\n`);
+    chmodSync(path.join(dir, 'claude'), 0o755);
+  }
+
   // 186：测试进程用这次专用的临时目录（哨兵目录与日志目录建在它外面，不算遗留）。
   const tempRoot = createTempRoot();
+  const userRoot = createTempRoot('ar-verify-user-');
   const childEnv = withTempRoot(env, tempRoot);
+  childEnv.USERPROFILE = userRoot;
+  childEnv.HOME = userRoot;
+  if (process.platform === 'win32') {
+    const drive = path.parse(userRoot).root.slice(0, 2);
+    childEnv.HOMEDRIVE = drive;
+    childEnv.HOMEPATH = userRoot.slice(drive.length);
+  }
   const pathKey = Object.keys(childEnv).find(key => key.toLowerCase() === 'path') ?? 'PATH';
   childEnv[pathKey] = `${dir}${path.delimiter}${childEnv[pathKey] ?? ''}`;
   // 069：终端仍是原来的 spec 输出；另让 node --test 同时写一份 TAP（失败的测试文件带 exitCode / signal 等细节）。
@@ -194,9 +215,17 @@ else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex�
   child.stderr.setEncoding('utf8'); child.stderr.on('data', capture);
   const code = await new Promise(resolve => child.on('exit', (exitCode, signal) => resolve(signal ? 1 : exitCode ?? 1)));
   const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+  const claudeCalls = existsSync(claudeLog) ? readFileSync(claudeLog, 'utf8').trim().split('\n').filter(Boolean) : [];
   rmSync(dir, { recursive: true, force: true });
   let finalCode = code;
+  // 先查并结束遗留进程，再删隔离用户目录：遗留进程占着目录时删除会失败，不能因此跳过遗留检查和日志保存。
   if (!await finishTempRoot(tempRoot, { print, printError })) finalCode = 1;
+  try {
+    rmSync(userRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (error) {
+    printError(`verify 遗留检查：删除隔离用户目录失败（${error.code ?? error.message}）：${userRoot}`);
+    finalCode = 1;
+  }
   if (calls.length) {
     printError(`\nverify 哨兵：有测试调用了 PATH 里的 codex（${calls.length} 次）。测试必须用自己的假 codex，不能碰真实 Codex 与 ~/.codex：`);
     for (const line of calls) printError(`  ${line}`);
@@ -204,6 +233,11 @@ else { process.stderr.write('verify 哨兵：测试调用了 PATH 里的 codex�
   } else {
     print('verify 哨兵：没有测试调用 PATH 里的 codex');
   }
+  if (claudeCalls.length) {
+    printError(`\nverify 哨兵：有测试调用了 PATH 里的 claude（${claudeCalls.length} 次）：`);
+    for (const line of claudeCalls) printError(`  ${line}`);
+    finalCode = 1;
+  } else print('verify 哨兵：没有测试调用 PATH 里的 claude');
   const file = saveVerifyLog(logDir, output.endsWith('\n') || !output ? output : `${output}\n`, now);
   print(`verify 日志：${file}${reporters.length ? `；TAP：${existsSync(tapFile) ? tapFile : '（没有生成）'}` : ''}`);
   return finalCode;

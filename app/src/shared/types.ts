@@ -348,6 +348,16 @@ export interface RolesView {
     families: string[]; profiles: RolesProfile[]; reviewerOrder: string[]; mustDiffer: boolean; differFamily: boolean; differFromLead: boolean;
     lead: { profiles: string[]; families: string[]; source: 'default' | 'set' }; leadFamily: string;
 }
+// lead:get 的返回（核心 ar lead --json，Stage09 / 任务 271）：
+// 没选主导是 { lead: null, problem }；选了是 { lead: {...}, problem? }，problem 只在启动程序找不到时出现（核心原文）。
+export interface LeadSelection {
+    profile: string; label: string; adapter: string; supported: boolean;
+    capabilities: { model: boolean; effort: boolean };
+}
+export interface LeadView { lead: LeadSelection | null; problem?: string }
+// stats:config（核心 ar config --json）的返回：主导卡从这里读 config.generics 里被引用的通用适配器声明，
+// 按声明的 executable 与 interactive 判断"已导入的是哪个工具"和"能不能当主导"（294 审查 R2-2 / R2-3）。
+export interface CoreConfigView { ok: true; file: string; exists: boolean; config: Record<string, unknown> | null }
 // 自定义 CLI 预览（agents:test-decl）：原始输出每行带映射出的统一事件。
 export interface PreviewLine { stream: 'stdout' | 'stderr'; text: string; events: { kind: string; [key: string]: unknown }[] }
 export interface PreviewResult {
@@ -429,6 +439,8 @@ export interface ProjectsList { ok: true; projects: ProjectRow[]; git?: GitVersi
     globalIdentity?: boolean;
     config: Record<string, unknown> | null;
     configError: string | null;
+    // 项目自己的主导启动参数（Stage09 / 295）：存在 projects.json 里这个项目的 lead 上，不在 .agent-router/project.json。
+    lead?: { model?: string; effort?: string } | null;
     lastTask: { name: string; started: number } | null;
     // 远程状态（核心只读本地已有的远程跟踪分支，不联网）；非 git 仓库为 null。
     remote?: ProjectRemote | null;
@@ -494,6 +506,8 @@ export interface API {
     demoNow?: number;
     preferences(action: string, payload?: Record<string, unknown>): Promise<any>;
     console(action: string, payload?: Record<string, unknown>): Promise<any>;
+    // Harness 部署事件（301 的 harness:event 通道）；返回取消订阅的函数。
+    onHarnessEvent(callback: (event: HarnessEvent) => void): () => void;
     snapshot(): Promise<Snapshot>;
     detail(id: string): Promise<{
         report: string;
@@ -628,6 +642,41 @@ export interface Settings {
     leftover: { home: string; at?: number } | null;
     own: { notifications: boolean; theme: 'system' | 'light' | 'dark'; wizardDone: boolean; closeAction: 'ask' | 'tray' | 'quit'; trayHintShown: boolean; taskSort?: TaskSort };
 }
+// Harness 检测结果（302）：字段来自核心检测与部署预设。
+// noNpm 是主进程把"没有找到 npm"整理成的结构化结果，界面据此给下载 Node.js 的说明。
+export interface HarnessCheck {
+    name: string;
+    title: string;
+    secretVar: string;
+    ok: boolean;
+    verified: string;
+    recommended?: string;
+    tags?: Record<string, string>;
+    versions?: string[];
+    warning?: string;
+    installed: string | null;
+    path: string | null;
+    updateAvailable: boolean;
+    noNpm?: boolean;
+    error?: string;
+}
+// 部署结果（核心最后一行 JSON）；incompatible 时 fallback 是 AgentRouter 验证过的版本。
+export interface HarnessResult {
+    ok: boolean;
+    path?: string;
+    version?: string;
+    imported?: boolean;
+    verified?: boolean;
+    unverified?: boolean;
+    error?: string;
+    incompatible?: boolean;
+    fallback?: string;
+}
+// 主进程推给渲染层的部署事件：中间步骤、取消、最后结果。
+export type HarnessEvent =
+    | { event: 'step'; step: string; message: string }
+    | { event: 'cancelled' }
+    | HarnessResult;
 export interface Connections {
     availableVersion: string;
     hosts: { host: string; detected: boolean; root: string; installedAt: number; actions: string[]; legacy?: { skill: string; link: boolean }[]; skills: { skill: string; version: string | null; state: string; checked: boolean }[] }[];

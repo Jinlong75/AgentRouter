@@ -12,5 +12,6 @@
   "baseUrlOptions": ["https://api.deepseek.com", "https://api.openai.com/v1"],
   "effortOptions": ["minimal", "low", "medium", "high"],
   "recommended": false,
-  "order": 9
+  "order": 9,
+  "fit": {"good": [], "avoid": []}
 }

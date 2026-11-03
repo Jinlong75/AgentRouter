@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { inflateRawSync, crc32 } from 'node:zlib';
 import { packSkills, zip } from '../../tools/pack-skills.mjs';
+import { setupFilename, nsisInstallArgs, findUninstaller } from '../../tools/verify-packaged.mjs';
 
 function fixture(t) {
   const base = mkdtempSync(path.join(tmpdir(), 'dispatchdock-release-'));
@@ -38,6 +39,12 @@ test('技能 ZIP 解压后无需依赖即可 --yes 安装并 --status 确认 Cla
   const result = await packSkills(source, path.join(s.base, 'release'));
   const bytes = readFileSync(path.join(s.base, 'release', result.filename));
   const unpacked = path.join(s.base, 'unpacked'), names = extract(bytes, unpacked);
+  const again = await packSkills(source, path.join(s.base, 'release-again'));
+  assert.deepEqual(bytes, readFileSync(path.join(s.base, 'release-again', again.filename)));
+  for (const name of ['SKILL.md', 'references/examples.md', 'references/closeout.md']) {
+    const file = `skills/lead-practices/${name}`;
+    assert.ok(names.includes(file)); assert.deepEqual(readFileSync(path.join(unpacked, file)), readFileSync(path.join(source, file)));
+  }
   assert.ok(names.includes('LICENSE')); assert.ok(names.includes('installer/install.mjs'));
   assert.ok(names.every(name => /^(skills\/|core\/|installer\/|package.json$|LICENSE$|THIRD_PARTY_NOTICES.md$|README.md$)/.test(name)));
   const env = { ...process.env, CODEX_DISPATCH_HOME: path.join(s.base, 'dispatch'), USERPROFILE: path.join(s.base, 'user'), HOME: path.join(s.base, 'user'),
@@ -45,6 +52,7 @@ test('技能 ZIP 解压后无需依赖即可 --yes 安装并 --status 确认 Cla
   // 本用例只设旧名；终端里设着新名时新名优先（协议 1），会盖掉隔离目录。
   // 复制出来的是普通对象，Windows 上要自己按不区分大小写删。
   for (const key of Object.keys(env)) if (process.platform === 'win32' ? key.toLowerCase() === 'agent_router_home' : key === 'AGENT_ROUTER_HOME') delete env[key];
+  env.AGENT_ROUTER_HOME = env.CODEX_DISPATCH_HOME;
   mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
   const run = args => { const r = spawnSync(process.execPath, ['installer/install.mjs', ...args], { cwd: unpacked, env, encoding: 'utf8', shell: false, windowsHide: true, timeout: 20000 }); assert.equal(r.status, 0, r.stderr); return r.stdout; };
   run(['--yes']); const status = run(['--status']);
@@ -53,6 +61,7 @@ test('技能 ZIP 解压后无需依赖即可 --yes 安装并 --status 确认 Cla
   const installed = name => status.split('\n').filter(line => line.trim().split(/\s+/).join(' ') === `${name} ${version}`).length;
   assert.equal(installed('agent-router'), 1);
   assert.equal(installed('lead-workflow'), 1);
+  assert.equal(installed('lead-practices'), 1);
   assert.equal(existsSync(path.join(unpacked, 'node_modules')), false);
 });
 test('ZIP 支持中文名称、空文件并可重复生成', t => {
@@ -69,4 +78,12 @@ test('dist 字体缺失或哈希不符时在构建前失败并提示准备字体
     assert.equal(result.status, 1); assert.match(result.stderr, /npm run fonts/);
     assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND/);
   }
+});
+
+test('安装包名、NSIS 参数与卸载程序', () => {
+  assert.equal(setupFilename('1.2.3'), 'AgentRouter-Setup-1.2.3-x64.exe');
+  assert.deepEqual(nsisInstallArgs('C:\\临时 目录\\安装'), ['/S', '/D=C:\\临时 目录\\安装']);
+  assert.equal(findUninstaller(['AgentRouter.exe', 'Uninstall AgentRouter.exe']), 'Uninstall AgentRouter.exe');
+  assert.throws(() => findUninstaller(['AgentRouter.exe']));
+  assert.throws(() => findUninstaller(['Uninstall A.exe', 'Uninstall B.exe']));
 });

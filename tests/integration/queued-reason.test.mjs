@@ -36,7 +36,7 @@ const specText = ({ allowed, verify = [] }) => {
   const lines = ['---', 'id: 901', 'title: 排队原因测试', 'type: code', 'expect_commit: true', 'max_retries: 0', 'allowed_paths:'];
   for (const item of allowed) lines.push(`  - ${item}`);
   if (verify.length) {
-    lines.push('verify:');
+    lines.push('verify_timeout_min: 60', 'verify:');
     for (const line of verify) lines.push(`  - ${line}`);
   }
   lines.push('---', '', '测试说明正文。', '');

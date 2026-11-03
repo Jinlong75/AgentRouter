@@ -36,7 +36,7 @@ function specText({ allowed, verify = [] }) {
   lines.push('allowed_paths:');
   for (const item of allowed) lines.push(`  - ${item}`);
   if (verify.length) {
-    lines.push('verify:');
+    lines.push('verify_timeout_min: 60', 'verify:');
     for (const line of verify) lines.push(`  - ${line}`);
   }
   lines.push('---', '', '测试说明正文。', '');
@@ -247,6 +247,47 @@ test('3 独占命令：独占门禁运行期间新任务排队，门禁结束后
   await until(() => f.has(g, 'end'), '孤立标记不挡新任务');
   assert.equal(f.events(g).some(row => row.event === 'queued'), false);
   assert.equal(existsSync(path.join(f.home, 'slots', 'exclusive.json')), false, '孤立标记被回收');
+});
+
+test('没有提交且工作区干净时跳过独占，普通门禁可以并行', async t => {
+  const f = fixture(t, { project: { exclusiveCommands: ['node scripts/slow.mjs --exclusive'] }, config: { gateConcurrency: 2 } });
+  const specA = f.spec('docs/specs/A.md', { allowed: ['docs/a/**'], verify: ['node scripts/slow.mjs', 'node scripts/slow.mjs --exclusive'] });
+  const specB = f.spec('docs/specs/B.md', { allowed: ['docs/b/**'] });
+  const started = path.join(f.base, 'gate-started.flag');
+  const marker = path.join(f.home, 'slots', 'exclusive.json');
+  const a = await f.dispatch(specA, '甲');
+  await until(() => existsSync(started), 'A 的普通验收开始');
+  assert.equal(existsSync(marker), false);
+  const b = await f.dispatch(specB, '乙');
+  await until(() => f.has(b, 'gate'), 'A 的门禁运行期间 B 的门禁完成');
+  assert.equal(f.has(a, 'gate'), false);
+  assert.equal(existsSync(marker), false);
+  f.release(path.join(f.base, 'gate-go.flag'));
+  await until(() => f.has(a, 'end'), 'A 完成');
+  const gate = JSON.parse(readFileSync(path.join(f.repo, '.agent-runs', '甲', 'attempts', '1', 'gate.json'), 'utf8'));
+  assert.deepEqual(gate.skippedVerify, ['node scripts/slow.mjs --exclusive']);
+});
+
+test('聚焦独占允许新执行者完成，但其门禁等独占结束', async t => {
+  const f = fixture(t, { project: { exclusiveCommands: ['node scripts/slow.mjs'] } });
+  const specD = f.spec('docs/specs/D.md', { allowed: ['docs/d/**'], verify: ['node scripts/slow.mjs --focus x'] });
+  const specE = f.spec('docs/specs/E.md', { allowed: ['docs/e/**'] });
+  f.setProfile({ writes: [{ path: 'docs/d/x.md', content: 'D\n' }], commit: '假执行者：D' });
+  const d = await f.dispatch(specD, '丁');
+  await until(() => existsSync(path.join(f.base, 'gate-started.flag')), '聚焦门禁开始');
+  assert.equal(JSON.parse(readFileSync(path.join(f.home, 'slots', 'exclusive.json'), 'utf8')).scope, 'focus');
+  f.setProfile({ writes: [{ path: 'docs/e/x.md', content: 'E\n' }], commit: '假执行者：E' });
+  const e = await f.dispatch(specE, '戊');
+  await until(() => f.progress('戊').includes('排队：丁 的门禁正在独占运行'), 'E 等门禁');
+  assert.equal(f.has(e, 'spawned'), true);
+  assert.equal(f.has(e, 'gating'), false);
+  assert.equal(f.events(e).some(row => row.event === 'queued'), false);
+  assert.match(f.progress('戊'), /排队：丁 的门禁正在独占运行（node scripts\/slow\.mjs --focus x），等它结束/);
+  f.release(path.join(f.base, 'gate-go.flag'));
+  await until(() => f.has(d, 'gate') && f.has(e, 'end'), '两个门禁完成');
+  const order = rows(f.home);
+  assert.ok(order.findIndex(row => row.id === e && row.event === 'gating') > order.findIndex(row => row.id === d && row.event === 'gate'));
+  assert.equal(f.events(e).find(row => row.event === 'gate').ok, true);
 });
 
 test('ar config 写入并发设置并拒绝非法值', async t => {

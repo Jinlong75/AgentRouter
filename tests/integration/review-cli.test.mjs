@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { registryWriter } from '../../core/lib/records.mjs';
-import { fixture, readJson } from '../fixtures/review/pipeline-fixture.mjs';
+import { fixture, git, write, readJson } from '../fixtures/review/pipeline-fixture.mjs';
 
 // Stage08 T4：ar review 的子命令——再审、confirm、show、stats、config / config set。
 // 假执行者 + reviewer-seq.mjs 经通用适配器接入的假审查者；配置、清单、worktree 都在每个用例自己的临时目录里。
@@ -105,6 +105,16 @@ test('ar review 只对待验收的 worktree 任务：别的状态、不存在的
   const refused = await plain.json(['review', '不用worktree']);
   assert.equal(refused.code, 2);
   assert.match(refused.value.error, /只能审查待验收的 worktree 任务/);
+});
+
+test('review confirm 的说明可以以双横线开头', async t => {
+  const f = await reviewedTask(t, '确认自由文字');
+  const result = await f.json(['review', 'confirm', '确认自由文字', 'R1-1', 'valid', '--note', '--type 也算']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.review('确认自由文字').issues[0].confirmation.note, '--type 也算');
+  const missing = await f.json(['review', 'confirm', '确认自由文字', 'R1-1', 'valid', '--note', '--by']);
+  assert.equal(missing.code, 2);
+  assert.match(missing.value.error, /用法：ar review/);
 });
 
 test('ar review confirm：写 confirmation 与 review-confirm 事件；同一问题以最后一次为准；编号不存在报错；--by 默认值', async t => {
@@ -276,4 +286,23 @@ test('项目配置的 review：ar projects config 写入与校验（default / bl
   assert.deepEqual(readJson(file), original, '删掉后回到原样');
   assert.equal((await f.json(['projects', 'config', f.repo, 'review={}'])).code, 0);
   assert.ok(!Object.hasOwn(readJson(file), 'review'), '空对象等于没设');
+});
+
+
+test('重新门禁后的再审收到此前不成立问题及理由，后续再审仍保留', async t => {
+  const f = await reviewedTask(t, '不成立理由');
+  const confirm = await f.json(['review', 'confirm', '不成立理由', 'R1-1', 'invalid', '--note', '已有调用方保证输入非空', '--by', 'lead']);
+  assert.equal(confirm.code, 0, confirm.stderr);
+  const dir = f.events('不成立理由').find(row => row.event === 'worktree').dir;
+  write(path.join(dir, 'src/a.js'), '补充修改\n');
+  git(dir, ['add', '--', 'src/a.js']);
+  git(dir, ['commit', '-q', '-m', '补充修改', '--', 'src/a.js']);
+  const regate = await f.json(['retry', '不成立理由', '--regate']);
+  assert.equal(regate.code, 0, JSON.stringify(regate));
+  const prompt = readFileSync(path.join(attemptDir(f, '不成立理由', 2), 'review', 'prompt.md'), 'utf8');
+  assert.ok(prompt.includes('## 主导已判为不成立的问题（上一轮）'));
+  assert.ok(prompt.includes('- R1-1 high src/a.js:1  示例高严重度问题\n  主导理由：已有调用方保证输入非空'));
+  const again = await f.json(['review', '不成立理由']);
+  assert.equal(again.code, 0, again.stderr);
+  assert.ok(readFileSync(path.join(attemptDir(f, '不成立理由', 2), 'review-2', 'prompt.md'), 'utf8').includes('已有调用方保证输入非空'));
 });

@@ -2,11 +2,12 @@
 // （汇报、进度页脚、gate / end 事件、退出码）。规则见文件协议第 14 节（14.1、14.2）。
 // 停止信号放在这里：它要同时覆盖执行者运行与门禁验收命令，从第一次启动执行者起一直有效到任务结束。
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { clip, formatProgress, progressFooter } from './progress.mjs';
+import { startSample, recordEndSample, effectiveConcurrency } from './resources.mjs';
 import { killProcessTree } from './process.mjs';
-import { runGate } from './gate.mjs';
-import { openWatch, shouldWatch, viewerTakesOver } from './watch.mjs';
+import { attemptReportFile, runGate, skipExclusiveVerify } from './gate.mjs';
+import { openWatch, watchPlan, viewerState } from './watch.mjs';
 import { noExitGrace, runOnce } from './runner.mjs';
 import { attemptPaths } from './records.mjs';
 import { buildPrompt } from './retry-prompt.mjs';
@@ -18,16 +19,16 @@ import { needsScopeLine, parseNeedsScope } from './needs-scope.mjs';
 import { readConfig, readEffectiveConfig, resolveSettings, slotLimits } from './config.mjs';
 import { classifyFailure, clockText, recordLimit } from './limits-state.mjs';
 import { markEnvironment } from './report.mjs';
-import { parseSpec, validateSpec } from './spec.mjs';
+import { mergeSpec, parseSpec, validateSpec } from './spec.mjs';
 import { acquireSlot } from './slots.mjs';
 import { awaitingOverlaps, createOverlapWatcher, createTaskLimit, enterGate, exclusiveCommandOf, overlapLine, overlapNoteLine, readProject, waitForOverlap } from './schedule.mjs';
 import { readDispatch } from './records.mjs';
 import { taskBaseBranch } from './status.mjs';
 import { createWorktree, mergeInto, requireSpecAt, resolveBase, runSetup, specRelative } from './worktree.mjs';
-import { OUTSIDE_NOTE, diffRoots, outsideField, outsideLine, outsideRecord, snapshotRoots, uncheckedLine, userTempLine } from './outside-writes.mjs';
+import { OUTSIDE_NOTE, confirmOutsideWrites, outsideField, outsideLine, outsideRecord, snapshotRoots, uncheckedLine, userTempLine, transientLine } from './outside-writes.mjs';
 import { homedir } from 'node:os';
 import { git, headSha, uncommittedFiles } from './git.mjs';
-import { chooseReviewer, markNeedsHuman, reviewApplies, reviewDecision, reviewSettings, reviewSpecOf, runReview } from './review.mjs';
+import { chooseReviewer, collectReviewNotes, markNeedsHuman, reviewApplies, reviewDecision, reviewSettings, reviewSpecOf, runReview } from './review.mjs';
 
 // 排队时每轮重读 config.json 里的名额上限；配置读不了（正在写、坏了）时抛错，由 acquireSlot 沿用上一轮的值。
 function slotLimitNow(home, key) {
@@ -39,11 +40,21 @@ function slotLimitNow(home, key) {
 function slotInfoNow(home) {
   const state = readConfig(home);
   if (state.reason) throw new Error(state.reason);
-  return slotLimits(state.config);
+  return effectiveConcurrency(home, slotLimits(state.config));
 }
 
 // 自动重试都没通过时，进度与汇报末尾的提示（end 事件另有 handBack: true）。
 const HAND_BACK_LINE = '自动重试都没通过，建议主导接手';
+export const AUTO_COMMIT_NOTE = '本次由 AgentRouter 在门禁前代为提交：git add / git commit 失败（例如沙箱写不了版本库）不算阻塞，不要因此停下；完成全部改动并跑完自测后正常结束，汇报里照常列出改动的文件。';
+// 代提交开关：执行者配置优先，没写时用适配器的默认（codex 默认开，其他适配器没有默认）。测试直接调用这个判断。
+export const willAutoCommit = (profile, adapter, worktree, gateInfo, rebaseOnly) => (profile?.autoCommit ?? adapter?.autoCommitDefault ?? false) === true && !!worktree && gateInfo?.readOnly !== true && !!gateInfo?.enabled && (gateInfo.merged?.expect_commit === true || gateInfo.textTask === true) && !rebaseOnly;
+
+// 执行者单次运行时限（383）：合并后的 timeout_min（分钟）换算成毫秒；
+// 测试用 AR_TEST_EXECUTOR_TIMEOUT_MS（毫秒，正数才生效）直接代替换算，和其他 AR_TEST_* 一样只给测试用。
+export function executorTimeoutMs(minutes, env = process.env) {
+  const value = Number(env?.AR_TEST_EXECUTOR_TIMEOUT_MS);
+  return value > 0 ? value : minutes * 60000;
+}
 
 // 限流 / 额度用完 / 服务不可用时自动换执行者（Stage07c T7，任务 148）：一个任务最多换这么多次（防止循环），换人不计自动重试次数。
 const MAX_SWITCHES = 5;
@@ -59,10 +70,22 @@ function routeSpecOf(root, specPath) {
   } catch { return null; }
 }
 
+// 执行者单次运行时限（383）：合并后的 timeout_min。派发时算好的门禁快照里带这个字段就用它；
+// 不带时按派发时的规则从任务说明与项目配置现算（mergeSpec 的默认值 60），读不了就当没有（不计时）。
+function timeoutMinOf(root, gateInfo, specPath) {
+  if (Number.isSafeInteger(gateInfo?.merged?.timeout_min)) return gateInfo.merged.timeout_min;
+  if (!gateInfo || !specPath) return null;
+  try {
+    const spec = validateSpec(parseSpec(readFileSync(resolve(root, specPath), 'utf8'), specPath), specPath);
+    return mergeSpec(spec, readProject(root)).timeout_min;
+  } catch { return null; }
+}
+
 // 进度分隔行里失败原因的写法（协议 14.2 第 2 条）。
 const reasonText = (reason, failure) => (reason === 'gate' ? '门禁未通过'
   : reason === 'agent' ? `执行者异常退出（exit ${failure?.exit ?? '?'}）`
     : reason === 'review' ? '审查发现问题，返工'
+    : reason === 'regate' ? '重跑门禁'
     : reason === 'rebase' ? '合并主分支的新提交后重跑门禁'
       : reason === 'conflict' ? '解决合并冲突'
         : '手动重试');
@@ -88,6 +111,8 @@ export async function pipeline(ctx) {
     maxRetries = 0, escalate = null, strong = null, effortOptions: initialEffortOptions = null, effortSupported: initialEffortSupported = true, settingSources = null, sources = [], retry = null, worktree = null,
     // 工作区外写入检查列的用户目录根：核心进程的 os.homedir()（不是交给执行者的沙箱目录），ctx 里可替换（测试用）。
     userHome = homedir(),
+    // 进度窗口的判断（428）：前台已经算好就沿用，保证打印的原因与真正弹窗一致；没传时按同一函数现算。
+    watch = null,
   } = ctx;
   // 手动重试：从第 retry.n 次开始、只跑这一次；正常派发从第 1 次开始，
   // 这一轮自动执行允许的总次数 1 + max_retries（协议 14.1；直接任务文字派发的 maxRetries 为 0）。
@@ -128,6 +153,8 @@ export async function pipeline(ctx) {
 
   // 调研 / 审查类任务（Stage07 105）：以只读模式运行，门禁不允许任何改动。信息来自门禁信息的 readOnly 字段（派发时算好，重试沿用）。
   const readOnly = gateInfo?.readOnly === true;
+  // 执行者单次运行时限（383）：所有执行者运行都用合并后的 timeout_min；没有门禁信息、取不到整数时不计时。
+  const timeoutMin = timeoutMinOf(root, gateInfo, taskSpec);
 
   // 当前执行者：最后一次自动重试可以换成 escalate（协议 14.1）；每次尝试用它构造命令与环境。
   let run = { adapter, label, profile, profileName, settings, detection, childEnv, envError };
@@ -180,7 +207,22 @@ export async function pipeline(ctx) {
   const worktreeEnv = dir => (worktree ? { AR_BASE_REPO: resolve(root), AR_WORKTREE: resolve(dir) } : undefined);
 
   // 工作目录：非 worktree 模式就是项目根；worktree 模式先排队占任务名额，建 worktree、跑准备命令，之后换成 worktree 目录（协议 15.2、15.4、15.5）。
+  let cpuMark = null;
   let workdir = root;
+  if (!worktree && gateInfo?.readOnly && Number.isSafeInteger(gateInfo.merged?.timeout_min)) {
+    armSignals();
+    let waitLimit = null;
+    const taskLimit = createTaskLimit({ home, env, progress, registry, id,
+      readLimits: () => { const info = slotInfoNow(home); waitLimit = info.limits.concurrency; return info; } });
+    try {
+      releaseTask = await acquireSlot({ home, kind: 'task', id, limit: taskLimit, signal,
+        onWait: () => { if (!taskLimit.paused()) registry({ event: 'queued', id, at: Date.now() }); progress(`排队：同时最多 ${waitLimit} 个任务，等前面的任务结束`); },
+        onLimit: (now, old) => progress(`排队：并发上限改为 ${now}（原来 ${old}）`) });
+    } catch (error) {
+      if (error?.stopped) return new Promise(() => {});
+      progress(`排队出错（${error.message}），不排队直接运行`);
+    }
+  }
   if (worktree) {
     armSignals();
     const prepared = await prepareWork();
@@ -205,7 +247,7 @@ export async function pipeline(ctx) {
       // 合并本身没能进行（不是冲突）：任务以失败结束，但仍是冲突状态（conflict 事件写在 end 之后，协议 15.3），可以再试。
       for (const [signal, handler] of handlers) process.off(signal, handler);
       emit({ kind: 'error', text: `合并 ${baseBranch} 失败：${merged.error}` });
-      const code = finish({ exitCode: 1, attempts: 0, label: run.label });
+      const code = await finish({ exitCode: 1, attempts: 0, label: run.label });
       // 失败 / 已中断的任务（不是从冲突来的）不补 conflict 事件：它们以这次失败结束，状态仍是失败。
       if (retry.rebase.fromConflict !== false) registry({ event: 'conflict', id, files: retry.rebase.files ?? [], at: Date.now() });
       return code;
@@ -216,7 +258,7 @@ export async function pipeline(ctx) {
       git(workdir, ['merge', '--abort']);
       for (const [signal, handler] of handlers) process.off(signal, handler);
       progress(`合并 ${baseBranch}（${newBase.slice(0, 7)}）：${rebased.length} 个文件有冲突（${rebased.slice(0, 5).join('、')}），已撤销这次合并，任务进入冲突状态；解决冲突用 ar retry ${paths.name} --rebase`);
-      const code = finish({ exitCode: 1, attempts: 0, label: run.label });
+      const code = await finish({ exitCode: 1, attempts: 0, label: run.label });
       registry({ event: 'conflict', id, files: rebased, at: Date.now() });
       return code;
     }
@@ -230,6 +272,7 @@ export async function pipeline(ctx) {
   let ranGate = false;   // 整个任务是否跑过门禁（跑过的 end 另有 agentExit，协议第 2 节）
   let lastGate = null;   // 最后一次尝试的门禁结果（收尾打印与 onGate 用；没跑为 null）
   let lastRun = null;    // 最后一次尝试的运行结果
+  let lastTimedOut = false;   // 最后一次尝试是否因超时被结束（end.timedOut，383）
   let lastNeedsScope = [];   // 最后一次尝试汇报里的"需要越界"（end 事件用）
   let exitCode = 1;
   let failure = retry ? retry.failure : null;    // 上一次的失败（下一次的重试段落与原因用；手动重试从任务里带入）
@@ -251,8 +294,9 @@ export async function pipeline(ctx) {
     // 手动重试的这一次是 manual；其余仍是 first / gate / agent（协议 14.2 第 1 条）。
     // ar retry --rebase 的这一次是 rebase（没有冲突，不启动执行者）或 conflict（有冲突，执行者解决）。
     // 换人的那次的上一次是执行者异常退出（限流 / 不可用），reason 记 agent；评分里它被"环境"归因免掉（report.mjs）。
-    const rebaseOnly = !!rebased && rebased.length === 0 && n === firstN;
-    const reason = rebased && n === firstN ? (rebased.length ? 'conflict' : 'rebase')
+    const regateOnly = retry?.regate === true && n === firstN;
+    const rebaseOnly = (!!rebased && rebased.length === 0 && n === firstN) || regateOnly;
+    const reason = regateOnly ? 'regate' : rebased && n === firstN ? (rebased.length ? 'conflict' : 'rebase')
       : retry && n === firstN ? 'manual' : n === 1 ? 'first' : taken ? 'agent' : failure?.kind === 'review' ? 'review' : failure?.kind === 'gate' ? 'gate' : 'agent';
 
     // 网络代理（Stage07 099）：这个进程里的第 2 次起的每次尝试都重新读一次（system 模式下系统代理可能已经变了）。
@@ -330,10 +374,15 @@ export async function pipeline(ctx) {
     // 没有 note 时 buildPrompt 不写补充说明段。
     const attemptFailure = rebased?.length && n === firstN ? { kind: 'conflict', files: rebased, baseBranch: retry.rebase.baseBranch } : retry?.failure;
     // 换人的那次与被换掉的那次是同一步（step），指令也一样；上一个执行者可能已经改了一部分，另加一段接手说明。
-    const stepPrompt = step === 1 && failure?.kind !== 'review' ? prompt : buildPrompt(prompt, { n: step, total, failure, note: null, escalation });
-    const attemptPrompt = retry && n === firstN ? buildPrompt(prompt, { n, total: null, failure: attemptFailure, note: retry.note })
+    const autoCommitEnabled = willAutoCommit(run.profile, run.adapter, worktree, gateInfo, rebaseOnly);
+    // 超时被结束的尝试按执行者异常退出重试，失败标题下写明原因（383）；和升级链的说明并排。
+    const promptNote = [failure?.timedOut ? `上一次执行超过时限（${failure.timeoutMin} 分钟）被结束。` : null, escalation].filter(Boolean).join('\n\n') || null;
+    const stepPrompt = step === 1 && failure?.kind !== 'review' ? prompt : buildPrompt(prompt, { n: step, total, failure, note: null, escalation: promptNote });
+    const rawAttemptPrompt = retry && n === firstN ? buildPrompt(prompt, { n, total: null, failure: attemptFailure, note: retry.note })
       : taken ? `${stepPrompt}\n\n## 接手说明\n\n上一个执行者（${taken.fromLabel}）因${environmentWhy(taken.kind)}中断了任务，工作区里可能已有它的部分改动。请在现有改动的基础上继续，不要推倒重来。`
         : stepPrompt;
+    // 代提交提示放在整段指令（含重试的失败信息与补充说明）的最末尾，免得被后面"确认通过再提交"一类的话盖过（272 审查 R2-1）。
+    const attemptPrompt = autoCommitEnabled ? `${rawAttemptPrompt}\n${AUTO_COMMIT_NOTE}` : rawAttemptPrompt;
     if (!rebaseOnly) writeFileSync(attempt.prompt, attemptPrompt);
 
     // 有状态映射（如 Claude Code 要靠 id 配对命令开始与结果）每次尝试新建一个：
@@ -342,10 +391,11 @@ export async function pipeline(ctx) {
     const attemptStarted = Date.now();
     let initialHead = null;
     let commitTitle = taskTitle;
-    if (run.profile.autoCommit === true && worktree && !readOnly && gateInfo?.enabled && gateInfo.merged?.expect_commit === true && !rebaseOnly) {
+    if (autoCommitEnabled) {
       try {
         initialHead = headSha(workdir);
-        const rel = specRelative(root, taskSpec);
+        // 文字任务没有任务说明：提交标题用派发时的标题。
+        const rel = taskSpec ? specRelative(root, taskSpec) : null;
         const shown = rel && git(workdir, ['show', `${initialHead}:${rel}`]);
         // 标题读不出来只回退到派发时的标题，不影响是否代提交。
         if (shown?.status === 0) try { commitTitle = validateSpec(parseSpec(shown.stdout, rel), rel).title ?? taskTitle; } catch { commitTitle = taskTitle; }
@@ -353,22 +403,43 @@ export async function pipeline(ctx) {
     }
     // 工作区外写入检查（协议 12.4）：启动执行者之前先列一遍用户目录根与公共目录根的第一层。
     const rootsBefore = snapshotRoots({ userHome, home });
+    // 执行者运行时限（383）：计时器每次尝试重新开始；只读调研沿用原来的原文与 researchTimedOut。
+    let executorTimer = null, executorTimedOut = false;
     lastRun = rebaseOnly ? { exit: 0, lastSay: null, result: null, stderrTail: '', startFailed: false } : await runOnce({
       adapter: run.adapter, label: run.label, profile: run.profile, profileName: run.profileName, settings: run.settings, detection: run.detection,
       workdir, childEnv: run.childEnv, paths, registry, id, progress,
       prompt: attemptPrompt, envError: run.envError, emit, errors: attemptErrors, mapLine, stopped,
       attempt: n, attemptFiles: attempt, readOnly, noExitGraceMs: noExitGrace(env),
-      onSpawn: installSignals,
+      onSpawn: pid => {
+        installSignals(pid);
+        if (pid && timeoutMin !== null) {
+          executorTimer = setTimeout(() => {
+            executorTimedOut = true;
+            progress(readOnly ? '调研超过时限，正在结束执行者' : `执行超过时限（${timeoutMin} 分钟），正在结束执行者`);
+            killProcessTree(pid).catch(() => {});
+          }, executorTimeoutMs(timeoutMin, env));
+          executorTimer.unref?.(); // 不让计时器拖住进程
+        }
+      },
       // 只弹一次进度窗口（本进程的第一次尝试；手动重试是新进程，从第 firstN 次起弹一次）。
       beforeSpawn: n === firstN ? () => {
-        if (shouldWatch({ platform: process.platform, interactive, policy: settings.watchWindow, takeover: viewerTakesOver(home) })) openWatch(paths.name, paths.progress, label);
+        const plan = watch ?? watchPlan({ platform: process.platform, interactive, policy: settings.watchWindow, viewer: viewerState(home) });
+        if (plan.opened) openWatch(paths.name, paths.progress, label);
       } : null,
     });
+    // 执行者已退出：取消运行时限，免得到点后去结束一个可能已被系统复用的进程号。
+    if (executorTimer) { clearTimeout(executorTimer); executorTimer = null; }
+    // 非只读任务超时按执行者异常退出处理（383）：进程若恰好在结束前以 0 退出，也按失败（退出码 1）算。
+    if (executorTimedOut && !readOnly && lastRun.exit === 0) lastRun = { ...lastRun, exit: 1 };
+    const timedOut = executorTimedOut && !readOnly;
+    lastTimedOut = timedOut;
+    cpuMark = startSample();
     // 被停止：信号处理器写 interrupted 后以 1 退出；不写这次的 attempt-end，也不写 end（协议 14.1）。
     if (stopping) return new Promise(() => {});
 
     // 执行者退出后、门禁之前再列一遍并比较；没能核对只写一行原因，不影响门禁结果与重试。
-    const outside = diffRoots(rootsBefore, snapshotRoots({ userHome, home }));
+    const outside = await confirmOutsideWrites(rootsBefore, { userHome, home });
+    if (outside.transient?.length) progress(transientLine(outside.transient));
     if (!outside.checked) progress(uncheckedLine(outside.error));
     else if (outside.userTemp?.length) progress(userTempLine(outside.userTemp));
 
@@ -376,23 +447,103 @@ export async function pipeline(ctx) {
     if (initialHead && lastRun.exit === 0 && !stopping) {
       try {
         if (headSha(workdir) === initialHead) {
-          const files = [...new Set(uncommittedFiles(workdir))];
-          if (files.length) {
-            for (const key of ['user.name', 'user.email']) {
-              const identity = git(workdir, ['config', '--get', key]);
-              if (identity.status !== 0 || !identity.stdout.trim()) throw new Error(`无法读取提交身份 ${key}：${identity.stderr.trim() || '未配置'}`);
+          let files = [...new Set(uncommittedFiles(workdir))];
+          const merging = git(workdir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).status === 0;
+          if (files.length || merging) {
+            let conflicts = [];
+            let manualConflicts = [];
+            if (merging) {
+              const unresolved = git(workdir, ['diff', '--name-only', '--diff-filter=U', '-z']);
+              if (unresolved.status !== 0) throw new Error(unresolved.stderr.trim() || `git diff 退出码 ${unresolved.status}`);
+              const unresolvedFiles = unresolved.stdout.split('\0').filter(Boolean);
+              const changed = git(workdir, ['diff', '--name-only', '-z']);
+              const untracked = git(workdir, ['ls-files', '--others', '--exclude-standard', '-z']);
+              for (const result of [changed, untracked]) {
+                if (result.status !== 0) throw new Error(result.stderr.trim() || `git 列出文件退出码 ${result.status}`);
+              }
+              files = [...new Set([...unresolvedFiles, ...changed.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(file => file && !file.startsWith('.agent-runs/')))];
+              const entries = git(workdir, ['ls-files', '-u', '-z']);
+              if (entries.status !== 0) throw new Error(entries.stderr.trim() || `git ls-files 退出码 ${entries.status}`);
+              const stages = new Map();
+              for (const entry of entries.stdout.split('\0').filter(Boolean)) {
+                const match = entry.match(/^\d+ ([0-9a-f]+) ([123])\t([\s\S]+)$/);
+                if (!match) throw new Error('无法解析未合并条目');
+                if (!stages.has(match[3])) stages.set(match[3], new Map());
+                stages.get(match[3]).set(Number(match[2]), match[1]);
+              }
+              for (const file of unresolvedFiles) {
+                const fileStages = stages.get(file);
+                if (!fileStages || ![1, 2, 3].every(stage => fileStages.has(stage))) {
+                  manualConflicts.push(`${file}：一方删除`);
+                  continue;
+                }
+                // 按索引里双方的版本判断二进制（与 git 一样看前 8000 字节有没有 NUL），不看工作区：
+                // 执行者没动的二进制冲突，工作区就是本方版本，和索引比没有差异（329 审查 R3-1）。
+                const binary = [2, 3].some(stage => {
+                  const blob = git(workdir, ['cat-file', 'blob', fileStages.get(stage)]);
+                  if (blob.status !== 0) throw new Error(blob.stderr.trim() || `git cat-file 退出码 ${blob.status}`);
+                  return blob.stdout.slice(0, 8000).includes('\0');
+                });
+                // .gitattributes 把文件标成二进制（-diff 或 binary）时没有 NUL 也算（329 审查 R4-1）。
+                const attrs = git(workdir, ['check-attr', '-z', 'diff', 'binary', '--', file]);
+                if (attrs.status !== 0) throw new Error(attrs.stderr.trim() || `git check-attr 退出码 ${attrs.status}`);
+                const values = attrs.stdout.split('\0');
+                const marked = values.some((value, i) => i % 3 === 2 && ((values[i - 1] === 'diff' && value === 'unset') || (values[i - 1] === 'binary' && value === 'set')));
+                if (binary || marked) {
+                  manualConflicts.push(`${file}：二进制`);
+                  continue;
+                }
+                // 冲突文件被删掉了：可能丢掉双方内容，交人工确认（329 审查 R4-2）。
+                if (!existsSync(join(workdir, file))) {
+                  manualConflicts.push(`${file}：冲突文件被删除`);
+                  continue;
+                }
+              }
+              for (const file of files) {
+                let content;
+                try { content = readFileSync(join(workdir, file), 'utf8'); }
+                catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+                if (/^(?:<<<<<<< |>>>>>>> |=======(?:\r?$))/m.test(content)) conflicts.push(file);
+              }
+              conflicts = [...new Set(conflicts)];
             }
-            const add = git(workdir, ['add', '--', ...files]);
-            if (add.status !== 0) throw new Error(add.stderr.trim() || `git add 退出码 ${add.status}`);
-            const commit = git(workdir, ['commit', '-m', `[执行] ${commitTitle}（执行者没能提交，由 AgentRouter 代提交）`, '--', ...files]);
-            if (commit.status !== 0) throw new Error(commit.stderr.trim() || `git commit 退出码 ${commit.status}`);
-            const sha = headSha(workdir);
-            autoCommit = { sha, files };
-            progress(`AgentRouter 代提交了 ${files.length} 个文件：${sha.slice(0, 7)}`);
+            if (manualConflicts.length) {
+              progress(`AgentRouter 没有代提交：有需要人工确认的冲突（${manualConflicts.slice(0, 5).join('、')}）`);
+            } else if (conflicts.length) {
+              progress(`AgentRouter 没有代提交：还有未解决的冲突（${conflicts.slice(0, 5).join('、')}）`);
+            } else {
+              for (const key of ['user.name', 'user.email']) {
+                const identity = git(workdir, ['config', '--get', key]);
+                if (identity.status !== 0 || !identity.stdout.trim()) throw new Error(`无法读取提交身份 ${key}：${identity.stderr.trim() || '未配置'}`);
+              }
+              if (files.length) {
+                const add = git(workdir, ['add', '--', ...files]);
+                if (add.status !== 0) throw new Error(add.stderr.trim() || `git add 退出码 ${add.status}`);
+              }
+              let message = `[执行] ${commitTitle}（执行者没能提交，由 AgentRouter 代提交）`;
+              if (merging) {
+                const mergePath = git(workdir, ['rev-parse', '--git-path', 'MERGE_MSG']);
+                let mergeMessage = '';
+                if (mergePath.status === 0) try { mergeMessage = readFileSync(resolve(workdir, mergePath.stdout.trim()), 'utf8').split(/\r?\n/)[0].trim(); } catch { /* 使用基线分支兜底。 */ }
+                message = `${mergeMessage || `合并 ${retry?.rebase?.baseBranch ?? ''}`}（冲突由执行者解决，AgentRouter 代提交）`;
+              }
+              const commit = git(workdir, merging ? ['commit', '--no-edit', '-m', message] : ['commit', '-m', message, '--', ...files]);
+              if (commit.status !== 0) throw new Error(commit.stderr.trim() || `git commit 退出码 ${commit.status}`);
+              const sha = headSha(workdir);
+              autoCommit = { sha, files };
+              progress(merging ? `AgentRouter 代提交了合并：${sha.slice(0, 7)}` : `AgentRouter 代提交了 ${files.length} 个文件：${sha.slice(0, 7)}`);
+            }
           }
         }
       } catch (error) { progress(`AgentRouter 代提交失败：${error.message}`); }
     }
+
+    // 先生成本次汇报，供门禁检查。
+    if (!run.adapter.writesReport && !rebaseOnly) {
+      const text = run.adapter.finish ? run.adapter.finish({ lastSay: lastRun.lastSay, result: lastRun.result, stdoutText: lastRun.stdoutText }) : lastRun.lastSay;
+      if (text != null) writeFileSync(attempt.report, text);
+    }
+    if (existsSync(attempt.report)) copyFileSync(attempt.report, paths.report);
 
     // 门禁（协议第 12 节）：执行者以 0 结束且启用门禁时跑，dir 指这次的 attempts/<n>/。
     let gate = null;
@@ -401,12 +552,19 @@ export async function pipeline(ctx) {
       // 门禁名额（协议 15.5）：写 gating 之前取；等待期间执行者已经退出，停止信号不该再去结束它的旧 pid。
       agentPid = null;
       try {
-        // 独占门禁（并行调度 140）：验收命令和项目配置 exclusiveCommands 里某条完全相同时，拿到名额后建独占标记；
+        // 匹配独占命令后建标记；带参数的聚焦独占不暂停新任务。
         // 别人的独占门禁在跑时，普通门禁也在这里等。release 一次放掉标记和名额。
         const signal = { get stopped() { return stopping; } };
+        let command = exclusiveCommandOf({ root, verify: gateInfo.merged?.verify });
+        if (command && !readOnly && gateInfo.merged?.expect_commit === true) {
+          try {
+            if (skipExclusiveVerify({ required: true, head: headSha(workdir), base: gateInfo.base, uncommitted: uncommittedFiles(workdir) })) command = null;
+          } catch { /* 无法核对时保留独占，交由门禁报告 git 错误。 */ }
+        }
+        const configured = readProject(root).exclusiveCommands;
+        const scope = Array.isArray(configured) && configured.some(item => typeof item === 'string' && item.trim() === command) ? 'full' : 'focus';
         const entered = await enterGate({
-          home, id, name: paths.name, signal, progress,
-          command: exclusiveCommandOf({ root, verify: gateInfo.merged?.verify }),
+          home, id, name: paths.name, signal, progress, command, scope,
           acquire: () => acquireSlot({
             home, kind: 'gate', id, limit: () => slotLimitNow(home, 'gateConcurrency'), signal,
             onWait: ({ held }) => progress(`等门禁名额：已有 ${held} 个门禁在运行`),
@@ -429,6 +587,11 @@ export async function pipeline(ctx) {
             // 去掉当前执行者配置 secrets 里的键与来源变量名（协议 12.2）。
             dropEnv: Object.entries(run.profile.secrets ?? {}).flatMap(([key, value]) => [key, value]),
             dir: attempt.dir, attempt: n, outsideWrites: outsideField(outside), extraEnv: worktreeEnv(workdir), readOnly,
+            onMutationCommand: result => {
+              const status = result.timedOut ? '超时' : result.error ?? (result.exit === 0 ? '退出码 0' : `预期非零退出 ${result.exit}`);
+              progress(`反向实验命令：${result.line} → ${status}（${(result.ms / 1000).toFixed(1)} 秒）`);
+              if (result.output) progress(result.output);
+            },
             onSpawn: pid => {
               gatePid = pid;
               // 停止信号已经到达时，刚启动的命令立即结束（门禁循环随后由进程退出结束）。
@@ -461,14 +624,6 @@ export async function pipeline(ctx) {
     // 门禁进行中收到停止信号：信号处理器写 interrupted 并以 1 退出，这里不再写 attempt-end / end。
     if (stopping) return new Promise(() => {});
 
-    // 这次的汇报写到 attempts/<n>/report.md，顶层 report.md 保持"最新"（协议 14.2 第 3、4 条）：
-    // 不自己写汇报的执行者由核心写（同样写这里）；这次没有汇报就保留上一次的。
-    if (!run.adapter.writesReport && !rebaseOnly) {
-      const text = run.adapter.finish ? run.adapter.finish({ lastSay: lastRun.lastSay, result: lastRun.result, stdoutText: lastRun.stdoutText }) : lastRun.lastSay;
-      if (text != null) writeFileSync(attempt.report, text);
-    }
-    if (existsSync(attempt.report)) copyFileSync(attempt.report, paths.report);
-
     // 执行者需要越界（协议 14.5）：只看这次尝试的汇报；有就不再自动重试。
     let needsScope = [];
     if (existsSync(attempt.report)) {
@@ -486,6 +641,7 @@ export async function pipeline(ctx) {
       usage: { input: usage.sawInput ? usage.input : null, output: usage.sawOutput ? usage.output : null },
       ms: Date.now() - attemptStarted, at: Date.now(),
       ...(needsScope.length ? { needsScope } : {}),
+      ...(timedOut ? { timedOut: true } : {}),
       ...(autoCommit ? { autoCommit } : {}),
       ...(outsideRecord(outside) ? { outsideWrites: outsideRecord(outside) } : {}),
     });
@@ -497,8 +653,26 @@ export async function pipeline(ctx) {
     // 失败分类（协议 14.1）：可重试的是门禁未通过（gate）与执行者非 0 退出（agent）；
     // 执行者没能启动（缺密钥、command 出错、spawn 失败）不重试——重试也不会好。
     if (lastRun.exit === 0 && (gate == null || gate.ok === true)) {
-      // 审查（Stage08 T3）：门禁通过之后、进入待验收之前。只合并主分支后只重跑门禁的那一次（rebaseOnly）不审查。
-      const reviewed = rebaseOnly ? null : await reviewStage({ n, gate, attempt, mayRework: !retry && needsScope.length === 0 && !outsideAdded });
+      // 审查在门禁通过之后、进入待验收之前；合并基线后只审查任务自己的新提交。
+      let reviewChanged = true;
+      if (regateOnly) {
+        try {
+          const previous = JSON.parse(readFileSync(join(paths.dir, 'review.json'), 'utf8'));
+          reviewChanged = !previous.head || previous.head !== headSha(workdir);
+        } catch { /* 没有可用的审查记录时照常审查。 */ }
+      }
+      let rebaseChanged = false;
+      if (rebaseOnly && !regateOnly) {
+        try {
+          const previous = JSON.parse(readFileSync(join(paths.dir, 'review.json'), 'utf8'));
+          if (typeof previous.head === 'string' && previous.head && retry.rebase.base) {
+            const commits = git(workdir, ['rev-list', '--no-merges', 'HEAD', `^${previous.head}`, `^${retry.rebase.base}`]);
+            rebaseChanged = commits.status === 0 && commits.stdout.trim().length > 0;
+          }
+        } catch { /* 没有可用审查记录时不审查。 */ }
+        if (rebaseChanged) progress('合并基线后发现上次审查之后的新提交：重新审查');
+      }
+      const reviewed = (rebaseOnly && !regateOnly && !rebaseChanged) || (regateOnly && !reviewChanged) ? null : await reviewStage({ n, gate, attempt, mayRework: !retry && needsScope.length === 0 && !outsideAdded });
       if (stopping) return new Promise(() => {});
       if (reviewed?.rework) {
         reworks++;
@@ -511,10 +685,14 @@ export async function pipeline(ctx) {
     }
     if (lastRun.startFailed) { exitCode = 1; failure = { kind: 'start' }; break; }
 
+    // 执行者异常退出（协议 14.1）。超时被结束的尝试按这条走（383）：失败信息带超时的分钟数，重试指令里写明原因。
+    const agentFailure = { kind: 'agent', exit: lastRun.exit, errors: attemptErrors, stderrTail: lastRun.stderrTail, ...(timedOut ? { timedOut: true, timeoutMin } : {}) };
+
     // 环境原因（Stage07c T7，任务 148）：执行者非 0 退出，原因是额度用完 / 限流（limit）或服务不可用 / 网络中断（unavailable）。
     // 这次失败归"环境"（marks.json）、不计重试、不扣分；limit 记恢复时间（limits.json），按路由链换下一个可用执行者；
     // unavailable 要同一执行者连续两次才算（第一次按普通失败走重试），不记恢复时间。先于下面的普通失败处理，也先于升级链（下一次尝试开头才走升级链）。
-    const environment = lastRun.exit !== 0 && !rebaseOnly ? classifyFailure({
+    // 超时的尝试不按环境归因（可能只是卡住的命令）：照常计入重试（383）。
+    const environment = lastRun.exit !== 0 && !rebaseOnly && !timedOut ? classifyFailure({
       adapter: run.adapter.id,
       events: [...attemptErrors.map(text => ({ kind: 'error', text })),
         ...(mapLine.rateLimit ? [{ type: 'rate_limit_event', rate_limit_info: mapLine.rateLimit }] : [])],
@@ -566,7 +744,7 @@ export async function pipeline(ctx) {
       // 不换人：这次失败仍归环境，但换人走不通，再试同一个被限流 / 不可用的执行者没有意义，直接按失败结束。
       progress(`${what}，不换执行者：${why}`);
       if (why === NO_ONE_LEFT) emit({ kind: 'error', text: NO_ONE_LEFT });
-      failure = { kind: 'agent', exit: lastRun.exit, errors: attemptErrors, stderrTail: lastRun.stderrTail };
+      failure = agentFailure;
       exitCode = lastRun.exit;
       break;
     }
@@ -575,7 +753,7 @@ export async function pipeline(ctx) {
       failure = { kind: 'gate', gate };
       exitCode = 3;
     } else {
-      failure = { kind: 'agent', exit: lastRun.exit, errors: attemptErrors, stderrTail: lastRun.stderrTail };
+      failure = agentFailure;
       exitCode = lastRun.exit;
     }
     // 手动重试只跑这一次，跑完就收尾（协议 14.3 第 7 条）；正常派发跑到这一轮允许的总次数为止（不含换人多出来的尝试）；
@@ -591,7 +769,7 @@ export async function pipeline(ctx) {
     exitCode,
     // end.agentExit：跑过门禁的任务才有（协议第 2 节），值为最后一次尝试执行者的退出码。
     gate: lastGate, agentExit: lastRun.exit, ranGate,
-    attempts: currentAttempt, label: run.label, needsScope: lastNeedsScope,
+    attempts: currentAttempt, label: run.label, needsScope: lastNeedsScope, timedOut: lastTimedOut,
     // 自动重试的次数全用完了还是没通过（至少重试过一次；手动重试、提前停下的不算）：提示主导接手。
     // 换人多出来的尝试不算（currentAttempt - switches 才是"计入重试"的次数）；因为所有执行者都被限流而停下的不提示（重试次数没用完）。
     handBack: !retry && exitCode !== 0 && total > 1 && currentAttempt - switches - reworks >= total,
@@ -607,18 +785,27 @@ export async function pipeline(ctx) {
     const setting = reviewSettings({ spec, project: readProject(root), global: config });
     if (!setting.enabled || !reviewApplies({ spec, readOnly })) return null;
     if (!worktree) { progress('审查：不用 worktree 的任务无法安全恢复，不审查'); return null; }
+    // reviewing 写在读不到全局配置的提前返回之前：合入前硬检查（343）靠它知道执行时要求了审查。
+    registry({ event: 'reviewing', id, attempt: n, at: Date.now() });
     if (!config) { progress('审查：读不到全局配置，不审查'); return null; }
     let report = '';
-    try { report = readFileSync(attempt.report, 'utf8'); } catch { /* 这次没有汇报：审查指令里就没有汇报。 */ }
+    const reportFile = attemptReportFile(attempt.dir);
+    try {
+      report = readFileSync(reportFile, 'utf8');
+      if (reportFile !== attempt.report) {
+        const sourceDir = dirname(reportFile);
+        const source = basename(dirname(sourceDir)) === 'attempts' ? `第 ${basename(sourceDir)} 次尝试的执行者汇报` : '最近一次执行者汇报';
+        report = `（本次只重跑门禁，没有启动执行者；以下是${source}）\n${report}`;
+      }
+    } catch { /* 没有汇报：审查指令里就没有汇报。 */ }
     const executor = run.profileName, model = run.settings?.model ?? run.profile?.model ?? null;
     const picked = chooseReviewer({ config, spec, executor, model, home });
-    registry({ event: 'reviewing', id, attempt: n, at: Date.now() });
     if (picked.ok) progress(`审查：交给 ${picked.profile}`);
     // 审查者进程启动后，停止信号要结束的是它（不是已经退出的执行者，也不是门禁命令）。
     agentPid = null; gatePid = null;
     const review = await runReview({
       root, paths, id, worktree: workdir, executor, model, attempt: n,
-      spec, specText: specSource ?? prompt, report, gate, base: gateInfo?.base ?? worktree.base ?? null,
+      spec, specText: specSource ?? prompt, report, notes: collectReviewNotes(paths, n), gate, base: gateInfo?.base ?? worktree.base ?? null,
       config, home, env, registry, progress,
       signal: { get stopped() { return stopping; } },
       onSpawn: pid => { agentPid = pid; },
@@ -773,7 +960,7 @@ export async function pipeline(ctx) {
     return { dir: created.dir };
   }
 
-  function finish({ exitCode: code, gate = null, agentExit, ranGate: ran = false, attempts, label: endLabel, needsScope = [], reason = null, handBack = false }) {
+  async function finish({ exitCode: code, gate = null, agentExit, ranGate: ran = false, attempts, label: endLabel, needsScope = [], reason = null, handBack = false, timedOut = false }) {
     const minutes = ((Date.now() - started) / 60000).toFixed(1);
     // 自动重试都没通过：进度（页脚之前）与汇报的末尾各写一句，提示主导接手。
     if (handBack) {
@@ -782,7 +969,15 @@ export async function pipeline(ctx) {
     }
     appendFileSync(paths.progress, progressFooter(code, minutes, paths.report, endLabel));
     // gate 事件已在每次门禁跑完后立刻写过；这里只写 end（在最后一个 attempt-end 之后）。
-    registry({ event: 'end', id, exit: code, at: Date.now(), minutes: Number(minutes), attempts, ...(reason ? { reason } : {}), ...(ran ? { agentExit } : {}), ...(needsScope.length ? { needsScope } : {}), ...(handBack ? { handBack: true } : {}) });
+    const controller = new AbortController();
+    let timer;
+    try {
+      await Promise.race([
+        recordEndSample({ home, id, name: paths.name, mark: cpuMark, minMs: ctx.resourceSampleIntervalMs ?? 500, signal: controller.signal, env }),
+        new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve(); }, 1000); }),
+      ]);
+    } finally { clearTimeout(timer); }
+    registry({ event: 'end', id, exit: code, at: Date.now(), minutes: Number(minutes), attempts, ...(reason ? { reason } : {}), ...(ran ? { agentExit } : {}), ...(needsScope.length ? { needsScope } : {}), ...(timedOut ? { timedOut: true } : {}), ...(handBack ? { handBack: true } : {}) });
     // 任务名额在写完 end 之后释放（协议 15.5：离开 preparing / running / gating）。
     try { releaseTask?.(); } catch { /* 名额文件删不掉时由下一个占用者按孤立回收。 */ }
     releaseTask = null;

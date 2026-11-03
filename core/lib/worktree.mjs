@@ -21,9 +21,11 @@ function run(cwd, args, step) {
   return result.stdout;
 }
 
-// 启用判断（协议 15.1）：用任务说明派发、项目配置 worktree 明确为 true、没有 --no-worktree，三条同时满足。
-export function worktreeEnabled({ spec, projectConfig, noWorktree = false } = {}) {
-  return !!spec && noWorktree !== true && projectConfig?.worktree === true;
+// 启用判断（协议 15.1）：项目配置 worktree 明确为 true、没有 --no-worktree；用任务说明派发时照旧。
+// 没有任务说明（直接写任务文字）也走 worktree，但只读任务（research / review，readOnly 为 true）不用。
+export function worktreeEnabled({ spec, projectConfig, noWorktree = false, readOnly = false } = {}) {
+  if (noWorktree === true || projectConfig?.worktree !== true) return false;
+  return !!spec || readOnly !== true;
 }
 
 // 基线（协议 15.2）：主分支当前指向的提交 SHA，不是主工作区检出的分支。取不到抛出中文原因。

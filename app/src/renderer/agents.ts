@@ -3,7 +3,7 @@
 // 其余执行者（claude-code）用通用模态框表单，保存走 agents:update。
 import { ag, gx, p, c, ro } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { AgentPreset, AgentRow, ProbeDetail, ProbeResult, RolesProfile, RolesView, RouteConfig, RouteProfile, Settings } from '../shared/types';
+import type { AgentPreset, AgentRow, CoreConfigView, HarnessCheck, HarnessEvent, HarnessResult, LeadView, ProbeDetail, ProbeResult, RolesProfile, RolesView, RouteConfig, RouteProfile, Settings } from '../shared/types';
 import { executorTag } from '../shared/executor';
 import { icon, menu, confirmAction, openSheet, field, toast, type Sheet } from './ui';
 import { bindChoices, choiceHtml, openCustomForm, type Choice, type ChoiceSpec, type Opt } from './agent-custom';
@@ -11,6 +11,83 @@ import { goToSuggest } from './routing';
 
 const mark = (state: string) => `<span class="mk ${state}">${icon(({ ok: 'checkbox-circle-line', fail: 'close-circle-line', info: 'information-line', run: 'loader-4-line' } as Record<string, string>)[state])}</span>`;
 const banner = (text: string) => text ? `<div class="banner fail" role="alert">${mark('fail')}<span>${esc(text)}</span></div>` : '';
+// 警告横幅（426）：ar 被系统 PATH 里更靠前的同名程序挡住时用，底色取 --brand-soft。
+const warnBanner = (title: string, text: string) => `<div class="banner brand" role="status" data-ar-shadow><span class="mk brand">${icon('error-warning-line')}</span><div class="rt"><b>${esc(title)}</b><span>${esc(text)}</span></div></div>`;
+
+export type HarnessStepId = 'download' | 'deps' | 'config' | 'test';
+// 423（D180）：每步的进度。percent 有值才画百分比，否则画不定长进度（下载兜底或测试连接）。
+export interface HarnessStepProgress { percent?: number; approx?: boolean; bytes?: number; total?: number | null; fallback?: boolean }
+export interface HarnessProgressState {
+    steps: Partial<Record<HarnessStepId, HarnessStepProgress>>;
+    current: HarnessStepId | null;
+    failed: HarnessStepId | null;
+    seconds: number;
+}
+const HARNESS_STEP_ORDER: HarnessStepId[] = ['download', 'deps', 'config', 'test'];
+export const emptyHarnessProgress = (): HarnessProgressState => ({ steps: {}, current: null, failed: null, seconds: 0 });
+// 核心的 step 事件：id 固定是四步之一；额外字段没有时不动原来的值。
+export function applyHarnessProgress(state: HarnessProgressState, event: { step: string } & HarnessStepProgress): HarnessProgressState {
+    if (!(HARNESS_STEP_ORDER as string[]).includes(event.step)) return state;
+    const id = event.step as HarnessStepId;
+    const next: HarnessStepProgress = { ...(state.steps[id] ?? {}) };
+    // 带百分比的事件同时说明是否约数：不带 approx 的（例如结束时的 100）清掉旧的"约"（423 审查 R3-2）。
+    if (typeof event.percent === 'number') { next.percent = event.percent; next.approx = event.approx === true; }
+    else if (event.approx) next.approx = true;
+    if (typeof event.bytes === 'number') next.bytes = event.bytes;
+    if (event.total !== undefined) next.total = event.total;
+    // 兜底改用 npm pack 后不报百分比：清掉之前下载到一半的百分比与字节，界面换成不定长进度与用时。
+    if (event.fallback) { next.fallback = true; delete next.percent; delete next.total; delete next.bytes; }
+    return { ...state, steps: { ...state.steps, [id]: next }, current: id };
+}
+const MB_BYTES = 1024 * 1024;
+const stepStateText = (id: HarnessStepId, step: HarnessStepProgress, kind: 'wait' | 'run' | 'done' | 'fail', seconds: number) => {
+    if (kind === 'wait') return p.harnessStepWait;
+    if (kind === 'fail') return p.harnessStepFail;
+    if (kind === 'done') return p.harnessStepDone;
+    if (typeof step.percent === 'number') return p.harnessStepPercent(step.percent, !!step.approx);
+    // 下载改用 npm pack 兜底时没有进度比例，显示不定长进度与用时。
+    if (id === 'download' && step.fallback) return p.wizardElapsed(seconds);
+    if (step.bytes !== undefined && (id === 'deps' || id === 'download')) {
+        return p.harnessStepBytes(Math.round(step.bytes / MB_BYTES), typeof step.total === 'number' ? Math.round(step.total / MB_BYTES) : null);
+    }
+    return p.wizardElapsed(seconds);
+};
+// 软件的 CSP 只允许 style-src 'self'，innerHTML 里的 style 属性会被拦下（宽度不生效、控制台报错）。
+// 进度条宽度写在 data-bar-width，插入页面后由这里用 CSSOM 设到 style.width（CSSOM 不受 CSP 限制）；
+// 观察整份文档，哪一页、哪条渲染路径插入的都会处理。
+function applyBarWidths(node: Element) {
+    const bars = node.matches('[data-bar-width]') ? [node as HTMLElement] : [];
+    for (const bar of [...bars, ...node.querySelectorAll<HTMLElement>('[data-bar-width]')]) bar.style.width = `${Number(bar.dataset.barWidth) || 0}%`;
+}
+if (typeof document !== 'undefined' && typeof MutationObserver !== 'undefined') {
+    new MutationObserver(records => { for (const record of records) for (const node of record.addedNodes) if (node instanceof Element) applyBarWidths(node); })
+        .observe(document.documentElement, { childList: true, subtree: true });
+}
+
+// 两处共用的四行分步进度：步骤名、细进度条、右侧状态文字；下载 / 依赖行再带一行小字的大小。
+export function harnessProgressHtml(state: HarnessProgressState) {
+    const rows = HARNESS_STEP_ORDER.map(id => {
+        const step = state.steps[id] ?? {};
+        const seen = state.steps[id] !== undefined;
+        const kind = state.failed === id ? 'fail' : state.current === id && !state.failed ? 'run' : seen ? 'done' : 'wait';
+        const text = stepStateText(id, step, kind, state.seconds);
+        // 完成的行一律画满格：中途停在 99 或用兜底没报百分比时也一样。
+        const percent = kind === 'done' ? 100 : typeof step.percent === 'number' ? step.percent : null;
+        const bar = percent !== null
+            ? `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${esc(text)}"><span data-bar-width="${percent}"></span></div>`
+            : kind === 'run'
+                ? `<div class="wiz-prog" role="progressbar" aria-valuetext="${esc(text)}"><span></span></div>`
+                : `<div class="bar" role="progressbar" aria-valuetext="${esc(text)}"><span data-bar-width="0"></span></div>`;
+        const markHtml = kind === 'done' ? mark('ok') : kind === 'run' ? mark('run') : kind === 'fail' ? mark('fail') : '<span class="mk"></span>';
+        const bytes = (id === 'download' || id === 'deps') && step.bytes !== undefined
+            ? `<span class="hstep-bytes muted">${esc(p.harnessStepBytes(Math.round(step.bytes / MB_BYTES), typeof step.total === 'number' ? Math.round(step.total / MB_BYTES) : null))}</span>` : '';
+        // 状态文字是"已用 N 秒"的行（测试连接、下载兜底、依赖拿不到字节）要跟着计时每秒刷新。
+        const timed = kind === 'run' && typeof step.percent !== 'number' && !((id === 'download' || id === 'deps') && step.bytes !== undefined);
+        const elapsed = timed ? ' data-wizard-elapsed' : '';
+        return `<div class="hstep" role="listitem" data-harness-step="${id}" data-state="${kind}">${markHtml}<span class="hstep-name">${esc(p.harnessStepNames[id])}</span>${bar}<span class="hstep-state"${elapsed}>${esc(text)}</span>${bytes}</div>`;
+    }).join('');
+    return `<div class="fld"><span class="lb">${esc(p.wizardProgressLabel)}</span><div class="hsteps" role="list" data-harness-progress>${rows}</div><p class="muted">${esc(p.wizardDownloading)}</p></div>`;
+}
 
 // ---------- 模型与推理强度的探针（Stage07c T2 界面、T3）----------
 // 下拉的选项来自 ar agents models <名> --probe（console 通道 agents:models，payload 带 probe: true；导入向导第 2 步导入之前带 preset，D102）：
@@ -170,6 +247,20 @@ export class RolesBox {
     syncSave(sheet: Sheet) { const save = sheet.root.querySelector<HTMLButtonElement>('[data-sheet-btn="1"]'); if (save) save.disabled = !this.valid; }
 }
 
+// ---------- 主导卡（Stage09 / 任务 294）----------
+// 检测到但未导入的工具：程序名与它对应的预设（导入向导预选用的预设）。标题取自 agents:presets 的卡片标题，
+// 界面里不写服务商名。Qoder 国内版与国际版的程序名不同，先查国际版。
+interface LeadTool { key: string; choices: { executable: string; preset: string }[] }
+// 核心 ar lead 未选择时的固定文案（core/lib/lead.mjs）：那是"还没选"，不是错误，不显示成横幅。
+// TODO(lead): 建议 lead:get 加结构化字段（如 reason: 'unset' | 'missing'），不靠文案区分（见汇报"协议建议"）。
+const LEAD_UNSET = '还没有选主导';
+const LEAD_TOOLS: LeadTool[] = [
+    { key: 'claude', choices: [{ executable: 'claude', preset: 'claude-native' }] },
+    { key: 'codex', choices: [{ executable: 'codex', preset: 'codex' }] },
+    { key: 'qoder', choices: [{ executable: 'qodercli', preset: 'qoder' }, { executable: 'qoderclicn', preset: 'qoder-cn' }] },
+];
+interface DetectedTool { key: string; title: string; version: string | null; preset: string }
+
 // preferences.ts 提供的回调：Codex 的编辑在设置视图里复用设置的数据，版本变更提示与"知道了"也由它掌管。
 export interface AgentsHost {
     // name：Codex 执行者的名字；label：显示名；others：可选的升级目标（其他已启用的执行者）。
@@ -185,45 +276,260 @@ export class AgentsView {
     private profiles: Settings['profiles'] = {};
     // 每个启用的执行者可担任的角色与模型家族（roles:list），以及现在被限流的执行者（route:config 的 limited）；界面只显示，不自己判断。
     private roles = new Map<string, RolesProfile>();
+    // 主导卡的当前选择（lead:get）、可担任主导的角色名单、操作失败的原因，以及检测到但未导入的工具。
+    private lead: LeadView | null = null;
+    private leadRoles: RolesView['lead'] | null = null;
+    private leadError = '';
+    private ar: { installed: boolean; path: string; shadow?: { shadowed: boolean | null; by?: string } | null } | null = null;
+    private arError = '';
+    private detected: DetectedTool[] = [];
     private limits = new Map<string, NonNullable<RouteProfile['limited']>>();
+    // config.json 里的通用适配器声明（stats:config → ar config --json 的 config.generics）：引用式 generic 配置按它取 executable / interactive。
+    private generics: Record<string, unknown> = {};
     private container?: HTMLElement;
+    // 主导卡单独放在"主导"小节里（技能卡上方），执行者列表在 data-agents 里（294 审查 R2-1）。
+    private leadContainer?: HTMLElement;
     private refreshing = false;
     private again = false;
     private testing: string | null = null;
     private busy = false;
     private error = '';
     private testResult: { name: string; result: { ok: boolean; seconds?: number; version?: string | null; reason?: string } } | null = null;
+    // Harness 卡片（302）：harness:check 的结果、检测 / 安装状态与说明；只在第一次刷新时读，之后由"重新检测"或装完再读。
+    private harness: HarnessCheck | null = null;
+    private harnessKnown = false;
+    private harnessLoading = false;
+    private harnessBusy = false;
+    private harnessError = '';
+    // 安装 / 更新的失败原因单独存：装完再读检测结果时不会被清掉（核心的"已退回 <版本>"要留在卡片上）。
+    private harnessDeployError = '';
+    private harnessNote = '';
+    private harnessProgress = emptyHarnessProgress();
+    private harnessStarted = 0;
+    private harnessTimer?: ReturnType<typeof setInterval>;
+    private harnessUnsubscribe?: () => void;
+    private harnessCancel?: Promise<void>;
+    unmount() { this.container = undefined; this.leadContainer = undefined; this.stopHarnessWatch(); }
+    private stopHarnessWatch() { clearInterval(this.harnessTimer); this.harnessTimer = undefined; this.harnessUnsubscribe?.(); this.harnessUnsubscribe = undefined; }
+    private watchHarness() {
+        if (!this.harnessBusy || !this.container?.isConnected) return;
+        if (!this.harnessUnsubscribe && typeof window.dock.onHarnessEvent === 'function') this.harnessUnsubscribe = window.dock.onHarnessEvent((event: HarnessEvent) => {
+            if (this.harnessBusy && 'event' in event && event.event === 'step') {
+                this.harnessProgress = applyHarnessProgress(this.harnessProgress, event as { step: string } & HarnessStepProgress);
+                this.render();
+            }
+        });
+        if (!this.harnessTimer) this.harnessTimer = setInterval(() => this.render(), 1000);
+    }
     constructor(private host: AgentsHost) {}
     // 设置视图每次重建页面都会给一个新的占位元素；点击在这里处理，不冒泡到设置视图。
-    mount(container: HTMLElement) {
+    // 主导卡在"主导"小节里（技能卡上方），和执行者列表不是同一个容器：两个容器都接点击（294 审查 R2-1）。
+    mount(container: HTMLElement, lead?: HTMLElement) {
         this.container = container;
-        container.onclick = e => { e.stopPropagation(); void this.click(e).catch(error => { this.error = String((error as Error).message || error); this.render(); }); };
+        this.leadContainer = lead;
+        this.watchHarness();
+        const onClick = (e: MouseEvent) => { e.stopPropagation(); void this.click(e).catch(error => { this.error = String((error as Error).message || error); this.render(); }); };
+        container.onclick = onClick;
+        // 主导小节里还有技能卡：只有点中主导卡时才拦下事件，别影响技能卡的点击。
+        if (lead) lead.onclick = e => { if (!(e.target as Element).closest('[data-lead-card]')) return; onClick(e); };
         this.render();
     }
     // 读取进行中又被要求刷新（例如"重新检测"之后）：排一次后续读取，不能丢掉，否则界面停在旧数据上。
     async refresh(keepResult = false) {
-        if (this.refreshing) { this.again = true; return; }
+        if (this.refreshing) { this.again = true; this.detected = []; this.render(); return; }
         this.refreshing = true;
+        this.detected = [];
+        this.render();
         if (!keepResult) this.testResult = null;
         try {
             // 角色 / 家族和限流只是行里的附加信息：读不到时不挡着列表（沿用上次读到的）。
-            const [list, settings, roles, route] = await Promise.all([
+            // 主导卡的当前选择（lead:get）读不到时也不挡着列表，按没选处理。
+            const [list, settings, roles, route, lead, config] = await Promise.all([
                 window.dock.console('agents:list', { detect: true }),
                 window.dock.preferences('settings'),
                 window.dock.console('roles:list').catch(() => null) as Promise<RolesView | null>,
                 window.dock.console('route:config').catch(() => null) as Promise<RouteConfig | null>,
+                window.dock.console('lead:get').catch(() => null) as Promise<LeadView | null>,
+                window.dock.console('stats:config').catch(() => null) as Promise<CoreConfigView | null>,
             ]);
             this.agents = list.agents;
             this.profiles = settings.profiles;
+            // 通用适配器声明读不到就当没有：引用式 generic 配置不认成任何工具、也不列进主导下拉（配置本身读不了，别处已有提示）。
+            const generics = config?.config?.generics;
+            this.generics = generics && typeof generics === 'object' && !Array.isArray(generics) ? generics as Record<string, unknown> : {};
             if (roles && Array.isArray(roles.profiles)) this.roles = new Map(roles.profiles.map(item => [item.name, item]));
+            if (roles?.lead && Array.isArray(roles.lead.profiles)) this.leadRoles = roles.lead;
             if (route && Array.isArray(route.profiles)) this.limits = new Map(route.profiles.flatMap(item => item.limited ? [[item.name, item.limited] as const] : []));
+            this.lead = lead;
+            try { this.ar = await window.dock.console('ar:status'); this.arError = ''; } catch (e) { this.arError = String((e as Error).message || e); }
             this.host.settingsLoaded?.(settings);
+            // 检测到但未导入的工具（只查没导入的那几个）：读不到就当没检测到。
+            this.detected = await this.detectTools();
             this.error = '';
         }
         catch (e) { this.error = String((e as Error).message || e); }
-        finally { this.refreshing = false; this.render(); if (this.again) { this.again = false; void this.refresh(true); } }
+        finally {
+            this.refreshing = false;
+            if (this.again) { this.again = false; void this.refresh(true); }
+            else this.render();
+            if (!this.harnessKnown && !this.harnessLoading) void this.loadHarness();
+        }
+    }
+    // 读一次 Harness 的检测结果（版本、可更新、npm 是否可用）。读失败用横幅说明，不挡执行者列表。
+    private async loadHarness() {
+        if (this.harnessLoading) return;
+        this.harnessLoading = true;
+        this.render();
+        try { this.harness = await window.dock.console('harness:check'); this.harnessError = ''; }
+        catch (e) { this.harnessError = String((e as Error).message || e); }
+        finally { this.harnessKnown = true; this.harnessLoading = false; this.render(); }
+    }
+    // 卡片上的"安装 / 更新"：安装前确认（约 830 MB）；已装但没导入时只导入预设，不重新下载。
+    // 不兼容或失败的原因原样显示（核心会写"已退回 <版本>"，界面不改写）。
+    private async harnessDeploy(anchor: HTMLElement) {
+        const imported = this.agents.some(a => !!this.harness?.name && a.name === this.harness.name);
+        const installed = !!this.harness?.installed;
+        const label = installed && imported && this.harness?.updateAvailable ? ag.harnessUpdate : ag.harnessInstall;
+        if (!await confirmAction(ag.harnessTitle(this.harness?.title || 'Harness'), p.wizardConfirm, label, anchor)) return;
+        this.harnessBusy = true; this.harnessError = ''; this.harnessDeployError = ''; this.harnessNote = ''; this.harnessProgress = emptyHarnessProgress(); this.harnessStarted = Date.now(); this.watchHarness(); this.render();
+        const version = installed && !(imported && this.harness?.updateAvailable) ? '' : (this.harness?.recommended || '');
+        let result: HarnessResult | undefined;
+        try { result = await window.dock.console('harness:deploy', version ? { version } : {}); }
+        catch (e) { this.harnessDeployError = String((e as Error).message || e); }
+        finally {
+            if (this.harnessCancel) await this.harnessCancel;
+            this.stopHarnessWatch();
+            this.harnessBusy = false;
+            this.harnessCancel = undefined;
+            if (result?.ok) this.harnessNote = ag.harnessInstalled(result.version || this.harness?.installed || '');
+            else if (result && !result.ok) this.harnessDeployError = result.error || p.wizardFailure;
+            this.harnessKnown = false;
+            await this.refresh(true);
+            void this.loadHarness();
+        }
     }
     private hint(state: string, text: string, extra = '') { return `<div class="hint">${mark(state)}<span>${esc(text)}</span>${extra}</div>`; }
+
+    // ---------- 主导卡（Stage09 / 任务 294）----------
+    // 已导入按配置的适配器与通用适配器的声明识别，不看配置名（294 审查 R1-1 / R2-2）：claude-code 适配器就是 Claude Code，
+    // codex 适配器就是 Codex；通用适配器一律按被引用声明的 executable 判断（内嵌声明直接读，引用 config.generics 的声明从 stats:config 读），
+    // 不看密钥变量名——改名后的密钥、别的程序用了同名密钥变量都不会误判。
+    private declaration(profile: Settings['profiles'][string]): Record<string, unknown> | null {
+        const ref: unknown = profile.generic;
+        if (ref && typeof ref === 'object' && !Array.isArray(ref)) return ref as Record<string, unknown>;
+        if (typeof ref !== 'string') return null;
+        const decl = this.generics[ref];
+        return decl && typeof decl === 'object' && !Array.isArray(decl) ? decl as Record<string, unknown> : null;
+    }
+    // 声明的程序名（去掉目录、统一小写）；没有 executable 时是空串。
+    private programOf(decl: Record<string, unknown> | null): string {
+        const executable = typeof decl?.executable === 'string' ? decl.executable.trim() : '';
+        return executable.split(/[\\/]/).pop()!.toLowerCase();
+    }
+    private importedTool(tool: LeadTool): boolean {
+        return Object.values(this.profiles).some(profile => {
+            if (tool.key === 'claude') return profile.adapter === 'claude-code';
+            if (tool.key === 'codex') return profile.adapter === 'codex';
+            if (profile.adapter !== 'generic') return false;
+            const program = this.programOf(this.declaration(profile));
+            return !!program && tool.choices.some(choice => choice.executable.toLowerCase() === program);
+        });
+    }
+    // 检测到但未导入的 Claude Code / Codex / Qoder：用 agents:detect-decl 跑一次 --version（只看程序与版本）。
+    private async detectTools(): Promise<DetectedTool[]> {
+        const presets = await this.presets();
+        const titles = new Map(presets.map(item => [item.name, item.card?.title ?? item.title]));
+        const jobs = LEAD_TOOLS
+            .filter(tool => !this.importedTool(tool))
+            .map(async (tool): Promise<DetectedTool | null> => {
+                for (const choice of tool.choices) {
+                    let found: { installed?: boolean; version?: string | null } | null = null;
+                    try { found = await window.dock.console('agents:detect-decl', { decl: { executable: choice.executable } }); }
+                    catch { found = null; }
+                    if (found?.installed) {
+                        const title = titles.get(choice.preset);
+                        if (!title) return null;
+                        return { key: tool.key, title, version: found.version ?? null, preset: choice.preset };
+                    }
+                }
+                return null;
+            });
+        return (await Promise.all(jobs)).filter((item): item is DetectedTool => item !== null);
+    }
+    // 下拉的选项：已导入、已启用、可担任主导（roles 含 lead）的配置——与核心 ar lead set 的规则一致（D128：主导要显式设置）。
+    // 核心还要求配置能交互启动：通用适配器只在声明有 interactive 时才算（294 审查 R2-3）；其余适配器照列，
+    // 选到不支持的配置时，lead:set 的原因显示在卡片里。
+    private leadCandidates(): { name: string; label: string }[] {
+        return (this.leadRoles?.profiles ?? [])
+            .filter(name => {
+                const profile = this.profiles[name];
+                if (profile?.adapter !== 'generic') return true;
+                return !!this.declaration(profile)?.interactive;
+            })
+            .map(name => ({ name, label: this.agent(name)?.label ?? this.roles.get(name)?.label ?? name }));
+    }
+    private leadCardHtml(): string {
+        const current = this.lead?.lead ?? null;
+        // lead:get 没设置时也带 problem（"还没有选主导：…"）：那不是错误，卡片本来就在未选择状态，不显示横幅。
+        // 其余情况照实显示：已选主导的程序找不到，或配置被删除 / 停用（lead 为 null 但问题不是"还没选"）。
+        const raw = this.lead?.problem ?? '';
+        const problem = !current && raw.startsWith(LEAD_UNSET) ? '' : raw;
+        const candidates = this.leadCandidates();
+        const version = current ? this.agent(current.profile)?.version ?? '' : '';
+        const pick = `<span class="selw"><button type="button" class="sel" data-lead-open aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(ag.leadTitle)}" ${candidates.length && !this.busy ? '' : 'disabled'}><span class="${current ? '' : 'ph'}">${esc(current?.label ?? ag.leadChoose)}</span>${version ? `<span class="muted">${esc(version)}</span>` : ''}${icon('arrow-down-s-line')}</button></span>`;
+        // 已选配置失效时（lead 为 null 但带问题）也要能清除 config.json 里残留的 lead。
+        const clear = current || problem ? `<button type="button" class="btn sm quiet" data-lead-clear ${this.busy ? 'disabled' : ''}>${esc(ag.leadClear)}</button>` : '';
+        const row = `<div class="set-r"><div class="l">${esc(ag.leadTitle)}<span>${esc(ag.leadChooseHelp)}</span></div><div class="ctl">${pick}${clear}</div></div>`;
+        // 能力行（界面稿 leadCard）：没选时三行都是"—"；程序找不到时按"未验证 / 不支持"写。
+        const cap = (label: string, state: string, why = '') => `<div class="set-r"><div class="l">${esc(label)}${why ? `<span>${esc(why)}</span>` : ''}</div><div class="ctl"><span class="${state === ag.leadSupported || state === ag.leadVerified ? 'ok-t' : 'muted'}">${esc(state)}</span></div></div>`;
+        const caps = !current
+            ? [ag.leadInteractive, ag.leadModelCapability, ag.leadEffortCapability].map(label => cap(label, '—', ag.leadAfterChoose)).join('')
+            : problem
+                ? cap(ag.leadInteractive, ag.leadUnverified, ag.leadMissingInteractive) + cap(ag.leadModelCapability, ag.leadUnsupported, ag.leadMissingCapability) + cap(ag.leadEffortCapability, ag.leadUnsupported, ag.leadMissingCapability)
+                : cap(ag.leadInteractive, current.supported ? ag.leadVerified : ag.leadUnverified)
+                    + cap(ag.leadModelCapability, current.capabilities?.model ? ag.leadSupported : ag.leadUnsupported)
+                    + cap(ag.leadEffortCapability, current.capabilities?.effort ? ag.leadSupported : ag.leadUnsupported, current.capabilities?.effort ? '' : ag.leadEffortUnsupported(current.label));
+        // 核心错误原文照实显示：缺程序时还能重新检测（不回退别的工具）；已选配置失效时用上一行的"清除"。
+        const failed = problem ? `<div data-lead-problem>${banner(problem)}</div>` + (current ? `<div class="lead-redetect"><button type="button" class="btn sm" data-lead-detect ${this.busy ? 'disabled' : ''}>${icon('refresh-line')}${esc(ag.redetect)}</button></div>` : '') : '';
+        const detected = this.detected.map(tool => `<div class="set-r" data-lead-detected="${esc(tool.key)}"><div class="l"><span>${esc(ag.leadDetected)}${esc(tool.title)}${tool.version ? ` ${esc(tool.version)}` : ''}</span></div><div class="ctl"><button type="button" class="btn sm" data-lead-import="${esc(tool.preset)}" ${this.busy ? 'disabled' : ''}>${esc(ag.leadImport)}</button></div></div>`).join('');
+        const installed = !!this.ar?.installed;
+        const shadow = installed && this.ar?.shadow?.shadowed === true && this.ar.shadow.by ? this.ar.shadow : null;
+        const ar = `<div class="set-r" data-ar-row><div class="l">${esc(p.arTitle)}<span>${esc(installed ? p.arInstalled(this.ar!.path) : p.arMissing)}</span>${installed ? `<span class="muted" data-ar-alias>${esc(p.arAlias)}</span>` : ''}</div><div class="ctl"><button type="button" class="btn sm" data-ar-action ${!this.ar || this.busy ? 'disabled' : ''}>${esc(installed ? p.arUninstall : p.arInstall)}</button></div></div>`;
+        const arShadow = shadow ? warnBanner(p.arShadowTitle, p.arShadowBody(shadow.by!)) : '';
+        return `<div data-lead-card><div data-lead-error>${banner(this.leadError)}</div><div class="card"><div class="card-b"><div class="set">${row}${caps}${ar}</div>${arShadow}</div></div>${banner(this.arError)}${failed}${detected ? `<div class="card lead-detected"><div class="card-b"><div class="set">${detected}</div></div></div>` : ''}</div>`;
+    }
+    private async changeAr(trigger: HTMLElement) {
+        const removing = !!this.ar?.installed;
+        if (!await confirmAction(removing ? p.arRemoveTitle : p.arInstall, removing ? p.arRemoveBody : p.arInstallBody, removing ? p.arUninstall : p.arConfirm, trigger, removing)) return;
+        this.busy = true; this.arError = ''; this.render();
+        try {
+            const result = await window.dock.console(removing ? 'ar:uninstall' : 'ar:install');
+            if (result.kept?.length) this.arError = p.arKept(result.kept.join('、'));
+            this.ar = await window.dock.console('ar:status');
+        } catch (e) { this.arError = String((e as Error).message || e); }
+        finally {
+            this.busy = false; this.render();
+            // 安装与卸载后按钮的 data-ar-action 值会变，重画后把焦点放回新按钮（278 审查 R2-1）。
+            (this.leadContainer?.querySelector<HTMLElement>('[data-ar-action]') ?? this.container?.querySelector<HTMLElement>('[data-ar-action]'))?.focus({ preventScroll: true });
+        }
+    }
+    private openLeadPicker(anchor: HTMLElement) {
+        const candidates = this.leadCandidates();
+        if (!candidates.length) return;
+        menu(anchor, candidates.map(item => ({ label: item.label, run: () => { void this.setLead(item.name); } })), true);
+    }
+    private async setLead(name: string) {
+        this.busy = true; this.leadError = '';
+        try { await window.dock.console('lead:set', { profile: name }); }
+        catch (e) { this.leadError = String((e as Error).message || e); }
+        finally { this.busy = false; await this.refresh(true); }
+    }
+    private async clearLead() {
+        this.busy = true; this.leadError = '';
+        try { await window.dock.console('lead:clear'); }
+        catch (e) { this.leadError = String((e as Error).message || e); }
+        finally { this.busy = false; await this.refresh(true); }
+    }
     private render() {
         if (!this.container?.isConnected) return;
         // 读取失败时只显示原因横幅：不显示"还没有导入执行者"的空状态（063：配置读不了≠没有执行者，空状态会误导）。
@@ -231,10 +537,37 @@ export class AgentsView {
             ? `<div class="card xlist">${this.agents.map(a => this.row(a)).join('')}</div>`
             : (this.refreshing || this.error ? '' : `<div class="card"><div class="empty short">${icon('robot-2-line')}<b>${esc(ag.empty)}</b><p>${esc(ag.emptyHelp)}</p><button class="btn primary sm" data-import-agent>${icon('add-line')}${esc(ag.importFirst)}</button></div></div>`);
         // 重建会丢掉焦点：记下焦点所在按钮的身份，重建后放回同一个（模态框关闭后焦点回到触发按钮也靠它）。
-        const focused = document.activeElement instanceof HTMLElement && this.container.contains(document.activeElement) ? document.activeElement : null;
-        const identity = focused ? ['data-test', 'data-more-agent', 'data-agent-ack', 'data-limited-clear'].filter(k => focused.hasAttribute(k)).map(k => `[${k}="${CSS.escape(focused.getAttribute(k)!)}"]`).join('') : '';
-        this.container.innerHTML = `<div class="sect">${banner(this.error)}<h2>${esc(p.workers)}</h2><p>${esc(p.workerHelp)}</p>${card}</div>`;
-        if (identity) this.container.querySelector<HTMLElement>(identity)?.focus({ preventScroll: true });
+        // 主导卡与执行者列表在两个容器里，身份可能在任一个里。
+        const focused = document.activeElement instanceof HTMLElement && (this.container.contains(document.activeElement) || this.leadContainer?.contains(document.activeElement))
+            ? document.activeElement : null;
+        const identity = focused ? ['data-test', 'data-more-agent', 'data-agent-ack', 'data-limited-clear', 'data-lead-open', 'data-lead-clear', 'data-lead-detect', 'data-lead-import', 'data-harness-check', 'data-harness-install', 'data-harness-update', 'data-harness-cancel'].filter(k => focused.hasAttribute(k)).map(k => `[${k}="${CSS.escape(focused.getAttribute(k)!)}"]`).join('') : '';
+        // 主导卡在"主导"小节内、技能卡上方（界面稿 connect 页）；执行者列表在同一页的"执行者"小节。
+        if (this.leadContainer) this.leadContainer.innerHTML = this.leadCardHtml();
+        this.container.innerHTML = `<div class="sect">${banner(this.error)}<h2>${esc(p.workers)}</h2><p>${esc(p.workerHelp)}</p>${card}</div>${this.harnessCardHtml()}`;
+        if (identity) (this.container.querySelector<HTMLElement>(identity) ?? this.leadContainer?.querySelector<HTMLElement>(identity))?.focus({ preventScroll: true });
+    }
+    // Harness 卡片（302）：显示实际版本；没装给出"安装"（始终可用，点之前确认约 830 MB）；
+    // 已装且有新版本给"更新"；装完但预设没导入时"安装"只做导入。"重新检测"重新跑 harness:check。
+    private harnessCardHtml() {
+        const check = this.harness;
+        const imported = this.agents.some(a => !!this.harness?.name && a.name === this.harness.name);
+        const installed = !!check?.installed;
+        const busy = this.harnessBusy;
+        const status = this.harnessLoading && !check
+            ? this.hint('run', p.detecting)
+            : installed
+                ? `<div class="kv">${mark('ok')}<span class="lb">dsh</span><span class="val mono" data-harness-version>${esc(check!.installed || '')}</span>${check?.updateAvailable ? `<span class="tag info" data-harness-update-tag>${esc(ag.harnessNewer(check.recommended || ''))}</span>` : ''}</div>`
+                : this.hint('info', ag.harnessMissing);
+        // "安装"始终可用（没装时安装，装过但预设没导入时只导入，已经装好时重新导入并测试）；有新版本时换成"更新"。
+        let action = '';
+        if (installed && imported && check?.updateAvailable) action = `<button class="btn sm primary" data-harness-update ${busy ? 'disabled' : ''}>${busy ? mark('run') : icon('refresh-line')}${esc(busy ? ag.harnessInstalling : ag.harnessUpdate)}</button>`;
+        else action = `<button class="btn sm primary" data-harness-install ${busy ? 'disabled' : ''}>${busy ? mark('run') : icon('download-2-line')}${esc(busy ? ag.harnessInstalling : ag.harnessInstall)}</button>`;
+        if (check?.noNpm && (!installed || (imported && check.updateAvailable))) action = action.replace('data-harness-install ', 'data-harness-install disabled ').replace('data-harness-update ', 'data-harness-update disabled ');
+        const missing = check?.noNpm ? `<div class="hint" role="status">${mark('info')}<span>${esc(p.wizardNoNpm(this.harness?.title || 'Harness'))}</span></div><p><a class="btn sm" href="https://nodejs.org/" target="_blank" rel="noreferrer">${esc(p.wizardDownloadNode)}</a></p>` : '';
+        const progress = busy ? `${harnessProgressHtml({ ...this.harnessProgress, seconds: Math.floor((Date.now() - this.harnessStarted) / 1000) })}<button class="btn" data-harness-cancel ${this.harnessCancel ? 'disabled' : ''}>${esc(ag.harnessCancel)}</button>` : '';
+        const recheck = `<button class="btn sm quiet" data-harness-check ${busy || this.harnessLoading ? 'disabled' : ''}>${this.harnessLoading ? mark('run') : icon('refresh-line')}${esc(ag.harnessCheck)}</button>`;
+        const note = this.harnessNote ? `<span class="note" role="status" data-harness-note>${esc(this.harnessNote)}</span>` : '';
+        return `<div class="sect" data-harness-card><h2>${esc(ag.harnessTitle(this.harness?.title || 'Harness'))}</h2><p>${esc(ag.harnessHelp)}</p><div class="card"><div class="card-b">${status}${missing}${progress}${banner(this.harnessDeployError || this.harnessError || check?.error || '')}</div><div class="card-f">${note}<span class="sp"></span>${recheck}${action}</div></div></div>`;
     }
     private tags(a: AgentRow) {
         const items = [a.default ? `<span class="tag brand">${esc(ag.isDefault)}</span>` : '', !a.enabled ? `<span class="tag">${esc(ag.disabled)}</span>` : '', this.limitedTag(a)];
@@ -302,7 +635,23 @@ export class AgentsView {
     private async click(e: MouseEvent) {
         const b = (e.target as Element).closest<HTMLButtonElement>('button');
         if (!b || b.disabled || this.busy) return;
+        // 主导卡：下拉选择 / 清除 / 重新检测 / 检测到但未导入的工具打开导入向导（预选对应预设）。
+        if (b.hasAttribute('data-ar-action')) { await this.changeAr(b); return; }
+        if (b.hasAttribute('data-lead-open')) { this.openLeadPicker(b); return; }
+        if (b.hasAttribute('data-lead-clear')) { await this.clearLead(); return; }
+        if (b.hasAttribute('data-lead-detect')) { this.leadError = ''; await this.refresh(true); return; }
+        if (b.dataset.leadImport) { openImportWizard(b, this.agents.map(a => a.name), () => { void this.refresh(); }, b.dataset.leadImport); return; }
         if (b.hasAttribute('data-agent-ack')) { this.host.ack(); return; }
+        if (b.hasAttribute('data-harness-cancel')) {
+            if (!this.harnessCancel) {
+                this.harnessCancel = (async () => { try { await window.dock.console('harness:cancel'); this.harnessNote = ag.harnessCancelled; } catch (e) { this.harnessDeployError = String((e as Error).message || e); } })();
+                this.render();
+                await this.harnessCancel;
+            }
+            return;
+        }
+        if (b.hasAttribute('data-harness-check')) { this.harness = null; this.harnessKnown = false; this.harnessError = ''; this.harnessDeployError = ''; await this.loadHarness(); return; }
+        if (b.hasAttribute('data-harness-install') || b.hasAttribute('data-harness-update')) { await this.harnessDeploy(b); return; }
         if (b.hasAttribute('data-import-agent')) { this.openImport(b); return; }
         if (b.dataset.limitedClear) { await this.clearLimit(b.dataset.limitedClear); return; }
         const name = b.dataset.test ?? b.dataset.moreAgent;

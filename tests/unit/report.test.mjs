@@ -66,6 +66,25 @@ function scene(t, {
 const item = (role, key) => role.items.find(entry => entry.key === key);
 const brief = role => role.items.map(entry => [entry.key, entry.count, entry.points]);
 
+test('主导启动记录按项目和派发时间选最近一条', t => {
+  const f = scene(t);
+  assert.equal(f.report().lead.launch, null);
+  assert.ok(reportLines(f.report()).includes('  主导：没有启动记录（不是从 AgentRouter 打开的主导）'));
+  const row = (at, project, label, model = null, effort = null) => ({ v: 1, event: 'lead-launch', at, project, profile: 'boss', adapter: 'fake', label, model, effort });
+  const rows = [row(T0 - 1, f.root, '较早'), row(T0, f.root, '最近', '模型甲'), row(T0 - 2, f.root, '更早'), row(T0 + 1, f.root, '派发后'), row(T0, path.join(f.dir, '其他项目'), '其他项目')];
+  put(path.join(f.home, 'leads.jsonl'), `坏行\n${rows.map(r => JSON.stringify(r)).join('\n')}\n`);
+  const report = f.report();
+  assert.deepEqual(report.lead.launch, { label: '最近', model: '模型甲', effort: null, at: T0 });
+  assert.ok(reportLines(report).includes('  主导：最近，启动参数 模型 模型甲、强度 工具默认（会话里后来是否换过模型，AgentRouter 无法得知）'));
+});
+
+test('主导启动记录：Windows 下项目路径大小写不同也算同一项目', { skip: process.platform !== 'win32' }, t => {
+  const f = scene(t);
+  const row = { v: 1, event: 'lead-launch', at: T0, project: f.root.toUpperCase(), profile: 'boss', adapter: 'fake', label: '大写路径', model: null, effort: null };
+  put(path.join(f.home, 'leads.jsonl'), `${JSON.stringify(row)}\n`);
+  assert.equal(f.report().lead.launch?.label, '大写路径');
+});
+
 test('scoreRole：按项扣分，超过上限只扣上限（越界 4 个 → −30），最低 0，不超过 cap', () => {
   const weights = reportWeightDefaults.executor;
   const result = scoreRole([{ key: 'outsideFile', count: 4, detail: 'a、b' }, { key: 'attemptGate', count: 1 }], weights);

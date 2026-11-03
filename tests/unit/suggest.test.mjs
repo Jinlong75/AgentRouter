@@ -98,3 +98,15 @@ test('没有任何执行者 / 测试记录：没有建议，candidates 为 0', (
   assert.deepEqual([r.rules, r.skipped, r.candidates], [[], [], 0]);
   assert.equal(r.write, "ar route rules set '[]'");
 });
+
+test('不同币种不比较单价，同币种按输入加输出比较', () => {
+  const config = base({ a: deepseek(), b: deepseek() });
+  const tests = { a: passed, b: passed };
+  config.prices = { a: { input: 1, output: 9, currency: 'CNY' }, b: { input: 3, output: 2, currency: 'USD' } };
+  const mixed = suggestRules({ config, presets, tests });
+  assert.ok(!mixed.rules.some(rule => rule.types.includes('chore') && rule.why.startsWith('按单价最低')));
+  assert.ok(mixed.skipped.some(item => item.types?.includes('chore') && item.why === '已填单价的币种不同（CNY、USD），不比较高低'));
+  config.prices.b.currency = 'CNY';
+  const same = suggestRules({ config, presets, tests });
+  assert.deepEqual(same.rules.find(rule => rule.types.includes('chore')), { types: ['chore'], profile: 'b', why: '按单价最低（输入加输出，CNY）' });
+});

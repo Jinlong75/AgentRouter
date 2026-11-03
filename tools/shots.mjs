@@ -1,9 +1,10 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import electron from 'electron';
 import { preferenceFixture } from './demo/preferences.mjs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { demo } from './demo/index.mjs';
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,9 +12,58 @@ import assert from 'node:assert/strict';
 import { isolatedEnvKey, isolationOverrides } from '../app/src/main/app-env.mjs';
 import { unsafeHomeReason } from '../core/lib/compat.mjs';
 import { preserveFailures } from './shots-failures.mjs';
+import { judgeProcessIdentity, renameWithRetry } from './shots-move.mjs';
+
+// 按 Windows 命令行的双引号与反斜杠规则还原参数，避免把任务名当作子串。
+function commandArgs(command) {
+  const args=[];
+  let i=0;
+  while(i<command.length) {
+    while(i<command.length&&/\s/.test(command[i])) i++;
+    if(i===command.length) break;
+    let arg='',quoted=false;
+    while(i<command.length&&(quoted||!/\s/.test(command[i]))) {
+      let slashes=0;
+      while(command[i]==='\\') { slashes++;i++; }
+      if(command[i]==='"') {
+        arg+='\\'.repeat(Math.floor(slashes/2));
+        if(slashes%2) arg+='"'; else quoted=!quoted;
+        i++;
+      } else {
+        arg+='\\'.repeat(slashes);
+        if(i<command.length&&(quoted||!/\s/.test(command[i]))) arg+=command[i++];
+      }
+    }
+    args.push(arg);
+  }
+  return args;
+}
+
+export function matchesWaiter(command, script, name, detached, platform=process.platform) {
+  if(!command) return false;
+  const args=commandArgs(command), paths=platform==='win32'?path.win32:path;
+  const normalize=value=>{
+    const result=paths.normalize(value);
+    return platform==='win32'?result.toLowerCase():result;
+  };
+  if(!args[1]||normalize(args[1])!==normalize(script)) return false;
+  const marker=detached?'wait':'--name';
+  return args.some((arg,index)=>index>=2&&arg===marker&&args[index+1]===name);
+}
+
+async function main() {
 // 界面验收可能跨午夜（037 第 2 项）：演示数据生成与软件里的"今天 / 昨天"分组用同一个"现在"——
 // AR_DEMO_NOW（毫秒时间戳）。这里在生成演示数据之前设好；外部已设时沿用不覆盖（负向验证要指定时刻）。
 process.env.AR_DEMO_NOW ||= String(Date.now());
+// 全量验收不允许通过参数或环境变量缩减检查。
+{
+  const args = process.argv.slice(2);
+  const has = name => args.some(a => a === name || a.startsWith(name + '='));
+  if (process.env.AR_FULL_VERIFY === '1' && (has('--from') || has('--focus') || process.env.AR_SHOTS_FROM !== undefined || process.env.AR_SHOTS_FOCUS !== undefined)) {
+    console.error('全量验收（AR_FULL_VERIFY=1）不能分段或聚焦运行界面检查：去掉 --from / --focus');
+    process.exit(2);
+  }
+}
 // 命令行 --focus <名>（D71）等同于环境变量 AR_SHOTS_FOCUS=<名>：门禁的验收命令不经过 shell，设不了环境变量。
 // 两个都给时以命令行为准；`npm run shots -- --focus routing` 会把参数接到 `node tools/shots.mjs` 后面。
 {
@@ -24,6 +74,33 @@ process.env.AR_DEMO_NOW ||= String(Date.now());
     const env=process.env.AR_SHOTS_FOCUS;
     console.log(`命令行 --focus ${value}${env&&env!==value?`（覆盖环境变量 AR_SHOTS_FOCUS=${env}）`:''}：只跑这个焦点。`);
     process.env.AR_SHOTS_FOCUS=value;
+  }
+}
+// 分段续跑（375 / D159）：--from <段名> 等同于环境变量 AR_SHOTS_FROM=<段名>，从该段起点一直跑到结尾。
+// 只用于确认修复；结果会标明分段、跳过编号覆盖，不能代替完整全量。段名与顺序要和 app/src/main/shots.ts 的 SEGMENTS 一致。
+const SHOTS_SEGMENTS = ['stats', 'audit', 'tail'];
+{
+  const args=process.argv.slice(2),at=args.findIndex(a=>a==='--from'||a.startsWith('--from='));
+  let value=process.env.AR_SHOTS_FROM;
+  if(at>=0) {
+    value=args[at]==='--from'?args[at+1]:args[at].slice('--from='.length);
+    if(!value||value.startsWith('--')) { console.error('--from 后面要写段名，例如 npm run shots -- --from tail'); process.exit(2); }
+  }
+  if(value!==undefined&&process.env.AR_SHOTS_FOCUS!==undefined) {
+    console.error('--from 与 --focus 不能同时使用：分段运行与只跑一个焦点只能二选一');
+    process.exit(2);
+  }
+  if(value!==undefined&&value!==''&&!SHOTS_SEGMENTS.includes(value)) {
+    console.error(`--from 的段名不认识：${value}；可用段名：${SHOTS_SEGMENTS.join('、')}`);
+    process.exit(2);
+  }
+  if(value!==undefined&&value==='') {
+    console.error(`--from 的段名不能为空；可用段名：${SHOTS_SEGMENTS.join('、')}`);
+    process.exit(2);
+  }
+  if(at>=0) {
+    console.log(`命令行 --from ${value}：从这一段开始跑到结尾，只用于确认修复，不能代替完整的 npm run shots。`);
+    process.env.AR_SHOTS_FROM=value;
   }
 }
 // Stage04 门禁演示任务（reader-app 的 t20～t22）默认隐藏：原有列表计数与检查不变，
@@ -121,19 +198,73 @@ try {
     // 中文输出不依赖控制台代码页：命令里先把输出编码固定为 UTF-8，Node 再按 UTF-8 读。
     // 024：进程身份（名字 + 创建时间）——PID 可能被复用，退出后要与就绪时记下的一致才算"同一个进程"。
     // 用与软件进程查询（app/src/main/platform.ts）相同的 API 和毫秒单位，便于直接比较。
-    const identity=pid=>{if(process.platform!=='win32')return null;const text=execFileSync('powershell.exe',['-NoProfile','-Command',`[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}";if($p){@{name=$p.Name;created=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress}`],{encoding:'utf8',windowsHide:true,timeout:30000}).trim();return text?JSON.parse(text):null;};
+    // 377（R2-1）：Get-CimInstance 的非终止错误不会让命令失败，曾被当成"查不到 = 已退出"。
+    // 现在返回 { ok:true, process } 或 { ok:false, error }：只有查询成功且没有该 PID 才算已退出，
+    // 查询失败按"状态未知"处理（继续等到上限，超时后带诊断失败）。判定规则见 judgeProcessIdentity。
+    const identity=pid=>{
+      const script=`$ErrorActionPreference="Stop";[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" -ErrorAction Stop;if($p){@{name=$p.Name;created=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress}`;
+      const result=spawnSync('powershell.exe',['-NoProfile','-Command',script],{encoding:'utf8',windowsHide:true,shell:false,timeout:30000});
+      if(result.error) return {ok:false,error:result.error};
+      if(result.status!==0) return {ok:false,error:new Error(`powershell 退出码 ${result.status}${result.stderr?.trim()?`：${result.stderr.trim()}`:''}`)};
+      const stderrText=(result.stderr??'').trim();
+      if(stderrText) return {ok:false,error:new Error(`powershell 标准错误：${stderrText}`)};
+      const text=(result.stdout??'').trim();
+      if(!text) return {ok:true,process:null};
+      try{return {ok:true,process:JSON.parse(text)};}catch(error){return {ok:false,error:new Error(`输出无法解析：${error.message}`)};}
+    };
     const describe=p=>p?`${p.name} 创建于 ${new Date(p.created).toISOString()}`:'（查不到）';
-    const who=pid=>{if(process.platform!=='win32')return '（非 Windows，不查）';try{const p=identity(pid);return p?describe(p):'不存在';}catch(e){return `查询失败（${e.code??e.message}）`;}};
-    // 就绪时记下的身份与现在的身份比对；查不到或对不上都按"不是同一个进程"处理（断言失败）。
-    const sameProcess=(item,pid)=>{const before=(item.processes??[]).find(x=>x.pid===pid);if(!before)return {same:false,before:null,now:null};try{const now=identity(pid);return {same:!!now&&now.name===before.name&&now.created===before.created,before,now};}catch{return {same:false,before,now:null};}};
+    const describeQuery=q=>q.ok?describe(q.process):`查询失败（${q.error?.message??String(q.error)}）`;
+    const who=pid=>{if(process.platform!=='win32')return '（非 Windows，不查）';try{return describeQuery(identity(pid));}catch(e){return `查询失败（${e.code??e.message}）`;}};
+    // 就绪时记下的身份与现在的身份比对；只有仍与就绪时一致才算"同一个进程"（断言失败），查询失败也不是已退出。
+    const sameProcess=(item,pid)=>{const before=(item.processes??[]).find(x=>x.pid===pid);const query=identity(pid);const state=judgeProcessIdentity(query,before);return {same:state==='same',state,before,now:query.ok?query.process:null,query};};
+    // 两个脱离的等待者没有写入 pending；在放行前按任务名与脚本识别并记录 PID、创建时间。
+    const waiters=[];
+    const captureWaiters=async()=>{ if(process.platform==='win32') {
+      const starts=await Promise.all(pending.map(async item=>(await rowsOf(item.id)).find(row=>row.event==='start')));
+      const script='$ErrorActionPreference="Stop";[Console]::OutputEncoding=[Text.Encoding]::UTF8;@(Get-CimInstance Win32_Process | ForEach-Object { @{pid=$_.ProcessId;name=$_.Name;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds();command=$_.CommandLine} }) | ConvertTo-Json -Compress';
+      const found=JSON.parse(execFileSync('powershell.exe',['-NoProfile','-Command',script],{encoding:'utf8',windowsHide:true,shell:false,timeout:30000}));
+      const processes=Array.isArray(found)?found:[found];
+      for(let i=0;i<pending.length;i++) {
+        const item=pending[i],name=starts[i]?.name;
+        assert.ok(name,`${item.label}缺少等待者任务名`);
+        const detached=item.label==='脱离任务';
+        const scriptPath=detached?path.resolve('app/dist/core/ar.mjs'):path.join(isolated.CLAUDE_CONFIG_DIR,'skills/agent-router/core/ar.mjs');
+        const matches=processes.filter(p=>matchesWaiter(p.command,scriptPath,name,detached));
+        assert.equal(matches.length,1,`${item.label}应找到一个等待者，找到 ${matches.length} 个`);
+        waiters.push({label:item.label,...matches[0]});
+      }
+    } else console.log('重置前等待者：非 Windows，无法按创建时间识别等待者'); };
+    const waitForWaiters=async()=>{
+      for(const waiter of waiters) {
+        const until=performance.now()+20000;
+        let query,state;
+        do {
+          // 377：查询失败不能当作进程退出（状态未知，继续等）；PID 被复用则原等待者已经退出。
+          query=identity(waiter.pid);
+          state=judgeProcessIdentity(query,waiter);
+          if(state==='exited'||state==='reused') break;
+          if(performance.now()>=until) throw Error(`重置前等待者超时：${waiter.label} pid=${waiter.pid}，${describeQuery(query)}，命令行 ${waiter.command}`);
+          await delay(100);
+        } while(true);
+        console.log(`重置前等待者已退出：${waiter.label} pid=${waiter.pid}，就绪时 ${describe(waiter)}，现在 ${describeQuery(query)}`);
+      }
+    };
     // 失败时也要等进程退出（放行后它们会在正常清理里结束）；与成功路径共用。
     const waitExit=async()=>{for(const item of pending) for(const [kind,pid] of [['执行者',item.executor],['假 agent',item.agent]]) {
-      let waited=0;
-      while(alive(pid)&&waited<20000) { await delay(100);waited+=100; }
-      if(alive(pid)) console.log(`注意：${item.label}的${kind}（pid=${pid}）在重置前仍未退出`);
+      const until=performance.now()+20000;
+      for(;;) {
+        const before=(item.processes??[]).find(p=>p.pid===pid);
+        const query=process.platform==='win32'?identity(pid):null;
+        // 377：只有查询成功且没有该 PID（或被复用）才结束等待；查询失败继续等，超时后带诊断失败。
+        const state=process.platform==='win32'?judgeProcessIdentity(query,before):alive(pid)?'same':'exited';
+        if(state==='exited'||state==='reused') break;
+        if(performance.now()>=until) throw Error(`重置前进程超时：${item.label}的${kind} pid=${pid}，就绪时 ${describe(before)}，现在 ${query?describeQuery(query):describe(null)}`);
+        await delay(100);
+      }
     }};
     let failure=null;
     try {
+      await captureWaiters();
       for(const item of pending) {
         const t0=item.readyAt,rel=at=>Number.isFinite(at)?`+${at-t0}ms`:'—';
         const events=(await rowsOf(item.id)).map(r=>`${r.event}${r.exit!==undefined?' exit='+r.exit:''} ${rel(r.at??r.started)}`).join('、')||'（没有记录）';
@@ -150,7 +281,7 @@ try {
         for(const [kind,pid] of [['执行者',item.executor],['假 agent',item.agent]]) {
           if(process.platform!=='win32') { console.log(`退出后实测进程身份（${item.label}的${kind}）：非 Windows，不查创建时间`);continue; }
           const same=sameProcess(item,pid);
-          console.log(`退出后实测进程身份（${item.label}的${kind}）：${same.same?'与就绪时是同一个进程':'不是同一个进程'}；就绪时 ${describe(same.before)}，现在 ${describe(same.now)}`);
+          console.log(`退出后实测进程身份（${item.label}的${kind}）：${same.same?'与就绪时是同一个进程':'不是同一个进程'}；就绪时 ${describe(same.before)}，现在 ${describeQuery(same.query)}`);
           assert.equal(same.same,true,`真实 Electron 退出后${item.label}的${kind}仍是就绪时的同一个进程`);
         }
         // 托管与脱离任务的假 agent 都等到这里才被放行：上面的存活与身份断言之后、等 end 之前写出放行文件（顺序与上限都不变）。
@@ -182,12 +313,13 @@ try {
       for(const item of pending) if(item.release) await writeFile(item.release,'1').catch(error=>console.log(`注意：放行${item.label}的假 agent 失败：${error.message}`));
     }
     // 失败时也等它们退出（放行后会在正常清理里结束），再把原来的断言错误抛出去。
-    if(failure) { await waitExit();throw failure; }
+    if(failure) { try { await waitExit();await waitForWaiters(); } catch(error) { console.log(`失败后等待进程退出出错：${error.message}`); } throw failure; }
     await writeFile(path.join(out,'managed-exit.json'),JSON.stringify({platform:process.platform,appExit:0,tasks:results},null,2));
     await unlink(path.join(out,'exit-pending.json'));
     // 重置前等这些进程真的退出：它们的工作目录与打开的文件都在公共目录里，Windows 上会挡住删除。
     // 不这样等，重置验收就会去删一个"任务已经结束但进程还在收尾"的目录，和用户实际能点重置的时机不一致。
     await waitExit();
+    await waitForWaiters();
 
     // 第二轮（012 B）：在隔离公共目录上真实重置一次。第一轮会改写配置、切换技能版本，所以这里重新准备一份
     // 带密钥来源的配置与测试密钥文件；重置的密钥来自测试文件，绝不会碰本机真实的用户环境变量。
@@ -219,10 +351,19 @@ try {
     resetTemp=fixture.home+'-tmp';
     await reportHome('移出前');
     await mkdir(reposAside,{recursive:true});
+    // 377：挪目录与 EPERM/EBUSY 重试在 tools/shots-move.mjs；这里只提供诊断（查询命令或可执行文件路径包含该目录的进程），
+    // 上限（10 秒、4 次、每次间隔 500 毫秒）与 373 相同。
+    const diagnoseMovedDir=async(source,error,{remaining})=>{
+      if(process.platform!=='win32') return '非 Windows，未查询进程';
+      if(remaining<=0) return '重试时限已到，未查询进程';
+      const script='$ErrorActionPreference="Stop";[Console]::OutputEncoding=[Text.Encoding]::UTF8;$dir=$env:AR_SHOTS_DIAG_DIR;@(Get-CimInstance Win32_Process | Where-Object { ($_.CommandLine -and $_.CommandLine.IndexOf($dir,[StringComparison]::OrdinalIgnoreCase) -ge 0) -or ($_.ExecutablePath -and $_.ExecutablePath.IndexOf($dir,[StringComparison]::OrdinalIgnoreCase) -ge 0) } | ForEach-Object { @{pid=$_.ProcessId;name=$_.Name;command=$_.CommandLine;executable=$_.ExecutablePath;created=([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()} }) | ConvertTo-Json -Compress';
+      try { return execFileSync('powershell.exe',['-NoProfile','-Command',script],{encoding:'utf8',windowsHide:true,shell:false,timeout:Math.max(1,Math.min(2000,Math.floor(remaining))),env:{...process.env,AR_SHOTS_DIAG_DIR:source}}).trim()||'[]'; }
+      catch(e) { return `查询失败：${e.code??e.message}`; }
+    };
     const moved=[];
     for(const item of await readdir(fixture.home,{withFileTypes:true})) {
       if(!item.isDirectory()||!item.name.startsWith('shots-')) continue;
-      await rename(path.join(fixture.home,item.name),path.join(reposAside,item.name));
+      await renameWithRetry(path.join(fixture.home,item.name),path.join(reposAside,item.name),{label:item.name,diagnose:diagnoseMovedDir});
       moved.push(item.name);
     }
     console.log(`重置前移出界面检查自建的测试仓库目录：${moved.join(', ')||'（无）'}`);
@@ -267,3 +408,6 @@ try {
   for(const dir of [reposAside,resetTemp]) if(dir) await rm(dir,{recursive:true,force:true,maxRetries:5,retryDelay:200}).catch(error=>console.log(`注意：删除 ${dir} 失败：${error.message}`));
   await announceFailures();
 }
+}
+
+if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) await main();

@@ -65,7 +65,7 @@ test('预设齐全：deepseek / mimo / mimo-payg / claude-native / claude-subscr
 test('deepseek：指向兼容接口、注入 DeepSeek 密钥、隔离配置目录、清掉主导会话的变量', () => {
   const { env, command } = build('deepseek');
   assert.equal(env.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic');
-  assert.equal(env.ANTHROPIC_MODEL, 'deepseek-v4-pro');
+  assert.equal(env.ANTHROPIC_MODEL, 'deepseek-v4-flash');
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, KEYS.DEEPSEEK_API_KEY);
   assert.equal(env.CLAUDE_CONFIG_DIR, path.join(home, 'workers', 'deepseek', 'claude'));
   assert.equal(env.DISABLE_AUTOUPDATER, '1');
@@ -128,7 +128,7 @@ test('配置校验：auth、secrets 变量名、maxTurns、非 codex 的 path', 
 test('托管请求的执行者快照只含非密钥部分；secrets 只能是变量名', () => {
   const snapshot = profileConfig(loadPreset('deepseek').profile, claudeCode);
   // 只带列出的字段：price、enabled、title 等无关字段不进请求。
-  assert.deepEqual(snapshot, { env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_MODEL: 'deepseek-v4-pro' }, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, auth: 'token', maxTurns: null, label: 'DeepSeek V4 Pro', adapter: 'claude-code', path: null });
+  assert.deepEqual(snapshot, { env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_MODEL: 'deepseek-v4-flash' }, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, auth: 'token', maxTurns: null, label: 'DeepSeek V4 Flash', adapter: 'claude-code', path: null });
   // 适配器声明的额外字段（fake 的回放说明）随快照带上，未声明的不带。
   assert.deepEqual(profileConfig({ adapter: 'fake', events: [], exit: 3, price: { inputPer1M: 1 }, enabled: true }, fake), { env: {}, secrets: {}, auth: null, maxTurns: null, label: null, adapter: 'fake', path: null, events: [], exit: 3 });
   const request = { v: 1, id: 'r1', at: 1, script: path.resolve('s', 'ar.mjs'), node: path.resolve('n', 'node.exe'), repo: path.resolve('r'), name: 'n', args: { task: 't', extra: '', role: null, spec: null },

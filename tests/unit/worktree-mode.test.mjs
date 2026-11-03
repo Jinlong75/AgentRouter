@@ -6,22 +6,33 @@ import { resolveBase, specRelative, worktreeEnabled } from '../../core/lib/workt
 
 // 083：worktree 模式的启用判断与请求字段校验（协议 15.1、15.2）。
 
-test('启用判断：用任务说明派发 + 项目配置 worktree 明确为 true + 没有 --no-worktree，三条同时满足', () => {
+test('启用判断：项目配置 worktree 明确为 true + 没有 --no-worktree，用说明派发与直接写文字都启用；只读任务不启用', () => {
   const spec = 'docs/specs/001-x.md';
   assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: true } }), true);
   assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: true }, noWorktree: false }), true);
+  // 425（D179）：直接写任务文字也走 worktree；只读任务（research / review）照旧不用。
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: true } }), true, '直接写任务文字也用');
+  assert.equal(worktreeEnabled({ spec: '', projectConfig: { worktree: true } }), true);
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: true }, readOnly: false }), true);
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: true }, readOnly: true }), false, '只读任务不用');
+  assert.equal(worktreeEnabled({ spec: '', projectConfig: { worktree: true }, readOnly: true }), false);
+  // 用任务说明派发时只读也照旧（不改已有行为）。
+  assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: true }, readOnly: true }), true);
   // 缺一条都不启用。
-  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: true } }), false, '直接写任务文字派发的任务不用');
-  assert.equal(worktreeEnabled({ spec: '', projectConfig: { worktree: true } }), false);
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: true }, noWorktree: true }), false, '--no-worktree');
   assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: true }, noWorktree: true }), false, '--no-worktree');
   assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: false } }), false);
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: false } }), false);
   assert.equal(worktreeEnabled({ spec, projectConfig: {} }), false, '没写 worktree 按 false');
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: {} }), false);
   assert.equal(worktreeEnabled({ spec, projectConfig: null }), false, '没有项目配置');
+  assert.equal(worktreeEnabled({ spec: null, projectConfig: null }), false);
   assert.equal(worktreeEnabled({ spec }), false);
   assert.equal(worktreeEnabled(), false);
   // 必须明确为布尔 true，其他真值不算。
   for (const value of ['true', 1, 'yes', [], {}]) {
     assert.equal(worktreeEnabled({ spec, projectConfig: { worktree: value } }), false, `worktree: ${JSON.stringify(value)}`);
+    assert.equal(worktreeEnabled({ spec: null, projectConfig: { worktree: value } }), false, `直接写文字 worktree: ${JSON.stringify(value)}`);
   }
 });
 

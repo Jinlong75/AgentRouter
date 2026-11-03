@@ -27,6 +27,24 @@ const texts = tracked.filter(f => isText(f) && existsSync(path.join(root, f)));
 for (const f of texts) {
   const b = read(f);
   if (b.includes(0)) continue; // 无扩展名的二进制文件
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  try {
+    decoder.decode(b);
+  } catch {
+    let start = 0, line = 1;
+    while (start <= b.length) {
+      const end = b.indexOf(0x0a, start);
+      try {
+        decoder.decode(b.subarray(start, end < 0 ? b.length : end));
+      } catch {
+        report('R2 非 UTF-8', f, `第 ${line} 行`);
+        break;
+      }
+      if (end < 0) break;
+      start = end + 1;
+      line++;
+    }
+  }
   if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) report('R2 BOM', f);
   const s = b.toString('utf8');
   const hasCrlf = s.includes('\r\n'), hasBareLf = /(^|[^\r])\n/.test(s);
@@ -122,6 +140,24 @@ for (const [f, s] of corpus) {
   const col = lines[at].search(badControl);
   const code = lines[at].charCodeAt(col).toString(16).toUpperCase().padStart(4, '0');
   report('R9 控制字符', f, `第 ${at + 1} 行第 ${col + 1} 列：U+${code}`);
+}
+
+// R10 问号串：代码与数据文件中连续四个及以上问号可能是中文丢失编码。
+for (const [f, s] of corpus) {
+  if (!/\.(mjs|js|cjs|ts|json|css|html|ps1|cmd)$/i.test(f) || s.includes('\u0000')) continue;
+  const lines = s.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (/\?{4,}/.test(lines[i])) report('R10 问号串', f, `第 ${i + 1} 行`);
+  }
+}
+
+// R11 问号紧挨中文：代码与数据文件中半角问号紧挨汉字可能是中文丢失编码。
+for (const [f, s] of corpus) {
+  if (!/\.(mjs|js|cjs|ts|json|css|html|ps1|cmd)$/i.test(f) || s.includes('\u0000') || f.startsWith('tests/fixtures/')) continue;
+  const lines = s.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (/[\u4e00-\u9fff]\?|\?[\u4e00-\u9fff]/.test(lines[i])) report('R11 问号紧挨中文', f, `第 ${i + 1} 行`);
+  }
 }
 
 if (problems.length === 0) { console.log(`目录检查通过：${tracked.length} 个已跟踪文件`); process.exit(0); }

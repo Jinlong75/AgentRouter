@@ -10,7 +10,7 @@ import type { Harness } from './shots-input';
 import { effects } from './effects';
 import { coreRun } from './core';
 import { appEnvironment } from './app-env.mjs';
-import { pj, s6 } from '../shared/copy';
+import { ag, pj, s6 } from '../shared/copy';
 
 // 隔离用的路径从软件内部环境读；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
@@ -152,13 +152,13 @@ export async function captureProjects(h: Harness) {
     await verify('UI15 点"初始化为 git 仓库"后文件夹里真的有 .git', async () => { assert.ok(await exists(path.join(dir.add, '.git'))); });
     await check('UI15 git init 后详情变成"未初始化"，列表标签跟着变', `!!document.querySelector('.banner.brand') && [...document.querySelectorAll('[data-pj-row]')].find(b => b.dataset.pjRow === ${JSON.stringify(dir.add)})?.textContent.includes('未初始化')`);
 
-    // 初始化：预览（新建 7 · 更新 1）→ 展开 → 取消不写 → 写入 → 提交。
+    // 初始化：预览（新建 9 · 更新 1）→ 展开 → 取消不写 → 写入 → 提交。
     await pick(dir.uninitialized);
     await wait('!!document.querySelector(".banner.brand [data-pj=init]")');
     await shot('projects-uninitialized');
     await press('[data-pj=init]');
     await wait('!!document.querySelector("[data-pj-init]")');
-    await check('UI15 初始化预览：新建 7、更新 1，计数写进说明', `(() => { const tags = [...document.querySelectorAll('.initlist .tag')].map(t => t.textContent); return tags.filter(x => x === '新建').length === 7 && tags.filter(x => x === '更新').length === 1 && document.querySelector('.sec-t').textContent.includes('新建 7 · 更新 1'); })()`);
+    await check('UI15 初始化预览：新建 9、更新 1，计数写进说明', `(() => { const tags = [...document.querySelectorAll('.initlist .tag')].map(t => t.textContent); return tags.filter(x => x === '新建').length === 9 && tags.filter(x => x === '更新').length === 1 && document.querySelector('.sec-t').textContent.includes('新建 9 · 更新 1'); })()`);
     await press('[data-pj-init]');
     await check('UI15 展开初始化项后能看到内容，aria-expanded 同步', `document.querySelector('[data-pj-init][aria-expanded=true]') !== null && (document.querySelector('[data-pj-preview]')?.textContent.length ?? 0) > 20`);
     await shot('projects-plan');
@@ -174,10 +174,10 @@ export async function captureProjects(h: Harness) {
     await press('[data-pj=apply]');
     await wait('!!document.querySelector("[data-pj=commit]")', '初始化写入完成', 30000);
     await verify('UI15 确认写入后临时仓库里真的生成了模板文件', async () => {
-        for (const rel of ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', '.gitignore'])
+        for (const rel of ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', 'docs/autonomy/README.md', 'handoff.md', '.gitignore'])
             assert.ok(await exists(path.join(dir.uninitialized, rel)), `缺少 ${rel}`);
     });
-    await check('UI15 写入成功后显示成功横幅、文件清单与提交按钮', `document.querySelector('.banner.ok .rt b')?.textContent === '已写入 8 个文件' && document.querySelectorAll('.rows .r').length === 8 && !!document.querySelector('[data-pj=commit]')`);
+    await check('UI15 写入成功后显示成功横幅、文件清单与提交按钮', `document.querySelector('.banner.ok .rt b')?.textContent === '已写入 10 个文件' && document.querySelectorAll('.rows .r').length === 10 && !!document.querySelector('[data-pj=commit]')`);
     await shot('projects-written');
     await writeFile(path.join(dir.uninitialized, 'notes-draft.txt'), '无关改动\n');
     const headBefore = git(dir.uninitialized, ['rev-parse', 'HEAD']);
@@ -186,7 +186,7 @@ export async function captureProjects(h: Harness) {
     await verify('UI15 提交后临时仓库多了一个提交，提交里只有清单中的文件，无关文件没进去', async () => {
         assert.notEqual(git(dir.uninitialized, ['rev-parse', 'HEAD']), headBefore);
         const files = git(dir.uninitialized, ['show', '--name-only', '--pretty=format:', 'HEAD']).split('\n').filter(Boolean).sort();
-        assert.deepEqual(files, ['.agent-router/project.json', '.gitignore', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/reviewer.md', 'docs/roles/worker.md', 'docs/specs/README.md']);
+        assert.deepEqual(files, ['.agent-router/project.json', '.gitignore', 'AGENTS.md', 'CLAUDE.md', 'docs/autonomy/README.md', 'docs/roles/lead.md', 'docs/roles/reviewer.md', 'docs/roles/worker.md', 'docs/specs/README.md', 'handoff.md']);
         assert.match(git(dir.uninitialized, ['status', '--porcelain', '--', 'notes-draft.txt']), /^\?\?/);
     });
     await check('UI15 提交后按钮处显示已提交的短哈希', `document.querySelector('[data-pj-committed]').dataset.pjCommitted === ${JSON.stringify(git(dir.uninitialized, ['rev-parse', '--short', 'HEAD']))}`);
@@ -374,7 +374,9 @@ export async function captureProjects(h: Harness) {
         await check('UI15 git 低于 2.40：项目详情顶部（项目配置之上）显示横幅"git 版本太旧：2.39.1"', `(() => { const b = document.querySelector('.pj-body > .banner.brand'); return !!b && b.querySelector('.rt b').textContent === 'git 版本太旧：2.39.1' && b.querySelector('.rt span').textContent.includes('git 2.40 或更新') && b === document.querySelector('.pj-body').firstElementChild && !!(b.compareDocumentPosition(document.querySelector('.pj-body .sec-t')) & Node.DOCUMENT_POSITION_FOLLOWING); })()`);
         // 132 新增：插入"远程"一节后，上面那条断言（横幅在最上面、在项目配置之上）仍成立；这里再钉死三者的顺序。
         await check('UI15 132 新增：横幅在最上面，远程一节在它下面、项目配置之上', `(() => { const kids = [...document.querySelector('.pj-body').children]; const banner = kids.indexOf(document.querySelector('.pj-body > .banner.brand')); const remote = kids.findIndex(x => x.classList.contains('sec-t') && x.textContent.startsWith(${JSON.stringify(pj.remoteSec)})); const config = kids.findIndex(x => x.classList.contains('sec-t') && x.textContent.includes('项目配置')); return banner === 0 && remote > banner && config > remote; })()`);
-        await check('UI15 git 版本太旧的横幅只是提示：编辑配置、打开文件夹、更多按钮仍可用', `['[data-pj=edit]', '[data-pj=folder]', '[data-pj=more]', '[data-pj=claude]'].every(s => { const b = document.querySelector(s); return !!b && !b.disabled; })`);
+        // 改写（295）：原断言里还有"在此项目打开 Claude Code"按钮可用；它现在换成"打开主导"，可用性取决于是否选了主导
+        // （这时还没选，禁用是对的），与 git 版本无关。其余三个按钮照旧断言可用，另外钉住主导按钮存在且因未选而禁用。
+        await check('UI15 git 版本太旧的横幅只是提示：编辑配置、打开文件夹、更多按钮仍可用；打开主导按钮存在，未选主导时禁用（与 git 版本无关）', `['[data-pj=edit]', '[data-pj=folder]', '[data-pj=more]'].every(s => { const b = document.querySelector(s); return !!b && !b.disabled; }) && document.querySelector('[data-pj=lead]')?.disabled === true`);
         await shot('projects-oldgit');
     }
     finally { delete process.env.AR_TEST_GIT_VERSION; }
@@ -584,61 +586,295 @@ export async function captureProjects(h: Harness) {
     await reopenProjects();
     await wait(`!!document.querySelector('[data-pj-remote=none]')`, '还原后远程一节回到“没有远程”');
 
-    // UI18 打开 Claude Code / 文件夹：两个按钮键盘可达，调用参数正确。
-    await wait('!!document.querySelector("[data-pj=claude]") && !!document.querySelector("[data-pj=folder]")');
-    const launched = effects.launched.length, opened = effects.opened.length, cwd = dir.initialized;
-    await tabTo('[data-pj=claude]');
-    await focusRing('UI18 在此项目打开 Claude Code');
-    await key('Enter');
-    await until(() => effects.launched.length > launched, '打开 Claude Code 的调用');
-    await verify('UI18 打开 Claude Code：cwd 与参数里的目录是项目绝对路径，参数以 claude 结尾', () => {
-        const last = effects.launched.at(-1)!;
-        assert.equal(effects.launched.length, launched + 1);
-        assert.equal(last.cwd, cwd);
-        assert.ok(last.args.includes(cwd), `参数里没有项目目录：${last.args.join(' ')}`);
-        assert.equal(last.args.at(-1), 'claude');
-    });
-    // 网络代理（099）：不使用时不传 env（终端照旧继承软件的环境）；手动填写时 env 里 HTTPS_PROXY 等于设置的地址，
-    // 并补上 NO_PROXY；每次点击都重新算（改了配置不用重开软件）。写 config.json 前记下原内容，结束后原样恢复。
-    const proxyConfig = path.join(home, 'config.json');
-    const proxyOriginal = await readFile(proxyConfig, 'utf8').catch(() => null);
-    const proxyUrl = 'http://127.0.0.1:7890';
+    // UI18 打开主导 / 文件夹（Stage09 / 295）：先在 Agent 页用真实输入选择主导，按钮这时才可用。
+    // 主导配置、隔离密钥文件和 projects.json 只在这一段里改，结束后原样恢复。
+    const configFile = path.join(home, 'config.json');
+    const configOriginal = await readFile(configFile, 'utf8').catch(() => null);
+    const secretsFile = appEnv.AR_TEST_SECRETS_FILE!;
+    const secretsOriginal = await readFile(secretsFile, 'utf8').catch(() => null);
+    const projectsOriginal = await readFile(projectsFile, 'utf8');
+    const leadSecret = 'sk-lead-shots-not-a-real-key';
+    // 配置名带 -shots 后缀：只有读取了新配置才会出现这一行，用它等 Agent 页刷新完（避免在旧候选上点下拉）。
+    const leadCodex = { v: 2, defaultProfile: 'lead-codex-shots', managed: false, watchWindow: 'never', profiles: {
+        'lead-codex-shots': { adapter: 'codex', label: 'Codex', enabled: true, auth: 'login', roles: ['executor', 'reviewer', 'lead'] },
+    } };
+    const leadClaude = { v: 2, defaultProfile: 'lead-claude-shots', managed: false, watchWindow: 'never', profiles: {
+        'lead-claude-shots': { adapter: 'claude-code', label: 'Claude Code', enabled: true, auth: 'token', secrets: { LEAD_SHOTS_KEY: 'LEAD_SHOTS_KEY' }, path: path.join(home, 'fake-claude.cjs'), roles: ['executor', 'reviewer', 'lead'] },
+    } };
+    // 只声明模型参数（interactive 里没有 effort）的通用执行者：用来检查切到"不支持强度"的主导后，已保存的强度会被清掉。
+    // executable 用 cmd.exe（探测跑 /c ver），避免检查里误启动 Electron 自己的可执行文件。
+    const leadQoder = { v: 2, defaultProfile: 'lead-qoder-shots', managed: false, watchWindow: 'never', profiles: {
+        'lead-qoder-shots': { adapter: 'generic', label: 'Qoder', enabled: true, roles: ['executor', 'reviewer', 'lead'], generic: {
+            label: 'Qoder', executable: 'cmd.exe', detect: ['/c', 'ver'],
+            interactive: { args: [], model: ['-m', '{model}'] },
+            args: ['-p', '{prompt}'], output: { format: 'text' },
+        } },
+    } };
+    const writeLeadConfig = async (value: unknown) => { await writeFile(configFile, `${JSON.stringify(value, null, 2)}\n`); };
+    // Agent 页的下拉里用真实输入选择：每份配置只放一个能当主导的执行者，选项总是第一个。
+    // 先等这次配置里的执行者出现在列表里，确保候选下拉读的是新配置。
+    const chooseLead = async (label: string, name: string) => {
+        await press('[data-page=connect]');
+        await wait(`!!document.querySelector('[data-agent="${name}"]')`, 'Agent 页读到新配置的执行者');
+        await wait(`!!document.querySelector('[data-lead-open]:not([disabled])')`, 'Agent 页的主导下拉可用');
+        await press('[data-lead-open]');
+        await wait(`!!document.querySelector('.ctx [data-option="0"]')`, '主导下拉打开');
+        await check(`UI18 主导下拉第一项是 ${label}`, `document.querySelector('.ctx [data-option="0"]')?.textContent.includes(${JSON.stringify(label)})`);
+        await press('.ctx [data-option="0"]');
+        await wait(`document.querySelector('[data-lead-open]')?.textContent.includes(${JSON.stringify(label)})`, `选择主导 ${label}`);
+        await press('[data-page=projects]');
+        await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '回到项目页');
+        await pick(dir.initialized);
+        await wait(`document.querySelector('[data-pj=lead]')?.disabled === false && document.querySelector('[data-pj=lead]').textContent.trim() === ${JSON.stringify(pj.leadOpen(label))}`, `项目页的打开主导按钮写 ${label}`);
+    };
+    const isFake = (last: { args: string[] }, name: string) => last.args.some(arg => arg.replace(/\\/g, '/').toLowerCase().endsWith(`/${name}`));
     try {
-        await verify('UI18 代理不使用（默认）：打开 Claude Code 没有传 env', () => {
-            assert.equal(effects.launched.at(-1)!.env, undefined);
-        });
-        const base = proxyOriginal ? JSON.parse(proxyOriginal) : {};
-        await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'manual', url: proxyUrl } }));
-        const beforeManual = effects.launched.length;
-        await tabTo('[data-pj=claude]'); await key('Enter');
-        await until(() => effects.launched.length > beforeManual, '手动代理下打开 Claude Code 的调用');
-        await verify('UI18 代理手动填写：打开 Claude Code 传的 env 里 HTTPS_PROXY / HTTP_PROXY 等于设置的地址，NO_PROXY 已补上，参数不变', () => {
+        await wait('!!document.querySelector("[data-pj=lead]") && !!document.querySelector("[data-pj=folder]")');
+        await check('UI18 没有选主导：打开主导按钮禁用，旁边灰字"先在 Agent 页选择主导"', `(() => { const b = document.querySelector('[data-pj=lead]'); return b.disabled && b.textContent.trim() === ${JSON.stringify(pj.leadOpenNone)} && b.title === ${JSON.stringify(pj.leadChooseFirst)} && b.nextElementSibling?.classList.contains('muted') && b.nextElementSibling.textContent === ${JSON.stringify(pj.leadChooseFirst)}; })()`);
+
+        await writeLeadConfig(leadCodex);
+        await chooseLead('Codex', 'lead-codex-shots');
+        await check('UI18 选择主导后：按钮文字是"在此项目打开 Codex"，旁边不再提示去 Agent 页选择', `(() => { const b = document.querySelector('[data-pj=lead]'); return !b.disabled && b.textContent.trim() === ${JSON.stringify(pj.leadOpen('Codex'))} && !b.nextElementSibling?.classList.contains('muted'); })()`);
+
+        const launched = effects.launched.length, opened = effects.opened.length, cwd = dir.initialized;
+        await tabTo('[data-pj=lead]');
+        await focusRing('UI18 在此项目打开主导');
+        await key('Enter');
+        await until(() => effects.launched.length > launched, '打开主导的调用');
+        await verify('UI18 打开主导：cwd 与参数里的目录是项目绝对路径，用选中的 Codex 假程序启动（不再硬编码 claude）', () => {
             const last = effects.launched.at(-1)!;
-            assert.equal(last.env?.HTTPS_PROXY, proxyUrl);
-            assert.equal(last.env?.HTTP_PROXY, proxyUrl);
-            assert.equal(last.env?.NO_PROXY, 'localhost,127.0.0.1,::1');
+            assert.equal(effects.launched.length, launched + 1);
             assert.equal(last.cwd, cwd);
-            assert.equal(last.args.at(-1), 'claude');
+            assert.ok(last.args.includes(cwd), `参数里没有项目目录：${last.args.join(' ')}`);
+            assert.ok(isFake(last, 'fake-codex.cjs'), `启动参数里没有 Codex 假程序：${last.args.join(' ')}`);
+            assert.ok(!last.args.includes('claude'), `参数里仍硬编码 claude：${last.args.join(' ')}`);
         });
-        await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'off', url: proxyUrl } }));
-        const beforeOff = effects.launched.length;
-        await tabTo('[data-pj=claude]'); await key('Enter');
-        await until(() => effects.launched.length > beforeOff, '代理改回不使用后打开 Claude Code 的调用');
-        await verify('UI18 代理改回不使用：打开 Claude Code 又没有传 env，代理变量没有被加上', () => {
-            assert.equal(effects.launched.at(-1)!.env, undefined);
+        // 网络代理（099）：不使用时不传 env（终端照旧继承软件的环境）；手动填写时 env 里 HTTPS_PROXY 等于设置的地址，
+        // 并补上 NO_PROXY；每次点击都重新算（改了配置不用重开软件）。写 config.json 前记下内容，结束后原样恢复。
+        const proxyConfig = configFile;
+        const proxyUrl = 'http://127.0.0.1:7890';
+        const beforeProxy = await readFile(proxyConfig, 'utf8');
+        try {
+            await verify('UI18 代理不使用（默认）：打开主导没有传 env', () => {
+                assert.equal(effects.launched.at(-1)!.env, undefined);
+            });
+            const base = JSON.parse(await readFile(proxyConfig, 'utf8'));
+            await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'manual', url: proxyUrl } }));
+            const beforeManual = effects.launched.length;
+            await tabTo('[data-pj=lead]'); await key('Enter');
+            await until(() => effects.launched.length > beforeManual, '手动代理下打开主导的调用');
+            await verify('UI18 代理手动填写：打开主导传的 env 里 HTTPS_PROXY / HTTP_PROXY 等于设置的地址，NO_PROXY 已补上，参数不变', () => {
+                const last = effects.launched.at(-1)!;
+                assert.equal(last.env?.HTTPS_PROXY, proxyUrl);
+                assert.equal(last.env?.HTTP_PROXY, proxyUrl);
+                assert.equal(last.env?.NO_PROXY, 'localhost,127.0.0.1,::1');
+                assert.equal(last.cwd, cwd);
+                assert.ok(isFake(last, 'fake-codex.cjs'), `启动参数里没有 Codex 假程序：${last.args.join(' ')}`);
+            });
+            await writeFile(proxyConfig, JSON.stringify({ ...base, proxy: { mode: 'off', url: proxyUrl } }));
+            const beforeOff = effects.launched.length;
+            await tabTo('[data-pj=lead]'); await key('Enter');
+            await until(() => effects.launched.length > beforeOff, '代理改回不使用后打开主导的调用');
+            await verify('UI18 代理改回不使用：打开主导又没有传 env，代理变量没有被加上', () => {
+                assert.equal(effects.launched.at(-1)!.env, undefined);
+            });
+        }
+        finally { await writeFile(proxyConfig, beforeProxy); }
+        await tabTo('[data-pj=folder]');
+        await focusRing('UI18 打开文件夹');
+        await key('Enter');
+        await until(() => effects.opened.length > opened, '打开文件夹的调用');
+        await verify('UI18 打开文件夹：桩记录的最后一条是项目路径', () => {
+            assert.equal(effects.opened.length, opened + 1);
+            assert.equal(effects.opened.at(-1), cwd);
+        });
+
+        // 主导启动参数：模型、推理强度保存到 projects.json 的这个项目上（不写 project.json），保存的值进入启动参数；空值清除。
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"model\\"]")', '编辑配置打开（含主导启动参数）');
+        await check('UI18 主导启动参数：有"主导启动参数"一节，模型与推理强度都可填写，占位"跟随默认"，下面有保存说明', `(() => { const s = document.querySelector('.sheet'), box = s.querySelector('[data-pj-lead-params]'), m = s.querySelector('[data-pj-lf=model]'), e = s.querySelector('[data-pj-lf=effort]'); return !!box && box.querySelector('.sec-t').textContent === ${JSON.stringify(pj.leadParameters)} && m.value === '' && e.value === '' && !m.disabled && !e.disabled && m.placeholder === ${JSON.stringify(pj.leadFollow)} && e.placeholder === ${JSON.stringify(pj.leadFollow)} && box.textContent.includes(${JSON.stringify(pj.leadSaveHint)}) && !box.querySelector('[data-pj-lead-effort-note]'); })()`);
+        await typeIn('[data-pj-lf="model"]', 'lead-model-x');
+        await typeIn('[data-pj-lf="effort"]', 'high');
+        await press('.sheet-btns .btn:last-child');
+        await wait('!document.querySelector(".sheet")', '保存主导启动参数');
+        await verify('UI18 保存主导启动参数：写进 projects.json 里这个项目的 lead，project.json 里没有', async () => {
+            const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+            assert.deepEqual(entry?.lead, { model: 'lead-model-x', effort: 'high' });
+            assert.equal('lead' in await config(dir.initialized), false);
+        });
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"model\\"]")', '再次打开编辑配置');
+        await check('UI18 再次打开编辑配置：主导启动参数是刚保存的值', `document.querySelector('.sheet [data-pj-lf=model]').value === 'lead-model-x' && document.querySelector('.sheet [data-pj-lf=effort]').value === 'high'`);
+        await key('Escape');
+        await wait('!document.querySelector(".sheet")', '关闭编辑配置');
+        const beforeParams = effects.launched.length;
+        await tabTo('[data-pj=lead]'); await key('Enter');
+        await until(() => effects.launched.length > beforeParams, '带主导启动参数打开主导的调用');
+        await verify('UI18 保存的模型与推理强度出现在启动参数里', () => {
+            const last = effects.launched.at(-1)!;
+            assert.equal(last.cwd, cwd);
+            assert.ok(last.args.includes('lead-model-x'), `参数里没有模型：${last.args.join(' ')}`);
+            assert.ok(last.args.includes('model_reasoning_effort=high'), `参数里没有推理强度：${last.args.join(' ')}`);
+        });
+
+        // 换主导：按钮文字与启动参数跟着换（Claude Code：--model / --effort），保存的参数仍然生效；密钥变量只记名字。
+        await writeLeadConfig(leadClaude);
+        await writeFile(secretsFile, `${JSON.stringify({ LEAD_SHOTS_KEY: leadSecret }, null, 2)}\n`);
+        await chooseLead('Claude Code', 'lead-claude-shots');
+        await check('UI18 换主导后：按钮文字变成"在此项目打开 Claude Code"', `(() => { const b = document.querySelector('[data-pj=lead]'); return !b.disabled && b.textContent.trim() === ${JSON.stringify(pj.leadOpen('Claude Code'))}; })()`);
+        const beforeClaude = effects.launched.length;
+        await tabTo('[data-pj=lead]'); await key('Enter');
+        await until(() => effects.launched.length > beforeClaude, '换成 Claude Code 后打开主导的调用');
+        await verify('UI18 换成 Claude Code：启动参数是 --model … --effort …，用的是 Claude Code 的假程序，保存的参数仍生效', () => {
+            const last = effects.launched.at(-1)!;
+            assert.equal(last.cwd, cwd);
+            assert.ok(isFake(last, 'fake-claude.cjs'), `启动参数里没有 Claude Code 假程序：${last.args.join(' ')}`);
+            assert.deepEqual(last.args.slice(-4), ['--model', 'lead-model-x', '--effort', 'high']);
+        });
+        await verify('UI18 293 交接：主导配置里的密钥变量在启动桩里只有名字、没有值', () => {
+            const last = effects.launched.at(-1)!;
+            assert.ok(last.env && 'LEAD_SHOTS_KEY' in last.env, '启动桩里没有密钥变量名');
+            assert.equal(last.env!.LEAD_SHOTS_KEY, undefined);
+            assert.ok(!Object.values(last.env!).includes(leadSecret), '启动桩的记录里出现了密钥值');
+        });
+
+        // 295 审查 R9-1：Codex 存下的强度 'high' 还在；切换到不支持推理强度的主导（通用适配器只声明了模型参数）后，
+        // 禁用字段要同时清空、保存时写空值，不能把旧强度继续带进启动参数让核心报错。
+        await writeLeadConfig(leadQoder);
+        await chooseLead('Qoder', 'lead-qoder-shots');
+        // 295 审查 R10-2：切换主导之前 projects.json 里存着强度 'high'；不支持强度的主导下强度字段自动清空，
+        // 但这不是用户的改动——打开编辑框后直接 Escape 应该直接关闭，不弹"放弃修改"的确认。
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"effort\\"]")', '打开编辑配置：检查自动清空不算改动');
+        await key('Escape');
+        await wait(`!document.querySelector('.sheet') && !document.querySelector('.confirm-overlay')`, '已存强度切到不支持强度的主导后直接 Escape 关闭，不弹放弃确认');
+        await check('UI18 审查 R10-2：已存强度切到不支持强度的主导后，打开编辑框直接 Escape 关闭，不弹放弃确认', `!document.querySelector('.sheet') && !document.querySelector('.confirm-overlay')`);
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"model\\"]")', '打开编辑配置：不支持推理强度的主导');
+        await check('UI18 主导不支持推理强度：强度输入禁用且为空，模型仍可填写并保留已保存的值，字段下显示原因', `(() => { const s = document.querySelector('.sheet'), m = s.querySelector('[data-pj-lf=model]'), e = s.querySelector('[data-pj-lf=effort]'), note = s.querySelector('[data-pj-lead-effort-note]'); return !m.disabled && m.value === 'lead-model-x' && e.disabled && e.value === '' && !!note && note.textContent === ${JSON.stringify(ag.leadEffortUnsupported('Qoder'))}; })()`);
+        await press('.sheet-btns .btn:last-child');
+        await wait('!document.querySelector(".sheet")', '保存清除不支持的推理强度');
+        await verify('UI18 切换到不支持推理强度的主导后保存：projects.json 的 lead 只留下模型，强度被删掉', async () => {
+            const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+            assert.deepEqual(entry?.lead, { model: 'lead-model-x' });
+        });
+        const beforeQoder = effects.launched.length;
+        await tabTo('[data-pj=lead]'); await key('Enter');
+        await until(() => effects.launched.length > beforeQoder, '换成不支持强度的主导后打开主导的调用');
+        await verify('UI18 清除不支持的强度后打开主导：启动参数里有模型、没有强度（不带 Codex 留下的 high）', () => {
+            const last = effects.launched.at(-1)!;
+            assert.equal(last.cwd, cwd);
+            assert.ok(last.args.includes('-m') && last.args.includes('lead-model-x'), `参数里没有模型：${last.args.join(' ')}`);
+            assert.ok(!last.args.includes('high'), `参数里仍带着强度：${last.args.join(' ')}`);
+        });
+        await check('UI18 清除不支持的强度后打开主导不报错：没有失败横幅，打开主导按钮仍可用', `!document.querySelector('.banner.fail') && document.querySelector('[data-pj=lead]')?.disabled === false`);
+
+        // 295 审查 R9-2：先校验并保存项目配置，成功后再写主导参数；后者失败时项目配置已经生效，提示要说清哪一半没保存。
+        // 用核心拒绝的模型名（以 - 开头）制造主导参数失败，同时把 baseBranch 改成合法的新值，确认它先被保存。
+        const projectFile = path.join(dir.initialized, '.agent-router', 'project.json');
+        const projectBeforeFailure = await readFile(projectFile, 'utf8');
+        const branchA = (JSON.parse(projectBeforeFailure) as { baseBranch?: string }).baseBranch;
+        assert.ok(branchA && branchA !== 'shots-save-order', `测试前提：项目配置已有主分支（${branchA}）`);
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"model\\"]")', '打开编辑配置：制造主导参数保存失败');
+        await press('[data-pj-f=baseBranch]'); await key('a', ['control']); await key('Backspace');
+        await typeIn('[data-pj-f="baseBranch"]', 'shots-save-order');
+        await press('[data-pj-lf=model]'); await key('a', ['control']); await key('Backspace');
+        await typeIn('[data-pj-lf="model"]', '-bad');
+        await press('.sheet-btns .btn:last-child');
+        await wait('!!document.querySelector(".sheet .sheet-fail")', '主导参数保存失败时显示原因');
+        await check('UI18 主导参数保存失败：提示"项目配置已保存，主导参数未保存：…"，模态框保留输入', `(() => { const s = document.querySelector('.sheet'), fail = s.querySelector('.sheet-fail'); return !!fail && fail.textContent.startsWith(${JSON.stringify(pj.leadParamsNotSaved(''))}) && fail.textContent.includes('lead.model') && s.querySelector('[data-pj-f=baseBranch]').value === 'shots-save-order' && s.querySelector('[data-pj-lf=model]').value === '-bad'; })()`);
+        await verify('UI18 主导参数保存失败：项目配置已经先保存（baseBranch 改了），主导参数保持原值', async () => {
+            assert.equal((await config(dir.initialized)).baseBranch, 'shots-save-order');
+            const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+            assert.deepEqual(entry?.lead, { model: 'lead-model-x' });
+        });
+        // 295 审查 R10-1：上面那次保存已经把项目配置（baseBranch = shots-save-order）写进磁盘，弹窗的比较基准
+        // 必须跟着前移。在同一个弹窗里把 baseBranch 改回原来的值、修正模型再保存，应该再次写盘（不能被当成"没改过"跳过），
+        // 这次同时修正模型，主导参数也保存成功，弹窗关闭。
+        await press('[data-pj-f=baseBranch]'); await key('a', ['control']); await key('Backspace');
+        await typeIn('[data-pj-f="baseBranch"]', branchA!);
+        await press('[data-pj-lf=model]'); await key('a', ['control']); await key('Backspace');
+        await typeIn('[data-pj-lf="model"]', 'lead-model-r10');
+        await press('.sheet-btns .btn:last-child');
+        await wait('!document.querySelector(".sheet")', '配置改回原值后再次保存：弹窗关闭');
+        await check('UI18 审查 R10-1：配置改回原值后再次保存成功，弹窗关闭', `!document.querySelector(".sheet")`);
+        await verify('UI18 审查 R10-1：配置已保存过之后改回原 baseBranch 再保存，磁盘上回到原值；修正后的主导参数也保存', async () => {
+            assert.equal((await config(dir.initialized)).baseBranch, branchA);
+            const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+            assert.deepEqual(entry?.lead, { model: 'lead-model-r10' });
+        });
+        await writeFile(projectFile, projectBeforeFailure);
+        await reopenProjects();
+
+        // 319 审查 R11-1：上一次读取主导设置失败时，不能按旧（上一次成功读到的）能力清空已保存的主导启动参数。
+        // 这时页面里留着的是 Qoder（不支持推理强度），projects.json 里已存强度 high。检查桩：把 config.json 临时写成
+        // 核心拒绝读取的内容，lead:get 随之失败（console 通道返回失败）；用"添加文件夹"取消后的那次页面内刷新触发重读。
+        // 刷新完成的标记：把项目主分支改成记号值，刷新后面板上的配置行会显示它。
+        const leadEntryBefore319 = await readFile(projectsFile, 'utf8');
+        const projectBefore319 = await readFile(projectFile, 'utf8');
+        const configBefore319 = await readFile(configFile, 'utf8');
+        try {
+            const marked = JSON.parse(leadEntryBefore319) as { projects: { path: string; lead?: unknown }[] };
+            for (const p of marked.projects) if (p.path === dir.initialized) p.lead = { model: 'lead-model-x', effort: 'high' };
+            await writeFile(projectsFile, `${JSON.stringify(marked, null, 2)}\n`);
+            await writeFile(projectFile, `${JSON.stringify({ ...(JSON.parse(projectBefore319) as object), baseBranch: 'shots-lead-unknown' }, null, 2)}\n`);
+            await writeFile(configFile, '{');
+            // 页面内再刷新一次（照常调用 lead:get，这时核心读不了 config.json）：只在同一次页面实例里才会留下旧的主导结果。
+            const ipcBefore = effects.ipcLog.length;
+            await press('.page-h [data-pj=add]');
+            await wait(`(() => [...document.querySelectorAll('.rows .r .v .mono')].some(x => x.textContent === 'shots-lead-unknown'))()`, '读取主导失败后的页面刷新完成', 30000);
+            await verify('UI18 319 检查桩：页面内刷新时 lead:get 返回失败', async () => {
+                assert.ok(effects.ipcLog.slice(ipcBefore).some(x => x.name === 'lead:get' && x.end !== undefined && x.ok === false), `没有失败的 lead:get：${JSON.stringify(effects.ipcLog.slice(ipcBefore))}`);
+            });
+            await press('[data-pj=edit]');
+            await wait('!!document.querySelector(".sheet [data-pj-lf=\\"effort\\"]")', '打开编辑配置：读取主导失败');
+            await check('UI18 319 读取主导失败：主导模型与推理强度按已保存的值显示、仍可编辑，旁边显示"读取主导设置失败…"的提示，不显示旧能力的不支持原因', `(() => { const s = document.querySelector('.sheet'), m = s.querySelector('[data-pj-lf=model]'), e = s.querySelector('[data-pj-lf=effort]'), n = s.querySelector('[data-pj-lead-unknown]'); return m.value === 'lead-model-x' && !m.disabled && e.value === 'high' && !e.disabled && !!n && n.textContent === ${JSON.stringify(pj.leadUnknown)} && !s.querySelector('[data-pj-lead-effort-note]'); })()`);
+            // 只改主分支：模型的输入框因为未聚焦、值相同，不算用户改动；保存后 projects.json 里的强度还在。
+            await press('[data-pj-f=baseBranch]'); await key('a', ['control']); await key('Backspace');
+            await typeIn('[data-pj-f="baseBranch"]', 'shots-lead-unknown-saved');
+            await press('.sheet-btns .btn:last-child');
+            await wait('!document.querySelector(".sheet")', '读取主导失败后只改主分支保存');
+            await verify('UI18 319 只改主分支保存：projects.json 里已保存的模型与强度都没有被清除', async () => {
+                const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+                assert.deepEqual(entry?.lead, { model: 'lead-model-x', effort: 'high' });
+            });
+            await wait(`(() => [...document.querySelectorAll('.rows .r .v .mono')].some(x => x.textContent === 'shots-lead-unknown-saved'))()`, '保存后配置行显示新的主分支', 30000);
+            await check('UI18 319 保存后主分支已改成新值（保存真的生效）', `(() => !document.querySelector('.sheet') && [...document.querySelectorAll('.rows .r .v .mono')].some(x => x.textContent === 'shots-lead-unknown-saved'))()`);
+        }
+        finally {
+            // 恢复检查桩（能读的 config.json）与这一段的配置，后面的检查照旧。
+            await writeFile(configFile, configBefore319);
+            await writeFile(projectFile, projectBefore319);
+            await writeFile(projectsFile, leadEntryBefore319);
+        }
+
+        // 清空前切回两个参数都支持的主导：清空检查仍然是"两个字段都清掉"，与旧检查的含义一致（Qoder 的强度字段已禁用）。
+        await writeLeadConfig(leadClaude);
+        await chooseLead('Claude Code', 'lead-claude-shots');
+        // 清空：两个字段都删掉保存 → projects.json 里这个项目的 lead 被删掉。
+        await press('[data-pj=edit]');
+        await wait('!!document.querySelector(".sheet [data-pj-lf=\\"model\\"]")', '清空主导启动参数前打开编辑配置');
+        await press('[data-pj-lf=model]'); await key('a', ['control']); await key('Backspace');
+        await press('[data-pj-lf=effort]'); await key('a', ['control']); await key('Backspace');
+        await press('.sheet-btns .btn:last-child');
+        await wait('!document.querySelector(".sheet")', '清空主导启动参数');
+        await verify('UI18 清空模型与推理强度：projects.json 里这个项目的 lead 被删掉', async () => {
+            const entry = (JSON.parse(await readFile(projectsFile, 'utf8')).projects as { path: string; lead?: unknown }[]).find(p => p.path === dir.initialized);
+            assert.equal(!!entry && 'lead' in entry, false);
         });
     }
     finally {
-        if (proxyOriginal === null) await rm(proxyConfig, { force: true }); else await writeFile(proxyConfig, proxyOriginal);
+        await writeFile(projectsFile, projectsOriginal);
+        if (secretsOriginal === null) await rm(secretsFile, { force: true }); else await writeFile(secretsFile, secretsOriginal);
+        if (configOriginal === null) await rm(configFile, { force: true }); else await writeFile(configFile, configOriginal);
     }
-    await tabTo('[data-pj=folder]');
-    await focusRing('UI18 打开文件夹');
-    await key('Enter');
-    await until(() => effects.opened.length > opened, '打开文件夹的调用');
-    await verify('UI18 打开文件夹：桩记录的最后一条是项目路径', () => {
-        assert.equal(effects.opened.length, opened + 1);
-        assert.equal(effects.opened.at(-1), cwd);
-    });
+    // 还原配置后等侧栏按原配置重画（不再是测试临时写的 Claude Code 主导配置），免得后面的 UI15 侧栏检查读到旧界面（主导接手 295）。
+    // 侧栏的执行者列表来自设置（Agent 页加载时刷新）：去 Agent 页让它按还原后的配置重读，再回项目页。
+    await press('[data-page=connect]');
+    await wait('[...document.querySelectorAll(".nav-foot .load-l")].some(r => r.textContent.startsWith("Codex"))', '还原配置后侧栏回到原来的执行者');
+    await press('[data-page=projects]');
+    await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '还原配置后回到项目页');
 
     // 提交身份：没有身份时的状态行、横幅、提交失败指引、模态框校验与保存（只用于这个项目），以及全局作用域。
     await pick(dir.identity);
@@ -919,7 +1155,8 @@ export async function captureProjects(h: Harness) {
             await pick(goneDir);
             await wait('!!document.querySelector("[data-pj=purge]")', '133 详情里有彻底清理按钮', 20000);
             await check('UI15 133 列表行标签是 pj.goneTag', `[...document.querySelectorAll('[data-pj-row]')].find(b => b.dataset.pjRow === ${JSON.stringify(goneDir)}).querySelector('.tag.fail')?.textContent === ${JSON.stringify(pj.goneTag)}`);
-            await check('UI15 133 详情：失败横幅 pj.goneTitle / pj.goneHelp(路径, 2)，右边按钮 pj.purgeOpen；没有 git 信息、打开 Claude Code、打开文件夹', `(() => { const b = document.querySelector('.banner.fail'); return b.querySelector('.rt b').textContent === ${JSON.stringify(pj.goneTitle)} && b.querySelector('.rt span').textContent === ${JSON.stringify(pj.goneHelp(goneDir, 2))} && document.querySelector('[data-pj=purge]').textContent.trim() === ${JSON.stringify(pj.purgeOpen)} && b.contains(document.querySelector('[data-pj=purge]')) && !document.querySelector('[data-pj=claude]') && !document.querySelector('[data-pj=folder]') && !document.querySelector('.dh-2 .ident') && document.querySelectorAll('.pj-task').length === 2; })()`);
+            // 改写（295）：原来断言没有"在此项目打开 Claude Code"；按钮现在叫"打开主导"，同样不该出现在已删除的项目上。
+            await check('UI15 133 详情：失败横幅 pj.goneTitle / pj.goneHelp(路径, 2)，右边按钮 pj.purgeOpen；没有 git 信息、打开主导、打开文件夹', `(() => { const b = document.querySelector('.banner.fail'); return b.querySelector('.rt b').textContent === ${JSON.stringify(pj.goneTitle)} && b.querySelector('.rt span').textContent === ${JSON.stringify(pj.goneHelp(goneDir, 2))} && document.querySelector('[data-pj=purge]').textContent.trim() === ${JSON.stringify(pj.purgeOpen)} && b.contains(document.querySelector('[data-pj=purge]')) && !document.querySelector('[data-pj=lead]') && !document.querySelector('[data-pj=folder]') && !document.querySelector('.dh-2 .ident') && document.querySelectorAll('.pj-task').length === 2; })()`);
             await shot('projects-gone');
             await press('[data-pj=purge]');
             await wait('!!document.querySelector(".sheet [data-pj-purge=worktrees]")', '133 彻底清理确认框');

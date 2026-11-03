@@ -12,6 +12,8 @@ import { PreferencesView } from './preferences';
 import { ProjectsView } from './projects';
 import { NewTaskView } from './newtask';
 import { RoutingView } from './routing';
+import { StatsView } from './stats';
+import { statsCopy } from '../shared/copy';
 import { gateBadge, gateEnabled, gateFile, gateState, gateTab, gateTrack, trackNode } from './gate';
 import { AcceptView } from './accept';
 import { ReviewView } from './review';
@@ -106,6 +108,7 @@ let projectsView = new ProjectsView(projectsHost);
 const newTaskView = new NewTaskView({ tasks: () => state.tasks, openTask: showTask });
 // 路由页：每次进入都重新读取路由配置（Stage07 O4）。
 const routingView = new RoutingView();
+const statsView = new StatsView(() => { page = 'newtask'; nav(); pageView(); });
 // 验收页：点轨道上的派发 / 执行 / 待验收 / 合并节点回到任务页对应的标签。
 // 交叉审查的"审查"标签（Stage08 158）：验收页与任务详情共用一份；点击、回车、失去焦点的监听只在 #app 上挂一次。
 // 点"文件:行"：待验收的任务去验收页的改动标签并定位；别的状态（改动已不可查）停在任务详情的"改动"标签。
@@ -154,7 +157,7 @@ function nav() {
     // 侧栏“验收”：徽标是待验收与冲突的数量（品牌色底），悬停说明有几个任务等你处理。
     const waiting = state.tasks.filter(needsAccept).length;
     const item = (key: string, i: string, label: string) => `<button ${preferences.wizard ? 'disabled' : ''} data-page="${key}" ${page === key ? 'aria-current="page"' : ''}${key === 'accept' && waiting ? ` data-tip="${esc(wtc.navTip(waiting))}"` : ''}>${icon(i)}${label}${key === 'tasks' && running ? `<span class="count">${running}</span>` : key === 'accept' && waiting ? `<span class="count brand">${waiting}</span>` : ''}</button>`;
-    const html = item('tasks', 'stack-line', c.tasks) + item('newtask', 'add-circle-line', c.newTask) + item('accept', 'git-pull-request-line', wtc.nav) + `<div class="nav-group">${esc(c.configGroup)}</div>` + item('projects', 'folder-3-line', c.projectsNav) + item('connect', 'plug-line', c.connect) + item('routing', 'route-line', ro.nav) + '<span class="sp"></span>' + item('settings', 'settings-3-line', c.settings) + item('about', 'information-line', c.about) + `<div class="nav-foot">${load}<button class="mg" data-managed-settings ${preferences.wizard?'disabled':''}><span class="dot ${preferences.settings?.managed ? 'ok' : ''}"></span>${preferences.settings?.managed?c.managedOn:c.managedOff}</button></div>`;
+    const html = item('tasks', 'stack-line', c.tasks) + item('newtask', 'add-circle-line', c.newTask) + item('accept', 'git-pull-request-line', wtc.nav) + `<div class="nav-group">${esc(c.configGroup)}</div>` + item('projects', 'folder-3-line', c.projectsNav) + item('connect', 'plug-line', c.connect) + item('routing', 'route-line', ro.nav) + item('stats', 'bar-chart-line', statsCopy.statsTitle) + '<span class="sp"></span>' + item('settings', 'settings-3-line', c.settings) + item('about', 'information-line', c.about) + `<div class="nav-foot">${load}<button class="mg" data-managed-settings ${preferences.wizard?'disabled':''}><span class="dot ${preferences.settings?.managed ? 'ok' : ''}"></span>${preferences.settings?.managed?c.managedOn:c.managedOff}</button></div>`;
     if (box.innerHTML && html === navHtml) return;
     navHtml = html;
     const focused = document.activeElement instanceof HTMLElement && box.contains(document.activeElement) ? document.activeElement.getAttribute('data-page') ?? (document.activeElement.hasAttribute('data-managed-settings') ? 'managed' : null) : null;
@@ -173,8 +176,9 @@ function pageView() {
     projectsView.unmount();
     newTaskView.unmount();
     routingView.unmount();
+    statsView.unmount();
     acceptView.unmount();
-    if (preferences.wizard || (page !== 'tasks' && page !== 'projects' && page !== 'newtask' && page !== 'accept' && page !== 'routing')) {
+    if (preferences.wizard || (page !== 'tasks' && page !== 'projects' && page !== 'newtask' && page !== 'accept' && page !== 'routing' && page !== 'stats')) {
         preferences.mount(content as HTMLElement, page, state.version);
         return;
     }
@@ -193,6 +197,7 @@ function pageView() {
         newTaskView.mount(content as HTMLElement);
         return;
     }
+    if (page === 'stats') { statsView.mount(content); return; }
     if (page === 'routing') {
         routingView.mount(content as HTMLElement);
         return;

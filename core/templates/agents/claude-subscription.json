@@ -15,5 +15,6 @@
   "types": ["code", "fix", "refactor"],
   "card": { "id": "claude-code", "title": "Claude Code", "description": "用 Claude API Key 或订阅令牌" },
   "variant": { "label": "认证方式", "option": "订阅令牌", "help": "在终端运行 claude setup-token 获取；用量计入你本人的同一份订阅" },
-  "order": 5
+  "order": 5,
+  "fit": {"good": ["代码、修复、重构", "大段中文文本与文档编辑"], "avoid": []}
 }

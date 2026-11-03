@@ -5,7 +5,8 @@ import * as path from 'node:path';
 import { tmpdir } from 'node:os';
 import { route, usageToday, supportsReadOnly, reviewerOf, routeConfigView, routeConfigCommand } from '../../core/lib/router.mjs';
 import { validateSpec, parseSpec } from '../../core/lib/spec.mjs';
-import { loadConfig, readEffectiveConfig } from '../../core/lib/config.mjs';
+import { loadConfig, readEffectiveConfig, validateV2 } from '../../core/lib/config.mjs';
+import { loadPreset } from '../../core/lib/agents.mjs';
 
 // 路由器的单元测试：配置、清单都在系统临时目录里，不碰真实目录。
 function home(t) {
@@ -16,6 +17,38 @@ function home(t) {
 const rows = (dir, list) => fs.writeFileSync(path.join(dir, 'runs.jsonl'), list.map(row => JSON.stringify({ v: 1, ...row })).join('\n') + '\n');
 const noon = new Date(2026, 9, 24, 12, 0, 0).getTime();
 const DAY = 86400000;
+
+test('默认路由开关校验与 Codex 预设适配说明', () => {
+  assert.throws(() => validateV2({ v: 2, profiles: {}, routing: { implicit: null } }), /implicit.*布尔/);
+  assert.ok(loadPreset('codex').profile.fit.avoid.includes('在 Windows 上大段中文文本编辑（易出编码错误）'));
+});
+
+test('预设默认路由：未测时回退，测试通过后优先于兜底，不可用规则不屏蔽，关闭后回退', t => {
+  const h = home(t);
+  const config = { v: 2, defaultProfile: 'fallback', profiles: { codex: { adapter: 'codex', enabled: true }, fallback: { adapter: 'fake', enabled: true } }, routing: { rules: [{ types: ['code'], profile: 'missing' }] } };
+  const choose = () => route({ spec: { type: 'code' }, config, home: h });
+  assert.equal(choose().profile, 'fallback');
+  fs.writeFileSync(path.join(h, 'agent-tests.json'), JSON.stringify({ codex: { ok: true, at: noon } }));
+  const result = choose();
+  assert.equal(result.profile, 'codex');
+  assert.deepEqual(result.rule, { scope: 'implicit' });
+  assert.match(result.trace.at(-1), /预设默认规则/);
+  assert.equal(route({ spec: { type: 'code' }, config, explicit: 'fallback', home: h }).profile, 'fallback');
+  assert.equal(route({ spec: { type: 'code', worker: 'fallback' }, config, home: h }).profile, 'fallback');
+  assert.equal(route({ config, home: h }).profile, 'fallback');
+  config.profiles.codex.enabled = false;
+  assert.equal(choose().profile, 'fallback');
+  config.profiles.codex.enabled = true;
+  config.profiles.codex.limits = { maxTasksPerDay: 1 };
+  rows(h, [{ event: 'start', id: 'one', profile: 'codex', started: noon }]);
+  assert.equal(route({ spec: { type: 'code' }, config, home: h, now: noon }).profile, 'fallback');
+  delete config.profiles.codex.limits;
+  fs.writeFileSync(path.join(h, 'agent-tests.json'), JSON.stringify({ codex: { ok: false, at: noon } }));
+  assert.equal(choose().profile, 'fallback');
+  fs.writeFileSync(path.join(h, 'agent-tests.json'), JSON.stringify({ codex: { ok: true, at: noon } }));
+  config.routing.implicit = false;
+  assert.equal(choose().profile, 'fallback');
+});
 
 // 一组常用执行者：claude-code / codex / fake 支持只读，没有 readOnlyArgs 声明的 generic（plain）不支持。
 const profile = (extra = {}) => ({ adapter: 'claude-code', label: '执行者', enabled: true, ...extra });
@@ -291,4 +324,40 @@ test('routeConfigCommand：写入前校验，被拒绝时配置文件不变；�
   const { result } = routeConfigCommand(['rules', 'set', JSON.stringify([{ types: ['code'], profile: 'sonnet' }])], { home: h });
   assert.deepEqual(result.rules, [{ types: ['code'], profile: 'sonnet' }]);
   assert.equal(route({ spec: { type: 'code' }, config: readEffectiveConfig(h), home: h }).profile, 'sonnet');
+});
+
+
+test('默认路由过滤不可用执行者，并让项目与全局规则优先', t => {
+  const h = home(t);
+  const config = { defaultProfile: 'fallback', profiles: {
+    codex: { adapter: 'codex' }, fallback: { adapter: 'fake' },
+    plain: { adapter: 'generic', generic: 'plain' }, reviewer: { adapter: 'codex', roles: ['reviewer'] },
+  }, generics: { plain: { executable: 'qodercli' } }, routing: { rules: [] } };
+  fs.writeFileSync(path.join(h, 'agent-tests.json'), JSON.stringify(Object.fromEntries(['codex', 'plain', 'reviewer'].map(name => [name, { ok: true, at: noon }]))));
+  const choose = (type, projectConfig = {}) => route({ spec: { type }, projectConfig, config, home: h, now: noon });
+  assert.equal(choose('code').profile, 'codex');
+  assert.equal(choose('research').profile, 'fallback');
+  fs.writeFileSync(path.join(h, 'limits.json'), JSON.stringify({ profiles: { codex: { kind: 'limit', until: noon + DAY } } }));
+  assert.equal(choose('code').profile, 'fallback');
+  fs.writeFileSync(path.join(h, 'limits.json'), JSON.stringify({ profiles: {} }));
+  config.routing.rules = [{ types: ['code'], profile: 'fallback' }];
+  const global = choose('code');
+  assert.equal(global.profile, 'fallback');
+  assert.equal(global.rule.scope, 'global');
+  const project = choose('code', { routing: { rules: [{ types: ['code'], profile: 'plain' }] } });
+  assert.equal(project.profile, 'plain');
+  assert.equal(project.rule.scope, 'project');
+});
+
+test('默认路由按同币种价格排序，混合币种回退', t => {
+  const h = home(t);
+  const config = { defaultProfile: 'fallback', profiles: { a: { adapter: 'codex' }, b: { adapter: 'codex' }, fallback: { adapter: 'fake' } },
+    prices: { a: { input: 1, output: 9, currency: 'CNY' }, b: { input: 3, output: 2, currency: 'CNY' } }, routing: { rules: [] } };
+  fs.writeFileSync(path.join(h, 'agent-tests.json'), JSON.stringify({ a: { ok: true, at: noon }, b: { ok: true, at: noon } }));
+  const choose = () => route({ spec: { type: 'chore' }, config, home: h, now: noon });
+  assert.equal(choose().profile, 'b');
+  assert.equal(choose().rule.scope, 'implicit');
+  config.prices.b.currency = 'USD';
+  assert.equal(choose().profile, 'fallback');
+  assert.equal(choose().rule, null);
 });

@@ -66,7 +66,7 @@ function fixture(t) {
   f.setProfile = value => {
     writeFileSync(path.join(home, 'config.json'), JSON.stringify({
       v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...value } },
     }));
   };
   f.setProfile({});
@@ -123,7 +123,7 @@ function fixture(t) {
 
 // 手写的记录没有参数来源（旧任务），--json 没有 params；真实派发的任务每次都记来源，多一个 params（154）。
 const legacyKeys = ['ok', 'id', 'name', 'state', 'attempts', 'gate', 'needsScope', 'outsideWrites', 'worktree', 'merge', 'conflict'];
-const keys = [...legacyKeys, 'params'];
+const keys = [...legacyKeys, 'params', 'report'];
 const change = { writes: [{ path: 'src/a.js', content: '改过\n' }], commit: '假执行者：改 src/a.js' };
 
 test('1 worktree 任务的十种状态各一例：排队、准备、运行、门禁中、待验收、冲突、已合并、已驳回、失败、已停止', async t => {
@@ -290,7 +290,8 @@ test('4 ar wait 遇到待验收：退出码 0、多一行原文、--json 多 sta
 
   const plain = await f.ar(['wait', '待验收任务']);
   assert.equal(plain.code, 0, plain.stderr + plain.stdout);
-  assert.equal(plain.stdout.trim().split(/\r?\n/).at(-1), line, '提示在最后一行');
+  const lines = plain.stdout.trim().split(/\r?\n/);
+  assert.ok(lines.indexOf(line) >= 0 && lines.indexOf(line) < lines.findIndex(item => item.startsWith('待验收（1）：')));
   assert.ok(plain.stdout.includes('exit=0 report='));
 
   const json = await f.ar(['wait', '待验收任务', '--json']);

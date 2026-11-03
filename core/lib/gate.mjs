@@ -1,18 +1,33 @@
 // 门禁：执行者结束后检查未提交、是否提交、改动范围，逐条运行验收命令，写 gate.json（文件协议第 12 节）。
 // 本模块只负责"跑门禁并写结果"；派发前检查、gating / gate / end 事件与退出码由派发流程（T6）接入。
 // 零依赖。
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join, posix, win32 } from 'node:path';
+import { existsSync, readFileSync, mkdirSync, renameSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { join, dirname, basename, posix, win32 } from 'node:path';
+import { missingSections, missingContentSections } from './spec.mjs';
+import { parseMutations, executeMutation } from './mutation.mjs';
 import { runCommand } from './command.mjs';
 import { homeEnv } from './compat.mjs';
 import { globToRegExp, matchesAny } from './glob.mjs';
-import { baseProjectConfig, changedFiles, deletedFiles, headSha, uncommittedFiles } from './git.mjs';
+import { baseProjectConfig, changedFiles, deletedFiles, git, headSha, parseNameStatusEntriesZ, uncommittedFiles } from './git.mjs';
 import { outsideSummary } from './outside-writes.mjs';
+import { exclusiveCommandOf } from './schedule.mjs';
 
 // summary 里文件最多列 5 个，多了加"等"（协议 12.3）。
 const MAX_SUMMARY_FILES = 5;
 // verify_timeout_min 缺省时与 mergeSpec 的默认值一致（协议 11.3）。
 const DEFAULT_VERIFY_TIMEOUT_MIN = 10;
+
+export function attemptReportFile(dir) {
+  let reportFile = join(dir, 'report.md');
+  // 无执行者的重跑不写 prompt；只在这种尝试中回溯已有汇报。
+  const attemptsDir = dirname(dir);
+  if (!existsSync(reportFile) && basename(attemptsDir) === 'attempts' && /^\d+$/.test(basename(dir)) && !existsSync(join(dir, 'prompt.md'))) {
+    let previous = [];
+    try { previous = readdirSync(attemptsDir).filter(name => /^\d+$/.test(name) && Number(name) < Number(basename(dir))).sort((a, b) => Number(b) - Number(a)); } catch { /* 没有历史尝试。 */ }
+    reportFile = previous.map(name => join(attemptsDir, name, 'report.md')).find(existsSync) ?? join(dirname(attemptsDir), 'report.md');
+  }
+  return reportFile;
+}
 // 基线项目配置没写 specsDir（或值不可用）时的任务说明目录（协议 12.1 第 4 步）。
 const DEFAULT_SPECS_DIR = 'docs/specs';
 // specsDir 为项目根本身（协议 12.1 第 4 步，065）：规范化结果记作 '.'，受保护的不是整个仓库。
@@ -123,6 +138,105 @@ export function summarizeGate(parts = {}) {
   return reasons.length ? reasons.join('；') : '门禁通过';
 }
 
+const DEFAULT_TEST_PATHS = ['tests/**', '**/*.test.*', 'app/src/main/shots*.ts', 'checks/**'];
+const DEFAULT_ASSERTIONS = ['\\bassert\\b', '\\bexpect\\s*\\(', '\\bcheck\\s*\\('];
+
+function testConfig(config) {
+  const paths = config?.testPaths === undefined ? DEFAULT_TEST_PATHS : config.testPaths;
+  const patterns = config?.testAssertionPatterns === undefined ? DEFAULT_ASSERTIONS : config.testAssertionPatterns;
+  for (const [name, value] of [['testPaths', paths], ['testAssertionPatterns', patterns]]) {
+    if (!Array.isArray(value) || !value.length || value.some(item => typeof item !== 'string' || !item.trim())) {
+      throw new Error(`${name} 必须是非空字符串数组`);
+    }
+  }
+  try { return { paths, assertions: patterns.map(pattern => new RegExp(pattern)) }; }
+  catch (error) { throw new Error(`testAssertionPatterns 正则无效：${error.message}`); }
+}
+
+function gitOutput(root, args, description) {
+  const result = git(root, args);
+  if (result.status !== 0) throw new Error(`${description}失败：${result.stderr.trim() || `git 退出码 ${result.status}`}`);
+  return result.stdout;
+}
+
+function treeText(root, revision, file) {
+  const text = gitOutput(root, ['show', `${revision}:${file}`], `读取 ${file}`);
+  if (text.includes('\0') || text.includes('\ufffd')) throw new Error(`读取 ${file}失败：二进制或非 UTF-8 文本`);
+  return text;
+}
+
+function assertionLines(text, assertions) {
+  return text.split(/\r?\n/).filter(line => assertions.some(pattern => pattern.test(line))).length;
+}
+
+function timeoutIncreases(diff) {
+  let removed = [], added = [];
+  const increases = [];
+  const values = line => {
+    const match = /(?:verify_timeout_min|timeout_min|timeoutMs|timeout)\b/i.exec(line);
+    if (!match) return [];
+    // 同一行关键字之后的数字取最大值，覆盖赋值和调用参数；数字分隔符不影响比较。
+    const numbers = [...line.slice(match.index + match[0].length).matchAll(/(?<![\w.])\d(?:[\d_]*\d)?(?:\.\d(?:[\d_]*\d)?)?(?![\w.])/g)]
+      .map(item => Number(item[0].replaceAll('_', '')));
+    return numbers.length ? [{ key: match[0].toLowerCase(), value: Math.max(...numbers) }] : [];
+  };
+  const flush = () => {
+    for (const next of added) {
+      const old = removed.find(item => item.key === next.key && next.value > item.value);
+      if (old) increases.push(`${next.key} ${old.value}→${next.value}`);
+    }
+    removed = []; added = [];
+  };
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('@@')) flush();
+    else if (line.startsWith('-') && !line.startsWith('---')) removed.push(...values(line.slice(1)));
+    else if (line.startsWith('+') && !line.startsWith('+++')) added.push(...values(line.slice(1)));
+  }
+  flush();
+  return [...new Set(increases)];
+}
+
+function reportMentions(report, file) {
+  const section = /^##[ \t]+断言改写[ \t]*\r?\n([\s\S]*?)(?=^##(?:[ \t]|$)|(?![\s\S]))/m.exec(report)?.[1] ?? '';
+  if (!section.trim() || section.trim() === '无') return false;
+  return section.split(/\r?\n/).some(line => {
+    let index = line.indexOf(file);
+    while (index !== -1) {
+      const before = line[index - 1] ?? '';
+      const after = line[index + file.length] ?? '';
+      if (!/[\w./\\-]/.test(before) && !/[\w./\\-]/.test(after)) return true;
+      index = line.indexOf(file, index + 1);
+    }
+    return false;
+  });
+}
+
+export function checkTestWeakening(root, base, head, config, report = '') {
+  const { paths, assertions } = testConfig(config);
+  if (base === head) return [];
+  const entries = parseNameStatusEntriesZ(gitOutput(root, ['diff', '--name-status', '-z', '-M', `${base}..${head}`], '读取测试改动'));
+  const results = [];
+  for (const { status, paths: names } of entries) {
+    if (status.startsWith('A')) continue;
+    const oldFile = names[0];
+    const file = names[names.length - 1];
+    if (!matchesAny(oldFile, paths) && !matchesAny(file, paths)) continue;
+    const before = treeText(root, base, oldFile);
+    const changes = [];
+    if (status === 'D') changes.push('删除测试文件');
+    else {
+      const after = treeText(root, head, file);
+      const oldCount = assertionLines(before, assertions);
+      const newCount = assertionLines(after, assertions);
+      if (newCount < oldCount) changes.push(`断言行数 ${oldCount}→${newCount}`);
+      const diff = gitOutput(root, ['diff', '--no-ext-diff', '--unified=0', '-M', base, head, '--', oldFile, file], `读取 ${file} 的差异`);
+      changes.push(...timeoutIncreases(diff).map(value => `超时增大 ${value}`));
+    }
+    if (changes.length) results.push({ file, changes, reported: reportMentions(report, file) });
+  }
+  return results;
+}
+
 // 去掉 dropEnv 列出的变量名和 AgentRouter 自己的变量（公共目录的新旧名、AR_*）；
 // Windows 上变量名不区分大小写（协议 12.2）。派发进程的公共目录等设置不能漏进项目自己的测试。
 export function removeEnv(env, names) {
@@ -153,6 +267,9 @@ function writeGateJson(dir, gate) {
   }
 }
 
+export const skipExclusiveVerify = ({ required, head, base, uncommitted }) =>
+  required && head === base && uncommitted.length === 0;
+
 // 跑一次门禁并写 <dir>/gate.json，返回 gate 对象（协议 12.3 的全部字段）。
 // spec 是 mergeSpec 的结果（allowed_paths、verify、expect_commit、verify_timeout_min）。
 // 检查步骤里的意外错误（如 git 不可用）不抛出：记成门禁失败，summary 写明原因，照样写 gate.json。
@@ -167,7 +284,7 @@ function writeGateJson(dir, gate) {
 // git 出错时整个门禁中止：commands 记空，summary 只写原因（协议 12.3 最后一段）。
 export async function runGate({
   root, base, spec = {}, env = process.env, dropEnv = [], dir = join(root, '.agent-runs'),
-  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn, outsideWrites, extraEnv, readOnly = false,
+  attempt = 1, now = Date.now, verifyTimeoutMs, onSpawn, onMutationCommand, outsideWrites, extraEnv, readOnly = false,
 } = {}) {
   const started = now();
   const merged = spec ?? {};
@@ -184,6 +301,10 @@ export async function runGate({
   const scope = { allowed, changed: [], outside: [], protected: [], deleted: [] };
   let commands = [];
   let failure = null;
+  let skippedVerify = [];
+  let testWeakening = [];
+  let mutations;
+  let mutationReason = null;
 
   try {
     head = headSha(root);
@@ -193,7 +314,8 @@ export async function runGate({
     // 受保护的路径（协议 12.1 第 4 步）：.agent-router/ 与基线项目配置的 specsDir；
     // 匹配 allowed_paths 但没被"明确写了这个目录"的模式放行时，照样算越界，另记入 protected。
     // specsDir 为项目根本身（'.'，065）时受保护的只有根目录下 NNN-*.md 的文件，不是整个仓库。
-    const specsDir = normalizeSpecsDir(baseProjectConfig(root, base)?.specsDir);
+    const config = baseProjectConfig(root, base);
+    const specsDir = normalizeSpecsDir(config?.specsDir);
     const rootSpecs = specsDir === ROOT_SPECS_DIR;
     const changed = changedFiles(root, base, head);
     scope.changed = changed;
@@ -215,44 +337,88 @@ export async function runGate({
     }
     // 删除的文件（协议 12.1 第 4 步）：只记录，不单独让门禁失败；超出范围的删除照常留在 outside 里。
     scope.deleted = deletedFiles(root, base, head);
+    if (!readOnly) {
+      const reportFile = attemptReportFile(dir);
+      const report = existsSync(reportFile) ? readFileSync(reportFile, 'utf8') : '';
+      testWeakening = checkTestWeakening(root, base, head, config, report);
+    }
     // extraEnv 在 removeEnv 之后合并，AR_ 前缀规则不会去掉它（worktree 模式的 AR_BASE_REPO、AR_WORKTREE）。
     const commandEnv = { ...removeEnv(env, dropEnv), ...(extraEnv ?? {}) };
     for (const line of verify) {
+      if (skipExclusiveVerify({ required, head, base, uncommitted }) && exclusiveCommandOf({ root, verify: [line] }) !== null) {
+        // 跳过的命令不进 commands（下游按 exit 判断成败），只记在 skippedVerify（292 审查 R3-2）。
+        skippedVerify.push(line);
+        continue;
+      }
       const result = await runCommand(line, { cwd: root, env: commandEnv, timeoutMs, onSpawn });
       commands.push({
         line: result.line, argv: result.argv, exit: result.exit, ms: result.ms,
         timedOut: result.timedOut, output: result.output, truncated: result.truncated, error: result.error,
       });
     }
+    if (!readOnly && skippedVerify.length === 0 && commands.every(c => !c.timedOut && c.error == null && c.exit === 0)) {
+      try {
+        const reportFile = attemptReportFile(dir);
+        const items = parseMutations(merged.mutation_body, existsSync(reportFile) ? readFileSync(reportFile, 'utf8') : '');
+        if (items.length || merged.mutations_required > 0) {
+          mutations = [];
+          if (items.length < (merged.mutations_required ?? 0)) mutationReason = `需要至少 ${merged.mutations_required} 个反向实验，说明和汇报里共 ${items.length} 个`;
+          for (let i = 0; i < items.length; i++) mutations.push(await executeMutation(root, items[i], verify, async (line, expect) => {
+            const result = await runCommand(line, { cwd: root, env: commandEnv, timeoutMs, onSpawn, expect });
+            onMutationCommand?.(result);
+            return result;
+          }, i + 1));
+        }
+      } catch (error) { mutations = []; mutationReason = error.message; }
+    }
   } catch (error) {
     failure = error;
     // 读不到 git 状态时，要求提交的任务按"没能核对"把 commit.ok 记为 false（协议 12.3 最后一段）。
     if (required) commit.ok = false;
     commands = [];
+    skippedVerify = [];
   }
 
   const ok = !failure
     && uncommitted.length === 0
     && commit.ok === true
     && scope.outside.length === 0
+    && !mutationReason && (mutations ?? []).every(item => item.ok)
+    && testWeakening.every(item => item.reported)
     && !(outsideWrites?.added?.length > 0)
-    && commands.every(command => !command.timedOut && command.error == null && command.exit === 0);
+    && commands.every(command => command.skipped === true || (!command.timedOut && command.error == null && command.exit === 0));
+  const reportFile = attemptReportFile(dir);
+  const missing = !readOnly && merged.reportRequired && existsSync(reportFile) ? missingSections(readFileSync(reportFile, 'utf8'), merged.reportRequired.sections) : [];
+  const reportReason = missing.length ? `汇报缺少必需的小节：${missing.join('、')}（项目配置 reportRequired）` : null;
+  const missingContent = !readOnly && merged.report_sections?.length ? missingContentSections(existsSync(reportFile) ? readFileSync(reportFile, 'utf8') : '', merged.report_sections) : [];
+  const specReportReason = missingContent.length ? `汇报缺少任务说明要求的小节：${missingContent.join('、')}（任务说明 report_sections）` : null;
   const at = now();
   const gate = {
     v: 1,
     attempt,
     at,
     ms: at - started,
-    ok,
+    ok: ok && !reportReason && !specReportReason,
     base: base ?? null,
     head,
     commit,
     uncommitted,
     scope,
+    testWeakening,
     commands,
+    ...(mutations ? { mutations } : {}),
+    ...(skippedVerify.length ? { skippedVerify } : {}),
     ...(outsideWrites ? { outsideWrites } : {}),
     summary: failure ? `无法读取 git 状态：${failure.message}` : summarizeGate({ commit, uncommitted, scope, commands, outsideWrites, readOnly }),
   };
+  for (const reason of [mutationReason, ...(mutations ?? []).filter(x => !x.ok).map(x => x.reason)].filter(Boolean)) gate.summary = gate.summary === '门禁通过' ? reason : `${gate.summary}；${reason}`;
+  const unreported = testWeakening.filter(item => !item.reported);
+  if (unreported.length) {
+    const reason = `测试检查可能被削弱：${unreported.map(item => `${item.file}（${item.changes.join('、')}）`).join('、')}；请在汇报的断言改写一节逐个说明`;
+    gate.summary = gate.summary === '门禁通过' ? reason : `${gate.summary}；${reason}`;
+  }
+  if (reportReason) gate.summary = gate.summary === '门禁通过' ? reportReason : `${gate.summary}；${reportReason}`;
+  if (specReportReason) gate.summary = gate.summary === '门禁通过' ? specReportReason : `${gate.summary}；${specReportReason}`;
   writeGateJson(dir, gate);
   return gate;
 }

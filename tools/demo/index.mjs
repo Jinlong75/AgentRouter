@@ -71,7 +71,7 @@ export async function demo({ confirmations = false } = {}){
         if(kind==='cmd'){const id=`cmd-${a.n}-${seq}`;add({kind,id,phase:'start',command:value,...stamp()});if(exit!==null)add({kind,id,phase:'end',command:value,exit,output,truncated:false,...stamp()});}
         else if(kind==='file')add({kind,files:value.map(([kind,path])=>({kind,path})),...stamp()});
         else add({kind,text:value,...stamp()});}}
-    await writeFile(entry.events,events.map(e=>JSON.stringify(e)).join('\n')+'\n');await writeFile(entry.raw,'??????\n');
+    await writeFile(entry.events,events.map(e=>JSON.stringify(e)).join('\n')+'\n');await writeFile(entry.raw,'（演示：没有原始输出）\n');
     await writeFile(entry.progress,`=== Codex 开始：${t.name}  ${new Date(started).toLocaleString('zh-CN',{hour12:false})} ===\n[15:39:00] ${t.last??'说：已完成，见汇报。'}\n`+(A?A.filter(a=>a.n>1).map(a=>`=== 第 ${a.n} 次尝试（执行者：${a.profile}；原因：门禁未通过）===\n`).join(''):''));
     // 多次尝试演示任务不写任务说明文件：reader-app 的"已有任务说明"列表保持原样（新建任务页的检查用这个项目）。
     if(entry.spec&&!A){await mkdir(path.join(repo,'docs/specs'),{recursive:true});await writeFile(path.join(repo,entry.spec??'docs/specs/demo.md'),t.goal?`# ${t.name}\n\n## 目标\n\n${t.goal}\n`:`# ${t.name}\n`);}

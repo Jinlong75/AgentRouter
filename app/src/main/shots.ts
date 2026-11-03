@@ -1,3 +1,4 @@
+import { UI_BASELINE } from './shots-baseline';
 import { captureWizard, capturePreferences } from './shots-preferences';
 import { captureProjects } from './shots-projects';
 import { captureSearch } from './shots-search';
@@ -9,6 +10,7 @@ import { captureScore } from './shots-score';
 import { captureAgents } from './shots-agents';
 import { captureNewtask, fixtures as prepareNewtaskFixtures, waitNewtaskReady } from './shots-newtask';
 import { captureRouting } from './shots-routing';
+import { captureStats } from './shots-stats';
 import { clock, cpuNow, coreReport, coreSeq, ipcReport, ipcSeq, pollUntil, recentReport } from './shots-input';
 import { app, BrowserWindow, nativeTheme } from 'electron';
 import { mkdir, writeFile, readFile, appendFile, open, rename, rm } from 'node:fs/promises';
@@ -32,41 +34,6 @@ import { reportRich } from '../../../tools/demo/data.mjs';
 // 隔离用的路径从软件内部环境读（AR_ISOLATED_ENV，见 app-env.mjs）；主进程 process.env 是用户原样。
 const appEnv = appEnvironment(process.env);
 
-/*
- * 界面功能基线与检查的对应；每条检查的标签以编号开头，交接记录直接引用：
- * UI01 侧栏导航到每个已交付页面，当前页高亮，键盘可切换 ——「UI01 …」（本文件）
- * UI02 任务列表：分组、筛选、项目下拉、搜索与排序 ——「UI02 …」（本文件；搜索与排序在 shots-search.ts）
- * UI03 选中任务显示详情；标签切换；时间线跟随最新进展 ——「UI03 …」（本文件）
- * UI04 停止任务：确认框默认焦点在取消，确认后真实停止 ——「UI04 …」（本文件：假派发进程树真的结束、清单写 interrupted、列表变中断）
- * UI05 更多菜单各项 ——「UI05 …」（本文件：打开类与复制由桩记录参数，隐藏写入 tasks.json）
- * UI06 技能安装、更新、回退、自改版本不替换 ——「UI06 …」（shots-preferences.ts：断言安装记录与备份文件）
- * UI07 设置页每一项写入、失败恢复、环境变量覆盖说明、并行、清理 ——「UI07 …」（shots-preferences.ts：读 config.json 断言；并行与清理在 shots-search.ts）
- * UI08 关于页信息正确；"重新运行首次引导"可用 ——「UI08 …」（shots-preferences.ts）
- * UI09 首次引导完整走一遍 ——「UI09 …」（shots-preferences.ts：断言配置与技能真的写入）
- * UI10 主题：跟随系统 / 深色 / 浅色切换即时生效 ——「UI10 …」（shots-preferences.ts）
- * UI11 最小窗口 960×600 下所有页面无溢出、操作可达 ——「UI11 …」（每页通用检查与本文件）
- * UI12 系统通知：任务结束发一条，点开选中该任务 ——「UI12 …」（本文件；通知由桩记录，点开调用与真实通知相同的回调）
- * UI13 导入 Agent 向导 ——「UI13 …」（shots-preferences.ts）
- * UI14 测试连接成功 / 失败 / 超时 ——「UI14 …」（shots-preferences.ts）
- * UI15 项目页：添加、git init、初始化预览 / 写入 / 提交、编辑配置、移除、侧栏分组与执行者负载、搜索与排序 ——「UI15 …」（shots-projects.ts；搜索与排序在 shots-search.ts）
- * UI16 新建任务页：三种来源、预览、派发成功 / 失败、必填校验、无项目 ——「UI16 …」（shots-newtask.ts：假执行者真实派发，读 runs.jsonl 与 git 提交）
- * UI18 在此项目打开 Claude Code / 打开文件夹 ——「UI18 …」（shots-projects.ts：调用由桩记录）
- * UI19 关闭询问与托盘（012 A）：点 × 的三种行为、记住选择、"窗口"设置、托盘状态与提示 ——「UI19 …」（本文件）
- * UI20 设置页"数据"一节（012 B）：清除缓存、重置确认框；真正的重置在隔离目录的第二次启动里执行 ——「UI20 …」（本文件、tools/shots.mjs）
- * UI21 进程查询失败（W4）：注入失败后横幅、"状态未知"、停止 / 隐藏 / 批量删除禁用且主进程拒绝、不推断结束；恢复后横幅消失、操作恢复 ——「UI21 …」（本文件）
- * UI22 门禁界面（Stage04）：轨道、门禁标签、列表徽标、新建任务页的门禁说明 ——「UI22 …」（shots-gate.ts）
- * UI23 多次尝试界面（Stage05）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、真实重试 ——「UI23 …」（shots-retry.ts）
- * UI24 验收页与 worktree 任务（Stage06）：任务页的排队 / 准备 / 待验收 / 冲突 / 已合并 / 已驳回、验收页概览 / 改动 / 门禁、批准并合并、驳回、被拒的合并、待验收通知 ——「UI24 …」（shots-accept.ts：真实核心、临时 git 仓库）
- * UI25 合并冲突与"解决冲突并重试"、并发排队与停止、准备失败 ——「UI25 …」（shots-accept.ts）
- * UI26 任务详情"评分"标签（两张卡片、每项扣分、门禁失败归因、综合分怎么算）与设置页"统计主导的 token 与用时" ——「UI26 …」（shots-score.ts：真实核心 ar report 对照）
- * UI27 路由页（Stage07 T8）：规则增删改与上移下移、兜底、试算（对照 ar route --explain）、每日上限、审查者候选，每一步读 config.json 断言 ——「UI27 …」（shots-routing.ts）
- * UI28 导入向导扩展与模型、推理强度（Stage07）：自定义 CLI 表单 / 校验 / 测试并预览 / 保存并真实派发、Claude 类的推理强度与"升级到"、OpenAI 兼容接口、Qoder 默认模型、导出与从文件导入 ——「UI28 …」（shots-agents.ts：假 CLI 与假执行者，文件对话框用桩）
- * UI29 新建任务页"执行者：自动"：按路由规则实时显示会派给谁、为什么、路由失败时派发照常可点 ——「UI29 …」（shots-newtask.ts）
- * UI30 审查界面（Stage08 158）：验收页与任务详情的"审查"标签（结论、问题按严重度、成立 / 不成立、跳到改动、再审一次）、列表徽标、轨道"审查"节点、批准确认提示、需人工处理横幅，说明框的焦点保护 ——「UI30 …」（shots-review.ts：真实派发的任务 + 假审查者）
- * UI31 路由页审查设置与准确率（Stage08 158）：开关 / 分段 / 下拉写入 config.json 的 review、写入失败恢复原值、准确率与 ar review stats 一致 ——「UI31 …」（shots-routing.ts）
- * 「通用 …」是每页通用检查、真实输入自测与环境检查。
- * 所有交互都用真实输入（press / key / type / tabTo / wheel，见 shots-input.ts），不再调用元素的 click() 或派发合成事件。
- */
 // 运行期对照探针（AR_SHOTS_PROBE=1，见 shots-probe.ts）：默认不开；开了就在整个验收期间运行，失败退出前也打印汇总。
 export async function capture(win: BrowserWindow, registry: Registry, out: string) {
     const stopProbe = startProbe();
@@ -300,6 +267,7 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // b5f2e71 曾放宽到 30 秒，按"原验收标准保持不变"恢复；用时按单调时钟计。
     // 每次都打印这段时间里的核心调用与核心进程各阶段，慢的那次能看出卡在哪个调用、哪个进程的哪一步。
     const prepareProjects = async () => { const started = clock(), ipcFrom = ipcSeq(), coreFrom = coreSeq(); await press('[data-page=projects]'); await wait('!!document.querySelector("[data-pj-row]") && !!document.querySelector("[data-pj-detail] .dh")', '项目页列表与详情'); console.log(`项目页加载用时：${Math.round(clock() - started)}ms；核心调用：${ipcReport(ipcFrom)}；核心进程：${coreReport(coreFrom)}`); };
+    const prepareTasks = async () => { await press('[data-page=tasks]'); await wait('!!document.querySelector("[data-task=t3]")', '任务页恢复演示任务 t3', 10000); await press('[data-task=t3]'); };
     // 单独复现 UI28（AR_SHOTS_FOCUS=agents）：引导之后只跑导入向导扩展的检查（自定义 CLI、模型与推理强度、OpenAI 兼容接口、导出与导入）。
     if (process.env.AR_SHOTS_FOCUS === 'agents') {
         await captureAgents(h, win);
@@ -324,6 +292,24 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'routing', checks, focusRestored: progress.focusRestored }, null, 2));
         return;
     }
+    // 单独复现统计页说明与额外数据目录（427，AR_SHOTS_FOCUS=stats）：引导之后只跑统计页与设置页本节的检查。
+    if (process.env.AR_SHOTS_FOCUS === 'stats') {
+        await captureStats(h, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'stats', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
+    if (process.env.AR_SHOTS_FOCUS === 'UI32') {
+        await captureStats(h, win);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'UI32', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
+    if (process.env.AR_SHOTS_FOCUS === 'UI32-tail') {
+        await captureRouting(h, win);
+        await captureStats(h, win);
+        await audit('任务页', prepareTasks);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'UI32-tail', checks, focusRestored: progress.focusRestored }, null, 2));
+        return;
+    }
     // 单独复现 UI20 清空任务列表（196，AR_SHOTS_FOCUS=UI20-lists）：引导之后、完整流程之前，先准备与新建任务页相同的
     // 新任务临时仓库（captureLists 用的 sample 项目与 001-已有说明），再跑同一个 captureLists；演示数据原样，不做退出后检查与重置。
     if (process.env.AR_SHOTS_FOCUS === 'UI20-lists') {
@@ -341,6 +327,20 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         await audit('项目页', prepareProjects);
         await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'keyboard-audit', checks, focusRestored: progress.focusRestored }, null, 2));
         console.log(`只跑项目页通用键盘审计：${checks.length} 项检查全部通过。`);
+        return;
+    }
+    // 单独复现项目页（UI15 / UI18 与项目页通用键盘审计，AR_SHOTS_FOCUS=projects，295）：跑完项目页就结束。
+    if (process.env.AR_SHOTS_FOCUS === 'projects') {
+        await audit('项目页', prepareProjects);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'projects', checks, focusRestored: progress.focusRestored }, null, 2));
+        console.log(`只跑项目页：${checks.length} 项检查全部通过。`);
+        return;
+    }
+    // 单独复现新建任务页（UI16 与 424 的"任务说明只在当前分支上"横幅，AR_SHOTS_FOCUS=newtask）：引导之后只跑新建任务页的检查，跑完结束。
+    if (process.env.AR_SHOTS_FOCUS === 'newtask') {
+        await captureNewtask(h);
+        await writeFile(path.join(out, 'checks.json'), JSON.stringify({ focus: 'newtask', checks, focusRestored: progress.focusRestored }, null, 2));
+        console.log(`只跑新建任务页：${checks.length} 项检查全部通过。`);
         return;
     }
     // UI02 / UI15 / UI07：任务页与项目页的搜索和排序、侧栏底部的执行者负载、设置页的“并行”与“清理”。
@@ -429,6 +429,44 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
         console.log(`只跑 ${process.env.AR_SHOTS_FOCUS}：${checks.length} 项检查全部通过。`);
         return;
     }
+    // 375 分段续跑（--from，D159）：从指定段的起点一直跑到结尾，只用于确认修复，不能代替完整的 npm run shots。
+    // 段名与顺序要和 tools/shots.mjs 的 SHOTS_SEGMENTS 一致。段边界只放在"后面的步骤不依赖被跳过步骤留下的状态"的地方；
+    // 被跳过的检查留下的状态（UI16 的临时仓库与项目登记、UI17 的源任务、UI04 停掉的 t2、UI12 结束的 t1）由下面按同一套做法补准备。
+    // 段的划分与依赖：
+    //   （引导前的准备）captureWizard / captureProjects / captureSearch 每个 --from 都照常跑，不重复检查代码。
+    //   第 1 段（不分段时的起点）：UI01～UI19、UI21～UI26、UI28 等界面检查；依赖上面三项准备留下的状态。
+    //   第 2 段 stats：captureRouting 起（UI27、UI32 与之后的每页通用检查）一直跑到结尾；
+    //     依赖 t2 已停（UI04）、UI16 的临时仓库与项目登记、UI17 的源任务（退出前再派一次要用）；这一段自己按 UI12 结束 t1。
+    //   第 3 段 audit：每页通用检查、UI03、UI12（t1 在这里结束）、UI20 数据与列表、UI02 空状态、控制台错误核对；
+    //     依赖 t1 还在进行（UI12 要新结束它）、t2 已停、UI16 的临时仓库（UI20 清空列表要用）。
+    //   第 4 段 tail：只跑结尾——退出前准备托管与脱离任务、真实退出后检查、第二轮隔离重置（11-01 EPERM 出在这里）；
+    //     依赖 UI16 的临时仓库与 UI17 的源任务（退出前再派一次要用，由下面准备）、没有进行中的任务（UI04 / UI12 的状态，由下面补上）。
+    const from = process.env.AR_SHOTS_FROM ?? '';
+    const SEGMENTS = ['stats', 'audit', 'tail'] as const;
+    const fromIndex = from ? SEGMENTS.indexOf(from as (typeof SEGMENTS)[number]) : -1;
+    if (from && fromIndex < 0) throw Error(`--from 的段名不认识：${from}；可用段名：${SEGMENTS.join('、')}`);
+    if (from && process.env.AR_SHOTS_FOCUS) throw Error('--from 与 --focus 不能同时使用：分段运行与只跑一个焦点只能二选一');
+    // 第 index 段及之后都要跑；不分段时全部跑。
+    const runsFrom = (index: number) => fromIndex < 0 || index >= fromIndex;
+    if (fromIndex >= 0) {
+        console.log(`分段运行 --from ${from}：从「${from}」起点跑到结尾，只用于确认修复，不能代替完整的 npm run shots。`);
+        // 被跳过的 UI04 / UI12：先真实停止 t2、结束 t1（tail 不跑 UI12）。UI20 与收尾都要求没有进行中的任务。
+        await stopDemoTask(registry, 't2');
+        if (fromIndex >= 2) await endDemoTask(registry, 't1');
+        // 被跳过的 UI16 / UI17：新建任务页的临时仓库、项目登记与源任务（UI20 清空列表与退出前再派一次都要用）。
+        await prepareSegmentFixtures(registry);
+        // 被跳过的 UI17 showAll：看板筛选恢复到全部项目、全部状态，后面按任务行定位才一定看得见。
+        await press('[data-page=tasks]');
+        await wait('!!document.querySelector("[data-task]")');
+        await press('[data-filter=all]');
+        await press('[data-project]');
+        await press('.ctx button');
+    }
+    // 跨段的截图检查结果（capturePreferences 的字体检查）；分段运行时可能没有跑，写进 checks.json 时省略。
+    let fontLoaded: boolean | undefined;
+    // 块内保持原来的缩进，只多一层标签，避免整段改动淹没真正的改动。
+    early: {
+    if (fromIndex >= 0) break early;
     await press('[data-page=tasks]');
     await wait('!!document.querySelector("[data-task=t1]")');
     // 066：失败现场自检开关（AR_SHOTS_FAIL_PROBE=1，只在测试或手动诊断时设置）：第一个页面之后让一条检查故意失败，验证 failures/ 里的截图与 JSON、非 0 退出码和原失败信息。
@@ -926,7 +964,7 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await captureScore(h, registry, win, save);
     // UI21（W4）：t1 仍在进行（真实的假派发进程），在这里注入进程查询失败再恢复；结束后 t1 状态不变，后面的检查照常使用。
     await captureProcessUnknown(h, registry, save, menuItem, runs);
-    const fontLoaded = await capturePreferences(h);
+    fontLoaded = await capturePreferences(h);
     // UI28（Stage07 导入向导扩展与模型、推理强度）：自己写专用的 config.json，结束后恢复；结束时停在设置页，和上面一致。
     await captureAgents(h, win);
     // UI19：关闭询问、托盘与"窗口"设置。此时 t1 还在进行，正好检查重置在有任务时禁用确认。
@@ -935,11 +973,20 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     await captureNewtask(h);
     // UI17 再派一次沿用新建任务页留下的临时仓库与假执行者配置。
     await captureRedispatch(h, saveNow, pressNow, registry, win);
+    }
+    // 第 2 段 stats（见上面的段划分）：UI27 路由页、UI32 统计页与之后的每页通用检查，一直跑到结尾。
+    stats: {
+    if (!runsFrom(0)) break stats;
     // UI27 路由页：自己写执行者配置（假执行者）与项目，结束时恢复配置、清单与项目登记。
     await captureRouting(h, win);
+    await captureStats(h, win);
+    }
+    // 第 3 段 audit（见上面的段划分）：每页通用检查、UI03、UI12、UI20 数据与列表、UI02 空状态、控制台错误核对。
+    audit: {
+    if (!runsFrom(1)) break audit;
 
     // 每页通用检查与 UI11：深浅两主题 × 1160×720 / 960×600。
-    await audit('任务页', async () => { await press('[data-page=tasks]'); await press('[data-task=t3]'); });
+    await audit('任务页', prepareTasks);
     // 项目页加载（描述与计时见 prepareProjects，和 AR_SHOTS_FOCUS=keyboard-audit 共用同一路径）。
     await audit('项目页', prepareProjects);
     await audit('Agent 页', async () => { await press('[data-page=connect]'); await wait('!!document.querySelector("[data-host-card]") && !document.querySelector("[data-pref=detect]").disabled'); });
@@ -1005,16 +1052,13 @@ async function captureAll(win: BrowserWindow, registry: Registry, out: string) {
     // 检查完把夹具恢复回去（见 captureLists 尾部），后面的退出检查继续用演示数据。
     await captureLists(h, registry, save);
     await verify('通用 全程渲染进程没有控制台错误', () => { assert.deepEqual(h.consoleErrors, []); });
-    await writeFile(path.join(out, 'checks.json'), JSON.stringify({ screenshots, fontLoaded, checks, focusRestored: progress.focusRestored }, null, 2));
+    }
+    await writeFile(path.join(out, 'checks.json'), JSON.stringify({ ...(from ? { from } : {}), screenshots, fontLoaded, checks, focusRestored: progress.focusRestored }, null, 2));
     const ui = [...new Set(checks.map(c => c.match(/^UI\d\d/)?.[0]).filter(Boolean))].sort();
-    // UI19 = 关闭询问与托盘（012 A），UI20 = 设置页"数据"一节与清除缓存 / 重置确认框（012 B）。
-    // 原 UI10 / UI11 已分别是"主题"与"最小窗口"，所以新增要求改用 UI19、UI20（见汇报）。
-    // UI22 = Stage04 门禁界面（040）：轨道、门禁标签、列表徽标与新建任务页的门禁说明。
-    // UI27 = Stage07 路由页，UI28 = 导入向导扩展与模型、推理强度（107），UI29 = 新建任务页"执行者：自动"的路由结果。
-    // UI23 = Stage05 多次尝试界面（061）：列表尝试 n/N、轨道、尝试切换条、按尝试看汇报与门禁、重试历史、重试按钮与弹窗、一次真实重试。
-    // UI30 = Stage08 审查页与审查徽标，UI31 = 审查设置与准确率；保留严格编号覆盖检查。
-    assert.deepEqual(ui, ['UI01', 'UI02', 'UI03', 'UI04', 'UI05', 'UI06', 'UI07', 'UI08', 'UI09', 'UI10', 'UI11', 'UI12', 'UI13', 'UI14', 'UI15', 'UI16', 'UI17', 'UI18', 'UI19', 'UI20', 'UI21', 'UI22', 'UI23', 'UI24', 'UI25', 'UI26', 'UI27', 'UI28', 'UI29', 'UI30', 'UI31'], '界面功能基线 UI01～UI31 都要有检查');
-    console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.`);
+    // 分段运行只覆盖起点之后的检查，编号覆盖断言不适用；结果不能代替完整的 npm run shots。
+    if (from) console.log(`分段运行（--from ${from}）：跳过界面功能基线编号覆盖检查；分段结果不能代替完整的 npm run shots`);
+    else assert.deepEqual(ui, [...UI_BASELINE], `界面功能基线 ${UI_BASELINE[0]}～${UI_BASELINE[UI_BASELINE.length - 1]} 都要有检查`);
+    console.log(`Generated ${screenshots} screenshots; ${checks.length} UI checks passed（${ui.join(' ')}）.${from ? ` 分段运行（--from ${from}），不能代替完整的 npm run shots` : ''}`);
     // 退出前准备两个任务：先准备技能派发、由本进程认领的托管任务（认领之后配置不再影响它），
     // 再准备「再派一次」派出的脱离任务，所以两者需要的 config.json 可以先后写入、互不干扰。
     // 外部启动器在 Electron 退出后分别核对两个任务继续运行并正常结束。
@@ -1052,6 +1096,40 @@ async function untilRow<T>(fn: () => Promise<T | undefined | null>, label: strin
     let value: T | undefined | null;
     if ((await pollUntil(async () => (value = await fn()), timeoutMs)).ok) return value as T;
     throw Error(`等待超时：${label}（${timeoutMs} ms）`);
+}
+
+// 375 分段续跑：补准备被跳过段留下的状态，用的是被跳过代码同一套做法，不复制任何界面检查。
+// 与 UI16 的 captureNewtask 用同一个 fixtures()：临时仓库、项目配置、项目登记；
+// 再按 UI17 的方式派发源任务并等它自然结束——退出前「再派一次」要用它的 start 记录与 dispatch.json。
+async function prepareSegmentFixtures(registry: Registry) {
+    const { repo } = await prepareNewtaskFixtures();
+    const configFile = path.join(appEnv.AGENT_ROUTER_HOME!, 'config.json');
+    const originalConfig = await readFile(configFile, 'utf8').catch(() => null);
+    await writeFile(configFile, JSON.stringify(redispatchConfig(150), null, 2) + '\n');
+    try {
+        const result = await coreRun(['dispatch', 'docs/specs/001-已有说明.md', '--name', REDISPATCH_SOURCE, '--profile', 'fake', '--detach', '--json'], { cwd: repo, timeoutMs: 60000 });
+        assert.equal(result.code, 0, `分段准备：派发源任务失败：${result.stderr || result.json?.error}`);
+        assert.equal(result.json?.ok, true, `分段准备：派发源任务失败：${result.json?.error}`);
+        assert.ok(result.json.id, '分段准备：派发源任务没有返回 id');
+        await untilRow(async () => (await readRows(registry)).find(row => row.event === 'end' && row.id === String(result.json.id)), '分段准备：源任务结束', 15000);
+    }
+    finally {
+        if (originalConfig === null) await rm(configFile, { force: true });
+        else await writeFile(configFile, originalConfig);
+    }
+    await registry.refresh();
+}
+// UI04 停掉 t2 走过的同一条路径（核对派发进程身份、结束进程树、写 interrupted）。
+async function stopDemoTask(registry: Registry, id: string) {
+    const task = registry.tasks.find(t => t.id === id);
+    assert.ok(task && task.status === 'run', `分段准备：演示任务 ${id} 应该在运行`);
+    await registry.stop(id);
+}
+// UI12 结束 t1 写的那条 end 记录；已经结束过就不重复写。
+async function endDemoTask(registry: Registry, id: string) {
+    if ((await readRows(registry)).some(row => row.event === 'end' && row.id === id)) return;
+    await appendFile(registry.file, '\n' + JSON.stringify({ v: 1, event: 'end', id, exit: 0, at: Date.now(), minutes: 1 }) + '\n');
+    await registry.refresh();
 }
 
 // UI17：已结束任务显示次要按钮「再派一次」，点击后按 dispatch.json 的参数派发并选中新任务；

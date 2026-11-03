@@ -44,6 +44,8 @@ test('--upgrade --dry-run：列出新建、角色差异、配置新字段，什�
   const plan = run(f, ['init', '--upgrade', '--dry-run', '--json']);
   assert.equal(plan.dryRun, true);
   assert.ok(plan.changes.some(c => c.action === 'create' && c.path === 'docs/roles/reviewer.md'));
+  assert.ok(plan.changes.some(c => c.action === 'create' && c.path === 'docs/autonomy/README.md'));
+  assert.ok(plan.changes.some(c => c.action === 'create' && c.path === 'handoff.md'));
   assert.ok(plan.changes.some(c => c.action === 'update' && c.path === 'AGENTS.md'));
   const diff = plan.changes.find(c => c.action === 'roleDiff' && c.path === 'docs/roles/worker.md');
   assert.ok(diff);
@@ -55,7 +57,7 @@ test('--upgrade --dry-run：列出新建、角色差异、配置新字段，什�
   assert.ok(diff.diff.some(l => l.op === '-' && l.text === '- 旧规则一'));
   assert.ok(diff.diff.some(l => l.op === '+') && diff.diff.every(l => ['+', '-', ' '].includes(l.op)));
   assert.equal(diff.truncated, false);
-  assert.deepEqual(plan.changes.filter(c => c.action === 'configField').map(c => [c.key, c.value]).sort(), [['setup', []], ['worktree', true]]);
+  assert.deepEqual(plan.changes.filter(c => c.action === 'configField').map(c => [c.key, c.value]).sort(), [['reportRequired', { sections: ['推断清单', 'TODO(lead)', '已知问题'], types: ['code', 'fix', 'test', 'refactor'] }], ['setup', []], ['specRequired', { sections: ['受影响的已有测试'], types: ['code', 'fix', 'test', 'refactor'] }], ['worktree', true]]);
   assert.deepEqual(f.snapshot(), before);
   assert.match(f.ar(['init', '--upgrade', '--dry-run']).stdout, /和最新模板不同/);
 });
@@ -80,6 +82,8 @@ test('不选任何角色和字段应用：只补文件，结果与普通 ar init
   assert.equal(f.read('docs/roles/worker.md'), OLD_WORKER);
   assert.equal(f.read('.agent-router/project.json'), OLD_CONFIG);
   assert.ok(fs.existsSync(join(f.repo, 'docs/roles/reviewer.md')));
+  assert.match(f.read('handoff.md'), /## 开工必做/);
+  assert.match(f.read('handoff.md'), /ar lead brief/);
   assert.ok(f.read('AGENTS.md').includes('<!-- agent-router:begin -->'));
   assert.ok(!fs.existsSync(join(f.repo, '.agent-router/backup')));
 });

@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { main } from '../../core/lib/cli.mjs';
 import { loadPreset } from '../../core/lib/agents.mjs';
+import { systemNodeSearch } from '../../core/lib/command.mjs';
 import { withFakeCodex } from '../fixtures/fake-codex-path.mjs';
 
 // 隔离公共目录；假密钥只放在传入的环境里。任何输出都不能出现它的值。
@@ -33,7 +34,7 @@ test('agents：add → list → disable → enable → remove；--json 只输出
   assert.equal(added.code, 0); assert.equal(added.out.length, 1);
   assert.deepEqual({ ...added.json, secretStatus: added.json.secretStatus }, { ok: true, name: 'deepseek', preset: 'deepseek', madeDefault: true, secrets: ['DEEPSEEK_API_KEY'], secretStatus: { DEEPSEEK_API_KEY: 'set' } });
   // 预设里给界面下拉用的说明字段（modelOptions / effortOptions 等）不写进配置，其余与预设一致。
-  const { modelOptions, effortOptions, types, ...writtenPreset } = loadPreset('deepseek').profile;
+  const { modelOptions, effortOptions, types, fit, ...writtenPreset } = loadPreset('deepseek').profile;
   assert.ok(modelOptions && effortOptions);
   assert.deepEqual(config().profiles.deepseek, writtenPreset);
   assert.equal(config().defaultProfile, 'deepseek', '有了 DeepSeek 后默认执行者是它');
@@ -41,7 +42,7 @@ test('agents：add → list → disable → enable → remove；--json 只输出
 
   const list = (await call(['agents', 'list', '--json'])).json.agents;
   const deepseek = list.find(a => a.name === 'deepseek'), codex = list.find(a => a.name === 'codex');
-  assert.deepEqual(deepseek, { name: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Pro', enabled: true, supported: true, default: true, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'set' }, login: null, model: 'deepseek-v4-pro', lastTest: null });
+  assert.deepEqual(deepseek, { name: 'deepseek', adapter: 'claude-code', label: 'DeepSeek V4 Flash', enabled: true, supported: true, default: true, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'set' }, login: null, model: 'deepseek-v4-flash', lastTest: null, fit });
   assert.equal(codex.default, false); assert.equal(codex.auth, 'login');
 
   const again = await call(['agents', 'add', '--preset', 'deepseek', '--json']);
@@ -63,6 +64,36 @@ test('agents：add → list → disable → enable → remove；--json 只输出
   const text = await call(['agents', 'list']);
   assert.match(text.out.join('\n'), /codex\s+Codex（codex）\s+已启用\s+默认/);
   for (const line of outputs) assert.ok(!line.includes(SECRET), '输出里出现了密钥值');
+});
+
+test('agents list --json：Node 写的执行者带 runtime（system / bundled），非 Node 的没有（430 第 4 条）', async t => {
+  const { home, env, call } = setup(t);
+  // 模拟软件（Electron）：只有在这种运行时里才有 system / bundled 的区别。
+  const saved = { had: Object.prototype.hasOwnProperty.call(process.versions, 'electron'), value: process.versions.electron };
+  process.versions.electron = '43.7.5';
+  t.after(() => { if (saved.had) process.versions.electron = saved.value; else delete process.versions.electron; });
+  const probe = path.join(home, 'probe.js');
+  fs.writeFileSync(probe, "console.log('ok');\n");
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'cli', profiles: {
+    cli: { adapter: 'generic', label: '我的 CLI', enabled: true, auth: 'login', generic: 'my-cli' },
+    fake: { adapter: 'fake', label: '假执行者', events: [], report: 'OK\n' },
+  }, generics: { 'my-cli': { label: '我的 CLI', executable: probe, detect: ['--version'], args: [], stdin: '{prompt}', output: { format: 'text' }, report: 'stdout' } } }));
+  const empty = path.join(home, 'empty-path'), missingHome = path.join(home, 'missing-home');
+  fs.mkdirSync(empty); fs.mkdirSync(missingHome);
+  // 预填缓存：同一 PATH 下常见位置当作不存在，测试机真的装了 Node（nvm / Homebrew 等）也不影响结果。
+  const bundledEnv = { ...env, PATH: empty };
+  assert.equal(systemNodeSearch({ inElectron: true, platform: process.platform, env: bundledEnv, exists: () => false, readdir: () => [], homedir: () => missingHome }).path, null);
+  const bundled = (await call(['agents', 'list', '--json'], { env: bundledEnv })).json.agents;
+  assert.equal(bundled.find(a => a.name === 'cli').runtime, 'bundled');
+  assert.ok(!('runtime' in bundled.find(a => a.name === 'fake')), '假执行者不是 Node 写的，没有 runtime');
+
+  // PATH 里查得到系统 Node（用测试进程自己的 node 代表）：runtime 变成 system。
+  const systemEnv = { ...env, PATH: path.dirname(process.execPath) };
+  // 查找按固定文件名 node.exe / node 拼路径；process.execPath 的大小写随启动方式而变（例如 node.EXE），不能直接拿来比。
+  const systemNode = path.join(path.dirname(process.execPath), process.platform === 'win32' ? 'node.exe' : 'node');
+  assert.equal(systemNodeSearch({ inElectron: true, platform: process.platform, env: systemEnv, exists: file => file === systemNode, readdir: () => [], homedir: () => missingHome }).path, systemNode);
+  const system = (await call(['agents', 'list', '--json'], { env: systemEnv })).json.agents;
+  assert.equal(system.find(a => a.name === 'cli').runtime, 'system');
 });
 
 test('secrets：status 只报告 set / missing；set 的值只从标准输入读，命令行与输出里都没有', async t => {
@@ -112,8 +143,8 @@ test('agents presets --json：按 order 排序，含 title/description/recommend
   assert.deepEqual(r.json.presets.map(p => p.name), ['deepseek', 'mimo', 'mimo-payg', 'claude-native', 'claude-subscription', 'compat', 'codex', 'qoder-cn', 'qoder', 'deepseek-harness', 'openai-compat']);
   assert.deepEqual(r.json.presets.filter(p => p.recommended).map(p => p.name), ['deepseek'], '推荐标记只在 DeepSeek 上');
   const deepseek = r.json.presets[0];
-  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Pro', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, supportsEffort: true,
-    modelOptions: ['deepseek-v4-pro', 'deepseek-v4-flash'], effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'] });
+  assert.deepEqual(deepseek, { name: 'deepseek', title: 'DeepSeek', description: '经 Claude Code 外壳运行，按量付费，用 API Key', recommended: true, adapter: 'claude-code', label: 'DeepSeek V4 Flash', auth: 'token', env: loadPreset('deepseek').profile.env, secrets: { ANTHROPIC_AUTH_TOKEN: 'DEEPSEEK_API_KEY' }, supportsEffort: true,
+    modelOptions: ['deepseek-v4-flash', 'deepseek-v4-pro'], effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'] });
   const codex = r.json.presets.find(p => p.name === 'codex');
   assert.deepEqual(codex, { name: 'codex', title: 'Codex', description: '用 ChatGPT 登录或 OpenAI API Key', recommended: false, adapter: 'codex', label: 'Codex', auth: 'login', env: {}, secrets: {}, supportsEffort: true,
     effortOptions: ['minimal', 'low', 'medium', 'high', 'xhigh'], types: ['code', 'fix', 'refactor'] });
@@ -130,7 +161,7 @@ test('预设 mimo / mimo-payg：完整内容与模板文件精确一致', () => 
     adapter: 'claude-code', label: 'MiMo V2.6 Pro', enabled: true,
     auth: 'token', secrets: { ANTHROPIC_AUTH_TOKEN: 'MIMO_API_KEY' }, maxTurns: null,
     price: { inputPer1M: null, outputPer1M: null, currency: 'CNY' }, recommended: false,
-    effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'],
+    effortOptions: ['low', 'medium', 'high', 'xhigh', 'max'], types: ['test', 'docs'], fit: { good: ['适合测试、文档'], avoid: [] },
     // 导入向导按服务合并卡片用的字段（112）：两个预设同一张卡片、同一个分段标签。
     card: { id: 'mimo', title: 'Xiaomi MiMo', description: '经 Claude Code 外壳运行，Token Plan 或按量付费' },
   };
@@ -226,7 +257,7 @@ test('agents add --preset openai-compat：写出有效的 provider 执行者；�
   assert.notEqual(config().defaultProfile, 'oai', 'Codex 外壳的执行者不当默认');
 
   const row = (await call(['agents', 'list', '--json'])).json.agents.find(a => a.name === 'oai');
-  assert.deepEqual(row, { name: 'oai', adapter: 'codex', label: 'DeepSeek（OpenAI 格式）', enabled: true, supported: true, default: false, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'set' }, login: null, model: 'deepseek-v4-flash', lastTest: null });
+  assert.deepEqual(row, { name: 'oai', adapter: 'codex', label: 'DeepSeek（OpenAI 格式）', enabled: true, supported: true, default: false, auth: 'token', secrets: { DEEPSEEK_API_KEY: 'set' }, login: null, model: 'deepseek-v4-flash', lastTest: null, fit: { good: [], avoid: [] } });
   const preset = (await call(['agents', 'presets', '--json'])).json.presets.find(x => x.name === 'openai-compat');
   assert.deepEqual(preset.baseUrlOptions, ['https://api.deepseek.com', 'https://api.openai.com/v1']);
   assert.deepEqual(preset.effortOptions, ['minimal', 'low', 'medium', 'high']);
@@ -235,6 +266,47 @@ test('agents add --preset openai-compat：写出有效的 provider 执行者；�
   assert.equal(updated.code, 0);
   assert.equal(config().profiles.oai.model, 'other-model'); assert.equal(config().profiles.oai.provider.baseUrl, 'http://127.0.0.1:9000/v1');
   for (const line of outputs) assert.ok(!line.includes(SECRET), '输出里出现了密钥值');
+});
+
+test('agents update：擅长和避免逐项覆盖、清空与恢复预设', async t => {
+  const { home, call, config } = setup(t);
+  await call(['agents', 'add', '--preset', 'deepseek']);
+  const preset = loadPreset('deepseek').profile.fit;
+  const fit = async () => (await call(['agents', 'list', '--json'])).json.agents.find(a => a.name === 'deepseek').fit;
+  assert.equal((await call(['agents', 'update', 'deepseek', '--avoid', ' 一 ； ; 二;  ', '--json'])).code, 0);
+  assert.deepEqual(await fit(), { good: preset.good, avoid: ['一', '二'] });
+  assert.deepEqual(config().profiles.deepseek.fit, { avoid: ['一', '二'] });
+  fs.writeFileSync(path.join(home, 'agent-tests.json'), JSON.stringify({ deepseek: { ok: true, at: Date.now() } }));
+  const route = await call(['route', 'suggest', '--json']);
+  assert.deepEqual(route.json.rules.find(r => r.profile === 'deepseek').fit, await fit());
+  await call(['agents', 'update', 'deepseek', '--avoid', '', '--good', '甲;乙']);
+  assert.deepEqual(await fit(), { good: ['甲', '乙'], avoid: [] });
+  await call(['agents', 'update', 'deepseek', '--avoid', '-']);
+  assert.deepEqual(await fit(), { good: ['甲', '乙'], avoid: preset.avoid });
+  assert.deepEqual(config().profiles.deepseek.fit, { good: ['甲', '乙'] });
+  await call(['agents', 'update', 'deepseek', '--good', '-']);
+  assert.deepEqual(await fit(), preset);
+  assert.equal(config().profiles.deepseek.fit, undefined);
+  for (const option of ['--good', '--avoid']) {
+    const bad = await call(['agents', 'update', 'deepseek', option, '--json']);
+    assert.equal(bad.code, 2);
+    assert.ok(bad.json.error.includes(option));
+  }
+});
+
+test('agents update：清空并恢复非空的 Codex 擅长和避免预设', async t => {
+  const { call, config } = setup(t);
+  const preset = loadPreset('codex').profile.fit;
+  assert.ok(preset.good.length > 0);
+  assert.ok(preset.avoid.length > 0);
+  const fit = async () => (await call(['agents', 'list', '--json'])).json.agents.find(a => a.name === 'codex').fit;
+  for (const key of ['avoid', 'good']) {
+    assert.equal((await call(['agents', 'update', 'codex', `--${key}`, ''])).code, 0);
+    assert.deepEqual((await fit())[key], []);
+    assert.equal((await call(['agents', 'update', 'codex', `--${key}`, '-'])).code, 0);
+    assert.deepEqual((await fit())[key], preset[key]);
+    assert.equal(Object.hasOwn(config().profiles.codex.fit ?? {}, key), false);
+  }
 });
 
 test('agents update：改 label/model/base-url/secret-var/max-turns；至少给一项；- 清空 maxTurns', async t => {
@@ -251,6 +323,81 @@ test('agents update：改 label/model/base-url/secret-var/max-turns；至少给�
   const badMax = await call(['agents', 'update', 'deepseek', '--max-turns', '0', '--json']);
   assert.equal(badMax.code, 2); assert.match(badMax.json.error, /--max-turns 必须为正整数或 -/);
   assert.match((await call(['agents', 'update', 'nope', '--label', 'x', '--json'])).json.error, /找不到执行者：nope/);
+});
+
+test('agents update：代提交开关与推理强度一起更新，非法值不写配置', async t => {
+  const { home, call, config } = setup(t);
+  await call(['agents', 'add', '--preset', 'deepseek', '--json']);
+  const other = structuredClone(config().profiles.codex);
+  const on = await call(['agents', 'update', 'deepseek', '--auto-commit', 'on', '--effort', 'high', '--json']);
+  assert.equal(on.code, 0);
+  assert.equal(config().profiles.deepseek.autoCommit, true);
+  assert.equal(config().profiles.deepseek.effort, 'high');
+  assert.deepEqual(config().profiles.codex, other);
+  assert.equal((await call(['agents', 'list', '--json'])).json.agents.find(a => a.name === 'deepseek').autoCommit, true);
+  assert.match((await call(['agents', 'list'])).out.join('\n'), /deepseek[^\n]*代提交：开/);
+  const before = fs.readFileSync(path.join(home, 'config.json'));
+  const bad = await call(['agents', 'update', 'deepseek', '--auto-commit', 'invalid', '--effort', 'low', '--json']);
+  assert.equal(bad.code, 2); assert.match(bad.json.error, /--auto-commit 必须为 on 或 off/);
+  assert.deepEqual(fs.readFileSync(path.join(home, 'config.json')), before);
+  assert.equal((await call(['agents', 'update', 'deepseek', '--auto-commit', 'off', '--json'])).code, 0);
+  assert.ok(!('autoCommit' in config().profiles.deepseek));
+  // codex 按 D181 默认代提交（列表显示"代提交：开（默认）"），这里只看 deepseek 这一行。
+  const deepseekLine = (await call(['agents', 'list'])).out.join('\n').split('\n').find(line => /^\s+deepseek\s/.test(line));
+  assert.ok(deepseekLine, '列表里有 deepseek');
+  assert.doesNotMatch(deepseekLine, /代提交：开/);
+});
+
+test('agents update：错误用法提示包含代提交开关', async t => {
+  const { call } = setup(t);
+  const result = await call(['agents', 'update', 'deepseek', '--json']);
+  assert.equal(result.code, 2);
+  assert.match(result.json.error, /--auto-commit on\|off/);
+  assert.ok(result.json.error.includes('[--price <输入>/<输出>/<CNY|USD>|""]'));
+});
+
+test('agents update：价格设置、覆盖和删除与其他设置一起原子保存', async t => {
+  const { home, call, config } = setup(t);
+  const file = path.join(home, 'config.json');
+  const initial = { v: 2, defaultProfile: 'fake1', profiles: {
+    fake1: { adapter: 'fake', label: '假执行者' }, fake2: { adapter: 'fake', label: '另一个' },
+  }, prices: { fake2: { input: 3, output: 4, currency: 'USD' } } };
+  fs.writeFileSync(file, JSON.stringify(initial));
+  const set = await call(['agents', 'update', 'fake1', '--price', '0/1.25/CNY', '--label', '更新', '--json']);
+  assert.equal(set.code, 0);
+  assert.deepEqual(set.json, { ok: true, name: 'fake1', profile: { adapter: 'fake', label: '更新' } });
+  assert.deepEqual(config().prices, { fake2: initial.prices.fake2, fake1: { input: 0, output: 1.25, currency: 'CNY' } });
+  assert.deepEqual(config().profiles.fake2, initial.profiles.fake2);
+  const overwrite = await call(['agents', 'update', 'fake1', '--price', '.5/2./USD']);
+  assert.equal(overwrite.code, 0); assert.equal(overwrite.out.join('\n'), '已更新执行者 fake1');
+  assert.deepEqual(config().prices.fake1, { input: 0.5, output: 2, currency: 'USD' });
+  const removed = await call(['agents', 'update', 'fake1', '--price', '', '--json']);
+  assert.equal(removed.code, 0); assert.deepEqual(config().prices, { fake2: initial.prices.fake2 });
+  assert.equal(config().profiles.fake1.label, '更新');
+  const before = fs.readFileSync(file);
+  const missing = await call(['agents', 'update', 'missing', '--price', '1/2/CNY', '--json']);
+  assert.equal(missing.code, 1); assert.equal(missing.json.error, '找不到执行者：missing');
+  assert.deepEqual(fs.readFileSync(file), before);
+});
+
+test('agents update：非法价格和混合选项失败不写配置', async t => {
+  const { home, call } = setup(t);
+  const file = path.join(home, 'config.json');
+  fs.writeFileSync(file, JSON.stringify({ v: 2, defaultProfile: 'fake1', profiles: { fake1: { adapter: 'fake', label: '假执行者' } }, prices: { fake1: { input: 1, output: 2, currency: 'CNY' } } }));
+  const before = fs.readFileSync(file);
+  for (const price of ['1/2', '1/2/CNY/x', '/2/CNY', '1//CNY', ' /2/CNY', '1 /2/CNY', '-1/2/CNY', '+1/2/CNY', 'Infinity/2/CNY', 'NaN/2/CNY', '1e3/2/CNY', '1/2/cny', '9'.repeat(310) + '/2/USD']) {
+    const bad = await call(['agents', 'update', 'fake1', '--label', '不应保存', '--price', price, '--json']);
+    assert.equal(bad.code, 1, price);
+    assert.equal(bad.json.error, '价格格式应为非负输入单价/非负输出单价/CNY或USD', price);
+    assert.deepEqual(fs.readFileSync(file), before, price);
+  }
+  const invalidOther = await call(['agents', 'update', 'fake1', '--price', '5/6/USD', '--auto-commit', 'bad', '--json']);
+  assert.equal(invalidOther.code, 2); assert.deepEqual(fs.readFileSync(file), before);
+  for (const args of [['--price'], ['--price', '1/2/CNY', '--price', '2/3/USD']]) {
+    const bad = await call(['agents', 'update', 'fake1', ...args, '--json']);
+    assert.equal(bad.code, 2); assert.match(bad.json.error, /^用法：/);
+    assert.deepEqual(fs.readFileSync(file), before);
+  }
 });
 
 test('agents default：设为默认；不存在或已停用报错', async t => {

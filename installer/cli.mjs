@@ -1,17 +1,21 @@
 import { join } from 'node:path';
-import { createPlan, executePlan, getStatus, rollbackPlan, version } from './lib/install.mjs';
+import { createPlan, executePlan, getStatus, listBackups, rollbackPlan, version } from './lib/install.mjs';
 import { homeDirectory, readConfig, writeConfig, formatConfig } from '../core/lib/config.mjs';
 import { readCodexConfig } from './lib/codex-config.mjs';
 
 export function parseInstallerArgs(args) {
   const options = {};
-  const flags = { '--status': 'status', '--dry-run': 'dryRun', '--yes': 'yes', '--replace-existing': 'replaceExisting', '--no-config': 'noConfig', '--rollback': 'rollback', '--uninstall': 'uninstall' };
+  const flags = { '--status': 'status', '--dry-run': 'dryRun', '--yes': 'yes', '--replace-existing': 'replaceExisting', '--no-config': 'noConfig', '--no-hook': 'noHook', '--rollback': 'rollback', '--uninstall': 'uninstall', '--list': 'list', '--help': 'help' };
   const values = { '--host': 'host', '--skill': 'skill', '--claude-dir': 'claudeDir' };
   for (let i = 0; i < args.length; i++) {
-    if (flags[args[i]]) options[flags[args[i]]] = true;
+    if (flags[args[i]]) {
+      options[flags[args[i]]] = true;
+      if (args[i] === '--rollback' && args[i + 1] && !args[i + 1].startsWith('--')) options.backup = args[++i];
+    }
     else if (values[args[i]] && args[i + 1] && !args[i + 1].startsWith('--')) options[values[args[i]]] = args[++i];
     else throw new Error(`无效参数或缺少值：${args[i]}`);
   }
+  if (options.list && !options.rollback) throw new Error('--list 只能和 --rollback 一起使用');
   if ([options.status, options.rollback, options.uninstall].filter(Boolean).length > 1) throw new Error('status、rollback、uninstall 不能同时使用');
   return options;
 }
@@ -30,7 +34,8 @@ export function formatPlan(plan, statusOnly = false) {
       lines.push(`    ${entry.skill.padEnd(22)}${stateText(entry)}${suffix}`);
     }
   }
-  for (const warning of plan.warnings) lines.push(`${warning.host}：lead-workflow 依赖 agent-router`);
+  if (plan.hook) lines.push(`${plan.hook.action === 'install' ? '注册' : plan.hook.action === 'uninstall' ? '移除' : '回退'}会话启动钩子：${plan.hook.target}`);
+  for (const warning of plan.warnings) lines.push(warning.message || `${warning.host}：lead-workflow 依赖 agent-router`);
   for (const h of plan.statuses) if (h.legacy?.length) lines.push(`检测到旧版 DispatchDock 技能：${h.legacy.map(l => l.skill).join('、')}（安装器不会改动，不再需要时可手动删除）`);
   return lines.join('\n');
 }
@@ -38,6 +43,16 @@ export function formatPlan(plan, statusOnly = false) {
 // 终端依赖由入口注入，测试可用模拟回答；lib 模块不接触终端。
 export async function runInstaller(args, { env = process.env, platform = process.platform, interactive = false, ask, output = console.log } = {}) {
   const options = { ...parseInstallerArgs(args), env, platform };
+  if (options.help) { output('用法：node installer/install.mjs [--status | --uninstall | --rollback [备份 id] [--list]] [--host 宿主] [--skill 技能] [--claude-dir 目录] [--dry-run] [--yes] [--replace-existing] [--no-config] [--no-hook]'); return { changed: [] }; }
+  if (options.list) {
+    const entries = listBackups(options), pad = n => String(n).padStart(2, '0');
+    if (!entries.length) output('没有可回退的备份');
+    for (const entry of entries) {
+      const date = new Date(entry.at), time = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+      output(`${entry.id}  ${time}  ${entry.reason}  ${entry.items.map(item => `${item.host}/${item.skill}`).join(', ')}`);
+    }
+    return { changed: [] };
+  }
   interactive = interactive && !options.yes;
   if (options.status) { output(formatPlan({ statuses: getStatus(options), items: [], warnings: [] }, true)); return { changed: [] }; }
   let plan = options.rollback ? rollbackPlan(options) : createPlan(options);
@@ -52,6 +67,10 @@ export async function runInstaller(args, { env = process.env, platform = process
     if (approved.size) {
       const replacements = createPlan({ ...options, replaceExisting: true });
       plan.items = plan.items.map(item => approved.has(item.target) ? replacements.items.find(i => i.target === item.target) : item);
+      for (const warning of replacements.warnings) {
+        if (!plan.warnings.some(existing => JSON.stringify(existing) === JSON.stringify(warning))) plan.warnings.push(warning);
+      }
+      if (!plan.hook && replacements.hook && approved.has(replacements.items.find(i => i.host === 'claude-code' && i.skill === 'agent-router')?.target)) plan.hook = replacements.hook;
       output(formatPlan(plan));
     }
   }

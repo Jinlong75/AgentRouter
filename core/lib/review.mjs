@@ -25,6 +25,9 @@ export const MAX_TRIES = 3;
 // 放进审查指令的汇报与差异的字节上限；超出的差异换成文件清单。
 export const REPORT_LIMIT = 8 * 1024;
 export const DIFF_LIMIT = 60 * 1024;
+// 所有重试补充说明合计最多 8KB，避免多次重试让审查指令无限增长。
+export const NOTES_LIMIT = 8 * 1024;
+const DISMISSED_LIMIT = 8 * 1024;
 // 解析出的结论里各字段的长度上限。
 const MAX_ISSUES = 50, TITLE_LIMIT = 200, DETAIL_LIMIT = 2000, SUMMARY_LIMIT = 300;
 const SEVERITIES = ['high', 'medium', 'low'];
@@ -107,9 +110,10 @@ function gateText(gate) {
 let template = null;
 const readTemplate = () => (template ??= readFileSync(new URL('../templates/review-prompt.md', import.meta.url), 'utf8'));
 
-// 组装审查指令：只替换 {{spec}} {{report}} {{diff}} {{gate}} {{base}} {{head}} 六个占位符（一次替换，内容里出现的占位符不再展开）。
+// 组装审查指令：一次替换模板占位符，内容里出现的占位符不再展开。
 // diff 超过 60KB 时换成 files（[{ path, added, deleted }]）的清单，请审查者自己读文件；汇报最多 8KB。
-export function reviewPrompt({ specText = '', report = '', diff = '', files = [], gate = null, base = '', head = '' } = {}) {
+// notes 按尝试顺序排列，每项为 { attempt: 尝试编号, text: 说明原文 }。
+export function reviewPrompt({ specText = '', report = '', diff = '', files = [], gate = null, base = '', head = '', notes = [], dismissed = [] } = {}) {
   const diffBytes = Buffer.byteLength(String(diff ?? ''), 'utf8');
   let diffPart;
   if (diffBytes > DIFF_LIMIT) {
@@ -117,14 +121,32 @@ export function reviewPrompt({ specText = '', report = '', diff = '', files = []
     diffPart = `改动太大（${Math.ceil(diffBytes / 1024)} KB），只列文件清单：${list.length ? `\n${list.join('\n')}\n` : '（读不到文件清单）'}请自己阅读这些文件。`;
   } else diffPart = String(diff ?? '').trim() === '' ? '（没有改动）' : String(diff);
   const values = {
-    spec: String(specText ?? ''),
+    spec: String(specText ?? '') + (notes.length ? `\n\n## 主导在重试时的补充说明（与任务说明冲突时以这里为准）\n\n${capBytes(notes.map(item => `第 ${item.attempt} 次尝试：${item.text}`).join('\n'), NOTES_LIMIT, `（补充说明超过 ${NOTES_LIMIT / 1024} KB，已截断）`)}` : ''),
+    dismissed: dismissed.length ? `## 主导已判为不成立的问题（上一轮）
+
+下面这些问题主导已逐条看过并判为不成立，理由附后。除非这次改动让情况变了、或你有理由之外的新证据，不要重复提出；确实要重提时，在问题说明里直接回应主导的理由。
+
+${capBytes(dismissed.map(item => `- ${item.id} ${item.severity} ${item.file}:${item.line ?? ''}  ${item.title}
+  主导理由：${item.note || '（未写理由）'}`).join('\n'), DISMISSED_LIMIT, '（问题列表超过 8 KB，已截断）')}
+
+` : '',
     report: capBytes(report, REPORT_LIMIT, `（汇报超过 ${REPORT_LIMIT / 1024} KB，已截断）`),
     diff: diffPart,
     gate: gateText(gate),
     base: String(base ?? ''),
     head: String(head ?? ''),
   };
-  return readTemplate().replace(/\{\{(spec|report|diff|gate|base|head)\}\}/g, (_, name) => values[name]);
+  return readTemplate().replace(/\{\{(spec|report|diff|gate|base|head|dismissed)\}\}/g, (_, name) => values[name]);
+}
+
+// 只读取已持久化的说明；历史记录中没有 note.md 的尝试自然跳过。
+export function collectReviewNotes(paths, attempt) {
+  const notes = [];
+  for (let n = 1; n <= attempt; n++) {
+    try { notes.push({ attempt: n, text: readFileSync(join(paths.dir, 'attempts', String(n), 'note.md'), 'utf8') }); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return notes;
 }
 
 // ---- 解析与完成判定 ----
@@ -419,8 +441,10 @@ export async function runReview(ctx) {
   const choose = exclude => chooseReviewer({ config, spec: ctx.spec, executor, model, exclude, home: ctx.home });
   let pick = choose(ctx.exclude ?? []);
   if (!pick.ok) {
-    progress('审查：没有可用的审查者');
-    return save({ summary: '没有可用的审查者', reasons: pick.reasons });
+    const whys = [...new Set((pick.reasons ?? []).map(item => text(item?.why)).filter(Boolean))];
+    const summary = whys.length ? `没有可用的审查者：${whys.join('；')}` : '没有可用的审查者';
+    progress(`审查：${summary}`);
+    return save({ summary, reasons: pick.reasons });
   }
 
   // 3. 只读校验准备：审查前 worktree 必须是干净的。
@@ -436,7 +460,7 @@ export async function runReview(ctx) {
   // 4. 组装指令：差异取基线到审查前 HEAD；太大时只给文件清单。
   const diff = ctx.base ? gitText(wt, ['diff', `${ctx.base}..${before.head}`]) : null;
   const prompt = reviewPrompt({
-    specText: ctx.specText, report: ctx.report,
+    specText: ctx.specText, report: ctx.report, notes: ctx.notes, dismissed: collectDismissed(paths, id),
     diff: diff ?? '（读不到差异，请自己用 git 查看）',
     files: diff !== null && Buffer.byteLength(diff, 'utf8') > DIFF_LIMIT ? diffFiles(wt, ctx.base, before.head) : [],
     gate: ctx.gate, base: ctx.base ?? '', head: before.head,
@@ -547,13 +571,13 @@ const REVIEW_USAGE = [
 const SUGGEST_MIN_CONFIRMED = 20;
 
 // 参数：记录名等位置参数 + 若干带值开关；不认识的 -- 开关、开关缺值都报用法。
-function parseArguments(args, values = []) {
+function parseArguments(args, values = [], freeText = []) {
   const positional = [], options = {};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (values.includes(arg)) {
       const value = args[++i];
-      if (value === undefined || value.startsWith('--')) throw new Error(REVIEW_USAGE);
+      if (freeText.includes(arg) ? value === undefined || /^--[A-Za-z][A-Za-z0-9-]*$/.test(value) : value === undefined || value.startsWith('--')) throw new Error(REVIEW_USAGE);
       options[arg] = value;
     } else if (arg.startsWith('--')) throw new Error(REVIEW_USAGE);
     else positional.push(arg);
@@ -630,7 +654,7 @@ async function rerunCommand(args, { homes, root, env }) {
     root: repo, paths, id: start.id, worktree: worktree.dir,
     executor: lastAttempt?.profile ?? start.profile, model: (resume ?? start).model ?? null,
     attempt: n, run, spec: { ...(spec ?? {}), ...(options['--profile'] ? { reviewer: options['--profile'] } : {}) },
-    specText, report, gate, base: gate?.base ?? lastAttempt?.base ?? worktree.base ?? start.base ?? null,
+    specText, report, notes: collectReviewNotes(paths, n), gate, base: gate?.base ?? lastAttempt?.base ?? worktree.base ?? start.base ?? null,
     config, home: homes[0], env, registry: registryWriter(found.home), progress: line => lines.push(line),
   });
   const done = VERDICTS.includes(review.verdict);
@@ -646,7 +670,7 @@ async function rerunCommand(args, { homes, root, env }) {
 
 // ar review confirm：在顶层 review.json 的这条问题上写确认，并写 review-confirm 事件（统计准确率用）。
 function confirmCommand(args, { homes, root, env }) {
-  const { positional, options } = parseArguments(args, ['--note', '--by']);
+  const { positional, options } = parseArguments(args, ['--note', '--by'], ['--note']);
   if (positional.length !== 3 || !['valid', 'invalid'].includes(positional[2])) throw new Error(REVIEW_USAGE);
   const [name, issueId, result] = positional;
   const by = options['--by'] ?? (env.CLAUDECODE === '1' ? 'lead' : 'human');
@@ -662,11 +686,22 @@ function confirmCommand(args, { homes, root, env }) {
   const note = options['--note'] ?? null;
   issue.confirmation = { result, by, note, at };
   writeJson(file, review);
+  const historyFile = join(dir, 'attempts', String(review.attempt), review.run > 1 ? `review-${review.run}.json` : 'review.json');
+  if (existsSync(historyFile)) writeJson(historyFile, review);
   registryWriter(found.home)({ event: 'review-confirm', id: found.start.id, issue: issueId, severity: issue.severity, result, by, reviewer: review.reviewer ?? null, at });
   return {
     result: { ok: true, name, issue: issueId, severity: issue.severity, result, by, note },
     text: `已确认：${issueId} ${result === 'valid' ? '成立' : '不成立'}（${by}）`,
   };
+}
+
+// 审查结论是"没有可用的审查者"时的补审提示：有可用的其他已启用执行者时填第一个（按配置顺序，排除本任务执行者），
+// 没有就留占位符，提醒换一个和执行者不同的。
+export function reviewerFixHint({ review = null, config = null, executor = null, name } = {}) {
+  if (typeof review?.summary !== 'string' || !review.summary.startsWith('没有可用的审查者')) return null;
+  const profiles = object(config?.profiles) ? config.profiles : {};
+  const other = Object.keys(profiles).find(key => key !== executor && object(profiles[key]) && profiles[key].enabled !== false) ?? null;
+  return `补审：ar review ${name} --profile ${other ?? '<执行者名>'}（换一个和执行者不同的）`;
 }
 
 function showCommand(args, { homes, root }) {
@@ -677,22 +712,60 @@ function showCommand(args, { homes, root }) {
   const dir = found.start.dir ?? taskPaths(resolve(found.start.repo ?? root), found.start.name).dir;
   const review = readJsonFile(join(dir, 'review.json'));
   if (!reviewBrief(review)) throw new Error(`审查：${name} 还没有审查结果`);
-  return { result: { ok: true, name, review }, text: reviewLines(review).join('\n') };
+  const lines = reviewLines(review);
+  let config = null;
+  try { config = readEffectiveConfig(homes[0]); } catch { /* 读不到配置时补审提示只能是占位符。 */ }
+  const hint = reviewerFixHint({ review, config, executor: found.start.profile, name: found.start.name });
+  if (hint) lines.push(hint);
+  return { result: { ok: true, name, review }, text: lines.join('\n') };
+}
+
+// 每个任务每条问题取最后一条有效的确认记录；输入按记录顺序排列。
+export function latestReviewConfirms(rows) {
+  const last = new Map();
+  for (const row of rows) {
+    if (row?.event !== 'review-confirm' || typeof row.id !== 'string' || typeof row.issue !== 'string' || !['valid', 'invalid'].includes(row.result)) continue;
+    last.set(`${row.id}\0${row.issue}`, row);
+  }
+  return last;
+}
+
+// 汇集历史审查与顶层结果，按确认时间取每个问题的最后一次判断。
+function collectDismissed(paths, id) {
+  const reviews = [];
+  const attemptsDir = join(paths.dir, 'attempts');
+  let attempts = [];
+  try { attempts = readdirSync(attemptsDir).filter(name => /^\d+$/.test(name)).sort((a, b) => Number(a) - Number(b)); } catch { /* 没有历史。 */ }
+  for (const attempt of attempts) {
+    const dir = join(attemptsDir, attempt);
+    let files = [];
+    try { files = readdirSync(dir).filter(name => /^review(?:-\d+)?\.json$/.test(name)).sort((a, b) => (Number(/-(\d+)/.exec(a)?.[1]) || 1) - (Number(/-(\d+)/.exec(b)?.[1]) || 1)); } catch { /* 没有审查。 */ }
+    for (const file of files) reviews.push(readJsonFile(join(dir, file)));
+  }
+  reviews.push(readJsonFile(join(paths.dir, 'review.json')));
+  const rows = [];
+  for (const review of reviews) for (const issue of review?.issues ?? []) {
+    if (issue?.confirmation) rows.push({ event: 'review-confirm', id, issue: issue.id, ...issue.confirmation, item: issue });
+  }
+  rows.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  return [...latestReviewConfirms(rows).values()].filter(row => row.result === 'invalid').map(row => ({
+    id: row.issue, severity: row.item.severity, file: row.item.file, line: row.item.line, title: row.item.title, note: row.note, by: row.by,
+  }));
 }
 
 // 每个审查者 × 严重度的准确率：清单里所有 review-confirm 事件，每个任务每条问题取最后一次。
 function statsCommand(args, { homes }) {
   if (args.length) throw new Error(REVIEW_USAGE);
-  const last = new Map();
+  const rows = [];
   let text = '';
   try { text = readFileSync(join(homes[0], 'runs.jsonl'), 'utf8'); } catch { /* 没有清单就是还没有确认过。 */ }
   for (const line of text.split('\n')) {
     if (!line.includes('review-confirm')) continue;
     let row;
     try { row = JSON.parse(line); } catch { continue; }
-    if (row?.event !== 'review-confirm' || typeof row.id !== 'string' || typeof row.issue !== 'string' || !['valid', 'invalid'].includes(row.result)) continue;
-    last.set(`${row.id}\0${row.issue}`, row);
+    rows.push(row);
   }
+  const last = latestReviewConfirms(rows);
   const byReviewer = new Map();
   for (const row of last.values()) {
     if (!Object.hasOwn(SEVERITY_LABEL, row.severity)) continue;

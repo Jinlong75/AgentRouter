@@ -1,11 +1,11 @@
 {
   "name": "deepseek",
   "adapter": "claude-code",
-  "label": "DeepSeek V4 Pro",
+  "label": "DeepSeek V4 Flash",
   "enabled": true,
   "env": {
     "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-    "ANTHROPIC_MODEL": "deepseek-v4-pro"
+    "ANTHROPIC_MODEL": "deepseek-v4-flash"
   },
   "auth": "token",
   "secrets": { "ANTHROPIC_AUTH_TOKEN": "DEEPSEEK_API_KEY" },
@@ -14,8 +14,9 @@
   "title": "DeepSeek",
   "description": "经 Claude Code 外壳运行，按量付费，用 API Key",
   "recommended": true,
-  "modelOptions": ["deepseek-v4-pro", "deepseek-v4-flash"],
+  "modelOptions": ["deepseek-v4-flash", "deepseek-v4-pro"],
   "effortOptions": ["low", "medium", "high", "xhigh", "max"],
   "types": ["test", "docs"],
-  "order": 1
+  "order": 1,
+  "fit": {"good": ["文档与大段中文文本编辑", "按清单补测试"], "avoid": []}
 }

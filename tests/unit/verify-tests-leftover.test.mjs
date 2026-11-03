@@ -79,6 +79,18 @@ test('runVerify：测试用完自己的临时目录就通过；样例里的 tmpd
   assert.match(text, /verify 遗留检查：测试没有留下临时目录和进程/);
 });
 
+test('runVerify：子进程的用户目录与环境一致，结束后清理', async t => {
+  const { code, text } = await nested(t, `test('用户目录', async () => {
+  const { homedir } = await import('node:os');
+  if (process.env.USERPROFILE !== process.env.HOME || homedir() !== process.env.HOME || !process.env.HOME.includes('ar-verify-user-')) throw Error('用户目录未隔离');
+  writeFileSync(process.env.AR_USER_PROBE, process.env.HOME);
+});`, { AR_USER_PROBE: join(tmpdir(), `ar-user-probe-${process.pid}`) });
+  const probe = join(tmpdir(), `ar-user-probe-${process.pid}`);
+  t.after(() => rmSync(probe, { force: true }));
+  assert.equal(code, 0, text);
+  assert.ok(!existsSync(readFileSync(probe, 'utf8')));
+});
+
 test('runVerify：测试留下临时目录就让 verify 失败，并写出是哪个测试文件留下的哪个目录', async t => {
   const { code, text } = await nested(t, "test('不清理', () => { mkdtempSync(join(tmpdir(), 'ar-sample-left-')); });");
   assert.equal(code, 1, text);

@@ -11,15 +11,15 @@ export { homeDirectory, userDirectory };
 // codex 执行者的派发设置与窗口策略的内置默认值。
 export const defaults = { model: null, effort: null, tier: null, sandbox: 'workspace-write', path: null, watchWindow: 'auto' };
 const codexKeys = ['model', 'effort', 'tier', 'sandbox', 'path'];
-const parallelKeys = ['concurrency', 'concurrencyMax', 'gateConcurrency', 'memLowPercent'];
+const parallelKeys = ['concurrency', 'concurrencyMax', 'gateConcurrency', 'memLowPercent', 'autoAdjustSamples', 'autoAdjustCpuPercent', 'autoAdjustMemoryMarginGb'];
 function parallelValue(key, value) {
   if (key === 'concurrency' && value === 'auto') return value;
-  const number = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  const number = typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)) ? Number(value) : value;
   const integer = Number.isSafeInteger(number) && number > 0;
-  const valid = key === 'memLowPercent' ? validMemLowPercent(number)
+  const valid = key === 'autoAdjustMemoryMarginGb' ? Number.isFinite(number) && number >= 0 : key === 'autoAdjustSamples' ? integer : key === 'autoAdjustCpuPercent' ? integer && number <= 100 : key === 'memLowPercent' ? validMemLowPercent(number)
     : key === 'gateConcurrency' ? integer : integer && number <= concurrencyCap;
   if (!valid) {
-    const requirement = key === 'gateConcurrency' ? '正整数' : key === 'memLowPercent' ? `1～${memLowPercentMax} 的整数` : `1～${concurrencyCap} 的整数${key === 'concurrency' ? '或 auto' : ''}`;
+    const requirement = key === 'autoAdjustMemoryMarginGb' ? '非负数' : key === 'autoAdjustSamples' ? '正整数' : key === 'autoAdjustCpuPercent' ? '1～100 的整数' : key === 'gateConcurrency' ? '正整数' : key === 'memLowPercent' ? `1～${memLowPercentMax} 的整数` : `1～${concurrencyCap} 的整数${key === 'concurrency' ? '或 auto' : ''}`;
     throw new Error(`命令行的 ${key} 必须为${requirement}`);
   }
   return number;
@@ -163,6 +163,7 @@ function validateFamilyRules(rules) {
 function validateRouting(routing) {
   if (routing == null) return;
   if (!object(routing)) throw new Error('config.json 的 routing 必须为对象');
+  if (Object.hasOwn(routing, 'implicit') && typeof routing.implicit !== 'boolean') throw new Error('config.json 的 routing.implicit 必须为布尔值');
   if (routing.rules != null) {
     if (!Array.isArray(routing.rules)) throw new Error('config.json 的 routing.rules 必须为数组');
     routing.rules.forEach((rule, index) => {
@@ -219,8 +220,18 @@ function validateProxy(proxy) {
   }
 }
 
+// 统计页的额外只读数据源（427）：字符串数组，每项是目录的绝对路径；不写表示只用公共目录。
+export function statsSourcesOf(config = {}) {
+  const raw = config?.statsSources;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.some(value => typeof value !== 'string' || !value || !isAbsolute(value))) throw new Error('config.json 的 statsSources 必须是绝对路径的数组');
+  return raw;
+}
+
 export function validateV2(config) {
   validateProxy(config.proxy);
+  statsSourcesOf(config);
+  if (config.lead !== undefined && (typeof config.lead !== 'string' || !config.lead.trim())) throw new Error('config.json 的 lead 必须为执行者名');
   if (config.profiles != null && !object(config.profiles)) throw new Error('config.json 的 profiles 必须为对象');
   for (const [name, profile] of Object.entries(config.profiles ?? {})) {
     if (!object(profile)) throw new Error(`config.json 的 profiles.${name} 必须为对象`);
@@ -281,6 +292,15 @@ export function slotLimits(config = {}, probe = {}) {
   const percentValue = config?.memLowPercent;
   const memLowPercent = validMemLowPercent(percentValue) ? percentValue : memLowPercentDefault;
   if (percentValue !== undefined && !validMemLowPercent(percentValue)) warnings.push(`配置：memLowPercent 必须为 1～${memLowPercentMax} 的整数，已按默认值 ${memLowPercentDefault} 处理`);
+  const adjust = {};
+  for (const [key, fallback, valid] of [
+    ['autoAdjustSamples', 3, v => Number.isSafeInteger(v) && v > 0],
+    ['autoAdjustCpuPercent', 60, v => Number.isSafeInteger(v) && v >= 1 && v <= 100],
+    ['autoAdjustMemoryMarginGb', 1, v => typeof v === 'number' && Number.isFinite(v) && v >= 0],
+  ]) {
+    adjust[key] = valid(config[key]) ? config[key] : fallback;
+    if (config[key] !== undefined && !valid(config[key])) warnings.push(`配置：${key} 无效，已按默认值 ${fallback} 处理`);
+  }
   const estimate = estimateConcurrency({ cores: probe.cores ?? machineCores(), freeMemBytes: probe.freeMemBytes ?? os.freemem(), max });
   let mode = 'fixed';
   for (const [key, fallback] of Object.entries(slotDefaults)) {
@@ -296,7 +316,7 @@ export function slotLimits(config = {}, probe = {}) {
     limits[key] = fallback; sources[key] = '内置默认';
     if (value !== undefined) warnings.push(`配置：${key} 必须为正整数，已按默认值 ${fallback} 处理`);
   }
-  return { limits, sources, warnings, mode, estimate, max, maxSource: inRange(maxValue) ? 'config.json' : '内置默认', memLowPercent, memLowSource: validMemLowPercent(percentValue) ? 'config.json' : '内置默认' };
+  return { limits, sources, warnings, mode, estimate, max, ...adjust, maxSource: inRange(maxValue) ? 'config.json' : '内置默认', memLowPercent, memLowSource: validMemLowPercent(percentValue) ? 'config.json' : '内置默认' };
 }
 
 // 执行者会话记录的保留天数（ar gc 用）：sessionRetentionDays 为正整数，没写为 14；不是正整数的值按默认处理并提示。
@@ -429,12 +449,35 @@ export function settingSourcesOf(sources) {
   return { model: sources?.model ?? null, effort: sources?.effort ?? null };
 }
 
+// 已导入的声明也补上预设后来加的环境变量和运行时要求：默认值由 agents.mjs 在加载时注册。
+// config.mjs 不能静态引用 agents.mjs：它用 import.meta.url 定位预设目录，打进 Electron 的 CJS 主进程包时
+// import.meta 为空、模块一载入就报错。只在读配置时补进内存，不改写用户的 config.json；
+// 配置里已有的同名键以配置为准。对应不到预设的声明（钩子返回空对象）不动。
+let genericEnvDefaults = null;
+export function registerGenericEnvDefaults(fn) { genericEnvDefaults = typeof fn === 'function' ? fn : null; }
+function withGenericEnvDefaults(config) {
+  if (!genericEnvDefaults || !object(config?.generics)) return config;
+  let changed = false;
+  const generics = {};
+  for (const [name, decl] of Object.entries(config.generics)) {
+    if (!object(decl)) { generics[name] = decl; continue; }
+    let defaults = null;
+    try { defaults = genericEnvDefaults(name, decl); } catch { /* 预设读不了：按原声明，不补。 */ }
+    const missing = object(defaults?.env) ? Object.entries(defaults.env).filter(([key, value]) => typeof value === 'string' && !(object(decl.env) && Object.hasOwn(decl.env, key))) : [];
+    const nodeDefault = !Object.hasOwn(decl, 'requiresSystemNode') && typeof defaults?.requiresSystemNode === 'boolean';
+    if (!missing.length && !nodeDefault) { generics[name] = decl; continue; }
+    generics[name] = { ...decl, ...(missing.length ? { env: { ...Object.fromEntries(missing), ...decl.env } } : {}), ...(nodeDefault ? { requiresSystemNode: defaults.requiresSystemNode } : {}) };
+    changed = true;
+  }
+  return changed ? { ...config, generics } : config;
+}
+
 // 只读取得"实际生效"的配置（ar route 用，不写任何文件，也不迁移旧目录的配置）：
 // 没有配置文件时是旧目录里的 v1 配置（迁移后的样子），再没有就是内置默认；读不了就拒绝。
 export function readEffectiveConfig(home) {
   const state = readConfig(home);
   if (state.reason) throw configInvalid(state);
-  return validateV2(state.exists ? state.config : state.legacy?.config ?? builtinConfig());
+  return withGenericEnvDefaults(validateV2(state.exists ? state.config : state.legacy?.config ?? builtinConfig()));
 }
 
 // choose：派发时用路由器选执行者（config => { profileName, profile, ...附带信息 }），附带信息原样带回；不给就是旧的 selectProfile。
@@ -453,6 +496,7 @@ export function loadConfig(home, opts = {}, env = process.env, { choose } = {}) 
     config = builtinConfig(); warning = '配置：未找到 config.json，模型、强度、档位跟随 Codex 自己的配置';
   } else if (state.upgraded) warning = '配置：config.json 是旧版本，已按 v2 解读';
   validateV2(config);
+  config = withGenericEnvDefaults(config);
   const { profileName, profile, ...chosen } = choose ? choose(config) : selectProfile(config, opts, env);
   return { ...state, config, profileName, profile, ...chosen, ...resolveSettings(config, opts, env, profileName), warning };
 }

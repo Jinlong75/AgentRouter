@@ -1,8 +1,8 @@
 import { ag, c, gx, p, pj, px, ro, s6, sc } from '../shared/copy';
 import { esc } from '../shared/markdown';
-import type { AgentPreset, Connections, GcItems, GcRun, Settings } from '../shared/types';
+import type { AgentPreset, Connections, GcItems, GcRun, HarnessCheck, HarnessEvent, HarnessResult, Settings } from '../shared/types';
 import { icon, menu, confirmAction, openSheet, field, trace, type Sheet } from './ui';
-import { AgentsView, ProbeBox, RolesBox, forgetProbe, loadRoles, modelControl, presetCards, redrawSheet, variantField } from './agents';
+import { AgentsView, applyHarnessProgress, emptyHarnessProgress, harnessProgressHtml, type HarnessProgressState, type HarnessStepProgress, ProbeBox, RolesBox, forgetProbe, loadRoles, modelControl, presetCards, redrawSheet, variantField } from './agents';
 import { bindChoices, choiceHtml, type Choice, type ChoiceSpec, type Opt } from './agent-custom';
 import { goToSuggest } from './routing';
 import brand from '../../design/icons/mark.svg';
@@ -20,6 +20,10 @@ const section = (title: string, description: string, body: string) => `<div clas
 // 与 agents.ts 的导入向导同形：预设与测试结果都来自核心（agents:presets / agents:test）。
 type Preset = AgentPreset;
 interface WizardTest { ok: boolean; seconds?: number; version?: string | null; reason?: string }
+// 第 1 步逐项检测（git / Claude Code / Codex / Qoder）：只记有没有和版本，读不到按没有。
+interface WizardTool { installed: boolean; version: string; root?: string }
+// 第 4 步 Harness 的状态机：检测 → 确认 / 已检测到 / 已安装 → 安装中 → 完成 / 失败 / 不兼容 / 保留。
+type HarnessState = 'idle' | 'loading' | 'confirm' | 'found' | 'installed' | 'installing' | 'done' | 'failed' | 'incompatible' | 'kept' | 'nonpm';
 
 export class PreferencesView {
     settings!: Settings;
@@ -48,6 +52,11 @@ export class PreferencesView {
     // 列表一节（018）：清空任务列表 / 项目列表后的行内说明。
     private tasksNote = '';
     private projectsNote = '';
+    // 额外的统计数据目录（427）：只读并入统计页；列表、忙碌态与错误。
+    private statsSources: string[] = [];
+    private statsSourcesBusy = false;
+    private statsSourcesError = '';
+    private statsSourcesLoaded = false;
     // 数据一节的“清理”（ar gc）：启动时在后台检查一次（只列出，不删）；结果、检查状态与上次清理完成的说明。
     private gcState: 'checking' | 'ready' | 'failed' = 'checking';
     private gcItems: GcItems | null = null;
@@ -83,28 +92,100 @@ export class PreferencesView {
     // 第 3 步"失败时想换用的强执行者"：测试通过后读到的已启用执行者，和所选的那个（空串是"不设"）。
     private wizardStrongList: { name: string; label: string }[] = [];
     private wizardStrong = '';
-    // 引导第 4 步：所选项目文件夹与"添加后打开初始化预览"。
+    // 引导第 5 步：所选项目文件夹与"添加后打开初始化预览"。
     private wizardProject = '';
     private wizardOpenInit = true;
+    // 引导第 1 步（302）：逐项检测结果；检测在途时整行写"检测中"。
+    private wizardGit: WizardTool | null = null;
+    private wizardClaude: WizardTool | null = null;
+    private wizardCodex: WizardTool | null = null;
+    private wizardQoder: WizardTool | null = null;
+    private wizardToolsLoading = false;
+    private wizardToolsError = '';
+    // 引导第 4 步（302）：Harness 的检测结果、状态机、版本选择与安装进度。
+    private harnessCheck: HarnessCheck | null = null;
+    private harnessState: HarnessState = 'idle';
+    private harnessVersion = '';
+    private harnessManual = false;
+    private harnessManualValue = '';
+    private harnessVersionErr = '';
+    private harnessProgress: HarnessProgressState = emptyHarnessProgress();
+    private harnessStarted = 0;
+    private harnessSeconds = 0;
+    private harnessTimer?: ReturnType<typeof setInterval>;
+    private harnessError = '';
+    private harnessLastImport = false;
+    private harnessResult: HarnessResult | null = null;
+    private harnessFallback = '';
+    private harnessCancelled = false;
+    private harnessUnsubscribe?: () => void;
     constructor(private redrawShell: () => void, private redrawStatus: () => void, private openProject?: (path: string) => void, private running: () => number = () => 0) {}
     focusManaged() { this.container?.querySelector('#managed-section')?.scrollIntoView({block:'start'}); }
-    unmount() { this.container=undefined; this.active=''; clearInterval(this.parallelTimer); }
-    async init() { this.settings = await window.dock.preferences('settings'); this.wizard = !this.settings.own.wizardDone; void this.detect(); void this.gcCheck(); }
+    focusStatsSources() { this.container?.querySelector('#stats-sources-section')?.scrollIntoView({block:'start'}); }
+    unmount() { this.agentsView.unmount(); this.container=undefined; this.active=''; clearInterval(this.parallelTimer); this.stopHarnessTimer(); }
+    async init() {
+        this.settings = await window.dock.preferences('settings');
+        this.wizard = !this.settings.own.wizardDone;
+        // 安装进度走主进程的事件通道（301）；测试里的 window.dock 没有这个函数时不影响页面。
+        if (typeof window.dock.onHarnessEvent === 'function') this.harnessUnsubscribe = window.dock.onHarnessEvent(event => this.onHarnessEvent(event));
+        void this.detect();
+        void this.detectWizardTools();
+        void this.gcCheck();
+        // 统计页的"在设置里管理"：切到设置页后由事件通知把这一节滚到眼前。
+        window.addEventListener('ar:stats-sources', () => this.focusStatsSources());
+    }
     mount(container: HTMLElement, page: string, version: string) {
         // 进入页面时丢掉上次没保存的代理草稿（同一页面内重绘不丢）。
         if (this.active !== page) { this.proxyManual = false; this.proxyDraft = null; this.proxyError = ''; this.proxySaved = false; }
+        if (page !== 'connect') this.agentsView.unmount();
         this.container = container; this.active = page; this.version = version;
         this.error='';
         container.replaceChildren(); this.renderedWizard = '';
         this.render();
         container.onclick = e => { void this.click(e).catch(error => { this.error = String(error.message || error); this.render(); }); };
         // 代理地址输入框：输入时记下草稿（整块重建后还在）；回车等同点"保存"。
-        container.oninput = e => { const input = e.target as HTMLInputElement; if (input.matches?.('[data-pref=proxy-url]')) this.proxyDraft = input.value; if (input.matches?.('[data-wizard-limit]')) { this.wizardLimit = input.value; this.wizardLimitErr = ''; const er = container.querySelector<HTMLElement>('[data-wizard-limit-error]'); if (er) { er.textContent = ''; er.classList.remove('on'); } input.classList.remove('bad'); } };
+        container.oninput = e => {
+            const input = e.target as HTMLInputElement;
+            if (input.matches?.('[data-pref=proxy-url]')) this.proxyDraft = input.value;
+            if (input.matches?.('[data-wizard-limit]')) { this.wizardLimit = input.value; this.wizardLimitErr = ''; const er = container.querySelector<HTMLElement>('[data-wizard-limit-error]'); if (er) { er.textContent = ''; er.classList.remove('on'); } input.classList.remove('bad'); }
+            // 第 4 步手动输入版本号：只记草稿，点"安装"时才校验并写入；
+            // 输入的同时更新"安装"按钮能不能点（合法版本可点、空值或非法不可点，R2-2）。
+            if (input.matches?.('[data-wizard-version]')) {
+                this.harnessManualValue = input.value;
+                this.harnessVersionErr = '';
+                const er = container.querySelector<HTMLElement>('[data-wizard-version-error]');
+                if (er) { er.textContent = ''; er.classList.remove('on'); }
+                input.classList.remove('bad');
+                const install = container.querySelector<HTMLButtonElement>('[data-pref=wizard-harness-install]');
+                if (install) install.disabled = !this.harnessVersionValid(this.harnessEffectiveVersion());
+            }
+        };
         container.onkeydown = e => { if (e.key === 'Enter' && (e.target as HTMLElement).matches?.('[data-pref=proxy-url]')) { e.preventDefault(); void this.saveProxyAddress(); } };
         if (page === 'connect') void this.detect();
-        if (page === 'settings') { void this.refreshSettings(); this.startParallelTimer(); } else clearInterval(this.parallelTimer);
+        if (page === 'settings') { void this.refreshSettings(); this.startParallelTimer(); void this.loadStatsSources(); } else clearInterval(this.parallelTimer);
     }
     async refreshSettings() { try { this.settings = await window.dock.preferences('settings'); this.render(); this.redrawStatus(); } catch(e) { this.error=String(e); this.render(); } }
+    // 427：额外的统计数据目录（只读并入统计页）。列表与增删都经主进程转给核心。
+    private async loadStatsSources() {
+        try { this.statsSources = await window.dock.preferences('statsSources') ?? []; this.statsSourcesError = ''; }
+        catch (e) { this.statsSourcesError = String((e as Error)?.message || e); }
+        this.statsSourcesLoaded = true;
+        if (this.active === 'settings') this.render();
+    }
+    private async addStatsSource() {
+        if (this.statsSourcesBusy) return;
+        this.statsSourcesBusy = true; this.statsSourcesError = ''; this.render();
+        try { this.statsSources = await window.dock.preferences('statsSourcesAdd') ?? this.statsSources; }
+        catch (e) { this.statsSourcesError = String((e as Error)?.message || e); }
+        finally { this.statsSourcesBusy = false; this.render(); }
+    }
+    private async removeStatsSource(source: string) {
+        if (this.statsSourcesBusy) return;
+        this.statsSourcesBusy = true; this.statsSourcesError = ''; this.render();
+        try { this.statsSources = await window.dock.preferences('statsSourcesRemove', { directory: source }) ?? this.statsSources; }
+        catch (e) { this.statsSourcesError = String((e as Error)?.message || e); }
+        finally { this.statsSourcesBusy = false; this.render(); }
+    }
     async detect() {
         if (this.detecting) { this.detectPending = true; trace('detect-skip', { reason: '已有检测在进行，结束后补做一次' }); return; }
         const redraw = () => { if(this.wizard || this.active==='connect') this.render(); };
@@ -115,6 +196,209 @@ export class PreferencesView {
             this.detecting = false; redraw(); if (!this.wizard && this.active === 'connect') void this.agentsView.refresh(true);
             // 在途检测期间收到的请求合并成一次补做：只补一次，补做期间再来的请求才会再记一次。
             if (this.detectPending) { this.detectPending = false; trace('detect-again', { reason: '在途检测结束后补做一次' }); void this.detect(); }
+        }
+    }
+    // 第 1 步逐项检测（302）：git / Claude Code / Codex / Qoder 用 agents:detect-decl 读命令，
+    // Claude Code 与 Codex 也参考连接检测（Claude Code 的安装目录、Codex 的登录方式从这里来）；Harness 用 harness:check。
+    private async detectWizardTools() {
+        if (!this.wizard || this.wizardToolsLoading) return;
+        this.wizardToolsLoading = true;
+        this.wizardToolsError = '';
+        this.render();
+        const declarative = async (executable: string): Promise<WizardTool> => {
+            try {
+                const result = await window.dock.console('agents:detect-decl', { decl: { executable } });
+                return { installed: !!result?.installed, version: typeof result?.version === 'string' ? result.version : '' };
+            }
+            catch { return { installed: false, version: '' }; }
+        };
+        try {
+            const [git, claude, qoder, check] = await Promise.all([declarative('git'), declarative('claude'), declarative('qodercli'), this.loadHarnessCheck()]);
+            let qoderTool = qoder;
+            if (!qoderTool.installed) {
+                const cn = await declarative('qoderclicn');
+                if (cn.installed) qoderTool = cn;
+            }
+            const codexTool = await declarative('codex');
+            const cc = this.connections?.hosts.find(host => host.host === 'claude-code');
+            const codexConn = this.connections?.codex;
+            this.wizardGit = git;
+            this.wizardQoder = qoderTool;
+            this.wizardClaude = cc?.detected ? { installed: true, version: '', root: cc.root } : claude;
+            this.wizardCodex = codexConn?.installed ? { installed: true, version: codexConn.version || '' } : codexTool;
+            this.harnessCheck = check;
+        }
+        catch (e) { this.wizardToolsError = String((e as Error)?.message || e); }
+        finally {
+            this.wizardToolsLoading = false;
+            if (this.wizard && this.step === 1) this.render();
+        }
+    }
+    // harness:check 失败（含没有 npm）也返回一份带原因的结果，界面据此显示说明而不是空白。
+    private async loadHarnessCheck(): Promise<HarnessCheck> {
+        const empty: HarnessCheck = { ok: false, name: '', title: 'Harness', secretVar: '', verified: '', installed: null, path: null, updateAvailable: false };
+        try { return await window.dock.console('harness:check'); }
+        catch (e) {
+            const message = String((e as Error)?.message || e);
+            return { ...empty, error: message, noNpm: message.includes('没有找到 npm') };
+        }
+    }
+    // 进入第 4 步：读一次检测结果；已经完成 / 保留 / 已安装的不重复检测（从第 5 步退回来时保持原状态）。
+    private async enterHarnessStep() {
+        this.step = 4;
+        this.error = '';
+        this.harnessError = '';
+        this.harnessCancelled = false;
+        if (!['idle', 'loading', 'confirm', 'nonpm'].includes(this.harnessState)) { this.render(); return; }
+        this.harnessState = 'loading';
+        this.render();
+        const check = await this.loadHarnessCheck();
+        this.harnessCheck = check;
+        this.harnessVersion = check.warning ? (check.verified || '') : (check.recommended || check.verified || '');
+        this.harnessManual = false;
+        this.harnessManualValue = '';
+        this.harnessVersionErr = '';
+        // 已经装好的 dsh 优先：没有 npm 只说明"不能安装 / 更新"，不影响直接导入（R2-4）。
+        if (check.installed) this.harnessState = await this.harnessImported() ? 'installed' : 'found';
+        else if (check.noNpm) this.harnessState = 'nonpm';
+        else this.harnessState = 'confirm';
+        this.render();
+    }
+    // "已经检测到 dsh"和"已安装"的区别：预设有没有导入成执行者。
+    private async harnessImported() {
+        try {
+            const list = await window.dock.console('agents:list');
+            return Array.isArray(list?.agents) && list.agents.some((agent: { name?: string }) => !!this.harnessCheck?.name && agent?.name === this.harnessCheck.name);
+        }
+        catch { return false; }
+    }
+    private harnessVersionChoices(): { value: string; label: string }[] {
+        const check = this.harnessCheck;
+        const verified = check?.verified || '';
+        // 联网失败时只剩验证过的版本；检测本身失败（读不到任何版本）时至少还能手动输入。
+        if (!check || !check.ok) return [...(verified ? [{ value: verified, label: this.harnessVersionLabel(verified) }] : []), { value: '', label: p.wizardManualVersion }];
+        if (check.warning) return verified ? [{ value: verified, label: this.harnessVersionLabel(verified) }] : [{ value: '', label: p.wizardManualVersion }];
+        const list: { value: string; label: string }[] = [];
+        const seen = new Set<string>();
+        const add = (value: string, label: string) => { if (value && !seen.has(value)) { seen.add(value); list.push({ value, label }); } };
+        for (const [tag, value] of Object.entries(check.tags ?? {})) if (typeof value === 'string') add(value, this.harnessVersionLabel(value, tag));
+        if (check.recommended) add(check.recommended, `${check.recommended}（${ag.recommended}）`);
+        for (const value of check.versions ?? []) add(value, this.harnessVersionLabel(value));
+        add(verified, this.harnessVersionLabel(verified));
+        list.push({ value: '', label: p.wizardManualVersion });
+        return list;
+    }
+    private harnessVersionLabel(version: string, tag = '') {
+        const parts = [tag === 'next' ? p.wizardVersionTagNext : tag === 'recommended' ? ag.recommended : '', version === this.harnessCheck?.verified ? p.wizardVersionVerified : ''].filter(Boolean);
+        return parts.length ? `${version}（${parts.join('，')}）` : version;
+    }
+    private harnessVersionText() {
+        if (this.harnessManual) return this.harnessManualValue.trim() || p.wizardManualVersion;
+        return this.harnessVersionChoices().find(item => item.value === this.harnessVersion)?.label ?? (this.harnessVersion || p.wizardManualVersion);
+    }
+    private harnessEffectiveVersion() { return (this.harnessManual ? this.harnessManualValue : this.harnessVersion).trim(); }
+    // 版本号的写法与核心 --version 的校验一致：不能为空，只允许字母、数字、点、加号、减号。
+    private harnessVersionValid(version: string) { return !!version && /^[0-9A-Za-z.+-]+$/.test(version); }
+    private chooseHarnessVersion(anchor: HTMLElement) {
+        menu(anchor, this.harnessVersionChoices().map(item => ({
+            label: item.label,
+            run: () => {
+                if (item.value === '') this.harnessManual = true;
+                else { this.harnessManual = false; this.harnessVersion = item.value; }
+                this.harnessVersionErr = '';
+                this.render();
+                this.container?.querySelector<HTMLElement>('[data-pref="wizard-harness-version"]')?.focus({ preventScroll: true });
+            },
+        })), true);
+    }
+    private startHarnessTimer() {
+        this.stopHarnessTimer();
+        const tick = () => {
+            this.harnessSeconds = Math.max(0, Math.floor((Date.now() - this.harnessStarted) / 1000));
+            this.container?.querySelectorAll<HTMLElement>('[data-wizard-elapsed]').forEach(node => { node.textContent = p.wizardElapsed(this.harnessSeconds); });
+        };
+        tick();
+        this.harnessTimer = setInterval(tick, 1000);
+    }
+    private stopHarnessTimer() { clearInterval(this.harnessTimer); this.harnessTimer = undefined; }
+    private onHarnessEvent(event: HarnessEvent) {
+        if (!this.wizard || this.step !== 4) return;
+        if ('event' in event) {
+            if (event.event === 'step') {
+                this.harnessProgress = applyHarnessProgress(this.harnessProgress, event as { step: string } & HarnessStepProgress);
+                this.render();
+                return;
+            }
+            this.harnessState = this.harnessLastImport && this.harnessCheck?.installed ? 'found' : 'confirm';
+            this.harnessCancelled = true;
+            this.stopHarnessTimer();
+            this.render();
+            return;
+        }
+        this.applyHarnessResult(event);
+    }
+    private applyHarnessResult(result: HarnessResult) {
+        this.stopHarnessTimer();
+        this.harnessResult = result;
+        if (result.ok) {
+            this.harnessState = 'done';
+            if (this.harnessCheck) this.harnessCheck = { ...this.harnessCheck, installed: result.version ?? this.harnessCheck.installed, path: result.path ?? null, updateAvailable: false };
+        }
+        else if (result.incompatible) {
+            this.harnessState = 'incompatible';
+            this.harnessProgress = { ...this.harnessProgress, failed: this.harnessProgress.current };
+            this.harnessError = result.error || p.wizardFailure;
+            this.harnessFallback = result.fallback || this.harnessCheck?.verified || '';
+        }
+        else {
+            this.harnessState = 'failed';
+            this.harnessProgress = { ...this.harnessProgress, failed: this.harnessProgress.current };
+            this.harnessError = result.error || p.wizardFailure;
+        }
+        this.render();
+    }
+    private async startHarnessDeploy(importExisting = false) {
+        if (this.busy || this.harnessState === 'installing') return;
+        this.harnessLastImport = importExisting;
+        let version: string | undefined;
+        if (!importExisting) {
+            version = this.harnessEffectiveVersion();
+            if (!version) { this.harnessVersionErr = p.wizardVersionEmpty; this.render(); return; }
+            if (!this.harnessVersionValid(version)) { this.harnessVersionErr = p.wizardVersionBad; this.render(); return; }
+        }
+        this.harnessVersionErr = '';
+        this.harnessError = '';
+        this.harnessResult = null;
+        this.harnessCancelled = false;
+        this.harnessProgress = emptyHarnessProgress();
+        this.harnessStarted = Date.now();
+        this.harnessSeconds = 0;
+        this.harnessState = 'installing';
+        this.error = '';
+        this.render();
+        this.startHarnessTimer();
+        try {
+            const result = await window.dock.console('harness:deploy', version === undefined ? {} : { version });
+            // 正常情况下结果已经通过事件通道回来；这里只在事件没到时兜底。
+            if (this.harnessState === 'installing' && result && typeof result.ok === 'boolean') this.applyHarnessResult(result);
+        }
+        catch (e) {
+            if (this.harnessState === 'installing') {
+                this.harnessState = 'failed';
+                this.harnessError = String((e as Error)?.message || e);
+                this.stopHarnessTimer();
+                this.render();
+            }
+        }
+    }
+    private async cancelHarnessDeploy() {
+        try { await window.dock.console('harness:cancel'); }
+        catch (e) {
+            // 取消时清理失败：回到确认，说明原因，不留一个永远"安装中"的界面。
+            this.stopHarnessTimer();
+            this.harnessState = this.harnessLastImport && this.harnessCheck?.installed ? 'found' : 'confirm';
+            this.harnessError = String((e as Error)?.message || e);
+            this.render();
         }
     }
     private button(label: string, action: string, cls = '', attrs = '') { return `<button class="btn ${cls}" data-pref="${action}" ${this.busy ? 'disabled' : ''} ${attrs}>${esc(label)}</button>`; }
@@ -145,7 +429,7 @@ export class PreferencesView {
         next?.focus({ preventScroll: true });
         if (next instanceof HTMLInputElement && caret?.start != null) { try { next.setSelectionRange(caret.start, caret.end ?? caret.start); } catch { /* 该类型的输入框没有光标位置 */ } }
         const agents = this.container.querySelector<HTMLElement>('[data-agents]');
-        if (agents) this.agentsView.mount(agents);
+        if (agents) this.agentsView.mount(agents, this.container.querySelector<HTMLElement>('[data-lead]') ?? undefined);
     }
     private connectPage() {
         const data = this.connections;
@@ -159,7 +443,8 @@ export class PreferencesView {
             const installed=h.installedAt?p.lastInstall(`${pad(date.getMonth()+1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`):'';
             return `<div class="card ${!h.detected?'is-off':custom?'is-brand':''}" data-host-card="${h.host}"><div class="card-h">${icon('terminal-line')}<b>${hostName(h.host)}</b><span class="aside">${h.detected?mark('ok')+p.detected:p.missingHost}</span></div><div class="card-b">${h.detected?`<div class="path mono">${esc(h.root)}</div>${skills}${h.skills.some(s=>s.skill==='agent-router'&&s.state==='custom')?hint(p.customHelp):''}${h.legacy?.length?`<div data-legacy-skills>${hint(p.legacySkills(h.legacy.map(l=>l.skill).join('、')))}${h.legacy.some(l=>!l.link)?this.button(p.removeLegacy,'host','sm',`data-legacy-remove data-host="${h.host}" data-operation="removeLegacy"`):''}</div>`:''}`:hint(p.hostMissing(hostName(h.host)))}${banner(this.hostErrors.get(h.host)||'')}</div>${h.detected?`<div class="card-f"><span class="note" role="status">${esc(this.messages.get(h.host)||(custom?p.customIdle:installed))}</span>${buttons}</div>`:''}</div>`;
         }).join('');
-        return section(p.dispatchers,p.dispatchHelp,`<div class="cards2">${hosts}</div>`)+`<div data-agents></div>`;
+        // 主导小节里依次是：主导卡、"主导"说明、技能卡（界面稿 connect 页）；执行者列表在小节之后。
+        return section(p.dispatchers,'',`<div data-lead></div><p>${esc(p.dispatchHelp)}</p><div class="cards2">${hosts}</div>`)+`<div data-agents></div>`;
     }
     private description(key: string, fallback = '') { const o=this.settings.overrides[key]; return o?`<span class="override">${esc(p.override(o.name,o.value))}</span>`:esc(fallback); }
     private segment(key: string, values: string[], labels: string[], selected: string, icons?: string[]) {
@@ -180,8 +465,15 @@ export class PreferencesView {
         section(p.appearance,'',`<div class="set">${row(p.theme,'',this.segment('theme',['system','light','dark'],p.themes,this.settings.own.theme,['computer-line','sun-line','moon-line']))}</div>`)+
         section(p.window,'',`<div class="set">${row(p.closeAction,esc(p.closeActionHelp),this.segment('closeAction',['ask','tray','quit'],[p.closeOptions.ask,p.closeOptions.tray,p.closeOptions.quit],this.settings.own.closeAction))}</div>`)+
         section(p.config,'',banner(this.settings.reason?p.configError(this.settings.reason):'')+`<div class="set">${row(p.location,`<span class="mono">${esc(this.settings.file)}</span>`,this.button(p.openFolder,'folder','sm quiet'))}</div>`)+
+        this.statsSourcesSection()+
         this.listsSection()+
         this.dataSection();
+    }
+    // 427：设置页"额外的统计数据目录"。列表只读展示；"添加目录…"由主进程弹系统选目录对话框。
+    private statsSourcesSection() {
+        const items = this.statsSources.map(source => row(source, '', `<button class="btn sm" data-pref="stats-source-remove" data-stats-source="${esc(source)}" ${this.statsSourcesBusy?'disabled':''}>${esc(p.statsSourcesRemove)}</button>`)).join('');
+        const content = (this.statsSourcesLoaded ? '' : hint(p.statsSourcesLoading)) + (items || (this.statsSourcesLoaded ? hint(p.statsSourcesEmpty) : '')) + `<div class="set-r"><div class="l"></div><div class="ctl"><button class="btn sm" data-pref="stats-source-add" ${this.statsSourcesBusy?'disabled':''}>${icon('folder-add-line')}${esc(p.statsSourcesAdd)}</button></div></div>`;
+        return `<div id="stats-sources-section">${section(p.statsSources, p.statsSourcesHelp, `${banner(this.statsSourcesError)}<div class="set">${content}</div>`)}</div>`;
     }
     // 并行一节（D59，界面稿"并行·自动 / 并行·机器正忙 / 并行·固定"）：同时运行的任务数（config.json 的 concurrency）是"自动 / 固定"分段。
     // 自动：一行估算（核心给的估算值、核数、可用内存；机器正忙时换成暂停说明）+ "自动时最多"1～8 的下拉（concurrencyMax）。
@@ -447,18 +739,98 @@ export class PreferencesView {
     }
     private aboutPage() { return `<div class="sect about"><div class="about-brand"><div class="about-mark">${brand}</div><h2 class="wordmark">${c.app}</h2></div><p class="mono">${esc(this.version)}</p><p>${c.protocol}</p><p>${p.about}</p>${this.button(p.rerun,'wizard')}</div>`; }
     private wizardPage() {
-        const steps=p.wizardSteps.map((label,i)=>`<span class="${this.step===i+1?'on':this.step>i+1?'done':''}"><b>${this.step>i+1?icon('check-line'):i+1}</b>${label}</span>`).join('<span class="ln"></span>');
+        const steps=p.wizardSteps(this.harnessCheck?.title || 'Harness').map((label,i)=>`<span class="${this.step===i+1?'on':this.step>i+1?'done':''}"><b>${this.step>i+1?icon('check-line'):i+1}</b>${esc(label)}</span>`).join('<span class="ln"></span>');
         let body='';
-        if(this.step===1) body=`<h1>${p.welcome}</h1><p>${p.welcomeHelp}</p><div class="card"><div class="card-b">${['claude-code'].map(host=>{const h=this.connections?.hosts.find(h=>h.host===host);return kv(hostName(host),this.detecting?p.detecting:h?.detected?h.root:p.missingHost,this.detecting?'run':h?.detected?'ok':'skip');}).join('')}${kv('Codex CLI',this.detecting?p.detecting:this.connections?.codex.version||p.codexMissing,this.detecting?'run':this.connections?.codex.installed?'ok':'fail')}</div></div>`;
-        if(this.step===2) body=`<h1>${p.installSkills}</h1><p>${p.installHelp}</p>${this.connections?.hosts.filter(h=>h.detected).flatMap(h=>h.skills.map(s=>{const key=h.host+'/'+s.skill,on=this.selected.has(key);return `<button class="choice" role="checkbox" aria-checked="${on}" data-choice="${key}" ${this.busy||s.state==='newer'?'disabled':''}><span class="cb ${on?'on':''}">${on?icon('check-line'):''}</span><span class="ct">${hostName(h.host)} · ${s.skill}<span>${s.state==='custom'?p.customChoice:p.skillHelp[s.skill]}</span></span>${s.state==='latest'||s.state==='custom'||s.state==='newer'?`<span class="tag ${s.state==='custom'?'brand':''}">${esc(s.state==='latest'?p.wizardLatest:s.state==='custom'?p.wizardCustom:p.newer)}</span>`:''}</button>`;})).join('')||''}${this.busy?`<div class="hint" role="status">${mark('run')}<span>${p.installing} <span class="mono">${this.installProgress.done}/${this.installProgress.total}</span></span></div>`:''}${this.managedToggle(true)}`;
-        if(this.step===3) body=this.wizardAgentPage();
-        if(this.step===4) body=this.wizardProjectPage();
-        // 第 3 步测试通过后主按钮变成"下一步"；第 4 步完成时若选了文件夹才写 projects.json（不写仓库文件）。
-        const primary = this.step===1 ? this.button(p.next,'next','primary',this.detecting?'disabled':'')
-            : this.step===2 ? this.button(p.installNext,'next','primary',this.detecting?'disabled':'')
-            : this.step===3 ? (this.wizardResult?.ok ? this.button(p.next,'next','primary','') : this.button(p.wizardAgentNext,'wizard-agent','primary',!this.wizardPreset||this.wizardLoading||this.wizardTesting?'disabled':''))
-            : this.button(p.finish,'wizard-finish','primary','');
-        return `<div class="wiz"><div class="wiz-steps">${steps}</div><div class="wiz-body scroll">${banner(this.error)}${body}</div><div class="wiz-f">${this.step>1?this.button(p.previous,'previous','quiet'):''}<span class="sp"></span>${this.button(p.skip,'skip','quiet')}${primary}</div></div>`;
+        if(this.step===1) body=this.wizardDetectPage();
+        if(this.step===2) body=this.wizardAgentPage();
+        if(this.step===3) body=this.wizardSkillsPage();
+        if(this.step===4) body=this.harnessPage();
+        if(this.step===5) body=this.wizardProjectPage();
+        return `<div class="wiz"><div class="wiz-steps">${steps}</div><div class="wiz-body scroll">${banner(this.error)}${body}</div><div class="wiz-f">${this.wizardFooter()}</div></div>`;
+    }
+    // 底栏按步骤与 Harness 状态给按钮；安装进行中只有"取消"（302）。
+    private wizardFooter() {
+        if (this.step === 4 && this.harnessState === 'installing') return `<span class="sp"></span>${this.button(p.wizardCancel,'wizard-harness-cancel','')}`;
+        const back = this.step > 1 ? this.button(p.wizardBack,'previous','quiet') : '';
+        // Harness 是可选的：这一步的"跳过"与"安装"一样是普通按钮，不做成不显眼的小字。
+        const skip = this.button(p.wizardSkip,'skip',this.step===4?'':'quiet');
+        let primary = '';
+        if (this.step === 1) primary = this.button(p.wizardNext,'next','primary',this.wizardDetectReady()?'':'disabled');
+        else if (this.step === 2) primary = this.wizardResult?.ok ? this.button(p.wizardNext,'next','primary','') : this.button(p.wizardImportTest,'wizard-agent','primary',!this.wizardPreset||this.wizardLoading||this.wizardTesting?'disabled':'');
+        else if (this.step === 3) primary = this.wizardSkillsAvailable() ? this.button(p.wizardInstallContinue,'next','primary','') : this.button(p.wizardNext,'next','primary','');
+        else if (this.step === 4) primary = this.harnessPrimary();
+        else primary = this.button(p.wizardFinish,'wizard-finish','primary','');
+        const keep = this.step === 4 && this.harnessState === 'incompatible' ? this.button(p.wizardKeepVersion,'wizard-harness-keep','quiet') : '';
+        return `${back}<span class="sp"></span>${keep}${skip}${primary}`;
+    }
+    private harnessPrimary() {
+        switch (this.harnessState) {
+            case 'loading': case 'idle': return this.button(p.wizardNext,'next','primary','disabled');
+            case 'confirm': return this.button(p.wizardInstall,'wizard-harness-install','primary',this.harnessVersionValid(this.harnessEffectiveVersion())?'':'disabled');
+            case 'found': return this.button(p.wizardDirectImport,'wizard-harness-import','primary','');
+            case 'installed': case 'done': case 'kept': case 'nonpm': return this.button(p.wizardNext,'next','primary','');
+            case 'failed': return this.button(p.wizardRetry,'wizard-harness-retry','primary','');
+            case 'incompatible': return this.button(p.wizardFallbackInstall,'wizard-harness-fallback','primary',this.harnessFallback||this.harnessCheck?.verified?'':'disabled');
+            default: return '';
+        }
+    }
+    private wizardDetectReady() { return !this.detecting && !this.wizardToolsLoading && !!this.wizardGit?.installed; }
+    private wizardSkillsAvailable() { return !!this.connections?.hosts.some(host => host.detected); }
+    // 第 1 步（302）：git（必需）、Claude Code、Codex、Qoder、Harness 的实际检测结果。
+    private wizardDetectPage() {
+        const loading = this.detecting || this.wizardToolsLoading;
+        const value = (tool: WizardTool | null) => loading ? p.detecting : tool?.installed ? (tool.version || p.detected) : p.wizardMissing;
+        const stateOf = (tool: WizardTool | null) => loading ? 'run' : tool?.installed ? 'ok' : 'skip';
+        const harnessTool: WizardTool | null = this.harnessCheck ? { installed: !!this.harnessCheck.installed, version: this.harnessCheck.installed || '' } : null;
+        const rows = kv(p.wizardGitRequired, value(this.wizardGit), stateOf(this.wizardGit))
+            + kv(p.wizardClaudeCode, value(this.wizardClaude), stateOf(this.wizardClaude))
+            + kv(p.wizardCodex, value(this.wizardCodex), stateOf(this.wizardCodex))
+            + kv(p.wizardQoder, value(this.wizardQoder), stateOf(this.wizardQoder))
+            + kv(p.wizardHarnessTitle(this.harnessCheck?.title || 'Harness'), value(harnessTool), stateOf(harnessTool));
+        const gitMissing = !loading && this.wizardGit && !this.wizardGit.installed;
+        const gitBanner = gitMissing ? `<div class="banner fail" role="alert" data-wizard-git-missing>${mark('fail')}<div class="rt"><b>${esc(p.wizardNoGit)}</b><span>${esc(p.wizardGitHelp)}</span></div><div><a class="btn sm" href="https://git-scm.com/download/win" target="_blank" rel="noreferrer" data-wizard-git-download>${esc(p.wizardDownloadGit)}</a>${this.button(p.wizardRecheck,'wizard-redetect','sm')}</div></div>` : '';
+        return `<h1>${p.welcome}</h1><p>${p.welcomeHelp}</p><div class="card"><div class="card-b">${rows}<p class="muted">${esc(p.wizardNoLead)}</p></div></div>${gitBanner}${banner(this.wizardToolsError)}`;
+    }
+    // 第 3 步：没有检测到 Claude Code 时不列技能，说明 Codex 等主导直接读 AGENTS.md，并默认跳过（302）。
+    private wizardSkillsPage() {
+        const heading = `<h1>${p.installSkills}</h1>`;
+        if (!this.wizardSkillsAvailable()) return `${heading}<div class="banner info" role="status" data-wizard-no-skills>${mark('info')}<div class="rt"><b>${esc(p.wizardNoSkills)}</b><span>${esc(p.wizardNoSkillsBody)}</span></div></div>`;
+        const choices = this.connections!.hosts.filter(host => host.detected).flatMap(host => host.skills.map(skill => {
+            const key = host.host + '/' + skill.skill, on = this.selected.has(key);
+            return `<button class="choice" role="checkbox" aria-checked="${on}" data-choice="${key}" ${this.busy||skill.state==='newer'?'disabled':''}><span class="cb ${on?'on':''}">${on?icon('check-line'):''}</span><span class="ct">${hostName(host.host)} · ${skill.skill}<span>${skill.state==='custom'?p.customChoice:(p.skillHelp[skill.skill] ?? '')}</span></span>${skill.state==='latest'||skill.state==='custom'||skill.state==='newer'?`<span class="tag ${skill.state==='custom'?'brand':''}">${esc(skill.state==='latest'?p.wizardLatest:skill.state==='custom'?p.wizardCustom:p.newer)}</span>`:''}</button>`;
+        })).join('');
+        const busy = this.busy ? `<div class="hint" role="status">${mark('run')}<span>${p.installing} <span class="mono">${this.installProgress.done}/${this.installProgress.total}</span></span></div>` : '';
+        return `${heading}<p>${esc(p.installHelp)}</p>${choices}${busy}${this.managedToggle(true)}`;
+    }
+    // 第 4 步（302）：Harness；状态机与文案见 HarnessState。
+    private harnessPage() {
+        const head = `<h1>${esc(p.wizardHarnessTitle(this.harnessCheck?.title || 'Harness'))}</h1>`;
+        const check = this.harnessCheck;
+        const errorBox = this.harnessError ? `<div class="banner fail" role="alert" data-wizard-harness-error>${mark('fail')}<span>${esc(this.harnessError)}</span></div>` : '';
+        if (this.harnessState === 'idle' || this.harnessState === 'loading') return `${head}<div class="hint" role="status">${mark('run')}<span>${esc(p.detecting)}</span></div>`;
+        if (this.harnessState === 'nonpm') return `${head}<p>${esc(p.wizardNoNpm(this.harnessCheck?.title || 'Harness'))}</p><p><a class="btn sm" href="https://nodejs.org/" target="_blank" rel="noreferrer" data-wizard-node>${esc(p.wizardDownloadNode)}</a></p><p class="muted">${esc(p.wizardAfterNode)}</p>${errorBox}`;
+        if (this.harnessState === 'installing') return `${head}<p>${esc(p.wizardConfirm)}</p>${harnessProgressHtml({ ...this.harnessProgress, seconds: this.harnessSeconds })}`;
+        // 没有 npm 时直接导入仍然可用（核心只需导入与测试），只是不能安装 / 更新：把原因写在卡片下面。
+        const npmMissing = check?.noNpm ? `<div class="hint" role="status" data-wizard-harness-nonpm>${mark('info')}<span>${esc(p.wizardNoNpm(this.harnessCheck?.title || 'Harness'))}</span></div><p><a class="btn sm" href="https://nodejs.org/" target="_blank" rel="noreferrer" data-wizard-node>${esc(p.wizardDownloadNode)}</a></p>` : '';
+        if (this.harnessState === 'found') return `${head}${this.harnessCancelled ? `<div class="banner ok" role="status" data-wizard-cancelled>${mark('ok')}<span>${esc(ag.harnessCancelled)}</span></div>` : ''}<p>${esc(p.wizardFound)}</p><div class="card"><div class="card-b">${kv('dsh', check?.installed || '', 'ok')}${kv(p.wizardPath, check?.path || '', check?.path ? 'ok' : 'skip')}</div></div>${npmMissing}${errorBox}`;
+        if (this.harnessState === 'installed') return `${head}<div class="testbox ok" data-wizard-installed>${mark('ok')}<div><b>${esc(p.wizardInstalledVersion(check?.installed || ''))}</b><span>${esc(check?.path || '')}</span></div></div>`;
+        if (this.harnessState === 'done') {
+            const version = this.harnessResult?.version ?? check?.installed ?? '';
+            const unverified = this.harnessResult?.unverified ? `<div class="hint" data-wizard-unverified>${mark('warn')}<span>${esc(p.wizardUnverified(version))}</span></div>` : '';
+            return `${head}<div class="testbox ok" data-wizard-harness-done>${mark('ok')}<div><b>${esc(p.wizardDone)} · ${esc(p.wizardInstalledVersion(version))}</b><span>${esc(p.wizardDoneHelp(this.harnessCheck?.title || 'Harness'))}</span></div></div><div class="card"><div class="card-b">${kv(p.wizardVersionLabel, version)}${kv(p.wizardPath, this.harnessResult?.path || '', 'ok')}${kv(p.wizardTestLabel, p.wizardTestPassed, 'ok')}</div></div>${unverified}`;
+        }
+        if (this.harnessState === 'failed') return `${head}${this.harnessProgress.current ? harnessProgressHtml({ ...this.harnessProgress, seconds: this.harnessSeconds }) : ''}<div class="testbox fail" data-wizard-harness-fail>${mark('fail')}<div><b>${esc(p.wizardFailure)}</b><span>${esc(this.harnessError)}</span></div></div><div class="hint">${mark('info')}<span>${esc(p.wizardRetryHint)}</span></div>`;
+        if (this.harnessState === 'incompatible') return `${head}<div class="testbox fail" data-wizard-incompatible>${mark('fail')}<div><b>${esc(p.wizardFailure)}</b><span>${esc(this.harnessError)}</span></div></div><div class="hint">${mark('info')}<span>${esc(p.wizardVersionNote(check?.verified || ''))}</span></div>`;
+        if (this.harnessState === 'kept') return `${head}<div class="hint" data-wizard-kept>${mark('info')}<span>${esc(p.wizardVersionNote(check?.verified || ''))}</span></div>`;
+        // confirm：安装前不写任何文件；取消回来时说明没有写入。
+        const note = esc(p.wizardVersionNote(check?.verified || '—'));
+        const warning = check?.warning ? `<div class="hint" data-wizard-warning>${mark('warn')}<span>${esc(check.warning)}</span></div>` : '';
+        const checkError = check?.error && !check.warning ? `<div class="hint">${mark('info')}<span>${esc(check.error)}</span></div>` : '';
+        const manual = this.harnessManual ? `<input class="inp mono${this.harnessVersionErr ? ' bad' : ''}" data-wizard-version value="${esc(this.harnessManualValue)}" placeholder="0.1.0" aria-label="${esc(p.wizardManualVersionLabel)}">` : '';
+        const versionField = field(p.wizardVersionLabel, note, `<div class="statusline"><span class="selw"><button class="sel" data-pref="wizard-harness-version" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(p.wizardVersionLabel)}：${esc(this.harnessVersionText())}"><span>${esc(this.harnessVersionText())}</span>${icon('arrow-down-s-line')}</button></span>${manual}</div><div class="ferr${this.harnessVersionErr ? ' on' : ''}" data-wizard-version-error role="alert">${esc(this.harnessVersionErr)}</div>${warning}${checkError}`);
+        const method = `<div class="card"><div class="card-b"><div class="set">${row(p.wizardInstallMethod, esc(p.wizardInstallMethodHelp(check?.secretVar || '')), `<span class="mono">${esc(p.wizardInstallMethodValue)}</span>`)}${row(p.wizardNetwork, esc(p.wizardNetworkHelp), `<span>${esc(p.wizardNetworkValue)}</span>`)}</div></div></div>`;
+        const cancelled = this.harnessCancelled ? `<div class="banner ok" role="status" data-wizard-cancelled>${mark('ok')}<span>${esc(p.wizardCancelled)}</span></div>` : '';
+        return `${head}<p>${esc(p.wizardConfirm)}</p>${cancelled}${versionField}${method}${errorBox}`;
     }
     // 引导第 3 步：只做"导入第一个 Agent"的最小版本（预设单选 + API Key 密码框 + 导入并测试）。
     private wizardPresetObj() { return this.wizardPresets.find(x => x.name === this.wizardPreset); }
@@ -526,27 +898,34 @@ export class PreferencesView {
         catch { this.wizardStrongList = []; }
         if (this.wizardStrong && !this.wizardStrongList.some(item => item.name === this.wizardStrong)) this.wizardStrong = '';
     }
-    // 第 3 步点“下一步”：每日上限空着跳过（不写 limits），填了合法整数就经 route:limit 写进这个执行者；选了强执行者就经 route:strong 写入（"不设"不写）；
-    // 上限非法或任一写入失败时留在第 3 步。
-    private async commitWizardLimit() {
+    // 第 2 步点“下一步”：每日上限空着跳过（不写 limits），填了合法整数就经 route:limit 写进这个执行者；选了强执行者就经 route:strong 写入（"不设"不写）；
+    // 上限非法或任一写入失败时留在第 2 步。
+    private async commitWizardLimit(advance = true): Promise<boolean> {
         const raw = this.wizardLimit.trim();
-        if (raw !== '' && !(/^[1-9]\d*$/.test(raw) && Number.isSafeInteger(Number(raw)))) { this.wizardLimitErr = p.wizardLimitBad; this.render(); return; }
+        if (raw !== '' && !(/^[1-9]\d*$/.test(raw) && Number.isSafeInteger(Number(raw)))) { this.wizardLimitErr = p.wizardLimitBad; this.render(); return false; }
         this.wizardLimitErr = '';
-        if (raw === '' && !this.wizardStrong) { this.step = 4; this.error = ''; this.render(); return; }
+        if (raw === '' && !this.wizardStrong) { if (advance) this.enterSkillsStep(); else this.render(); return true; }
         this.busy = true; this.error = ''; this.render();
         try {
             if (raw !== '') await window.dock.console('route:limit', { name: this.wizardAdded, tasks: Number(raw) });
             if (this.wizardStrong) await window.dock.console('route:strong', { name: this.wizardStrong });
             this.busy = false;
-            this.step = 4;
+            if (advance) this.enterSkillsStep(); else this.render();
+            return true;
         }
-        catch (e) { this.busy = false; this.error = String((e as Error)?.message || e); }
+        catch (e) { this.busy = false; this.error = String((e as Error)?.message || e); this.render(); return false; }
+    }
+    // 进入第 3 步：默认勾选检测到的、还没装最新的技能。
+    private enterSkillsStep() {
+        this.selected = new Set(this.connections?.hosts.filter(host => host.detected).flatMap(host => host.skills.filter(skill => skill.checked).map(skill => host.host + '/' + skill.skill)));
+        this.step = 3;
+        this.error = '';
         this.render();
     }
-    // 第 3 步测试通过后的"可以按你的执行者生成建议规则"：路由页在引导期间不可用，所以先结束引导（等同"跳过"），再跳到路由页并打开建议弹窗。
-    // 第 3 步已经填了每日上限或选了强执行者时，先照"下一步"写入；写入失败就留在这一步。
+    // 第 2 步测试通过后的"可以按你的执行者生成建议规则"：路由页在引导期间不可用，所以先结束引导（等同"跳过"），再跳到路由页并打开建议弹窗。
+    // 第 2 步已经填了每日上限或选了强执行者时，先照"下一步"写入；写入失败就留在这一步。
     private async wizardSuggest() {
-        if (this.wizardLimit.trim() !== '' || this.wizardStrong) { await this.commitWizardLimit(); if (this.step !== 4) return; }
+        if (this.wizardLimit.trim() !== '' || this.wizardStrong) { if (!await this.commitWizardLimit(false)) return; }
         await this.finish(false);
         goToSuggest();
     }
@@ -582,7 +961,7 @@ export class PreferencesView {
         finally {
             this.wizardLoading = false;
             if (this.wizardPreset && this.wizardPresetObj()?.auth === 'token') await this.refreshWizardSecret();
-            if (this.wizard && this.step === 3) this.render();
+            if (this.wizard && this.step === 2) this.render();
         }
     }
     private async chooseWizardPreset(name: string) {
@@ -683,6 +1062,25 @@ export class PreferencesView {
         this.wizardStrong = ''; this.wizardStrongList = [];
         this.wizardProject = '';
         this.wizardOpenInit = true;
+        this.stopHarnessTimer();
+        this.wizardGit = null;
+        this.wizardClaude = null;
+        this.wizardCodex = null;
+        this.wizardQoder = null;
+        this.wizardToolsLoading = false;
+        this.wizardToolsError = '';
+        this.harnessCheck = null;
+        this.harnessState = 'idle';
+        this.harnessVersion = '';
+        this.harnessManual = false;
+        this.harnessManualValue = '';
+        this.harnessVersionErr = '';
+        this.harnessProgress = emptyHarnessProgress();
+        this.harnessSeconds = 0;
+        this.harnessError = '';
+        this.harnessResult = null;
+        this.harnessFallback = '';
+        this.harnessCancelled = false;
     }
     private async save(key: string, value: string|number|boolean|null, own = false) {
         this.busy=true; this.error=''; this.render();
@@ -704,6 +1102,8 @@ export class PreferencesView {
         if(d.pref==='clear-cache') { await this.clearCache(); return; }
         if(d.pref==='clear-tasks') { await this.clearTasks(b); return; }
         if(d.pref==='clear-projects') { await this.clearProjects(b); return; }
+        if(d.pref==='stats-source-add') { await this.addStatsSource(); return; }
+        if(d.pref==='stats-source-remove') { await this.removeStatsSource(d.statsSource!); return; }
         if(d.pref==='reset-app') { await this.openReset(b); return; }
         if(d.pref==='ack-leftover') { this.settings=await window.dock.preferences('ackLeftover'); this.render(); return; }
         if(d.choice) { this.selected.has(d.choice)?this.selected.delete(d.choice):this.selected.add(d.choice); this.render(); return; }
@@ -726,13 +1126,36 @@ export class PreferencesView {
         if(d.pref==='choose') { const result=await window.dock.preferences('choosePath'); if(result) { this.settings=result; await this.detect(); } }
         if(d.pref==='reset') { await this.save('path',null); await this.detect(); }
         if(d.pref==='ack') { await this.ack(); }
-        if(d.pref==='wizard') { this.resetWizard(); this.wizard=true; this.error=''; this.redrawShell(); await this.detect(); }
-        if(d.pref==='skip') await this.finish(false);
+        if(d.pref==='wizard') { this.resetWizard(); this.wizard=true; this.error=''; this.redrawShell(); await this.detect(); void this.detectWizardTools(); }
+        // 每一步都能跳过：第 2 步跳到技能，第 3 步跳到 Harness，第 4 步跳到项目，其余跳到结束（跳过不写任何文件）。
+        if(d.pref==='skip') {
+            if(this.step===2) { this.enterSkillsStep(); return; }
+            if(this.step===3) { await this.enterHarnessStep(); return; }
+            if(this.step===4) { this.step=5; this.error=''; this.render(); return; }
+            await this.finish(false);
+            return;
+        }
         if(d.pref==='previous') { if(this.step>1){ this.step--; this.error=''; this.render(); } return; }
+        if(d.pref==='wizard-redetect') { this.harnessCheck=null; void this.detect(); void this.detectWizardTools(); return; }
+        if(d.pref==='wizard-harness-version') { this.chooseHarnessVersion(b); return; }
+        if(d.pref==='wizard-harness-install') { await this.startHarnessDeploy(); return; }
+        // R3-2：失败后重试沿用上一次的操作（直接导入已有安装，或按版本安装）。
+        if(d.pref==='wizard-harness-retry') { await this.startHarnessDeploy(this.harnessLastImport); return; }
+        if(d.pref==='wizard-harness-import') { await this.startHarnessDeploy(true); return; }
+        if(d.pref==='wizard-harness-cancel') { await this.cancelHarnessDeploy(); return; }
+        if(d.pref==='wizard-harness-fallback') {
+            const fallback = this.harnessFallback || this.harnessCheck?.verified || '';
+            if(fallback) { this.harnessManual=false; this.harnessVersion=fallback; await this.startHarnessDeploy(); }
+            return;
+        }
+        if(d.pref==='wizard-harness-keep') { this.harnessState='kept'; this.render(); return; }
         if(d.pref==='next') {
-            if(this.step===1) { this.selected=new Set(this.connections?.hosts.filter(h=>h.detected).flatMap(h=>h.skills.filter(s=>s.checked).map(s=>h.host+'/'+s.skill))); this.step=2; this.error=''; this.render(); return; }
-            if(this.step===3) { await this.commitWizardLimit(); return; }
+            if(this.step===1) { this.step=2; this.error=''; this.render(); void this.loadWizardPresets(); return; }
+            if(this.step===2) { await this.commitWizardLimit(); return; }
+            if(this.step===4) { this.step=5; this.error=''; this.render(); return; }
+            // 第 3 步：安装勾选的技能，装完进入第 4 步（Harness）；失败留在这一步。
             this.busy=true; this.installProgress={done:0,total:this.selected.size}; this.error=''; this.render();
+            let installed=true;
             try {
                 for(const h of this.connections!.hosts.filter(h=>h.detected)) {
                     const skills=h.skills.filter(s=>this.selected.has(h.host+'/'+s.skill)).map(s=>s.skill);
@@ -743,9 +1166,12 @@ export class PreferencesView {
                         this.render();
                     }
                 }
-                this.step=3;
-            } catch(e) { this.error=String((e as Error).message||e); }
-            finally { this.busy=false; await this.refreshSettings(); if(this.wizard&&this.step===3) void this.loadWizardPresets(); }
+            } catch(e) { installed=false; this.error=String((e as Error).message||e); }
+            finally {
+                this.busy=false;
+                await this.refreshSettings();
+                if(installed && this.wizard && this.step===3) await this.enterHarnessStep();
+            }
         }
         if(d.pref==='host') {
             if(d.operation==='removeLegacy'&&!await confirmAction(p.removeLegacyTitle,p.removeLegacyBody(this.connections?.hosts.find(h=>h.host===d.host)?.legacy?.filter(l=>!l.link).map(l=>l.skill).join('\u3001') || ''),p.removeLegacy,b,true)) return;
@@ -886,6 +1312,7 @@ export class PreferencesView {
         });
     }
     private async finish(configure: boolean, project = '') {
+        this.stopHarnessTimer();
         this.settings=await window.dock.preferences('finish',{configure}); this.wizard=false; this.error=''; this.resetWizard(); this.redrawShell();
         // 勾选了"添加后打开初始化预览"：切到项目页并选中它；初始化预览仍要用户自己点。
         if(project) this.openProject?.(project);

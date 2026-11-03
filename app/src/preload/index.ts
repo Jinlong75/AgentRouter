@@ -1,11 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import type { HarnessEvent } from '../main/console.mjs';
 import type { API, Snapshot } from '../shared/types';
 // 验收 / 演示模式的固定"现在"（AR_DEMO_NOW，毫秒）：主进程只在验收模式经 additionalArguments 传 --ar-demo-now，
 // 正常启动没有这个参数，window.dock.demoNow 为 undefined，渲染层按当前时间（037 第 2 项）。
 const demoNowArg = process.argv.find(arg => arg.startsWith('--ar-demo-now='));
 const demoNowValue = demoNowArg ? Number(demoNowArg.slice('--ar-demo-now='.length)) : NaN;
 const demoNow = Number.isFinite(demoNowValue) && demoNowValue > 0 ? demoNowValue : undefined;
-const api: API = { demoNow, preferences: async (action, payload) => {
+const api: API & { onHarnessEvent(callback: (event: HarnessEvent) => void): () => void } = {
+    onHarnessEvent(callback) { const listener = (_event: unknown, value: HarnessEvent) => callback(value); ipcRenderer.on('harness:event', listener); return () => ipcRenderer.removeListener('harness:event', listener); }, demoNow, preferences: async (action, payload) => {
     const result = await ipcRenderer.invoke('preferences', action, payload);
     if (!result.ok) throw Error(result.error);
     return result.value;
@@ -14,7 +16,8 @@ const api: API = { demoNow, preferences: async (action, payload) => {
     if (!result.ok) {
         // contextBridge 跨进程只保留 Error 的标准属性（message / stack），挂在 Error 上的自定义 code 会丢。
         // 因此抛一个带 message 和 code 的普通对象：渲染层统一用 message 显示，用 code 区分"没有提交身份"等情况。
-        throw { name: 'Error', message: String(result.error), ...(typeof result.code === 'string' && result.code ? { code: result.code } : {}) };
+        // 424：SPEC_BASE 另带当前分支与项目基线，界面据此给出"以当前分支为基线派发"。
+        throw { name: 'Error', message: String(result.error), ...(typeof result.code === 'string' && result.code ? { code: result.code } : {}), ...(typeof result.current === 'string' && result.current ? { current: result.current } : {}), ...(typeof result.base === 'string' && result.base ? { base: result.base } : {}) };
     }
     return result.value;
 }, snapshot: () => ipcRenderer.invoke('snapshot'), detail: id => ipcRenderer.invoke('detail', id), events: (id, cursor, before) => ipcRenderer.invoke('events', id, cursor, before), action: (id, action, value) => ipcRenderer.invoke('action', id, action, value), deleteTasks: (ids, files) => ipcRenderer.invoke('delete-tasks', ids, files), import: () => ipcRenderer.invoke('import'), subscribe(callback) { const listener = (_event: unknown, s: Snapshot) => callback(s); ipcRenderer.on('snapshot', listener); return () => ipcRenderer.removeListener('snapshot', listener); }, closeReady: () => ipcRenderer.invoke('close-ready'), closeChoice: (action, remember) => ipcRenderer.invoke('close-choice', action, remember), closeShown: () => ipcRenderer.invoke('close-shown'), onCloseRequest(callback) { const listener = () => callback(); ipcRenderer.on('close-request', listener); return () => ipcRenderer.removeListener('close-request', listener); } };

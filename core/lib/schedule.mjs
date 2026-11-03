@@ -1,3 +1,4 @@
+import { cpuTimes, cpuPercent } from './resources.mjs';
 // 并行调度的判断（Stage07c 140）：改动范围重叠时排队、独占命令、并发"自动"档。
 // 纯函数为主（pathsOverlap、estimateConcurrency、createLoadMonitor），方便单元测试；
 // pipeline.mjs / slots.mjs 只负责调用。零依赖。
@@ -271,7 +272,7 @@ async function waitExclusiveClear({ deps, id, signal, progress, intervalMs }) {
 // 进门禁：先等别人的独占门禁结束，再占门禁名额（acquire() 返回释放函数）；独占门禁（command 非空）拿到名额后再建标记，
 // 并等已经在跑的别的门禁结束。返回 { release }，release 一次放掉标记和名额。
 // 刚拿到名额时别人的标记已经出现：放回名额重新等。两个独占门禁抢标记：输的放回名额重新等，不会互相等死。
-export async function enterGate({ home, id, name, command = null, acquire, signal, progress, intervalMs = 2000, isAlive = pidAlive, createdOf = processCreated }) {
+export async function enterGate({ home, id, name, command = null, scope = 'full', acquire, signal, progress, intervalMs = 2000, isAlive = pidAlive, createdOf = processCreated }) {
   const deps = { home, isAlive, createdOf };
   for (;;) {
     await waitExclusiveClear({ deps, id, signal, progress, intervalMs });
@@ -279,7 +280,7 @@ export async function enterGate({ home, id, name, command = null, acquire, signa
     const other = await readExclusive(deps);
     if (other && other.id !== id) { releaseSlot(); continue; }
     if (!command) return { release: releaseSlot };
-    const releaseMarker = await acquireExclusive({ ...deps, id, name, command });
+    const releaseMarker = await acquireExclusive({ ...deps, id, name, command, scope });
     if (!releaseMarker) { releaseSlot(); continue; }
     const release = () => { releaseMarker(); releaseSlot(); };
     try {
@@ -290,7 +291,7 @@ export async function enterGate({ home, id, name, command = null, acquire, signa
         await delay(intervalMs);
       }
     } catch (error) { release(); throw error; }
-    progress?.(`门禁独占运行：${command}，别的任务和门禁等它结束`);
+    progress?.(scope === 'focus' ? `门禁独占运行：${command}，别的门禁等它结束` : `门禁独占运行：${command}，别的任务和门禁等它结束`);
     return { release };
   }
 }
@@ -309,14 +310,7 @@ export function estimateConcurrency({ cores, freeMemBytes, max = concurrencyCap 
 export const machineCores = () => (typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length);
 
 // os.cpus() 的累计时间：{ idle, total }。
-function cpuTimes(cpus) {
-  let idle = 0, total = 0;
-  for (const cpu of cpus()) {
-    for (const value of Object.values(cpu.times)) total += value;
-    idle += cpu.times.idle;
-  }
-  return { idle, total };
-}
+
 
 // "内存不够"的阈值（D100 / D114，182）：max(1.5 GB, 总内存 × percent%)。percent 是 config.json 的 memLowPercent（1～50 的整数，默认 5）。
 // 监视器、ar config 的瞬时判断、软件设置页都用这一个函数，不各写一份比例。
@@ -340,8 +334,7 @@ export function createLoadMonitor({
       const at = now();
       const times = cpuTimes(cpus);
       if (previous && times.total > previous.total) {
-        const total = times.total - previous.total, idle = times.idle - previous.idle;
-        cpu = Math.round(Math.min(100, Math.max(0, (1 - idle / total) * 100)));
+        cpu = cpuPercent(previous, times);
       }
       previous = times;
       const free = freemem();
@@ -397,11 +390,15 @@ export function createTaskLimit({
     const info = readLimits();
     let limit = info.limits.concurrency;
     if (info.mode === 'auto') {
-      if (!estimate || now() - estimate.at > estimateTtlMs) estimate = { at: now(), value: info.estimate };
-      limit = Math.min(estimate.value, info.max);
+      // 344：经 effectiveConcurrency 读到的是自动调整后的上限（持久化状态），以它为准；没经过调整的老调用方仍按缓存的估算值。
+      if (info.adjusted) limit = Math.min(info.limits.concurrency, info.max);
+      else {
+        if (!estimate || now() - estimate.at > estimateTtlMs) estimate = { at: now(), value: info.estimate };
+        limit = Math.min(estimate.value, info.max);
+      }
     }
     const held = await readExclusive({ home, isAlive, createdOf });
-    if (held) {
+    if (held && held.scope !== 'focus') {
       say(exclusiveText(held), { reason: 'exclusive', blockers: [{ id: held.id ?? null, name: held.name ?? null }], command: held.command ?? null });
       return 0;
     }
@@ -427,7 +424,7 @@ export function currentLoad({ sleepMs = 150, memLowPercent } = {}) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleepMs);
   const second = cpuTimes(os.cpus);
   const total = second.total - first.total;
-  const cpu = total > 0 ? Math.round(Math.min(100, Math.max(0, (1 - (second.idle - first.idle) / total) * 100))) : null;
+  const cpu = total > 0 ? cpuPercent(first, second) : null;
   const free = os.freemem();
   return { cpu, freeMemBytes: free, memLow: free < memLowThreshold(os.totalmem(), memLowPercent) };
 }

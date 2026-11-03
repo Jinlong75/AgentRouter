@@ -6,18 +6,21 @@ import { join } from 'node:path';
 
 // 公共目录根下核心与软件自己会写的名字（协议第 1 节的表）。
 export const HOME_NAMES = Object.freeze([
-  'runs.jsonl', 'config.json', 'projects.json', 'viewer.json', 'managed', 'agent-tests.json',
+  'runs.jsonl', 'leads.jsonl', 'config.json', 'projects.json', 'viewer.json', 'managed', 'agent-tests.json',
   'backups', 'staging', 'workers', 'monitor',
+  // 任务结束采样（312）与并发自动调整状态及其锁（344）。
+  'resources.jsonl', 'concurrency-state.json', 'concurrency-state.json.lock',
 ]);
 // 并发名额目录（协议 15.5）。
 export const SLOTS_NAME = 'slots';
 // 整个名字都不算的条目 = 第 1 节的表 + slots。
 export const EXCLUDED_NAMES = Object.freeze([...HOME_NAMES, SLOTS_NAME]);
 // 原子写入时短暂存在的临时文件：名字以 .tmp 结尾，并且以这些前缀之一开头（表里的文件名与 .config-、.agent-tests-）。
-export const TEMP_PREFIXES = Object.freeze([...HOME_NAMES, '.config-', '.agent-tests-']);
+export const TEMP_PREFIXES = Object.freeze([...HOME_NAMES, '.config-', '.agent-tests-', 'concurrency-state.']);
 export const TEMP_SUFFIX = '.tmp';
 // added 最多记这么多条（目录里一次多出成百上千个文件时，记录与横幅不该跟着膨胀）。
 export const MAX_ADDED = 100;
+export const OUTSIDE_RECHECK_MS = 500;
 
 const lowerIf = (value, caseInsensitive) => (caseInsensitive ? value.toLowerCase() : value);
 
@@ -60,7 +63,7 @@ const ROOT_LABEL = { user: '用户目录', home: '公共目录' };
 
 // diffRoots(before, after) → { checked, added: [{ root, name, type }], error? }。
 // 只看新增的名字（已有条目的修改时间变化不算）；两边有任何一项读不了就是"没能核对"：checked 为 false、不记新文件。
-export function diffRoots(before, after, { caseInsensitive = process.platform === 'win32' } = {}) {
+export function diffRoots(before, after, { caseInsensitive = process.platform === 'win32', limit = MAX_ADDED } = {}) {
   const problems = [];
   for (const root of ['user', 'home']) {
     for (const [phase, snapshot] of [['前', before?.[root]], ['后', after?.[root]]]) {
@@ -83,11 +86,26 @@ export function diffRoots(before, after, { caseInsensitive = process.platform ==
   }
   added.sort((a, b) => (a.root === b.root ? (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) : a.root === 'user' ? -1 : 1));
   // userTemp 只在有临时文件时才有，其余情况返回值与原来一致。
-  return { checked: true, added: added.slice(0, MAX_ADDED), ...(userTemp.length ? { userTemp: userTemp.sort().slice(0, MAX_ADDED) } : {}) };
+  return { checked: true, added: added.slice(0, limit), ...(userTemp.length ? { userTemp: userTemp.sort().slice(0, MAX_ADDED) } : {}) };
 }
 
 // 进度里的一行（协议 12.4）：用户目录根的临时文件已忽略，名字最多列 5 个，多了加" 等"。
 export const userTempLine = names => `用户目录根出现临时文件（已忽略）：${names.slice(0, 5).join('、')}${names.length > 5 ? ' 等' : ''}`;
+
+export async function confirmOutsideWrites(before, roots, { wait = ms => new Promise(resolve => setTimeout(resolve, ms)), snapshot = snapshotRoots, caseInsensitive = process.platform === 'win32' } = {}) {
+  const first = diffRoots(before, snapshot(roots), { caseInsensitive, limit: Infinity });
+  if (!first.checked || !first.added.length) return first;
+  await wait(OUTSIDE_RECHECK_MS);
+  const later = snapshot(roots);
+  const second = diffRoots(before, later, { caseInsensitive });
+  if (!second.checked) return second;
+  const present = new Set(['user', 'home'].flatMap(root => later[root].entries.map(item => `${root}/${lowerIf(item.name, caseInsensitive)}`)));
+  const added = first.added.filter(item => present.has(`${item.root}/${lowerIf(item.name, caseInsensitive)}`));
+  const transient = first.added.filter(item => !present.has(`${item.root}/${lowerIf(item.name, caseInsensitive)}`));
+  return { ...first, added: added.slice(0, MAX_ADDED), ...(transient.length ? { transient: transient.slice(0, MAX_ADDED) } : {}) };
+}
+
+export const transientLine = items => `工作区外出现过又消失的条目（不算残留）：${listAdded(items)}`;
 
 // "<root>/<name>、…"：文件最多列 5 个，多了在最后加" 等"（同门禁 summary 的写法，协议 12.3）。
 export function listAdded(added, limit = 5) {
@@ -107,12 +125,12 @@ export const uncheckedLine = error => `工作区外写入没能核对：${error}
 // 写进 gate.json 的值（协议 12.4）：核对了是 { checked: true, added }，没能核对是 { checked: false, error }。
 export const outsideField = diff => (diff.checked === false
   ? { checked: false, error: diff.error ?? '' }
-  : { checked: true, added: diff.added ?? [] });
+  : { checked: true, added: diff.added ?? [], ...(diff.transient?.length ? { transient: diff.transient } : {}) });
 
 // 要写进 attempt-end 的值：只在有新文件或没能核对时写，否则 null。
 export function outsideRecord(diff) {
   if (!diff) return null;
-  return diff.checked === false || diff.added?.length ? outsideField(diff) : null;
+  return diff.checked === false || diff.added?.length || diff.transient?.length ? outsideField(diff) : null;
 }
 
 // 读取方校验（清单里的 outsideWrites）：{ checked: true, added: [{ root, name, type }] } 或 { checked: false, error }。
@@ -126,6 +144,11 @@ export function readOutsideWrites(value) {
     if (!item || typeof item !== 'object' || !['user', 'home'].includes(item.root)
       || typeof item.name !== 'string' || item.name === '' || !['file', 'dir', 'other'].includes(item.type)) return null;
     added.push({ root: item.root, name: item.name, type: item.type });
+  }
+  if (value.transient !== undefined) {
+    const parsed = readOutsideWrites({ checked: true, added: value.transient });
+    if (!parsed || !parsed.added.length) return null;
+    return { checked: true, added, transient: parsed.added };
   }
   return { checked: true, added };
 }

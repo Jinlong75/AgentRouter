@@ -68,7 +68,7 @@ function fixture(t) {
   f.setConfig = (extra = {}, profile = {}) => {
     writeFileSync(path.join(home, 'config.json'), JSON.stringify({
       v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...profile } },
+      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...profile } },
       ...extra,
     }));
   };
@@ -304,38 +304,42 @@ test('4 清理失败不中断其他项：被占用的 worktree 记进 errors，�
   const locked = await f.task('占用的');
   const holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: path.join(locked.wt.dir, 'src'), stdio: 'ignore', windowsHide: true, shell: false });
   const holderClosed = new Promise(resolve => holder.once('close', resolve));
-  t.after(async () => { holder.kill(); await holderClosed; });
-  await until(() => holder.pid, '占用进程启动');
-  const accepted = await f.ar(['accept', '占用的', '--json']);
-  assert.equal(accepted.code, 0, accepted.stderr + accepted.stdout);
-  assert.equal(JSON.parse(accepted.stdout).cleanup, false, 'accept 清理失败，worktree 留下');
-  // 另一个正常的残留，排在它前后都应照删。
-  const other = await f.task('其他的');
-  f.event(other.id, { event: 'rejected', reason: '不要了', keptBranch: false, by: 'cli' });
-  const sessionDir = path.join(f.home, 'workers', 'idle', 'claude', 'projects', 'old-project');
-  write(path.join(sessionDir, 'session.jsonl'), '会话\n');
-  utimesSync(sessionDir, new Date(Date.now() - days(30)), new Date(Date.now() - days(30)));
+  try {
+    await until(() => holder.pid, '占用进程启动');
+    const accepted = await f.ar(['accept', '占用的', '--json']);
+    assert.equal(accepted.code, 0, accepted.stderr + accepted.stdout);
+    assert.equal(JSON.parse(accepted.stdout).cleanup, false, 'accept 清理失败，worktree 留下');
+    // 另一个正常的残留，排在它前后都应照删。
+    const other = await f.task('其他的');
+    f.event(other.id, { event: 'rejected', reason: '不要了', keptBranch: false, by: 'cli' });
+    const sessionDir = path.join(f.home, 'workers', 'idle', 'claude', 'projects', 'old-project');
+    write(path.join(sessionDir, 'session.jsonl'), '会话\n');
+    utimesSync(sessionDir, new Date(Date.now() - days(30)), new Date(Date.now() - days(30)));
 
-  const result = await f.gc([]);
-  assert.equal(result.ok, true);
-  assert.equal(result.errors.length, 1, JSON.stringify(result.errors));
-  assert.equal(result.errors[0].kind, 'worktree');
-  assert.equal(result.errors[0].path, locked.wt.dir);
-  assert.ok(typeof result.errors[0].error === 'string' && result.errors[0].error !== '');
-  assert.ok(!existsSync(other.wt.dir), '其他项照删');
-  assert.ok(!existsSync(sessionDir), '会话记录照删');
-  assert.ok(existsSync(locked.wt.dir), '被占用的还在');
-  const text = await f.ar(['gc']);
-  assert.equal(text.code, 0);
-  assert.ok(text.stdout.includes('清理失败：'), text.stdout);
+    const result = await f.gc([]);
+    assert.equal(result.ok, true);
+    assert.equal(result.errors.length, 1, JSON.stringify(result.errors));
+    assert.equal(result.errors[0].kind, 'worktree');
+    assert.equal(result.errors[0].path, locked.wt.dir);
+    assert.ok(typeof result.errors[0].error === 'string' && result.errors[0].error !== '');
+    assert.ok(!existsSync(other.wt.dir), '其他项照删');
+    assert.ok(!existsSync(sessionDir), '会话记录照删');
+    assert.ok(existsSync(locked.wt.dir), '被占用的还在');
+    const text = await f.ar(['gc']);
+    assert.equal(text.code, 0);
+    assert.ok(text.stdout.includes('清理失败：'), text.stdout);
 
-  // 占用结束后再清理一次：目录、分支都清掉。
-  holder.kill();
-  await holderClosed;
-  const retry = await f.gc([]);
-  assert.deepEqual(retry.errors, []);
-  assert.ok(!existsSync(locked.wt.dir));
-  assert.ok(!f.branches().includes(locked.wt.branch), '合并过的分支也删掉');
+    // 占用结束后再清理一次：目录、分支都清掉。
+    holder.kill();
+    await holderClosed;
+    const retry = await f.gc([]);
+    assert.deepEqual(retry.errors, []);
+    assert.ok(!existsSync(locked.wt.dir));
+    assert.ok(!f.branches().includes(locked.wt.branch), '合并过的分支也删掉');
+  } finally {
+    holder.kill();
+    await holderClosed;
+  }
 });
 
 test('5 项目文件夹已不存在：待验收、失败的任务留下的 worktree 列出并只删目录；仓库还在的、仓库已删但仍在进行中的不动；清单不变', async t => {

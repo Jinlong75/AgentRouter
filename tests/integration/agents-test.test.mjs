@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { main } from '../../core/lib/cli.mjs';
+import { systemNodeSearch } from '../../core/lib/command.mjs';
 import { redactPaths } from '../../core/lib/process.mjs';
 
 // 失败现场用的完整进程快照（一次 PowerShell 查询）：pid、父 PID、创建时间、可执行文件名、命令行（脱敏）。
@@ -139,6 +140,47 @@ test('agents test：成功（exit 0 且有 OK）写 agent-tests.json，list 读�
   assert.equal(list.length, 1);
   assert.deepEqual(list[0].lastTest, saved, 'list 的 lastTest 来自 agent-tests.json');
   assert.ok(!fs.existsSync(path.join(home, 'runs.jsonl')), '不写入真实任务清单');
+});
+
+test('agents test：Node 写的执行者带 runtime，bundled 时文字输出多一行说明（430 第 4 条）', async t => {
+  const { home, env, call } = setup(t);
+  // 隔离系统临时目录：agents test 会建 ar-agent-test-*，别让并行文件里的超时诊断看见、也别看见别人的。
+  const tmp = path.join(home, 'tmp');
+  fs.mkdirSync(tmp);
+  const originalTemp = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+  Object.assign(process.env, { TEMP: tmp, TMP: tmp, TMPDIR: tmp });
+  t.after(() => { for (const [key, value] of Object.entries(originalTemp)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  // 模拟软件（Electron）：只有在这种运行时里才有 system / bundled 的区别。
+  const saved = { had: Object.prototype.hasOwnProperty.call(process.versions, 'electron'), value: process.versions.electron };
+  process.versions.electron = '43.7.5';
+  t.after(() => { if (saved.had) process.versions.electron = saved.value; else delete process.versions.electron; });
+
+  const probe = path.join(home, 'probe.js');
+  fs.writeFileSync(probe, "process.stdout.write('OK\\n');\n");
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ v: 2, defaultProfile: 'probe', profiles: {
+    probe: { adapter: 'generic', label: '我的 CLI', enabled: true, auth: 'login', generic: 'my-cli' },
+  }, generics: { 'my-cli': { label: '我的 CLI', executable: probe, detect: ['--version'], args: [], stdin: '{prompt}', output: { format: 'text' }, report: 'stdout' } } }));
+  const empty = path.join(home, 'empty-path'), missingHome = path.join(home, 'missing-home');
+  fs.mkdirSync(empty); fs.mkdirSync(missingHome);
+  // 预填缓存：同一 PATH 下常见位置当作不存在，测试机真的装了 Node（nvm / Homebrew 等）也不影响结果。
+  const bundledEnv = { ...env, PATH: empty };
+  assert.equal(systemNodeSearch({ inElectron: true, platform: process.platform, env: bundledEnv, exists: () => false, readdir: () => [], homedir: () => missingHome }).path, null);
+  const bundled = await call(['agents', 'test', 'probe', '--json'], { env: bundledEnv });
+  assert.equal(bundled.code, 0);
+  assert.equal(bundled.json.runtime, 'bundled');
+  const bundledText = await call(['agents', 'test', 'probe'], { env: bundledEnv });
+  assert.match(bundledText.out.join('\n'), /用的是 AgentRouter 自带的 Node（系统里没找到 Node\.js）；个别执行者不支持，装上 Node\.js 后重新检测/);
+
+  // PATH 里查得到系统 Node（用测试进程自己的 node 代表）：runtime 变成 system，文字输出不再有那一行。
+  const systemEnv = { ...env, PATH: path.dirname(process.execPath) };
+  // 查找按固定文件名 node.exe / node 拼路径；process.execPath 的大小写随启动方式而变（例如 node.EXE），不能直接拿来比。
+  const systemNode = path.join(path.dirname(process.execPath), process.platform === 'win32' ? 'node.exe' : 'node');
+  assert.equal(systemNodeSearch({ inElectron: true, platform: process.platform, env: systemEnv, exists: file => file === systemNode, readdir: () => [], homedir: () => missingHome }).path, systemNode);
+  const system = await call(['agents', 'test', 'probe', '--json'], { env: systemEnv });
+  assert.equal(system.code, 0);
+  assert.equal(system.json.runtime, 'system');
+  const systemText = await call(['agents', 'test', 'probe'], { env: systemEnv });
+  assert.doesNotMatch(systemText.out.join('\n'), /用的是 AgentRouter 自带的 Node/);
 });
 
 test('agents test：失败（exit 非 0 且有 error 事件）', async t => {

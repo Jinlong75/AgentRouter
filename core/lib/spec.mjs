@@ -1,13 +1,13 @@
 // 任务说明 v1 的解析、校验与合并（文件协议第 11 节）。零依赖。
 // 只导出 parseSpec、validateSpec、mergeSpec、SPEC_TYPES、SpecError。
-export const SPEC_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review'];
+export const SPEC_TYPES = ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review', 'chore'];
 
 // 默认要求提交的类型（协议第 11.3 节）。
 const COMMIT_TYPES = new Set(['code', 'test', 'fix', 'refactor']);
 const KNOWN_FIELDS = new Set([
   'id', 'title', 'type', 'worker', 'allowed_paths', 'verify', 'expect_commit',
   'timeout_min', 'verify_timeout_min', 'max_retries', 'review', 'read_only',
-  'effort', 'model', 'reviewer', 'review_block',
+  'effort', 'model', 'reviewer', 'review_block', 'depends', 'report_sections', 'mutations_required',
 ]);
 const FIELD_NAME = /^[a-z_]+$/;
 
@@ -94,6 +94,10 @@ export function parseSpec(text, file = '任务说明') {
     }
     const value = rawValue.trim();
     if (value === '[]') { setField(key, []); listKey = null; continue; }
+    if (key === 'depends' && value.startsWith('[')) {
+      try { setField(key, JSON.parse(value)); } catch { throw new SpecError(file, lineNo, 'depends 必须是任务编号的字符串数组'); }
+      listKey = null; continue;
+    }
     if (value.startsWith('[')) throw new SpecError(file, lineNo, '不支持内联数组（只有 [] 可以内联）');
     if (value.startsWith('{')) throw new SpecError(file, lineNo, '不支持内联对象');
     if (value.startsWith('|') || value.startsWith('>')) throw new SpecError(file, lineNo, '不支持多行字符串（| 或 >）');
@@ -208,6 +212,14 @@ export function validateSpec(parsed, file = '任务说明') {
     spec.type = value;
   }
   if (has('worker')) spec.worker = asString('worker');
+  if (has('depends')) {
+    if (!Array.isArray(meta.depends) || !meta.depends.length || meta.depends.some(item => typeof item !== 'string' || !item.trim())) fail('depends', '必须是任务编号的字符串数组');
+    spec.depends = meta.depends.slice();
+  }
+  if (has('report_sections')) {
+    if (!Array.isArray(meta.report_sections) || meta.report_sections.some(x => typeof x !== 'string' || !x.trim())) fail('report_sections', '必须是非空字符串数组');
+    spec.report_sections = meta.report_sections.slice();
+  }
   if (has('allowed_paths')) {
     spec.allowed_paths = asList('allowed_paths');
     spec.allowed_paths.forEach((item, index) => checkAllowedPath(item, index, fail));
@@ -221,6 +233,7 @@ export function validateSpec(parsed, file = '任务说明') {
   if (has('expect_commit')) spec.expect_commit = asBoolean('expect_commit');
   if (has('timeout_min')) spec.timeout_min = asInteger('timeout_min', 1);
   if (has('verify_timeout_min')) spec.verify_timeout_min = asInteger('verify_timeout_min', 1);
+  if (has('mutations_required')) spec.mutations_required = asInteger('mutations_required', 0);
   if (has('max_retries')) spec.max_retries = asInteger('max_retries', 0);
   if (has('review')) spec.review = asBoolean('review');
   if (has('read_only')) spec.read_only = asBoolean('read_only');
@@ -241,6 +254,7 @@ export function validateSpec(parsed, file = '任务说明') {
     if (value !== 'none' && value !== 'high') fail('review_block', `只能是 none 或 high（当前：${show(value)}）`);
     spec.review_block = value;
   }
+  if (spec.type === 'chore' && spec.review === undefined) spec.review = false;
   return spec;
 }
 
@@ -263,7 +277,7 @@ export function checkAllowedPath(item, index, fail) {
 // gate 为真表示派发后要跑门禁（协议第 11.4 节的三个条件任一条成立）。
 export function mergeSpec(spec = {}, project = {}) {
   const source = spec ?? {};
-  const config = project ?? {};
+  const config = source.type === 'chore' ? { ...(project ?? {}), verify: [], allowedPaths: ['**'] } : (project ?? {});
   const nonEmpty = value => Array.isArray(value) && value.length > 0;
 
   const allowed_paths = nonEmpty(source.allowed_paths)
@@ -291,4 +305,39 @@ export function mergeSpec(spec = {}, project = {}) {
     || expect_commit === true;
 
   return { allowed_paths, verify, expect_commit, timeout_min, verify_timeout_min, max_retries, gate };
+}
+
+// 项目必填规则只接受非空字符串数组，缺省时不启用。
+export function validateRequiredConfig(project = {}) {
+  for (const name of ['specRequired', 'reportRequired']) {
+    if (!Object.hasOwn(project, name)) continue;
+    const rule = project[name];
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule) || Object.keys(rule).some(k => !(name === 'specRequired' ? ['fields', 'sections', 'types'] : ['sections', 'types']).includes(k))) throw new Error(`项目配置无效：${name}`);
+    for (const value of Object.values(rule)) if (!Array.isArray(value) || value.some(x => typeof x !== 'string' || !x.trim())) throw new Error(`项目配置无效：${name}`);
+  }
+}
+export function sectionHasContent(lines) {
+  return !/^(?:|(?:无|没有)[。]?)$/.test(lines.join('').replace(/\s/g, ''));
+}
+export function missingContentSections(text, sections = []) {
+  const bodies = new Map(sections.map(name => [name, []]));
+  let active = null, fence = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) { if (!fence) fence = marker[1]; else if (marker[1][0] === fence[0] && marker[1].length >= fence.length) fence = null; if (active) active.push(line); continue; }
+    if (fence) { if (active) active.push(line); continue; }
+    const heading = line.match(/^#{1,2}\s+(.+?)\s*$/);
+    if (heading) { active = /^##\s/.test(line) && bodies.has(heading[1]) ? [] : null; if (active) bodies.get(heading[1]).push(active); }
+    else if (active) active.push(line);
+  }
+  return sections.filter(name => !bodies.get(name).some(sectionHasContent));
+}
+export function missingSections(text, sections = []) {
+  const headings = String(text).split(/\r?\n/).filter(line => /^\s*#{1,6}\s+/.test(line));
+  return sections.filter(section => !headings.some(line => line.includes(section)));
+}
+export function requiredApplies(rule, type) { return !!rule && (!rule.types || rule.types.includes(type)); }
+export function missingSpecRequired(parsed, rule) {
+  if (!requiredApplies(rule, parsed.meta.type)) return { fields: [], sections: [] };
+  return { fields: (rule.fields ?? []).filter(key => { const v = parsed.meta[key]; return v == null || (typeof v === 'string' && !v.trim()) || (Array.isArray(v) && !v.length); }), sections: missingSections(parsed.body, rule.sections) };
 }

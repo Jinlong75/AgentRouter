@@ -23,13 +23,21 @@ export const READONLY_TOOLS = 'Read,Grep,Glob,WebSearch,WebFetch';
 export const CLEAR = [/^ANTHROPIC_/i, /^CLAUDE_/i, /^CLAUDECODE$/i];
 
 const missing = '找不到 Claude Code CLI。确认 claude --version 能运行；非标准安装可在 config.json 的执行者配置里写 path（claude.exe 或 claude.cmd 的绝对路径）。';
-const launcherFor = file => resolveFile(file, { missing, unwrapError: file => `无法解析 Claude Code 的启动包装：${file}。可在执行者配置的 path 里写 claude.exe 的绝对路径。` });
+const launcherFor = (file, env) => resolveFile(file, { missing, env, unwrapError: file => `无法解析 Claude Code 的启动包装：${file}。可在执行者配置的 path 里写 claude.exe 的绝对路径。` });
+export function interactiveLaunch(profile = {}, { model, effort, env = process.env } = {}) {
+  const launcher = resolveLauncher(env, process.platform, profile.path);
+  const args = [...launcher.args];
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
+  return { executable: launcher.executable, args, capabilities: { model: true, effort: true } };
+}
+
 export function resolveLauncher(env = process.env, platform = process.platform, configuredPath = null) {
-  if (configuredPath) return launcherFor(configuredPath);
+  if (configuredPath) return launcherFor(configuredPath, env);
   // 测试可指定一个 Node 假执行者（回放真实输出样例）；不改变真实安装或 PATH（与 codex 相同）。
   if (testAgent(env)) return { executable: process.execPath, args: [path.resolve(testAgent(env))] };
   const file = findOnPath(platform === 'win32' ? ['claude.exe', 'claude.cmd'] : ['claude'], env);
-  if (file) return launcherFor(file);
+  if (file) return launcherFor(file, env);
   throw new Error(missing);
 }
 
@@ -154,6 +162,7 @@ export const claudeCode = {
   isolate({ home, profileName }) {
     return { clear: CLEAR, set: { CLAUDE_CONFIG_DIR: path.join(home, 'workers', profileName, 'claude'), DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' } };
   },
+  interactiveLaunch,
   command({ prompt, settings = {}, detection, env = process.env, profile = {}, readOnly = false }) {
     const { executable, args: base } = detection?.launcher ?? resolveLauncher(env, process.platform, settings.path ?? profile.path);
     const args = [...base, '-p', '--output-format', 'stream-json', '--verbose'];

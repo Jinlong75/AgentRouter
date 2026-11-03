@@ -85,7 +85,7 @@ function fixture(t, { project = {} } = {}) {
   f.setProfile = value => {
     writeFileSync(path.join(home, 'config.json'), JSON.stringify({
       v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+      profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...value } },
     }));
   };
   f.setProfile({});

@@ -29,6 +29,8 @@
 
 1. **先确认它的非交互用法**：在一个临时目录里手动试，记下三件事——任务指令怎么传（参数 / 文件 / 标准输入）、输出是什么格式（纯文本 / 每行一个 JSON / Claude Code 风格的 stream-json）、只读用什么参数（没有就不能做调研、审查类任务）。
 2. **在软件里填表**：导入 Agent →"自定义 CLI"。程序、检测参数、参数模板（任务指令用 `{prompt}` 或 `{promptFile}` 占位符）、输出格式；JSONL 时填事件映射（例如 `type = message` → 说话，字段 `text ← content`）。点"测试并预览"，左边原始输出、右边映射出的事件，没匹配的行会标出来，改好再保存。
+
+   `{promptFile}` 被 `ar stop` 中断时临时文件可能留下，`ar gc` 会清理修改时间早于 1 小时前的残留文件。
 3. **或者写一份声明 JSON**，用命令行导入：
 
    ```json
@@ -46,7 +48,7 @@
    }
    ```
 
-   `ar agents validate <文件>` 先校验（错误带字段路径），通过后加入：`ar agents add --generic "$(cat <文件>)" --name <名>`（在 Git Bash 里运行；Windows PowerShell 5.1 会把带双引号的 JSON 参数拆坏，请改用 Git Bash 或软件里的表单）。也可以手动在 `config.json` 的 `generics` 里放这份声明、执行者配置写 `"adapter": "generic", "generic": "<名>"`（先退出软件）。别人用 `ar agents export` 导出的文件直接 `ar agents import <文件>`；`import` 不收单独的声明。完整字段、占位符与映射规则以校验器 `../lib/generic-schema.mjs` 为准（错误信息会指出哪个字段不对）。
+   `ar agents validate <文件>` 先校验（错误带字段路径），通过后加入：`ar agents add --generic "$(cat <文件>)" --name <名>`（在 Git Bash 里运行；Windows PowerShell 5.1 会把带双引号的 JSON 参数拆坏，请改用 Git Bash 或软件里的表单）。也可以手动在 `config.json` 的 `generics` 里放这份声明、执行者配置写 `"adapter": "generic", "generic": "<名>"`（先退出软件）。别人用 `ar agents export` 导出的文件直接 `ar agents import <文件>`；单独的声明可用 `ar agents import <文件> --name <名>` 导入。完整字段、占位符与映射规则以校验器 `../lib/generic-schema.mjs` 为准（错误信息会指出哪个字段不对）。
 4. **测试**：`ar agents test <名>`（让它只回复 OK：汇报里有 OK 才算通过），再派一个小任务看进展和汇报是否正常。
 5. **分享**：`ar agents export <名> --out <文件>` 导出声明，不含密钥值，别人可以直接导入。
 
@@ -54,9 +56,25 @@
 
 只读任务（调研、审查）靠 `readOnlyArgs`（换一套参数）和 / 或 `readOnlyEnv`（额外设置的环境变量，如 DeepSeek Harness 的 `DSH_PERMISSION_MODE: "read-only"`）：两者至少写一个才支持只读。`readOnlyEnv` 与 `env` 同样校验（变量名合法、值是字符串、名字不能以 `_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD` 结尾，密钥放 `secrets`）；只读运行时先合并 `env`（公共层并入执行者配置），再合并 `readOnlyEnv`（同名覆盖，变量名不分大小写）；非只读运行不用它。
 
-DeepSeek Harness（预设 `deepseek-harness`，程序 `dsh`，用户自己用 npm 安装 `@deepseek-ai/dsh`）也是这样接入的：`dsh headless --json -` 从标准输入读任务，输出 JSONL，映射写在预设的 `output.map` 里；可写任务用 dsh 默认的 `workspace-write`，只读任务设 `DSH_PERMISSION_MODE=read-only`。练习用的假程序是 `tests/fixtures/generic/dsh-cli.mjs`。
+| 字段 | 类型及含义 |
+|---|---|
+| `requiresSystemNode` | 布尔值，默认 `false`；为 `true` 时软件里找不到系统 Node 就直接报错，不退回自带运行时。 |
 
-Qoder 就是这样接入的（预设 `qoder-cn`、`qoder`，见 `../templates/agents/`）：它的输出是 Claude Code 风格的 stream-json，所以 `output.format` 写 `stream-json`，不用写映射。
+DeepSeek Harness（预设 `deepseek-harness`，程序 `dsh`；可以由 AgentRouter 自动安装到它自己的工具目录（软件首次引导或 Agent 页，命令行 `ar agents deploy deepseek-harness`），也可以自己用 npm 安装 `@deepseek-ai/dsh` 后导入）也是这样接入的：`dsh headless --json -` 从标准输入读任务，输出 JSONL，映射写在预设的 `output.map` 里；可写任务用 dsh 默认的 `workspace-write`，只读任务设 `DSH_PERMISSION_MODE=read-only`。练习用的假程序是 `tests/fixtures/generic/dsh-cli.mjs`。
+
+Qoder 就是这样接入的（预设 `qoder-cn`、`qoder`，见 `../templates/agents/`）：它的输出是 Claude Code 风格的 stream-json，所以 `output.format` 写 `stream-json`，不用写映射。两个预设的声明还在 `env` 里设了 `QODERCLI_PRINT_BG_WAIT_CEILING_MS=0`：非交互 `-p` 模式下它默认等后台任务到上限就把任务停掉并退出，设成 0 表示一直等；单轮总时长仍由任务说明的 `timeout_min` 兜底。已导入的执行者读配置时会补上预设里新增的变量（配置里自己写了同名键以配置为准），不用重新导入。
+
+**作为主导启动（Stage09）**：声明里可以再加一个可选的 `interactive`，写交互式程序的启动参数模板：
+
+```json
+"interactive": {
+  "args": [],
+  "model": ["-m", "{model}"],
+  "effort": ["--reasoning-effort", "{effort}"]
+}
+```
+
+`args` 是基础参数；`model` / `effort` 各是一组字符串、其中恰好一项含 `{model}` / `{effort}`，启动时值非空才整组追加，每项替换后仍是一个参数。Qoder 的两个预设就是这样写的：`args` 为空，模型用 `-m {model}`，推理强度用 `--reasoning-effort {effort}`。没有 `interactive` 声明的执行者不能 `ar lead set` 当主导；只允许 `args` / `model` / `effort` 三个键，校验错误见 `../lib/generic-schema.mjs`。适配器的 `interactiveLaunch` 只算参数，不启动进程。
 
 **`failureHints[].kind`（额度用完 / 限流时自动换人，Stage07c T7）**：声明里的 `failureHints` 每项是 `{ match, text }`（`match` 是不分大小写的正则，匹配 stderr 与出错事件；`text` 是写进进度的中文说明），可以再加一个可选的 `kind`：
 
@@ -110,6 +128,7 @@ Qoder 就是这样接入的（预设 `qoder-cn`、`qoder`，见 `../templates/ag
 | `writesReport` | 是否由执行者写 `report`。为 `false` 时公共层把最后一条 `say.text` 原样写入；没有 `say` 时不虚构汇报 |
 | `detect({env, settings, profile})` | 返回（或异步返回）`{installed, version}`；取不到版本写 `null`，可携带适配器私有的 `launcher` / `error`。检测只运行版本命令，不发任务 |
 | `command({root, report, prompt, settings, detection, env, profile, profileName, attempt, readOnly})` | 返回 `{executable, args, stdin, cleanup?}`（`cleanup` 是任务结束后要删的临时文件，如 generic 的 `{promptFile}`；Stage07 起 `readOnly` 在调研 / 审查类任务时为 `true`），分别为可执行文件、字符串数组、输入文本。公共层固定 `shell:false`；检测结果原样传回此处。`report` 指这次尝试的 `<任务目录>/attempts/<n>/report.md`（顶层 `report.md` 是最新一次的副本）；`attempt` 是这次的尝试次数（1 起），执行者想按次表现不同时用它（见 fake 的 `attempts`） |
+| `interactiveLaunch(profile, {model, effort, env})`（可选，Stage09） | 作为主导启动时的命令行：返回 `{ executable, args, capabilities?: { model, effort }, verbatim? }`，**只算参数，不启动进程**。`model` / `effort` 为空时不拼。找不到程序时抛出以 `找不到 ` 开头的错误，`ar lead` 会换成中文提示；generic 的 `.cmd` / `.bat` 经 `cmd.exe` 运行时带 `verbatim: true`。没有这个成员（generic 是没有 `interactive` 声明）的执行者不能当主导 |
 | `mapLine(line, {root})` | 一行 stdout 转成零到多个事件数组。事件只含协议规定的 `kind` 及附加字段，`v/seq/at` 由公共层追加。未知 JSON 事件丢弃，非空非 JSON 行转 `text` |
 | `createMapper()`（可选） | 返回有状态的 `mapLine`（同一任务内记住命令 id 等）；有它时公共层每个任务新建一个，否则用 `mapLine`。映射函数可带 `lastResult`，交给 `finish` |
 | `isolate({home, profileName, profile})`（可选；`profile` 是 Stage07 104 加的） | 返回 `{clear, set, keep}`：`keep` 是白名单之外该执行者还要从基础环境保留的变量名（如 codex 的 `CODEX_HOME`，不得是密钥）；`clear` 是要去掉的变量名或正则；`set` 是追加的变量（如执行者自己的配置目录）。公共层按"原环境取密钥 → 白名单（系统、代理、keep；所有 profile 的密钥来源变量除外）→ 清除 → profile.env → 密钥 → set"的顺序合成环境（`../lib/env.mjs`）。白名单之外的变量一律不传给执行者，需要时写进 profile 的 `env` |
@@ -183,7 +202,8 @@ export function makeAdapter(executable) {
 ## 公共行为与 Codex 配置
 
 - profile 选择：派发时由路由器选（任务说明 `worker` → 项目规则 → 全局规则 → 兜底 → 默认执行者，见 `core/lib/router.mjs`）；`--profile` 直接指定则不经路由。路由没有结果时才按 `AR_PROFILE` > `config.json` 的 `defaultProfile` > 唯一启用的 profile 兜底；都没有时报"还没有可用的执行者"。没有配置文件时内置一个 `codex` profile。
-- Codex：`profiles.codex.path` 有值时直接使用，不查 PATH；Node 入口（`.js` / `.mjs` / `.cjs`）用 `process.execPath`，可执行文件直接启动，`.cmd` / `.bat` 按 npm 包装解析；文件不存在或包装不支持则报错。未设置时在 PATH 中查找 `codex.exe` 或 npm `codex.cmd`。不经过 shell，因此空格和中文参数不会被拆开。
+- Codex：`profiles.codex.path` 有值时直接使用，不查 PATH；Node 入口（`.js` / `.mjs` / `.cjs`）优先用系统 Node，找不到时按运行环境回退自带运行时，可执行文件直接启动，`.cmd` / `.bat` 按 npm 包装解析；文件不存在或包装不支持则报错。未设置时在 PATH 中查找 `codex.exe` 或 npm `codex.cmd`。不经过 shell，因此空格和中文参数不会被拆开。
+- Codex 的主导启动（Stage09）：`interactiveLaunch` 在启动器参数后按需追加 `-m <模型>`、`-c model_reasoning_effort=<JSON 字符串>`，返回 `capabilities: { model: true, effort: true }`；只算参数，不启动进程，也不带沙箱设置（完全访问要在 Codex 界面里选）。
 - 参数优先级：命令行 > 环境变量（`CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_TIER` / `CODEX_SANDBOX`，只作用于 codex 执行者）> 任务说明（仅模型、推理强度）> 命中的路由规则（仅推理强度）> `config.json` 里该执行者的设置 > 内置默认，见 `core/lib/config.mjs` 的 `resolveSettings`。模型、强度、档位默认 `null`，沙箱默认 `workspace-write`，窗口默认 `auto`。
 - 公共目录 `AGENT_ROUTER_HOME`、预演 `AR_DRY_RUN`、关窗口 `AR_NO_WATCH`、测试执行者 `AR_TEST_AGENT`；旧变量名仍有效，兼容规则集中在 `../lib/compat.mjs`。
 - 预演时只打印去重后的记录名和任务指令，不读配置、不检测执行者、不创建目录或文件。`AR_TEST_AGENT` 仅供测试，指定一个 Node 脚本代替 Codex 入口；自动测试使用临时目录和假进程，`npm run verify` 不访问真实 Agent。
@@ -198,8 +218,9 @@ export function makeAdapter(executable) {
 - 写入模式：`-p --output-format stream-json --verbose --permission-mode bypassPermissions`，任务指令从标准输入传入。只读模式：`--permission-mode dontAsk --tools Read,Grep,Glob,WebSearch,WebFetch --allowedTools` 同一白名单。profile 的 `maxTurns` 拼成 `--max-turns`。`model` / `effort`（命令行 > profile，见协议第 4 节）不为 `null` 时两种模式都依次追加 `--model <值>`、`--effort <值>`，值原样传入、不校验；为 `null` 时不拼。`tier` 不传入任何参数，派发时进度里写一行"配置：claude-code 执行者不支持 tier，已忽略"。
 - 隔离：`CLAUDE_CONFIG_DIR` 指向 `<公共目录>/workers/<profile>/claude`，读不到用户本人的登录、设置与个人技能；设 `DISABLE_AUTOUPDATER=1`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`。子进程环境是白名单（见接口表 `isolate`），另按前缀清掉 `ANTHROPIC_*`、`CLAUDE_*`、`CLAUDECODE`（主导会话会传下自己的会话变量），再放入 profile 的 `env` 与密钥。
 - 认证：profile 的 `auth` 为 `token` 时，`secrets` 里的变量（如 `ANTHROPIC_AUTH_TOKEN`）从用户环境变量读出值后放入子进程环境，值不进命令行、日志或文件；为 `login` 时用执行者配置目录里的订阅登录。
+- 主导启动（Stage09）：`interactiveLaunch` 在启动器参数后按需追加 `--model <值>`、`--effort <值>`，返回 `capabilities: { model: true, effort: true }`；只算参数，不启动进程。
 - 映射：`system/init` → 模型；`assistant` 的文字 / 思考 / 工具调用与 `user` 的工具结果 → `say` / `think` / `cmd` / `file` / `plan` / `tool`；`result` → `turn` 用量与最终汇报（`finish` 优先用它）。其余 `system` 事件丢弃。执行者把验证放后台时，后台通知会让 Claude Code 多开几轮、每轮一条 `result`，此时取文字最长的一条作汇报（一样长取靠后的），免得真正的汇报被后面的"等通知"之类短回复覆盖；只有一条时就是它。
-- 预设：`../templates/agents/*.json`（`ar agents presets` 查看），按 `order` 排列：`deepseek`（1，推荐）、`mimo`（2）、`mimo-payg`（3）、`claude-native`（4）、`claude-subscription`（5）、`compat`（6）、`codex`（7）、`qoder-cn` / `qoder`（8，通用适配器）、`deepseek-harness`（8.5，通用适配器，用户自己安装 dsh）、`openai-compat`（9，Codex 外壳）。预设里的 `modelOptions`、`effortOptions`、`baseUrlOptions`、`listModels` 是预设与探测用的元数据，不写进 `config.json`：软件的下拉框和 `ar agents models` 用它们（`listModels` 是列出模型用的命令行参数，缺省或失败时退回 `modelOptions`）；`effortOptions` 还用于校验任务说明 / 路由规则给出的推理强度（命令行明确给的强度不校验），自动重试升档也按它的顺序。
+- 预设：`../templates/agents/*.json`（`ar agents presets` 查看），按 `order` 排列：`deepseek`（1，推荐）、`mimo`（2）、`mimo-payg`（3）、`claude-native`（4）、`claude-subscription`（5）、`compat`（6）、`codex`（7）、`qoder-cn` / `qoder`（8，通用适配器）、`deepseek-harness`（8.5，通用适配器，可由 AgentRouter 安装 dsh，也可自行用 npm 安装）、`openai-compat`（9，Codex 外壳）。预设里的 `modelOptions`、`effortOptions`、`baseUrlOptions`、`listModels` 是预设与探测用的元数据，不写进 `config.json`：软件的下拉框和 `ar agents models` 用它们（`listModels` 是列出模型用的命令行参数，缺省或失败时退回 `modelOptions`）；`effortOptions` 还用于校验任务说明 / 路由规则给出的推理强度（命令行明确给的强度不校验），自动重试升档也按它的顺序。
 - 预设的 `card` 与 `variant` 也只给导入向导用（`ar agents presets --json` 原样输出，`ar agents add` 不写进 `config.json`）：`card`（`id`、`title`、`description`）把同一服务的几个预设合成向导第 1 步的一张卡片，`variant`（`label`、`option`、`help`）是第 2 步分段按钮里这个预设对应的选项与说明。目前合并的有 Claude Code（`claude-native` / `claude-subscription`）、Xiaomi MiMo（`mimo` / `mimo-payg`）、Qoder（`qoder-cn` / `qoder`）。同一 `card.id` 的预设必须有相同的 `card` 和相同的 `variant.label`、不同的 `variant.option`，否则 `ar agents presets` 报"预设模板错误"。预设本身（名字、地址、密钥变量）不受合并影响。预设模板是代码里唯一写具体服务商与模型名的地方。
 - MiMo 有两种接入，密钥类型与接口地址不能混用：Token Plan（个人 / 团队，API Key 以 `tp-` / `ttp-` 开头）用 `mimo` 预设，地址 `https://token-plan-cn.xiaomimimo.com/anthropic`；按量付费（API Key 以 `sk-` 开头）用 `mimo-payg` 预设，地址 `https://api.xiaomimimo.com/anthropic`。两者都用 `ANTHROPIC_AUTH_TOKEN` 认证，密钥来源环境变量是 `MIMO_API_KEY`，默认模型 `mimo-v2.6-pro`。
 - 导入 Agent 向导的第 2 步，或 Agent 页执行者的"编辑"，都可以改接口地址与模型；`ar agents add` / `update` 也可以用 `--base-url`、`--model`。

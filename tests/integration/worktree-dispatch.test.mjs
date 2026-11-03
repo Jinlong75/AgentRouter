@@ -114,7 +114,7 @@ function fixture(t, { worktree = true, setup = ['node scripts/setup.mjs'], concu
   if (worktree !== null) project.worktree = worktree;
   write(path.join(repo, '.agent-router/project.json'), JSON.stringify(project, null, 2));
   commitAll(repo, '初始提交');
-  const profile = { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0 };
+  const profile = { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0 };
   const f = { base, repo, home, wtRoot, env, profile, since };
   f.setProfile = value => {
     Object.assign(profile, value);
@@ -214,9 +214,10 @@ test('2 任务说明没提交到主分支：退出码 2、原文、没有记录�
   // 只提交在别的分支：检出 other，任务说明在工作区里，但 main 里没有。
   git(f.repo, ['checkout', '-q', '-b', 'other']);
   const onOther = f.spec('docs/specs/002-别的分支.md');
-  let result = await f.ar(['dispatch', onOther, '--name', '别的分支', '--json']);
+  let result = await f.ar(['dispatch', onOther, '--base', 'main', '--name', '别的分支', '--json']);
   assert.equal(result.code, 2, result.stderr + result.stdout);
-  assert.deepEqual(JSON.parse(result.stdout), { ok: false, error: '任务说明还没提交到 main，执行者看不到它' });
+  const specError = '任务说明还没提交到 main，执行者看不到它';
+  assert.deepEqual(JSON.parse(result.stdout), { ok: false, error: specError, code: 'SPEC_BASE', specCheck: { ok: false, errors: [{ code: 'SPEC_BASE', file: null, line: null, message: specError }], warnings: [] } });
   assert.ok(!existsSync(path.join(f.repo, '.agent-runs')), '没有记录目录');
   // 没提交：回到 main，任务说明只在工作区里。
   git(f.repo, ['checkout', '-q', 'main']);

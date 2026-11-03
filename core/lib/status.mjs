@@ -1,8 +1,9 @@
 // 任务状态查询（协议 15.11）：ar status <记录名>。只读清单，不等待、不碰进程。零依赖。
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { readJson } from './json.mjs';
 import { activeLimits, clockText } from './limits-state.mjs';
-import { readNeedsScope } from './needs-scope.mjs';
+import { parseNeedsScope, readNeedsScope } from './needs-scope.mjs';
 import { readOutsideWrites } from './outside-writes.mjs';
 import { findTerminal, locateStart, reverseRows, worktreeOutcome } from './wait.mjs';
 
@@ -58,6 +59,68 @@ function readReviewBrief(dir) {
   try { return reviewBrief(readJson(join(dir, 'review.json'))); } catch { return null; }
 }
 
+// TODO(lead) 按全文字面出现次数计数；推断清单也认汇报模板的编号项及其子项，
+// 越界节标题复用协议 14.5 的解析器；两节按列表项计数，
+// “无”表示零项，缺节、空节、重复节或无法辨认的正文记 null；代码块不作为标题或列表。
+function reportBrief(text) {
+  const sections = { 推断清单: [], 需要越界: [] };
+  let current = null, level = 0, fence = null, numberedIndent = null;
+  for (const line of text.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence) {
+      if (marker && marker[0] === fence[0] && marker.length >= fence.length && /^\s*(?:`+|~+)\s*$/.test(line)) fence = null;
+      else if (current) current.invalid = true;
+      continue;
+    }
+    if (marker) { fence = marker; if (current) current.invalid = true; continue; }
+    const heading = /^\s*(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (heading) {
+      if (numberedIndent !== null || (current && heading[1].length <= level)) { current = null; numberedIndent = null; }
+      const title = heading[2].replace(/^(?:\d+[.、)）]|[（(]\d+[)）])\s*/, '').replace(/[:：]$/, '').replace(/^\*\*(.*?)\*\*$/, '$1').replace(/[:：]$/, '').trim();
+      const name = parseNeedsScope(`${line}\n- __status_probe__`).length ? '需要越界' : title === '推断清单' ? title : null;
+      if (name && !current) {
+        current = { name, count: 0, inline: 0, none: false, invalid: false, content: false };
+        sections[name].push(current); level = heading[1].length;
+      } else if (current) current.invalid = true;
+      continue;
+    }
+    const numbered = /^(\s*)\d+[.)]\s+\*\*推断清单\*\*\s*[:：]\s*(.*)$/.exec(line);
+    if (numbered && (!current || numberedIndent !== null)) {
+      current = { name: '推断清单', count: 0, inline: 0, none: false, invalid: false, content: false };
+      sections.推断清单.push(current); numberedIndent = numbered[1].length;
+      // 同一行冒号后的文字：后面没有子条目时它就是唯一一条推断；后面有子条目时它只是引言（审查 R4-1）。
+      if (numbered[2]) {
+        if (/^(?:无|没有)[。.]?$/.test(numbered[2].trim())) current.none = current.content = true;
+        else { current.inline = 1; current.content = true; }
+      }
+      continue;
+    }
+    if (numberedIndent !== null && new RegExp(`^\\s{0,${numberedIndent}}\\d+[.)]\\s+`).test(line)) {
+      current = null; numberedIndent = null;
+    }
+    if (!current || !line.trim()) continue;
+    const item = /^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$/.exec(line);
+    const content = (item?.[1] ?? line).trim();
+    if (/^(?:无|没有)[。.]?$/.test(content)) { current.none = true; current.content = true; }
+    else if (item) { current.count++; current.content = true; }
+    // 需要越界节里的非列表行是说明，不算路径（协议 14.5，与 parseNeedsScope 一致，审查 R4-2）。
+    else if (current.name !== '需要越界') current.invalid = true;
+  }
+  const count = name => {
+    const entries = sections[name], section = entries[0];
+    const total = section && (section.count || section.inline);
+    return entries.length !== 1 || !section.content || section.invalid || (section.none && total) ? null : total;
+  };
+  // 需要越界：有这一节时直接用协议 14.5 的 parseNeedsScope 计数，节边界、下级标题、说明行都与它一致（审查 R5-1）；没有这一节为 null。
+  const needsScope = sections.需要越界.length ? parseNeedsScope(text).length : null;
+  return { todoLead: (text.match(/TODO\(lead\)/g) ?? []).length, inferences: count('推断清单'), needsScope };
+}
+
+function readReportBrief(dir) {
+  if (typeof dir !== 'string' || dir === '') return null;
+  try { return reportBrief(readFileSync(join(dir, 'report.md'), 'utf8')); } catch { return null; }
+}
+
 // 任务当前状态。不查进程：进程已经不在、清单里又没有结束记录的任务仍按进行中显示；ar wait 会把它当中断（协议 15.11）。
 export function taskState(file, start, rows = taskRows(file, start.id)) {
   if (start.worktree === true) {
@@ -90,10 +153,14 @@ export function taskStatus({ homes, root, name }) {
   const layered = resume ?? start;
   const settingSources = layered.settingSources && typeof layered.settingSources === 'object' ? layered.settingSources : null;
   // 现在被限流的执行者（Stage07c T7，limits.json）：{ <名>: { kind, until, since } }；没有被限流的就没有这个字段，输出保持原样。
+  let route = null;
+  try { route = readJson(join(start.dir, 'dispatch.json'))?.route ?? null; } catch { /* 旧任务可能没有派发记录。 */ }
   const review = readReviewBrief(start.dir);
+  const report = readReportBrief(start.dir);
   const limited = Object.fromEntries(Object.entries(activeLimits([homes].flat()[0])).map(([profile, entry]) => [profile, { kind: entry.kind, until: entry.until, since: entry.since }]));
   return {
     ok: true, id: start.id, name: start.name, state, attempts,
+    ...(route?.rule?.scope === 'implicit' ? { route: { source: 'implicit', profile: route.profile } } : {}),
     gate: gate ? { ok: gate.ok === true, summary: gate.summary ?? null } : null,
     needsScope: end ? readNeedsScope(end.needsScope) : null,
     outsideWrites: outside?.added.length ? { added: outside.added } : null,
@@ -109,6 +176,7 @@ export function taskStatus({ homes, root, name }) {
     ...(Object.keys(limited).length ? { limits: limited } : {}),
     // 审查结果（Stage08 T3）：只在有审查结果时才有这个字段，其余任务的 JSON 保持原样。
     ...(review ? { review } : {}),
+    ...(report ? { report } : {}),
   };
 }
 
@@ -130,6 +198,7 @@ const localStamp = ms => {
 // 不加 --json 时给人看的几行。
 export function statusLines(status) {
   const lines = [`状态：${status.name}（${status.state}）`, `尝试次数：${status.attempts}`];
+  if (status.route?.source === 'implicit') lines.push(`路由：预设默认规则 → ${status.route.profile}`);
   if (status.gate) lines.push(status.gate.ok ? '门禁：通过' : `门禁：未通过（${status.gate.summary ?? '无说明'}）`);
   if (status.worktree) lines.push(`worktree：${status.worktree.dir}（分支 ${status.worktree.branch}）`);
   if (status.review) lines.push(reviewLine(status.review));

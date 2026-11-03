@@ -1,4 +1,4 @@
-import { openSync, fstatSync, readSync, closeSync, readdirSync, readFileSync } from 'node:fs';
+import { openSync, fstatSync, readSync, closeSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { printCompletion } from './completion.mjs';
@@ -150,23 +150,38 @@ function hasResumeN(file, id, n) {
   return false;
 }
 
+// 脱离派发返回前已创建记录目录；请求文件与 start 之间可能有空档。
+function recentRecord(root, name) {
+  if (typeof name !== 'string' || !name || name === '.' || name === '..' || /[\\/]/.test(name)) return false;
+  try {
+    const dir = statSync(join(root, '.agent-runs', name));
+    return dir.isDirectory() && Date.now() - dir.birthtimeMs < 60000;
+  } catch { return false; }
+}
+
 // 按托管请求文件等待清单跟上（协议 14.4 与开工前第 8 条）：
 // - 清单还找不到 start，但 managed/ 里有这个项目、这个记录名的请求文件 → 每 50 ms 重查，最多 15 秒；
 // - 已有 start 而请求文件带 retry、清单还没有对应 n 的 resume（ar retry --detach 的空档）→ 同样重查，
 //   以免把上一次的 end / 旧 pid 当成本次的结果。
-// 没有请求文件时立刻返回，行为与直接 locateStart 相同。
-export async function locateStartWaiting(homes, root, name) {
-  const deadline = Date.now() + startWaitLimit;
-  let found = locateStart(homes, root, name);
-  while (Date.now() < deadline) {
-    const requests = pendingRequests(homes, root, name);
+// 没有请求文件但指定的记录目录刚创建时，也限时等待 start；其他情况立刻返回。
+export async function locateStartWaiting(homes, root, name, { timeoutDeadline, onTimeout, startLimit = startWaitLimit,
+  locate = locateStart, pending = pendingRequests, hasResume = hasResumeN, recent = recentRecord } = {}) {
+  const deadline = Date.now() + startLimit;
+  let found = locate(homes, root, name);
+  while (timeoutDeadline !== undefined || Date.now() < deadline) {
+    const requests = pending(homes, root, name);
     const waiting = !found
-      ? requests.length > 0
-      : requests.some(request => request.id === found.start.id && request.retry
-        && Number.isSafeInteger(request.retry.n) && !hasResumeN(found.file, found.start.id, request.retry.n));
-    if (!waiting) return found;
-    await delay(waitInterval);
-    found = locateStart(homes, root, name);
+      ? requests[0]
+      : requests.find(request => request.id === found.start.id && request.retry
+        && Number.isSafeInteger(request.retry.n) && !hasResume(found.file, found.start.id, request.retry.n));
+    const gap = !found && !waiting && Date.now() < deadline && recent(root, name);
+    if (!waiting && !gap) return locate(homes, root, name);
+    if (timeoutDeadline !== undefined && performance.now() >= timeoutDeadline) {
+      onTimeout?.(found, waiting ?? { name });
+      return null;
+    }
+    await delay(timeoutDeadline === undefined ? waitInterval : Math.min(waitInterval, Math.max(0, timeoutDeadline - performance.now())));
+    found = locate(homes, root, name);
   }
   return found;
 }
@@ -174,8 +189,19 @@ export async function locateStartWaiting(homes, root, name) {
 // worktree 任务等到结束时的状态（协议 15.3）；onState 收到它。待验收（awaiting）时多打印一行怎么处理（协议 15.11）。
 export const awaitingLine = name => `待验收：用 ar accept ${name} 合并，或 ar reject ${name} --reason "…" 驳回`;
 
-export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log, onGate, onState } = {}) {
-  const found = await locateStartWaiting(homes, root, name), file = found?.file, start = found?.start;
+export async function waitForTask(homes, root, name, { alive = taskAlive, log = console.log, onGate, onState, timeout, onTimeout } = {}) {
+  const deadline = timeout === undefined ? undefined : performance.now() + timeout * 1000;
+  let pendingTimeout = false;
+  const timedOut = (found, pending) => {
+    const taskName = found?.start.name ?? pending?.name ?? name;
+    const error = `等待超时（${timeout} 秒），任务仍在运行：${taskName}`;
+    log(error);
+    onTimeout?.({ error, name: taskName, found });
+  };
+  let found = await locateStartWaiting(homes, root, name, { timeoutDeadline: deadline, onTimeout: (item, request) => {
+    pendingTimeout = true; timedOut(item, request);
+  } }), file = found?.file, start = found?.start;
+  if (pendingTimeout) return 4;
   if (!start) {
     // 未指定记录名且仓库无记录时省略记录名（设计 2026-10-13 定稿）。
     log(`等待：在当前仓库找不到记录${name === undefined ? '' : ` ${name}`}`);
@@ -185,7 +211,7 @@ export async function waitForTask(homes, root, name, { alive = taskAlive, log = 
   let running = terminal ? false : await alive(start);
   // 查询进程时任务可能恰好结束，输出和中断判定前再次检查清单。
   terminal ??= findTerminal(file, start.id);
-  log(`等待：${start.name}（${terminal || !running ? '已结束' : '进行中'}）`);
+  let statusLogged = false;
   // 门禁结果来自同一任务的 gate 事件，打印在结果行之前（协议 13）。
   const finishWait = async done => {
     const gate = done.event === 'end' ? findGate(file, start.id) : null;
@@ -203,13 +229,32 @@ export async function waitForTask(homes, root, name, { alive = taskAlive, log = 
     return code;
   };
   while (true) {
+    if (!terminal && !running) {
+      const latest = locateStart(homes, root, name);
+      const next = latest?.start;
+      if (next?.id === start.id && next.resumed
+        && (!start.resumed || next.pid !== start.pid || next.started !== start.started || next.n !== start.n)) {
+        found = latest; file = latest.file; start = next;
+        running = await alive(next);
+        terminal = findTerminal(file, start.id);
+        if (terminal || running) continue;
+      }
+    }
+    if (!statusLogged) {
+      log(`等待：${start.name}（${terminal || !running ? '已结束' : '进行中'}）`);
+      statusLogged = true;
+    }
     if (terminal) return finishWait(terminal);
     if (!running) {
       log('等待：任务进程已经不在了，没有结束记录，按中断处理');
       if (start.worktree === true) onState?.('stopped');
       return 1;
     }
-    await delay(waitInterval);
+    if (deadline !== undefined && performance.now() >= deadline) {
+      timedOut(found);
+      return 4;
+    }
+    await delay(deadline === undefined ? waitInterval : Math.min(waitInterval, Math.max(0, deadline - performance.now())));
     terminal = findTerminal(file, start.id);
     if (!terminal) {
       running = await alive(start);

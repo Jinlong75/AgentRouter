@@ -8,7 +8,7 @@ export const c = {
     running: (n: number) => n ? `${n} 个任务进行中` : '没有进行中的任务',
     // 侧栏状态行：按执行者统计正在运行的任务（Stage06 起加并发上限，写成 1/2）
     load: (parts: [label: string, n: number][]) => parts.map(([label, n]) => `${label} ${n}`).join(' · '), loadHelp: '正在运行的任务数（按执行者）',
-    empty: '还没有派发过任务', emptyHelp: '点"新建任务"选项目和执行者派发；在 Claude Code 里让主导派活，任务也会出现在这里。',
+    empty: '还没有派发过任务', emptyHelp: '点"新建任务"选项目和执行者派发；让主导派活，任务也会出现在这里。',
     select: '选择一个任务', emptyDetail: '这里会显示任务的进展和汇报', detailHelp: '进展、汇报、改动的文件和派发参数都在这里看。',
     stop: '停止', more: '更多', cancel: '取消', stopTitle: (name: string) => `停止「${name}」？`, stopBody: (executor: string) => `${executor} 会立刻结束，工作区里没提交的改动会保留。`, changed: '任务状态已经变了，请重试',
     flow: '进展', report: '汇报', files: '改动', params: '参数', think: '显示思考', plan: '计划', follow: '正在跟随最新进展', latest: '跳到最新',
@@ -64,8 +64,14 @@ export const c = {
 
 // 以下逐项取自 004 任务说明与界面定稿。
 export const p = {
+    arTitle: 'ar 命令', arInstall: '安装 ar 命令', arUninstall: '卸载', arMissing: '未安装', arInstalled: (path: string) => `已安装：${path}`,
+    arInstallBody: '会在 %LOCALAPPDATA%\\AgentRouter\\bin 写入 ar.cmd 和 agr.cmd（两个名字是同一个命令），并把这个目录加入当前用户的 PATH（不改系统 PATH）。新打开的终端才会生效。',
+    arAlias: '也可以用 agr（和 ar 是同一个命令）',
+    arShadowTitle: '新终端里的 ar 会先找到别的程序',
+    arShadowBody: (by: string) => `系统 PATH 里的 ${by} 排在前面。请用 agr（例如 agr version），或者把 %LOCALAPPDATA%\\AgentRouter\\bin 移到系统 PATH 里那个目录之前。`,
+    arRemoveTitle: '卸载 ar 命令？', arRemoveBody: '移除 AgentRouter 安装的 ar 命令及它加入当前用户 PATH 的目录，不删除其他数据。', arCancel: '取消', arConfirm: '安装', arConflict: '目标文件已存在且不属于 AgentRouter，未覆盖', arKept: (paths: string) => `这些 PATH 目录没有找到 AgentRouter 的安装记录，为安全起见保留了：${paths}。确认不再需要的话，请在 Windows 的"编辑账户的环境变量"里手动删除。`,
     subtitle: '谁在派活、谁在干活', detect: '重新检测', detected: '已检测到', missingHost: '未检测到',
-    dispatchers: '主导', workers: '执行者', dispatchHelp: '在这些工具里装上技能，它们就能写任务说明、把工作派给执行者。装之前会备份原来的版本，可以回退。', workerHelp: '实际执行任务的 Agent。任务按路由页的规则分配给它们；没有规则命中时派给"默认"那一个。',
+    dispatchers: '主导', workers: '执行者', dispatchHelp: '在这些工具里装上技能，它们就能写任务说明、把工作派给执行者。装之前会备份原来的版本，可以回退。', workerHelp: '实际执行任务的 Agent。任务依次按任务说明指定、项目规则、全局规则、预设默认规则（可关闭）、兜底和默认执行者分配。',
     hostMissing: (host: string) => `没有找到 ${host}。装好以后点右上角"重新检测"。`,
     latest: '最新', update: (version: string) => `可更新到 ${version}`, missing: '未安装', custom: '自己改过的版本', protected: '不会自动替换',
     actions: { install: '安装', update: '更新', reinstall: '重新安装', rollback: '回退', replace: '备份后替换…' } as Record<string, string>,
@@ -90,7 +96,7 @@ export const p = {
     configError: (reason: string) => `config.json 无法读取（${reason}）。修好或删掉它之后，这里才能修改派发默认值。`,
     welcome: '欢迎使用 AgentRouter', welcomeHelp: '强的 Agent 当主导写任务说明，便宜或专长的 Agent 当执行者干活，你在这里统一派发、查看、停止和验收。先看看这台电脑上有什么。',
     installSkills: '安装技能', installHelp: '技能装在主导（Claude Code）里，告诉它怎么写任务说明、怎么派活、怎么看结果。已有的版本会先备份。',
-    skillHelp: { 'agent-router': '派活、看进度、收汇报', 'lead-workflow': '可选：让对话的模型当主导，执行者负责实现' } as Record<string, string>,
+    skillHelp: { 'agent-router': '派活、看进度、收汇报', 'lead-workflow': '可选：让对话的模型当主导，执行者负责实现', 'lead-practices': '可选：主导到了写说明、派发、验收、收尾等时刻按它自查' } as Record<string, string>,
     customChoice: '已有自己改过的版本，勾选后会先备份再替换',
     next: '下一步', previous: '上一步', skip: '跳过', installNext: '安装并继续', finish: '完成', rerun: '重新运行首次引导',
     about: '让强的 Agent 当主导、把执行工作派给便宜或专长的 Agent，在这里统一派发、查看、停止和验收。',
@@ -102,17 +108,54 @@ export const p = {
     // 卡片底部平时的说明（操作完成后的"已安装 N 个"只显示 3 秒）
     customIdle: '替换前会备份',
     managed: '托管', managedHelp: '技能派发的任务默认是派活方会话的子进程，关掉会话可能连带中断任务。从本软件派发的任务总是独立运行。',
-    managedToggle: '由 AgentRouter 托管任务', managedToggleHelp: '打开后，技能派出的任务由本软件启动。关掉 Claude Code 的会话，任务照常进行；要停止就在这里停。软件没开时，任务照旧由派活方启动。',
+    managedToggle: '由 AgentRouter 托管任务', managedToggleHelp: '打开后，技能派出的任务由本软件启动。关掉派活方的会话，任务照常进行；要停止就在这里停。软件没开时，任务照旧由派活方启动。',
     wizardManaged: '托管任务', wizardManagedHelp: '关掉派活方的会话也不中断技能派出的任务',
-    // Stage03 首次引导：检测 → 技能（含托管开关）→ 导入第一个 Agent → 添加第一个项目（O5）
-    wizardSteps: ['检测', '技能', 'Agent', '项目'],
+    // Stage10 T4（302）：首次引导五步：检测 → Agent → 技能 → Harness → 项目。
+    wizardSteps: (name: string) => ['检测', 'Agent', '技能', name, '项目'],
+    // 步骤名单独留一份：wizardSteps 是给进度条的数组，这几项给需要单独写步骤名的地方。
+    wizardDetect: '检测', wizardAgentStep: 'Agent', wizardSkills: '技能', wizardHarness: (name: string) => name, wizardProjectStep: '项目',
+    wizardWelcome: '欢迎使用 AgentRouter',
+    // 第 1 步：git 必需，其余工具只报告检测结果；不要求有 Claude Code。
+    wizardGitRequired: 'git（必需）', wizardMissing: '未找到', wizardNoGit: '没有找到 git',
+    wizardGitHelp: 'git 是必需的：AgentRouter 用它记录改动、建立工作区和合并。到 git-scm.com 下载 Windows 版安装，安装时选“Git from the command line and also from 3rd-party software”；装好后点“重新检测”。',
+    wizardDownloadGit: '下载 git', wizardRecheck: '重新检测', wizardClaudeCode: 'Claude Code', wizardCodex: 'Codex', wizardQoder: 'Qoder',
+    wizardNoLead: '主导工具不要求非得有 Claude Code：都没有时，可以先导入执行者，之后在 Agent 页选择主导。',
+    // 第 3 步：没有 Claude Code 时说明技能只用于 Claude Code，其他主导直接读 AGENTS.md。
+    wizardNoSkills: '不需要安装技能',
+    wizardNoSkillsBody: '技能用于 Claude Code。Codex 等其他主导直接读项目里的 AGENTS.md，不需要装技能。这一步会跳过；以后装了 Claude Code，可以在 Agent 页安装。',
+    // 第 4 步：Harness（可选）。
+    wizardHarnessTitle: (name: string) => `${name}（可选）`,
+    wizardFound: '已经检测到 dsh。直接导入预设就能把它当执行者用，不用再下载（当主导的交互启动方式还在核实，暂不能选它当主导）。',
+    wizardConfirm: '开发者预览版，约 830 MB，预计 3～10 分钟；装到 AgentRouter 自己的目录（%LOCALAPPDATA%\\agent-router\\tools\\dsh），不改 PATH。安装前不会写入任何文件。',
+    wizardInstallMethod: '安装方式', wizardInstallMethodHelp: (secret: string) => `用 npm 安装到 AgentRouter 的目录，不全局安装；密钥复用已设置的 ${secret}`, wizardInstallMethodValue: 'npm install --prefix',
+    wizardNetwork: '网络', wizardNetworkHelp: '走设置里的代理', wizardNetworkValue: '跟随设置里的代理',
+    wizardVersionLabel: '版本', wizardVersionNote: (verified: string) => `AgentRouter 验证过的是 ${verified}；其他版本装完会自动测试连接，不兼容会提示。`,
+    wizardVersionTagNext: '最新预览', wizardVersionVerified: 'AgentRouter 验证过', wizardManualVersion: '手动输入…', wizardManualVersionLabel: '版本号',
+    wizardVersionBad: '版本号只能包含字母、数字和 . + -，例如 0.1.0-preview.3', wizardVersionEmpty: '先选一个版本，或者手动输入版本号',
+    wizardPath: '位置', wizardTestLabel: '测试连接',
+    wizardProgressLabel: '安装进度', wizardDownloading: '下载完成后会自动导入预设并测试连接。', wizardElapsed: (seconds: number) => `已用 ${seconds} 秒`,
+    // 423（D180）：安装拆成四步，每步一条分进度条。
+    harnessStepNames: { download: '下载安装包', deps: '安装依赖', config: '配置环境', test: '测试连接' },
+    harnessStepWait: '等待', harnessStepDone: '完成', harnessStepFail: '失败',
+    harnessStepPercent: (n: number, approx: boolean) => approx ? `约 ${n}%` : `${n}%`,
+    harnessStepBytes: (mb: number, total: number | null) => total ? `${mb} / ${total} MB` : `${mb} MB`,
+    wizardDone: '安装完成', wizardDoneHelp: (name: string) => `已导入 ${name} 预设，并跑了一次只回复 OK 的测试连接。`, wizardTestPassed: '已通过',
+    wizardUnverified: (version: string) => `版本 ${version} 没有经过 AgentRouter 验证，但安装后的测试连接已通过。`,
+    wizardCancelled: '已取消安装，没有写入任何文件。',
+    wizardNoNpm: (name: string) => `没有找到 npm，装不了 ${name}。它需要 Node.js 18 或更新版本；AgentRouter 不替你装 Node。`,
+    wizardDownloadNode: '下载 Node.js', wizardAfterNode: '装好 Node.js 后重新打开 AgentRouter 再走这一步，或者先跳过，之后在 Agent 页安装。',
+    wizardFailure: '安装失败', wizardRetryHint: '安装失败时会清理这次下载的文件，可以直接重试',
+    wizardRetry: '重试', wizardSkip: '跳过', wizardCancel: '取消', wizardInstall: '安装', wizardDirectImport: '直接导入',
+    wizardNext: '下一步', wizardBack: '上一步', wizardFinish: '完成', wizardInstallContinue: '安装并继续', wizardImportTest: '导入并测试',
+    wizardInstalledVersion: (version: string) => `已安装：${version}`,
+    wizardFallbackInstall: '改装验证过的版本', wizardKeepVersion: '保留这个版本',
     wizardAgent: '导入第一个 Agent', wizardAgentHelp: '执行者是实际写代码的 Agent。先导入一个标着"推荐"的预设，以后可以在 Agent 页导入更多。',
     // Stage07c T0d（D60①、D73）：第 3 步测试通过后可选填每日上限；空着就是不限，不写 limits
     wizardLimitQ: '这个执行者的用量有限吗？', wizardLimitHelp: '比如订阅套餐每天只能跑几个任务。填了上限，当天用满后路由会换别的执行者；空着就是不限，以后在路由页随时改。',
     wizardLimitLabel: '每天最多', wizardLimitUnit: '个任务', wizardLimitNone: '不限', wizardLimitBad: '填 1 以上的整数，或者空着（不限）',
     // Stage07c D82（150）：第 3 步可跳过的问题"失败时想换用的强执行者"；只有一个执行者时不出下拉，只写一句说明
-    wizardStrongQ: '失败时想换用的强执行者', wizardStrongHelp: '自动重试的最后一次换它来做，例如用更强的模型；不设就一直用原来的执行者，全部失败后提示主导接手。以后在路由页"兜底"随时改。',
-    wizardStrongNone: '不设', wizardStrongOnly: '现在只有这一个执行者。以后导入了更强的执行者，可以在路由页"兜底"把它设为强执行者。',
+    wizardStrongQ: '失败时想换用的强执行者', wizardStrongHelp: '自动重试的最后一次换它来做，例如用更强的模型；不设就一直用原来的执行者，全部失败后提示主导接手。以后在路由页"强执行者"随时改。',
+    wizardStrongNone: '不设', wizardStrongOnly: '现在只有这一个执行者。以后导入了更强的执行者，可以在路由页"强执行者"把它设为强执行者。',
     wizardAgentNext: '导入并测试', wizardNoPresets: '没有读到可用的预设，可以先跳过，之后在 Agent 页导入。',
     wizardProject: '添加第一个项目', wizardProjectHelp: '选一个 git 仓库文件夹。添加后到项目页初始化协作约定（先预览改动，确认后才写入），然后就能新建任务派发。',
     // 关闭窗口（012）：点 × 时询问；托盘
@@ -142,11 +185,28 @@ export const p = {
     clearConfirm: '清空', tasksCleared: (n: number) => `已从列表移除 ${n} 个任务`, projectsCleared: (n: number) => `已取消登记 ${n} 个项目`, listEmpty: '列表已经是空的',
     resetLeftover: (dir: string) => `上次重置没能删完：${dir}。关掉占用它的程序后，可以手动删除这个文件夹。`,
     wizardProjectFolder: '项目文件夹', wizardProjectNone: '还没有选择', wizardOpenInit: '添加后打开初始化预览', wizardOpenInitHelp: '只预览，不会自动写入任何文件',
+    // 427：设置页"额外的统计数据目录"（只读并入统计页）。
+    statsSources: '额外的统计数据目录',
+    statsSourcesHelp: '把别的 AgentRouter 公共目录（例如开发时用的隔离目录）里的任务记录加进统计页，只读，不会改动它们。',
+    statsSourcesEmpty: '还没有添加额外的目录，统计只读当前公共目录。', statsSourcesAdd: '添加目录…', statsSourcesRemove: '移除', statsSourcesLoading: '正在读取…',
 };
 
 // Stage03 Agent 页（原"连接"页）：主导区沿用 p 的文案，执行者区与导入向导用这里的。
 export const ag = {
     import: '导入 Agent', importFirst: '导入第一个 Agent', empty: '还没有导入执行者', emptyHelp: '执行者是实际写代码的 Agent。导入一个，设置密钥或确认登录、测试连接后就能派发任务。',
+    // 302：Agent 页的 Harness 卡片。检测、安装与更新走 console 的 harness:check / harness:deploy。
+    harnessTitle: (name: string) => name, harnessMissing: '未安装', harnessInstalled: (version: string) => `已安装：${version}`,
+    harnessNewer: (version: string) => `有新版本 ${version}`, harnessInstall: '安装', harnessUpdate: '更新', harnessInstalling: '正在安装…',
+    harnessCancel: '取消', harnessCancelled: '已取消',
+    harnessHelp: '开发者预览版；装到 AgentRouter 自己的目录，不改 PATH。', harnessCheck: '重新检测',
+    harnessUpdateFailed: (text: string) => `更新失败：${text}`, harnessInstalledNote: (version: string) => `当前版本 ${version}`,
+    // Stage09 / 294：Agent 页主导卡（界面稿 preview.js 的 leadCard；能力几行来自启动检测）
+    leadTitle: '主导', leadChoose: '选择主导', leadChooseHelp: '从已导入的主导和检测到的工具中选择', leadAfterChoose: '选择主导后显示',
+    leadDetected: '检测到：', leadImport: '导入', leadClear: '清除',
+    leadInteractive: '交互启动', leadModelCapability: '模型参数', leadEffortCapability: '强度参数',
+    leadVerified: '已验证', leadUnverified: '未验证', leadSupported: '支持', leadUnsupported: '不支持',
+    leadEffortUnsupported: (name: string) => `${name} 不支持在启动时指定强度`,
+    leadMissingInteractive: '找不到程序，无法验证交互启动', leadMissingCapability: '找不到程序，能力未知',
     isDefault: '默认', disabled: '已停用', enable: '启用',
     // Stage07c T2 / T3（D79）：模型与推理强度的下拉来自探针；"刷新列表"重新查；查不到时用预设值并写原因
     refreshList: '刷新列表', refreshingList: '正在查询…',
@@ -197,9 +257,19 @@ export const ag = {
 // Stage03 项目页
 export const pj = {
     title: '项目', lead: 'AgentRouter 在哪些仓库里派活', add: '添加项目', addFirst: '添加第一个项目', chooseFolder: '选择项目文件夹',
-    empty: '还没有添加项目', emptyHelp: '选择一个 git 仓库文件夹。添加后可以初始化协作约定、派发任务、在项目里打开 Claude Code。',
+    empty: '还没有添加项目', emptyHelp: '选择一个 git 仓库文件夹。添加后可以初始化协作约定、派发任务、在项目里打开主导。',
     notInit: '未初始化', notGit: '不是 git 仓库', select: '选择一个项目',
     openClaude: '在此项目打开 Claude Code', openFolder: '打开文件夹', dirty: (n: number) => `${n} 个文件未提交`, clean: '没有未提交的改动',
+    // Stage09 / 295：打开主导按钮与主导启动参数（界面稿 preview.js 项目页的 leadbtn、leadnobtn、leadparams）。
+    leadOpen: (name: string) => `在此项目打开 ${name}`, leadOpenNone: '在此项目打开主导', leadChooseFirst: '先在 Agent 页选择主导',
+    leadParameters: '主导启动参数', leadModel: '模型', leadEffort: '推理强度', leadFollow: '跟随默认',
+    leadModelHelp: '留空跟随主导工具自己的默认模型', leadEffortHelp: '选项来自所选主导工具；不支持时不能指定',
+    leadParamsNote: '路径与目录写入 .agent-router/project.json；主导启动参数只存在本机，不写进项目文件',
+    leadSaveHint: '保存后下次打开主导时生效，不影响已经打开的会话。',
+    // 319 审查 R11-1：上一次读取主导设置失败，编辑配置里按已保存的主导启动参数显示、保存时不清除。
+    leadUnknown: '读取主导设置失败，暂按已保存的参数显示；保存时不会清除它们',
+    // 295 审查 R9-2：项目配置先保存成功、主导参数随后写失败时的提示（原因是核心原文）。
+    leadParamsNotSaved: (reason: string) => `项目配置已保存，主导参数未保存：${reason}`,
     menu: { edit: '编辑配置', remove: '移除' } as Record<string, string>,
     // Stage07 116：移除还有未处理任务的项目时，在确认框里列出这些任务
     removePending: (n: number) => `这个项目还有 ${n} 个任务没处理完（待验收、合并冲突或进行中）：`, removePendingMore: (n: number) => `…等 ${n} 个`, removePendingHelp: '移除后这些任务仍留在任务列表里，驳回、确认和删除照常可以做；要合并或重试，得先把项目重新添加回来。建议先处理完再移除。',
@@ -317,9 +387,16 @@ export const nt = {
     // 底栏后果说明的门禁后缀（接在 conseqNew / conseqExisting 后面）：没有验收命令时门禁只检查提交与改动范围
     conseqGate: (commands: number) => commands ? `；结束后跑门禁（${commands} 条验收命令）` : '；结束后跑门禁（检查提交与改动范围）',
     preview: '预览', previewTitle: '预览任务说明', previewViews: { rendered: '排版', source: '源码' } as Record<string, string>, close: '关闭', dispatch: '派发', dispatching: '正在派发…', dispatchingNote: '正在写任务说明并派发……',
-    conseqText: (label: string) => `直接把这段文字派给 ${label}：在项目里直接改，不跑门禁，也不进验收页`, conseqExisting: (spec: string, label: string) => `派发 ${spec} 给 ${label}`,
+    conseqText: (label: string) => `直接把这段文字派给 ${label}：在单独的工作区里改，跑项目的验收命令，做完进验收页`,
+    // 项目没开 worktree 时照旧直接改：不跑门禁，也不进验收页。
+    conseqTextDirect: (label: string) => `直接把这段文字派给 ${label}：在项目里直接改，不跑门禁，也不进验收页`, conseqExisting: (spec: string, label: string) => `派发 ${spec} 给 ${label}`,
     conseqNew: (spec: string, label: string, commit: boolean) => `写入 ${spec}${commit ? '，提交后' : '，'}派给 ${label}`,
     failed: '派发没有完成',
+    // 424：任务说明只在当前分支上（核心的 SPEC_BASE），可以以当前分支为基线派发。
+    baseTitle: (current: string) => `任务说明只在 ${current} 分支上`,
+    baseBody: (current: string, base: string) => `项目基线 ${base} 上还没有这份任务说明。可以以当前分支 ${current} 为基线派发（批准后合并回 ${current}），或者先把说明合进 ${base} 再派发。`,
+    baseUseCurrent: (current: string) => `以 ${current} 为基线派发`,
+    baseDismiss: '取消',
     identityWarn: '这个项目还没有设置 git 提交身份："先提交任务说明"和执行者提交改动都会失败。',
     // Stage07 T8b：允许路径输入框下面的匹配预览（ar spec check-paths；界面稿新建任务页场景"允许路径·匹配预览"）
     pathsMatched: (n: number) => `匹配到 ${n} 个现有文件：`, pathsMore: (n: number) => `，还有 ${n} 个`, pathsAll: (n: number) => `匹配项目里全部 ${n} 个文件`,
@@ -524,7 +601,7 @@ export const s6 = {
     // D114（2026-10-28）：自动档"内存不够"的比例可调，写进 config.json；下限 1.5 GB 不变
     memLowPercent: '内存不够时暂停', memLowPercentHelp: (gb: string) => `可用内存低于总内存的这个比例（且不低于 1.5 GB）时不启动新任务；这台电脑现在是 ${gb} GB。`,
     memLowPercentOption: (n: number) => `低于 ${n}%`,
-    concurrency: '同时运行的任务', concurrencyHelp: '超出时排队，轮到时自动开始；门禁同一时间只跑一个。不用 worktree 的项目不受这个限制。',
+    concurrency: '同时运行的任务', concurrencyHelp: '超出时排队，轮到时自动开始；门禁默认同一时间跑一个，可用 gateConcurrency 调整。不用 worktree 的项目不受这个限制。',
     // 设置页"数据"里的"清理"（ar gc）
     gc: '清理', gcHelp: (days: number) => `已合并、已驳回任务没删掉的 worktree，项目文件夹已经不存在的任务留下的 worktree，和超过 ${days} 天的执行者会话记录。`,
     gcIdle: '软件启动时检查，不会自动删除。没有可清理的内容。', gcFound: (n: number, size: string) => `发现 ${n} 项可以清理，约 ${size}`,
@@ -551,9 +628,9 @@ export const ro = {
     ruleEffort: '推理强度', ruleEffortHelp: '可选：这条规则派出的任务用这个强度；任务说明或单次派发写了时以它们为准。选项来自所选执行者', ruleEffortNone: '不指定',
     // 151：换执行者后原来的推理强度不在新选项里（规则弹窗与新建任务表单共用）。
     effortReset: (old: string) => `推理强度 ${old} 不在这个执行者的选项里，已改为不指定`,
-    types: { code: '代码', test: '测试', fix: '修复', refactor: '重构', research: '调研', docs: '文档', review: '审查' } as Record<string, string>,
-    rulesSec: '规则', rulesLead: '按顺序匹配：任务说明指定了执行者时直接用它；否则找第一条类型相符、执行者可用的规则；都不符合时用兜底。停用、不支持只读、今天已达上限的执行者会被跳过。',
-    emptyTitle: '还没有规则', emptyHelp: (label: string) => `所有任务都派给默认执行者 ${label}。按任务类型分给不同的执行者，就添加一条规则。`,
+    types: { code: '代码', test: '测试', fix: '修复', refactor: '重构', research: '调研', docs: '文档', review: '审查', chore: '杂务' } as Record<string, string>,
+    rulesSec: '规则', rulesLead: '按顺序匹配：任务说明指定了执行者时直接用它；否则找第一条类型相符、执行者可用的规则；都不符合时，有任务类型且预设默认路由开启才会尝试预设默认规则，再用兜底；审查类任务不走预设默认规则。停用、不支持只读、今天已达上限的执行者会被跳过。',
+    emptyTitle: '还没有规则', emptyHelp: (label: string) => `有任务类型且预设默认路由开启时，会先尝试预设默认规则；审查类任务不走预设默认规则。没有合适的规则时使用兜底或默认执行者 ${label}。按任务类型分给不同的执行者，就添加一条规则。`,
     escTo: (label: string) => `升级到 ${label}`, noEsc: '不升级',
     moveUp: (n: number) => `上移第 ${n} 条`, moveDown: (n: number) => `下移第 ${n} 条`, edit: (n: number) => `编辑第 ${n} 条`, remove: (n: number) => `删除第 ${n} 条`,
     stateDisabled: '已停用', stateNoReadOnly: '不支持只读', stateLimited: '今天已达上限', stateMissing: '执行者不存在',
@@ -562,7 +639,7 @@ export const ro = {
     ruleTypes: '任务类型', ruleTypesHelp: '可以选多个；一个类型只认第一条符合的规则', ruleTypesRequired: '至少选一个任务类型',
     ruleTo: '执行者', ruleToHelp: '调研、审查类任务只能选支持只读的执行者', ruleEsc: '升级到', ruleEscHelp: '可选：最后一次自动重试改用它',
     ruleNote: '写进 config.json 的 routing.rules，加在最后', ruleAdd: '添加', ruleSave: '保存',
-    fallbackSec: '兜底', fallback: '兜底执行者', fallbackHelp: (label: string) => `没有规则符合时派给它；不设时用默认执行者（${label}）`, fallbackNone: '用默认执行者',
+    fallbackSec: '兜底', fallback: '兜底执行者', fallbackHelp: (label: string) => `规则和预设默认路由都没有合适的执行者时派给它；不设时用默认执行者（${label}）`, fallbackNone: '用默认执行者',
     trialSec: '试算', trialLead: '不派发，只看会派给谁、为什么。', trialType: '任务类型', trialProject: '项目', trialAny: '不限项目',
     trialResult: (label: string) => `将派给 ${label}`, trialWhy: '为什么选它', trialFail: '没有可用的执行者',
     limitsSec: '每日上限', limitsLead: '到上限的执行者当天不再接任务，路由跳到下一条规则或兜底；第二天自动恢复。留空为不限。',
@@ -612,7 +689,7 @@ export const gx = {
     mapWhen: '条件', mapKind: '事件', mapFields: '字段',
     kinds: { say: '说话', think: '思考', cmd: '命令', file: '文件', plan: '计划', tool: '工具', turn: '用量', error: '错误' } as Record<string, string>,
     reportFrom: '汇报来源', reports: { stdout: '标准输出', lastSay: '最后一句话', file: '汇报文件 {report}' } as Record<string, string>,
-    readOnlyArgs: '只读参数', readOnlyArgsHelp: '不填时它不能做调研、审查类任务', readOnlyPh: '例如 --read-only',
+    readOnlyArgs: '只读参数', readOnlyArgsHelp: '不填时不能通过此表单启用只读；也可以在导入的声明中设置 readOnlyEnv 来支持调研、审查类任务', readOnlyPh: '例如 --read-only',
     secretVar: '密钥环境变量', secretVarHelp: '可选；只写变量名', secretVarPh: '例如 EXAMPLE_API_KEY',
     testPreview: '测试并预览', customNote: (name: string) => `保存为 config.json 的 generics.${name}，可以在"⋯ → 导出声明"里导出`,
     invalid: (n: number) => `声明有 ${n} 处问题，改好后才能保存`,
@@ -632,7 +709,7 @@ export const gx = {
 
 // Stage07 O8（D33）：设置页"网络代理"（界面稿 app/design/preview.js 设置页场景"代理·跟随系统 / 代理·系统代理未开启 / 代理·手动填写"）
 export const px = {
-    sec: '网络代理', lead: '对"在此项目打开 Claude Code"和派发的执行者生效；已经打开的终端和运行中的任务不变。',
+    sec: '网络代理', lead: '对在项目里打开的主导和派发的执行者生效；已经打开的终端和运行中的任务不变。',
     row: '代理', modes: { off: '不使用', system: '跟随系统代理', manual: '手动填写' } as Record<string, string>,
     offHelp: '不设置也不清除代理变量，照旧继承',
     systemFound: (url: string) => `当前读到：${url}（Windows 系统代理）`, systemNone: '当前：系统代理未开启，不使用代理', systemUnreadable: '当前：读不到系统代理设置，不使用代理',
@@ -719,4 +796,34 @@ export const rv = {
     rerunAuto: '按规则自动选', rerunReviewer: '审查者', rerunning: '正在审查…',
     rerunNone: '没有可以担任审查者的执行者：在 Agent 页给一个支持只读的执行者勾上"审查者"。',
     jumpNoLine: '改动里没有这一行，已定位到这个文件的开头',
+};
+
+export const statsCopy = {
+    tipLead: '主导在自己的会话里运行，AgentRouter 量不到；请在主导工具里查看用量', tipCost: '缺单价或用量，算不出费用', tipZero: '还没有可以计算的任务', tipMissing: '数据不足，暂时算不出',
+    statsTitle: '统计', statsRange7: '7 天', statsRange30: '30 天', statsRangeAll: '全部', statsAllProjects: '全部项目', statsOverall: '整体效果', statsExecutor: '执行者', statsReviewer: '审查者', statsLead: '主导', statsTrend: '趋势', statsPrice: '价格', statsUnitPrice: '执行者单价', statsInsufficient: '数据不足', statsNoPrice: '填了单价才会计算费用', statsEdit: '编辑', statsSave: '保存', statsCancel: '取消', statsInput: '输入', statsOutput: '输出', statsPerMillion: '每百万 token', statsUnset: '未填', statsRetry: '重试', statsEmpty: '还没有统计', statsEmptyBody: '派发几个任务后，这里会出现统计。', statsNewTask: '去新建任务', statsNoReviewerGroups: '暂无按审查者分组的数据',
+    statsLatestWeek: '最近一周',
+    range: '时间范围', overallHelp: '每周合并任务数、端到端时长、人工介入、费用，以及主导与执行者的 token 之比。拿不到的值显示 —，悬停看原因。', weekly: '每周合并任务数', duration: '端到端时长中位数', interventions: '人工介入次数', totalCost: '总费用', ratio: '主导与执行者 token 之比', executorHelp: '按执行者 × 任务类型 × 推理强度分层。样本少于 5 的格子标"数据不足"，比例仍然显示，但只能作参考。', type: '类型', effort: '强度', sample: '样本', firstPass: '一次通过', attempts: '平均尝试', outside: '越界', escalation: '升级', median: '用时中位数', tokens: '每个合并任务 token', cost: '费用', reviewerHelp: '准确率来自你在验收页标的"成立 / 不成立"；这里只做提示，开关在路由页由你决定。', leadHelp: '按主导启动时用的工具与模型分行。没有记录到工具或模型时显示"未记录"。', leadName: '主导（工具 · 模型）', specFailure: '说明导致的门禁失败率', supplement: '补充说明次数', mergeMedian: '派发到合并时长中位数', unrecorded: '未记录', trendHelp: '所选时间范围内按天。柱是任务数，折线是通过数；悬停看当天数值。', tasks: '任务数', accepted: '通过数', task: '任务', pass: '通过', priceHelp: '每百万 token 的输入 / 输出单价。只在 AgentRouter 里用于估算费用，不作为计费依据。', clear: '清除单价', executorTable: '执行者统计', leadTable: '主导统计', trendLabel: '按天趋势：柱是任务数，折线是通过数',
+    recent7: '最近 7 天', dispatchToMerge: '派发到合并', interventionDetail: '手动重试、驳回、需人工处理', noPrice: '没有单价', estimated: '按已填单价估算', noLeadUsage: '主导用量量不到', noLeadUsageReason: '主导在自己的会话里运行，AgentRouter 量不到，请在主导工具里查看', noPriceReason: '还没有填执行者单价，填了才会计算费用', reviewerTable: '审查者统计', reviewCount: '审查次数', reviewFailed: '没审成', reviewAccuracy: '准确率（区间）', reviewIssues: '每次成立问题', reviewHint: '准确率稳定，可考虑在路由页开启高严重度拦截',
+    // 427：列头说明（原文由主导给定）、方向与"怎么看这张表"。
+    helpExecutorCol: '执行任务的 Agent（导入时起的名字）',
+    helpTypeCol: '任务类型（code、fix、docs…）；文字任务可用命令行 --type 指定，未指定时显示 —',
+    helpEffortCol: '派发时用的推理强度；— 表示用执行者默认',
+    helpSampleCol: '这一行统计了多少个已结束的任务。少于 5 个标"数据不足"，比例只能作参考',
+    helpFirstPassCol: '第一次尝试就通过门禁和审查的比例，越高越好。后面的小字是 95% 置信区间：样本越少区间越宽，例如 4 个任务全过是 51–100%，意思是真实通过率大概在这个范围里',
+    helpAttemptsCol: '每个任务平均派了几次才结束（含重试），越低越好；1 表示都是一次做完',
+    helpOutsideCol: '改了允许范围以外文件的任务比例，越低越好',
+    helpEscalationCol: '自动重试后换更强执行者的比例，越低越好；小字同样是 95% 置信区间',
+    helpMedianCol: '从派发到执行者结束的时间，取中间值（不受个别特别慢的任务影响），越短越好',
+    helpTokensCol: '平均每合并一个任务用掉的 token：斜杠前是输入（发给模型的），斜杠后是输出（模型写的），越低越省',
+    helpCostCol: '按页面下方填的单价估算的每个合并任务费用；没填单价显示 —，越低越省',
+    // 427：主导表的列头说明（原文由主导给定）。
+    helpLeadNameCol: '主导用的工具与模型（启动主导时记下的）；没记录到的显示未记录', helpSpecFailureCol: '门禁失败里，归因为任务说明本身的问题（漏列文件、验收命令写错、要求矛盾）的比例，越低越好：说明写得越清楚越低', helpSupplementCol: '主导重试时补充说明的次数，越少越好（说明一次写清楚）；目前还没有统计，显示 —', helpMergeMedianCol: '从派发到合并的时间，取中间值，越短越好',
+    higher: '越高越好', lower: '越低越好', helpPrefix: '说明：',
+    howSummary: '怎么看这张表',
+    howText: '每一行是一个执行者在某类任务、某个推理强度下的表现。先看"样本"够不够（至少 5 个）；再比"一次通过"（越高越好）和"平均尝试"（越低越好），判断谁更靠谱；同样靠谱时比"每个合并任务 token"和"费用"，选更省的。路由页可以按这些结果调整谁做哪类任务。',
+    ciTitle: (lo: number, hi: number) => `95% 置信区间 ${lo}–${hi}`,
+    tokensCell: (input: string, output: string) => `输入 ${input} / 输出 ${output}`,
+    sourcesLine: (n: number) => `统计包含 ${n} 个额外的数据目录（只读）· `,
+    sourcesSkipped: (n: number) => `（${n} 个目录读不到，已跳过）`,
+    sourcesManage: '在设置里管理',
 };

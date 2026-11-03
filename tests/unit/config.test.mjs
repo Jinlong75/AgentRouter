@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
 import { tmpdir } from 'node:os';
-import { readConfig, slotLimits, validateV2 } from '../../core/lib/config.mjs';
+import { readConfig, slotLimits, statsSourcesOf, validateV2 } from '../../core/lib/config.mjs';
 
 // 注入读取函数模拟不同平台的错误码：公共目录被一个文件占着时，Linux 读 config.json 得到 ENOTDIR，Windows 得到 ENOENT，
 // 在 Windows 上没法用真实的文件系统构造 ENOTDIR。
@@ -105,4 +105,17 @@ test('concurrencyMax：1～8 的整数，默认 8；其他值按默认并提示'
 test('autoCommit boolean validation', () => {
   for (const value of [true, false]) assert.doesNotThrow(() => validateV2({ v: 2, profiles: { fake: { adapter: 'fake', autoCommit: value } } }));
   for (const value of [null, 1, 'true', {}, []]) assert.throws(() => validateV2({ v: 2, profiles: { fake: { adapter: 'fake', autoCommit: value } } }), /profiles\.fake\.autoCommit/);
+});
+
+// 427：额外的统计数据目录是可选的字符串数组，每项必须是非空的绝对路径。
+test('statsSources：可选，但必须是绝对路径的数组，否则报原文', () => {
+  const message = 'config.json 的 statsSources 必须是绝对路径的数组';
+  const absolute = path.resolve(tmpdir(), 'ar-stats-source');
+  assert.deepEqual(statsSourcesOf({}), []);
+  assert.doesNotThrow(() => validateV2({ v: 2, statsSources: [] }));
+  assert.doesNotThrow(() => validateV2({ v: 2, statsSources: [absolute] }));
+  for (const bad of [null, 'x', [''], ['relative/path'], [1], {}, [absolute, 1], [null]]) {
+    assert.throws(() => validateV2({ v: 2, statsSources: bad }), { message }, JSON.stringify(bad));
+    assert.throws(() => statsSourcesOf({ statsSources: bad }), { message }, JSON.stringify(bad));
+  }
 });

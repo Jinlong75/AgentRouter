@@ -34,6 +34,9 @@ const committed = {
   'core/ar.mjs': 'export const dispatch = () => {};\n',
   'skills/agent-router/SKILL.md': '# 技能\n',
   'skills/lead-workflow/SKILL.md': '# 工作流技能\n',
+  'skills/lead-practices/SKILL.md': '# 主导实践技能\n',
+  'skills/lead-practices/references/closeout.md': '# 收尾\n',
+  'skills/lead-practices/references/examples.md': '# 示例\n',
   'installer/install.mjs': 'export const install = () => {};\n',
   'tools/hello.mjs': 'console.log("hello");\n',
   'tests/smoke.test.mjs': 'import test from "node:test";\ntest("占位", () => {});\n',
@@ -406,15 +409,12 @@ test('允许目录里未列入白名单的文档导致失败并列出', () => {
   assert.equal(existsSync(target), false, '文档白名单外时不写快照');
 });
 
-// —— 194：skills/ 只导出两个已发布技能；运行模板与限额样例说明补进白名单 ——
-test('194：两个已发布技能与两份新白名单文档正常导出；第三技能初稿即使有内部引用也不进入快照', () => {
+// 三个已发布技能与运行模板、限额样例说明均可导出。
+test('三个已发布技能与两份白名单文档正常导出', () => {
   const { repo, target } = makeRepo({
     ...committed,
     'core/templates/review-prompt.md': '# 审查运行时模板\n',
     'tests/fixtures/limits/README.md': '# 限额样例说明\n',
-    'skills/lead-practices/SKILL.md': '# 实践初稿\n见 ' + 'CHECK' + 'POINT' + '\n',
-    'skills/lead-practices/references/closeout.md': '见 ' + 'Master' + 'Plan 6.5\n',
-    'skills/lead-practices/references/examples.md': '见 ' + 'docs' + '/plan/' + 'Stage09.md' + '\n',
   });
   const { status, out } = run(repo, target);
   assert.equal(status, 0, out);
@@ -424,12 +424,14 @@ test('194：两个已发布技能与两份新白名单文档正常导出；第�
     assert.ok(files.includes(rel), `应导出：${rel}\n${out}`);
   }
   assert.deepEqual(files.filter(f => f.startsWith('skills/')),
-    ['skills/agent-router/SKILL.md', 'skills/lead-workflow/SKILL.md'], '只导出两个已发布技能');
+    ['skills/agent-router/SKILL.md', 'skills/lead-practices/SKILL.md',
+      'skills/lead-practices/references/closeout.md', 'skills/lead-practices/references/examples.md',
+      'skills/lead-workflow/SKILL.md'], '导出三个已发布技能');
   assert.ok(!out.includes('文档白名单外'), out);
   assert.ok(out.includes('最终结论：可推送'), out);
 });
 
-test('194：新白名单文档里的泄漏触发扫描失败；第三技能初稿不参与扫描也不导出', () => {
+test('194：新白名单文档和第三技能里的泄漏触发扫描失败', () => {
   for (const rel of ['core/templates/review-prompt.md', 'tests/fixtures/limits/README.md']) {
     const { repo, target } = makeRepo({ ...committed, [rel]: `# 文档\n见 ${'FakeLeak' + 'Name42'}\n` });
     const { status, out } = run(repo, target);
@@ -437,16 +439,18 @@ test('194：新白名单文档里的泄漏触发扫描失败；第三技能初�
     assert.ok(out.includes(`${rel}:2 个人信息 ***`), `${rel}：${out}`);
     assert.equal(existsSync(target), false, `${rel}：失败时不写快照`);
   }
-  // 同一类泄漏放进第三技能初稿：不在导出范围，既不扫描也不阻断导出。
+  // 第三技能已纳入导出，泄漏也须阻断导出。
   const { repo, target } = makeRepo({
     ...committed,
     'skills/lead-practices/SKILL.md': `见 ${'FakeLeak' + 'Name42'}\n`,
     'skills/lead-practices/references/closeout.md': `const k = '${'sk-' + 'a'.repeat(24)}';\n`,
   });
   const { status, out } = run(repo, target);
-  assert.equal(status, 0, out);
-  assert.ok(out.includes('扫描结果：个人信息 0、本机路径 0、密钥格式 0、内部文档引用 0'), out);
-  assert.ok(walk(target).every(f => !f.startsWith('skills/lead-practices/')), '第三技能初稿不导出');
-  assert.ok(out.includes('最终结论：可推送'), out);
+  assert.equal(status, 1, out);
+  assert.ok(out.includes('扫描结果：个人信息 1、本机路径 0、密钥格式 1、内部文档引用 0'), out);
+  assert.ok(out.includes('skills/lead-practices/SKILL.md:1 个人信息 ***'), out);
+  assert.ok(out.includes('skills/lead-practices/references/closeout.md:1 密钥格式 ***'), out);
+  assert.equal(existsSync(target), false, '扫描失败时不写快照');
+  assert.ok(out.includes('最终结论：失败'), out);
 });
 

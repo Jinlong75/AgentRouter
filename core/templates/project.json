@@ -7,5 +7,7 @@
   "verify": [],
   "allowedPaths": ["**"],
   "routing": { "rules": [] },
-  "worktree": true
+  "worktree": true,
+  "specRequired": { "sections": ["受影响的已有测试"], "types": ["code", "fix", "test", "refactor"] },
+  "reportRequired": { "sections": ["推断清单", "TODO(lead)", "已知问题"], "types": ["code", "fix", "test", "refactor"] }
 }

@@ -6,13 +6,14 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { readConfig, builtinConfig, loadConfig, updateConfig, configInvalid, validateV2 } from './config.mjs';
+import { readConfig, builtinConfig, loadConfig, registerGenericEnvDefaults, updateConfig, configInvalid, validateV2 } from './config.mjs';
 import { resolveSecret, secretStatus, setUserSecret } from './secrets.mjs';
 import { PROBE_TIMEOUT_MS, formatProbe, listUrls, maskSecrets, parseCodexModels, probeApi, probeEnv } from './probe.mjs';
 import { resolveLauncher as resolveCodexLauncher } from '../adapters/codex.mjs';
+import { resolveLauncher as resolveClaudeLauncher } from '../adapters/claude-code.mjs';
 import { authOf, buildEnv, ensureSandboxHome, secretSources } from './env.mjs';
 import { adapterFor, adapters, genericDeclaration, resolveProfile } from '../adapters/index.mjs';
-import { makeGeneric } from '../adapters/generic.mjs';
+import { declarationLauncher, makeGeneric } from '../adapters/generic.mjs';
 import { validateGeneric } from './generic-schema.mjs';
 import { killProcessTree, pidAlive, redactPaths } from './process.mjs';
 import { trace, traced, tracing } from './trace.mjs';
@@ -25,10 +26,47 @@ const AUTH_VALUES = ['login', 'token'];
 const validEnvName = name => typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+const presetText = value => (typeof value === 'string' && value !== '' ? value : null);
+
+// 建议和 fit 回填共用的预设匹配：名字、接口地址与认证方式、通用程序名或 provider。
+function matchSuggestionPreset(name, profile, presets, config) {
+  const same = presets.find(p => p.name === name && p.profile.adapter === profile.adapter);
+  if (same) return same.profile;
+  const kind = presets.filter(p => p.profile.adapter === profile.adapter && (p.profile.provider != null) === (profile.provider != null));
+  if (profile.adapter === 'claude-code') {
+    const url = presetText(profile.env?.ANTHROPIC_BASE_URL);
+    if (url) return kind.find(p => p.profile.env?.ANTHROPIC_BASE_URL === url)?.profile ?? null;
+    // 没有接口地址：官方 Claude，按用到的密钥变量名分辨。
+    const secrets = Object.keys(isObject(profile.secrets) ? profile.secrets : {});
+    return kind.find(p => !p.profile.env?.ANTHROPIC_BASE_URL && Object.keys(p.profile.secrets ?? {}).some(key => secrets.includes(key)))?.profile ?? null;
+  }
+  if (profile.adapter === 'generic') {
+    const decl = isObject(profile.genericDecl) ? profile.genericDecl : isObject(profile.generic) ? profile.generic : config.generics?.[profile.generic];
+    const executable = presetText(decl?.executable);
+    return executable ? kind.find(p => p.profile.generic?.executable === executable)?.profile ?? null : null;
+  }
+  return kind[0]?.profile ?? null;
+}
+
+// 列表与路由建议共用逐项覆盖后的适配信息。
+export function suggestionPresetOf(name, profile, presets, config) {
+  const preset = matchSuggestionPreset(name, profile, presets, config);
+  if (!preset?.fit && !profile.fit) return preset;
+  const fit = { good: profile.fit?.good ?? preset?.fit?.good ?? [], avoid: profile.fit?.avoid ?? preset?.fit?.avoid ?? [] };
+  return { ...preset, fit };
+}
+
 // 全部预设对象，按 order 升序（没有 order 的按 0 排在最前）；order 相同时按文件名排，结果不随文件系统顺序变。
 export function presetObjects() {
   return readdirSync(presetDir).filter(f => f.endsWith('.json')).sort().map(f => loadPreset(f.slice(0, -5)))
     .sort((a, b) => (a.profile.order ?? 0) - (b.profile.order ?? 0));
+}
+
+// 部署元数据只属于预设，不写入执行者配置或预设摘要。
+export function deployPreset() {
+  const preset = presetObjects().find(({ profile }) => profile.deploy?.package);
+  if (!preset) throw new Error('没有可部署的预设');
+  return { name: preset.name, title: preset.profile.title, package: preset.profile.deploy.package };
 }
 
 export function listPresets() {
@@ -52,11 +90,21 @@ export function loadPreset(name) {
   return { name: presetName ?? name, profile };
 }
 
+// 已导入的配置也补上预设后来加的环境变量和运行时要求：名字对得上预设时采用该预设的默认值，
+// 名字对不上时按程序名找（导入后改过名的声明）。对应不到预设的返回空对象，config.mjs 不会改它。
+registerGenericEnvDefaults((name, decl) => {
+  const presets = presetObjects().filter(({ profile }) => profile.adapter === 'generic' && isObject(profile.generic));
+  const executable = presetText(decl?.executable);
+  const preset = presets.find(p => p.name === name) ?? (executable ? presets.find(p => p.profile.generic.executable === executable) : undefined);
+  return preset ? { env: preset.profile.generic.env, requiresSystemNode: preset.profile.generic.requiresSystemNode } : {};
+});
+
+// TODO(lead): 各预设 fit 按现有任务类型保守填写，缺少证据的避免项待主导定稿。
 // 预设里只给界面下拉用的说明字段：add 时不写进 config.json，presets --json 里有就输出。
 // types：预设建议的任务类型；listModels：列出模型用的命令行参数（ar agents models 用）。
 // card / variant：导入向导把同一服务的几个预设合成一张卡片（card），第 2 步用 variant 的分段按钮选具体预设。
 // supportsEffort：预设声明这个执行者不支持推理强度时写 false（Stage07c 154，D87）；没写等于支持。
-const PRESET_ONLY = ['modelOptions', 'effortOptions', 'supportsEffort', 'baseUrlOptions', 'listModels', 'types', 'card', 'variant'];
+const PRESET_ONLY = ['modelOptions', 'effortOptions', 'supportsEffort', 'baseUrlOptions', 'listModels', 'types', 'card', 'variant', 'fit'];
 
 // 带 card 的预设按 card.id 分组：同组的 card 与 variant.label 必须一致，且 variant 完整，否则是模板错误。
 export function checkPresetCards(presets) {
@@ -87,13 +135,29 @@ function presetSummary({ name, profile }) {
     supportsEffort: profile.supportsEffort !== false,
     // 预设给了默认模型 / 推理强度（例如 Qoder 国内版）：软件导入第 2 步的下拉据此选中初始值。
     ...(typeof profile.model === 'string' && profile.model ? { model: profile.model } : {}), ...(typeof profile.effort === 'string' && profile.effort ? { effort: profile.effort } : {}),
-    ...Object.fromEntries(PRESET_ONLY.filter(key => profile[key] !== undefined).map(key => [key, profile[key]])) };
+    ...Object.fromEntries(PRESET_ONLY.filter(key => key !== 'fit' && profile[key] !== undefined).map(key => [key, profile[key]])) };
 }
 
 // 每项的模型名：适配器能算就由适配器算（Claude Code 读 env.ANTHROPIC_MODEL），否则取配置里的 model 字段。
 function modelOf(adapter, profile) {
   if (adapter?.modelName) return adapter.modelName({ profile }) ?? null;
   if (profile.adapter === 'codex') return profile.model ?? null;
+  return null;
+}
+
+// Node 写的执行者在软件里跑在哪种运行时上（430 第 4 条）：system = 系统 Node，bundled = 软件自带。
+// 只有软件里（Electron）有区别；不在 Electron 里时 process.execPath 本身就是 Node，不输出。
+// 程序找不到或声明有误时也不输出：那是检测的问题，不是运行时。
+function runtimeOf(profile, config, env) {
+  if (!process.versions.electron) return null;
+  try {
+    if (profile.adapter === 'claude-code') return resolveClaudeLauncher(env, process.platform, profile.path ?? null).runtime ?? null;
+    if (profile.adapter === 'codex') return resolveCodexLauncher(env, process.platform, profile.path ?? null).runtime ?? null;
+    if (profile.adapter === 'generic') {
+      const { decl } = genericDeclaration(profile, config);
+      return declarationLauncher(decl, env)?.runtime ?? null;
+    }
+  } catch { /* 找不到程序或声明有误：没有 runtime。 */ }
   return null;
 }
 
@@ -108,6 +172,7 @@ export function listAgents(home, { env = process.env, query, detect = false, tra
   let selected = null;
   try { selected = step('agents list 确定默认执行者', () => loadConfig(home, {}, {}).profileName); } catch { /* 没有可用执行者时不标默认。 */ }
   const lastTests = step('agents list 读测试结果', () => readTestResults(home));
+  const presets = presetObjects();
   const rows = Object.entries(config.profiles ?? {}).map(([name, p]) => {
     // generic 执行者的适配器由 config.generics 里的声明现做；声明有问题时是一个检测必然失败的适配器。
     let adapter;
@@ -118,7 +183,11 @@ export function listAgents(home, { env = process.env, query, detect = false, tra
     // tracePrefix 只用于追踪标签，适配器忽略没有的字段；不改变 detect / loginStatus 的行为。
     const detectOptions = { env, settings: p, profile: p, ...(tracePrefix ? { tracePrefix } : {}) };
     const row = { name, adapter: p.adapter, label: p.label ?? adapter?.label ?? p.adapter, enabled: p.enabled !== false, supported: !!adapter, default: name === selected, auth,
-      model: modelOf(adapter, p), lastTest: lastTests[name] ?? null };
+      model: modelOf(adapter, p), lastTest: lastTests[name] ?? null, ...(p.autoCommit !== undefined ? { autoCommit: p.autoCommit } : {}) };
+    const runtime = runtimeOf(p, config, env);
+    if (runtime) row.runtime = runtime;
+    const fit = suggestionPresetOf(name, p, presets, config)?.fit;
+    if (fit) row.fit = fit;
     const detection = detect && adapter?.detect ? adapter.detect(detectOptions) : null;
     const secretNames = Object.values(p.secrets ?? {});
     // token：各个密钥变量是否已设置（只有 set / missing）；login：适配器能检测时显示是否已登录。
@@ -205,7 +274,7 @@ function buildPresetAgent({ preset, name, label, model, baseUrl, secretVar, auth
   if (!validProfileName(target)) throw new Error(`执行者名无效：${String(target).slice(0, 40)}（小写字母、数字、连字符）`);
   const p = structuredClone(profile);
   // 预设里给软件下拉用的说明字段，不写进 config.json。
-  for (const key of PRESET_ONLY) delete p[key];
+  for (const key of [...PRESET_ONLY, 'deploy']) delete p[key];
   // 通用适配器预设：声明写进 config.generics.<执行者名>，执行者配置里的 generic 只写这个名字。
   let declaration = null;
   if (p.adapter === 'generic' && isObject(p.generic)) { declaration = p.generic; p.generic = target; }
@@ -235,6 +304,37 @@ export function addAgent(home, { preset, name, label, model, baseUrl, secretVar,
   });
   const warnings = effortWarning(effort, profile.effortOptions);
   return { name: target, preset, madeDefault, secrets: Object.values(p.secrets ?? {}), ...(warnings.length ? { warnings } : {}) };
+}
+
+// 保留已有执行者设置，只更新通用声明里的程序路径。
+export function importDsh(home, executable) {
+  const built = buildPresetAgent({ preset: deployPreset().name });
+  updateConfig(home, config => {
+    config.profiles ??= {};
+    const existing = config.profiles[built.target];
+    if (!existing) {
+      config.generics ??= {};
+      if (config.generics[built.target] !== undefined) throw new Error('已有同名通用适配器声明');
+      built.declaration.executable = executable;
+      config.generics[built.target] = built.declaration;
+      config.profiles[built.target] = built.p;
+      if (shouldBecomeDefault(config, built.p.adapter)) config.defaultProfile = built.target;
+    } else {
+      if (existing.adapter !== 'generic') throw new Error('同名执行者不是通用适配器，无法更新程序路径');
+      let decl = typeof existing.generic === 'string' ? config.generics?.[existing.generic] : existing.generic;
+      if (!decl || typeof decl !== 'object') throw new Error('同名执行者缺少通用适配器声明');
+      if (typeof existing.generic === 'string' && Object.entries(config.profiles).some(([name, profile]) =>
+        name !== built.target && profile.generic === existing.generic)) {
+        const base = `${built.target}-deploy`;
+        let name = base;
+        for (let suffix = 2; config.generics[name] !== undefined; suffix++) name = `${base}-${suffix}`;
+        decl = structuredClone(decl);
+        config.generics[name] = decl;
+        existing.generic = name;
+      }
+      decl.executable = executable;
+    }
+  });
 }
 
 // 通用适配器声明对应的执行者配置：add --generic 与导入单独声明共用。
@@ -267,8 +367,50 @@ export function addGenericAgent(home, { name, decl, label }) {
 export function updateAgent(home, name, opts) {
   const config = updateConfig(home, config => {
     const profile = config.profiles?.[name];
-    if (!profile) throw new Error(`找不到执行者：${name}`);
+    if (!profile) {
+      const error = new Error(`找不到执行者：${name}`);
+      if (opts.price !== undefined) error.priceUpdate = true;
+      throw error;
+    }
+    if (opts.price !== undefined) {
+      if (opts.price === '') {
+        if (config.prices) delete config.prices[name];
+      } else {
+        const parts = opts.price.split('/');
+        const decimal = /^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/;
+        const input = Number(parts[0]), output = Number(parts[1]);
+        if (parts.length !== 3 || !decimal.test(parts[0]) || !decimal.test(parts[1]) || !Number.isFinite(input) || !Number.isFinite(output) || !['CNY', 'USD'].includes(parts[2])) {
+          const error = new Error('价格格式应为非负输入单价/非负输出单价/CNY或USD');
+          error.priceUpdate = true;
+          throw error;
+        }
+        config.prices ??= {};
+        config.prices[name] = { input, output, currency: parts[2] };
+      }
+    }
+    for (const key of ['good', 'avoid']) {
+      if (opts[key] === undefined) continue;
+      if (opts[key] === '-') {
+        if (profile.fit) {
+          delete profile.fit[key];
+          if (!Object.keys(profile.fit).length) delete profile.fit;
+        }
+      } else {
+        profile.fit ??= {};
+        profile.fit[key] = opts[key].split(/[；;]/).map(item => item.trim()).filter(Boolean);
+      }
+    }
     applyProfileOptions(profile, opts);
+    if (opts.autoCommit !== undefined) {
+      if (opts.autoCommit === 'on') profile.autoCommit = true;
+      else if (opts.autoCommit === 'off') {
+        // 适配器默认开的（codex）必须写 false；删字段会退回默认开。
+        let adapter = null;
+        try { adapter = adapterFor(profile, { config, tolerant: true }); } catch { /* 适配器有问题时按没有默认处理。 */ }
+        if (adapter?.autoCommitDefault === true) profile.autoCommit = false;
+        else delete profile.autoCommit;
+      } else throw new Error('--auto-commit 必须为 on 或 off');
+    }
     // 升级目标：必须是已有执行者且不是自己；空串删除这一项。
     if (opts.escalate !== undefined) {
       if (opts.escalate === '') delete profile.escalate;
@@ -750,6 +892,12 @@ function writeAtomicJson(home, file, value) {
   finally { rmSync(temp, { force: true }); }
 }
 
+// 这个执行者上一次连接测试的记录（deployDsh 比较两次失败原因用）；没有记录时为 null。
+export function lastTestResult(home, name) {
+  const entry = readTestResults(home)[name];
+  return entry && typeof entry === 'object' ? entry : null;
+}
+
 // 把一次测试的结果按执行者名写进 agent-tests.json（供 list 的 lastTest 读取）。
 function writeTestResult(home, name, entry) {
   const file = path.join(home, 'agent-tests.json');
@@ -846,6 +994,7 @@ export async function testAgent(home, name, { env = process.env, scriptPath, tim
   const config = state.exists ? state.config : builtinConfig();
   const profile = config.profiles?.[name];
   if (!profile) throw new Error(`找不到执行者：${name}`);
+  const runtime = runtimeOf(profile, config, env);
   trace(`agents test ${name} 开始（超时 ${timeoutSeconds} 秒）`);
   const base = traced('agents test 创建临时目录', () => mkdtempSync(path.join(tmpdir(), 'ar-agent-test-')));
   trace(`agents test 临时目录：${redactPaths(base, [base])}`);
@@ -878,6 +1027,7 @@ export async function testAgent(home, name, { env = process.env, scriptPath, tim
     const error = child.spawnError ? `无法启动派发进程：${child.spawnError}` : child.timedOut ? `超过 ${timeoutSeconds} 秒没有结束，测试已停止`
       : ok ? null : errors.at(-1) ?? `测试未通过（exit=${child.exit}）`;
     const result = { name, ok, exit: child.exit, timedOut: child.timedOut, seconds, version: startLine?.agentVersion ?? null, model: startLine?.model ?? null,
+      ...(runtime ? { runtime } : {}),
       report: report?.slice(0, 200) ?? null, usage: turns.at(-1)?.usage ?? null, errors: errors.slice(-3), error };
     writeTestResult(home, name, { at: Date.now(), ok, seconds, version: result.version, error });
     return result;
@@ -907,7 +1057,7 @@ const parseMaxTurns = value => {
 };
 const parseTimeout = value => { const n = Number(value); if (!Number.isFinite(n) || n <= 0) throw new Error('--timeout 必须为正的秒数'); return n; };
 
-const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> [--probe] | models --preset <预设> [--model <模型>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] [--probe] | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]（单独的声明必须加 --name）';
+const usageAgents = 'ar agents list [--detect] | add --preset <预设> [--name <名>] [--label <显示名>] [--model <模型>] [--effort <级别>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] | add --generic <声明JSON> --name <名> [--label <显示名>] | update <名> [--label <显示名>] [--model <模型>] [--effort <级别>|""] [--base-url <地址>] [--secret-var <变量名>] [--max-turns <正整数>|-] [--escalate <名>|""] [--auto-commit on|off] [--price <输入>/<输出>/<CNY|USD>|""] [--good "<...>"|""|-] [--avoid "<...>"|""|-] | default <名> | remove <名> | enable <名> | disable <名> | test <名> [--timeout <秒>] | test --decl <声明JSON> [--timeout <秒>] | detect --decl <声明JSON> | presets | models <名> [--probe] | models --preset <预设> [--model <模型>] [--base-url <地址>] [--secret-var <变量名>] [--auth login|token] [--probe] | validate <文件> | validate --decl <声明JSON> | export <名> [--out <文件>] [--force] | import <文件> [--name <名>] [--force]（单独的声明必须加 --name）';
 
 // 不带 --probe 的 models 输出：预设的可选值或程序的列表。
 function modelsReply(r) {
@@ -935,6 +1085,7 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath,
         const key = a.slice(2);
         if (flags.includes(key)) { opts[key] = true; continue; }
         if (!keys.includes(key) || i + 1 >= args.length || args[i + 1].startsWith('--')) throw new Error(`用法：${usageAgents}`);
+        if (sub === 'update' && key === 'price' && opts[key] !== undefined) throw new Error(`用法：${usageAgents}`);
         opts[key] = args[++i];
       } else positional.push(a);
     }
@@ -951,7 +1102,7 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath,
       const detect = args.includes('--detect');
       if (args.length !== (detect ? 1 : 0)) throw new Error(`用法：${usageAgents}`);
       const agents = listAgents(home, { env, detect, traceSteps: true });
-      return { result: { ok: true, agents }, text: formatList(agents) };
+      return { result: { ok: true, agents }, text: formatList(agents, autoCommitDefaultNames(home)) };
     }
     case 'presets': {
       if (args.length) throw new Error(`用法：${usageAgents}`);
@@ -976,10 +1127,15 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath,
         ...(added.warnings ?? []), line].filter(Boolean).join('\n') };
     }
     case 'update': {
-      const { opts, positional } = parseOptions(['label', 'model', 'effort', 'base-url', 'secret-var', 'max-turns', 'escalate']);
+      const { opts, positional } = parseOptions(['label', 'model', 'effort', 'base-url', 'secret-var', 'max-turns', 'auto-commit', 'escalate', 'price', 'good', 'avoid']);
       if (positional.length !== 1 || !positional[0] || positional[0].startsWith('--')) throw new Error(`用法：${usageAgents}`);
-      if (!['label', 'model', 'effort', 'base-url', 'secret-var', 'max-turns', 'escalate'].some(k => opts[k] !== undefined)) throw new Error(`用法：${usageAgents}`);
-      const r = updateAgent(home, positional[0], { label: opts.label, model: opts.model, effort: opts.effort, escalate: opts.escalate, baseUrl: opts['base-url'], secretVar: opts['secret-var'], maxTurns: opts['max-turns'] === undefined ? undefined : parseMaxTurns(opts['max-turns']) });
+      if (!['label', 'model', 'effort', 'base-url', 'secret-var', 'max-turns', 'auto-commit', 'escalate', 'price', 'good', 'avoid'].some(k => opts[k] !== undefined)) throw new Error(`用法：${usageAgents}`);
+      let r;
+      try { r = updateAgent(home, positional[0], { good: opts.good, avoid: opts.avoid, price: opts.price, label: opts.label, model: opts.model, effort: opts.effort, autoCommit: opts['auto-commit'], escalate: opts.escalate, baseUrl: opts['base-url'], secretVar: opts['secret-var'], maxTurns: opts['max-turns'] === undefined ? undefined : parseMaxTurns(opts['max-turns']) }); }
+      catch (error) {
+        if (!error.priceUpdate) throw error;
+        return { result: { ok: false, error: error.message }, text: error.message, code: 1 };
+      }
       return { result: { ok: true, name: r.name, profile: r.profile, ...(r.warnings ? { warnings: r.warnings } : {}) }, text: [`已更新执行者 ${r.name}`, ...(r.warnings ?? [])].join('\n') };
     }
     case 'models': {
@@ -1070,18 +1226,31 @@ export async function agentsCommand(rest, { home, env = process.env, scriptPath,
       const timeoutSeconds = opts.timeout === undefined ? 180 : parseTimeout(opts.timeout);
       const r = await testAgent(home, positional[0], { env, scriptPath, timeoutSeconds });
       const { ok, error, ...fields } = r;
-      return { result: { ok, ...fields, ...(ok ? {} : { error }) }, code: ok ? 0 : 1,
-        text: r.timedOut ? `测试超时：${r.name}，超过 ${timeoutSeconds} 秒没有结束，已停止`
-          : `${r.ok ? '连接正常' : '测试未通过'}：${r.name}，exit=${r.exit}，用时 ${r.seconds} 秒${r.usage ? `，输入 ${r.usage.input ?? '?'} / 输出 ${r.usage.output ?? '?'} tokens` : ''}${r.ok || !r.errors.length ? '' : `\n${r.errors.join('\n')}`}` };
+      const line = r.timedOut ? `测试超时：${r.name}，超过 ${timeoutSeconds} 秒没有结束，已停止`
+        : `${r.ok ? '连接正常' : '测试未通过'}：${r.name}，exit=${r.exit}，用时 ${r.seconds} 秒${r.usage ? `，输入 ${r.usage.input ?? '?'} / 输出 ${r.usage.output ?? '?'} tokens` : ''}${r.ok || !r.errors.length ? '' : `\n${r.errors.join('\n')}`}`;
+      const bundled = r.runtime === 'bundled' ? '用的是 AgentRouter 自带的 Node（系统里没找到 Node.js）；个别执行者不支持，装上 Node.js 后重新检测' : null;
+      return { result: { ok, ...fields, ...(ok ? {} : { error }) }, code: ok ? 0 : 1, text: [line, bundled].filter(Boolean).join('\n') };
     }
     default: throw new Error(`用法：${usageAgents}`);
   }
 }
 
-function formatList(agents) {
+// 适配器默认代提交的执行者名：只给文字输出用，不改变 list --json 已有的行形状。
+function autoCommitDefaultNames(home) {
+  try {
+    const state = readConfig(home);
+    const config = state.exists ? state.config : state.legacy?.config ?? builtinConfig();
+    return new Set(Object.entries(config.profiles ?? {}).filter(([, profile]) => {
+      if (!isObject(profile) || profile.autoCommit !== undefined) return false;
+      try { return adapterFor(profile, { config, tolerant: true })?.autoCommitDefault === true; } catch { return false; }
+    }).map(([name]) => name));
+  } catch { return new Set(); }
+}
+
+function formatList(agents, defaultAutoCommit = new Set()) {
   if (!agents.length) return '还没有执行者：运行 ar agents add --preset <预设>（ar agents presets 查看可用预设）';
   const auth = a => a.auth === 'login' ? `订阅登录${a.login === 'in' ? '（已登录）' : a.login === 'out' ? '（未登录）' : ''}` : `密钥 ${Object.entries(a.secrets).map(([n, s]) => `${n}：${s === 'set' ? '已设置' : '未设置'}`).join('、')}`;
-  return ['执行者：', ...agents.map(a => `  ${a.name}  ${a.label}（${a.adapter}）  ${a.enabled ? '已启用' : '已停用'}${a.supported ? '' : '  不支持的类型'}${a.default ? '  默认' : ''}  ${auth(a)}`)].join('\n');
+  return ['执行者：', ...agents.map(a => `  ${a.name}  ${a.label}（${a.adapter}）  ${a.enabled ? '已启用' : '已停用'}${a.supported ? '' : '  不支持的类型'}${a.default ? '  默认' : ''}${a.autoCommit === true ? '  代提交：开' : defaultAutoCommit.has(a.name) ? '  代提交：开（默认）' : ''}  ${auth(a)}${a.fit ? `  擅长：${a.fit.good.join('、')}；避免：${a.fit.avoid.join('、')}` : ''}`)].join('\n');
 }
 
 // ar secrets status [名…] / ar secrets set <名>：值只从标准输入读（不进命令行参数、不回显），写入 Windows 用户环境变量。

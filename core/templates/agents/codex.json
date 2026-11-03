@@ -9,5 +9,6 @@
   "recommended": false,
   "effortOptions": ["minimal", "low", "medium", "high", "xhigh"],
   "types": ["code", "fix", "refactor"],
-  "order": 7
+  "order": 7,
+  "fit": {"good": ["逻辑代码、修复、重构与补测试", "只读审查"], "avoid": ["在 Windows 上大段中文文本编辑（易出编码错误）"]}
 }

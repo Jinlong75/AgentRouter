@@ -1,0 +1,34 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fixture, git, write } from '../fixtures/review/pipeline-fixture.mjs';
+
+test('重试和重跑门禁持久化说明，自动审查及再审按顺序收到原文', async t => {
+  const f = fixture(t, { reviewers: [{ name: 'rev', modes: 'pass' }] });
+  const spec = f.spec('docs/specs/901-说明.md', { review: true, maxRetries: 0, verify: ['node scripts/check.mjs'] });
+  const first = await f.dispatch(spec, '说明');
+  assert.equal(first.code, 3, first.stderr);
+  f.executor.writes = [{ path: 'src/ok.txt', content: '通过\n' }];
+  f.executor.commit = '补充验收文件';
+  f.writeConfig();
+  const note = '主导决定 X\n保留原文';
+  const retry = await f.json(['retry', '说明', '--note', note]);
+  assert.equal(retry.code, 0, retry.stderr);
+  const attempt = n => path.join(f.dir('说明'), 'attempts', String(n));
+  assert.equal(readFileSync(path.join(attempt(2), 'note.md'), 'utf8'), note);
+  assert.ok(readFileSync(path.join(attempt(2), 'review', 'prompt.md'), 'utf8').includes(note));
+  const wt = f.events('说明').find(row => row.event === 'worktree').dir;
+  write(path.join(wt, 'src/extra.txt'), '新增\n');
+  git(wt, ['add', '--', 'src/extra.txt']);
+  git(wt, ['commit', '-q', '-m', '补充改动', '--', 'src/extra.txt']);
+  const regate = await f.json(['retry', '说明', '--regate', '--note', '主导决定 Y']);
+  assert.equal(regate.code, 0, JSON.stringify(regate));
+  assert.equal(readFileSync(path.join(attempt(3), 'note.md'), 'utf8'), '主导决定 Y');
+  const prompt = readFileSync(path.join(attempt(3), 'review', 'prompt.md'), 'utf8');
+  assert.ok(prompt.indexOf(note) >= 0 && prompt.indexOf(note) < prompt.indexOf('主导决定 Y'));
+  const rereview = await f.json(['review', '说明']);
+  assert.equal(rereview.code, 0, rereview.stderr);
+  const again = readFileSync(path.join(attempt(3), 'review-2', 'prompt.md'), 'utf8');
+  assert.ok(again.includes(note) && again.includes('主导决定 Y'));
+});

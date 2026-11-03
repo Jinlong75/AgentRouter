@@ -123,11 +123,11 @@ test('401 → 退回预设，reason 含 401，models 是预设的 modelOptions�
   assert.equal(r.code, 0, '退回预设是正常结果');
   assert.equal(r.json.ok, false); assert.equal(r.json.source, 'preset');
   assert.match(r.json.reason, /^接口返回 401：密钥无效或没有权限/);
-  assert.deepEqual(r.json.models, ['deepseek-v4-pro', 'deepseek-v4-flash']);
+  assert.deepEqual(r.json.models, ['deepseek-v4-flash', 'deepseek-v4-pro']);
   assert.ok(!('details' in r.json));
   assert.equal(api.hits.length, 1);
   const text = await ctx.call(['agents', 'models', 'deepseek', '--probe'], env);
-  assert.match(text.text, /^没有查到（接口返回 401：密钥无效或没有权限.*）?，用预设的可选值：\n {2}deepseek-v4-pro\n {2}deepseek-v4-flash\n推理强度：low \/ medium \/ high \/ xhigh \/ max$/);
+  assert.match(text.text, /^没有查到（接口返回 401：密钥无效或没有权限.*）?，用预设的可选值：\n {2}deepseek-v4-flash\n {2}deepseek-v4-pro\n推理强度：low \/ medium \/ high \/ xhigh \/ max$/);
 });
 
 test('超时（注入短超时）→ 退回预设，原因写明没有响应', async t => {
@@ -285,8 +285,8 @@ test('不带 --probe 的输出和原来逐字节相同（对照 agents-import �
   await ctx.call(['agents', 'add', '--preset', 'claude-native']);
   const j = await ctx.call(['agents', 'models', 'deepseek', '--json']);
   assert.equal(j.code, 0);
-  assert.equal(JSON.stringify(j.json), JSON.stringify({ ok: true, models: ['deepseek-v4-pro', 'deepseek-v4-flash'], source: 'preset' }));
-  assert.equal((await ctx.call(['agents', 'models', 'deepseek'])).text, '模型（预设的可选值）：\n  deepseek-v4-pro\n  deepseek-v4-flash');
+  assert.equal(JSON.stringify(j.json), JSON.stringify({ ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'], source: 'preset' }));
+  assert.equal((await ctx.call(['agents', 'models', 'deepseek'])).text, '模型（预设的可选值）：\n  deepseek-v4-flash\n  deepseek-v4-pro');
   assert.equal(JSON.stringify((await ctx.call(['agents', 'models', 'claude-native', '--json'])).json), JSON.stringify({ ok: true, models: [], source: 'preset' }));
   assert.equal((await ctx.call(['agents', 'models', 'claude-native'])).text, '没有可选的模型列表');
 });
@@ -367,14 +367,14 @@ test('169：没有设置密钥变量 → 退回预设的可选值，reason 写�
   const r = await ctx.call([...base, '--probe', '--json']);
   assert.equal(r.code, 0);
   assert.deepEqual([r.json.ok, r.json.source, r.json.reason], [false, 'preset', '没有设置密钥环境变量 DEEPSEEK_API_KEY']);
-  assert.deepEqual(r.json.models, ['deepseek-v4-pro', 'deepseek-v4-flash']);
+  assert.deepEqual(r.json.models, ['deepseek-v4-flash', 'deepseek-v4-pro']);
   const named = await ctx.call([...base, '--secret-var', 'PREIMPORT_MISSING_KEY', '--probe', '--json']);
   assert.equal(named.json.reason, '没有设置密钥环境变量 PREIMPORT_MISSING_KEY');
   assert.equal(api.hits.length, 0);
   // 不带 --probe：返回预设的可选值，和 ar agents models <名> 一样。
   const plain = await ctx.call(['agents', 'models', '--preset', 'deepseek', '--json']);
-  assert.equal(JSON.stringify(plain.json), JSON.stringify({ ok: true, models: ['deepseek-v4-pro', 'deepseek-v4-flash'], source: 'preset' }));
-  assert.equal((await ctx.call(['agents', 'models', '--preset', 'deepseek'])).text, '模型（预设的可选值）：\n  deepseek-v4-pro\n  deepseek-v4-flash');
+  assert.equal(JSON.stringify(plain.json), JSON.stringify({ ok: true, models: ['deepseek-v4-flash', 'deepseek-v4-pro'], source: 'preset' }));
+  assert.equal((await ctx.call(['agents', 'models', '--preset', 'deepseek'])).text, '模型（预设的可选值）：\n  deepseek-v4-flash\n  deepseek-v4-pro');
 });
 
 test('169：名字和 --preset 同时给 / 都不给 / 预设不存在 / 参数不合法 → 报错，退出码 2', async t => {

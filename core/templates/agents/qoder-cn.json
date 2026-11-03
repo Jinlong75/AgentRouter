@@ -5,12 +5,14 @@
   "enabled": true,
   "auth": "token",
   "secrets": { "QODERCN_PERSONAL_ACCESS_TOKEN": "QODERCN_PERSONAL_ACCESS_TOKEN" },
-  "model": "DeepSeek-Flash",
-  "effort": "ultracode",
+  "model": null,
+  "effort": null,
   "generic": {
     "label": "Qoder（国内版）",
     "executable": "qoderclicn",
     "detect": ["--version"],
+    "env": { "QODERCLI_PRINT_BG_WAIT_CEILING_MS": "0" },
+    "interactive": { "args": [], "model": ["-m", "{model}"], "effort": ["--reasoning-effort", "{effort}"] },
     "args": ["-p", "--output-format", "stream-json", "--permission-mode", "bypass_permissions", "--no-session-persistence", "-m", "{model}", "--reasoning-effort", "{effort}"],
     "readOnlyArgs": ["-p", "--output-format", "stream-json", "--permission-mode", "dont_ask", "--tools", "Read", "Grep", "Glob", "--no-session-persistence", "-m", "{model}", "--reasoning-effort", "{effort}"],
     "stdin": "{prompt}",
@@ -29,5 +31,6 @@
   "recommended": false,
   "card": { "id": "qoder", "title": "Qoder", "description": "国内版或国际版，用个人访问令牌；适合调研、阅读类任务，也能写代码" },
   "variant": { "label": "版本", "option": "国内版", "help": "程序 qoderclicn，在 qoder.cn 的账户集成页生成个人访问令牌" },
-  "order": 8
+  "order": 8,
+  "fit": {"good": ["只读调研与长文阅读", "耗时长的杂务（读日志、整理证据）"], "avoid": []}
 }

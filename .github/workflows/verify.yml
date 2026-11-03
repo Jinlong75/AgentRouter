@@ -50,8 +50,8 @@ jobs:
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # verify 不启动 Electron，省下载时间
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
@@ -67,8 +67,8 @@ jobs:
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'   # verify 不启动 Electron，省下载时间
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
@@ -81,7 +81,7 @@ jobs:
         if: always()
         run: echo "dir=$(node -p "require('os').tmpdir()")/agent-router-verify" >> "$GITHUB_OUTPUT"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-verify-logs
           path: ${{ steps.logdir.outputs.dir }}
@@ -97,8 +97,8 @@ jobs:
       NODETEST: ${{ github.event.inputs.nodetest }}
       REPEAT: ${{ github.event.inputs.repeat }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
@@ -112,8 +112,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.21.0'
           cache: npm
@@ -128,8 +128,8 @@ jobs:
     # 界面检查 v0.7.5 是 1572 项，CI 上 30 分钟跑不完（v0.7.0 的 1424 项已用 28 分 44 秒），放宽到 50 分钟；只改超时，不改检查。
     timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           # 只有 H1 负载实验要用与 Electron 内置 Node 相同的版本（24.21.0），其余情况仍是 24。
           node-version: ${{ github.event.inputs.h1 == 'load' && '24.21.0' || '24' }}
@@ -138,7 +138,7 @@ jobs:
       # 字体缓存：MiSans 全量包（约 20 MB，hyperos.mi.com）在托管运行器上下载曾超时。键取 tools/fonts.mjs 的哈希
       # （其中固定了字体版本与 SHA-256），换字体自动失效；命中时跳过下载，build 复制时仍逐个核对 SHA-256。
       - id: fonts-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/fonts
           key: fonts-${{ hashFiles('tools/fonts.mjs') }}
@@ -241,7 +241,7 @@ jobs:
           ENVTEST: ${{ github.event.inputs.envtest }}
         run: ./tools/ci-env-experiment.ps1 -Group $env:ENVTEST -Phase after
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shots
           path: app/dist/shots/

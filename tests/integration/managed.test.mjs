@@ -620,7 +620,8 @@ for (const managed of [false, true]) test(`停止命令结束多层假进程，�
   else fs.writeFileSync(f.configFile, JSON.stringify({ ...json(f.configFile), managed: false }));
   const name = '停止 中文 任务';
   const waiter = f.launch(f.script, ['隔离任务', '--name', name]);
-  await until(() => fs.existsSync(path.join(f.base, 'descendant.json')));
+  // 假子孙进程 writeFileSync 先建文件再写内容：只看存在可能读到空文件，等到能解析出 pid 再继续。
+  await until(() => { try { return json(path.join(f.base, 'descendant.json')).pid; } catch { return null; } });
   const [start, , spawned] = rows(f.home), descendant = json(path.join(f.base, 'descendant.json')).pid;
   // 失败时残留的假 agent 与子孙（命令行都带本 fixture 的临时目录）由 fixture 的 cleanupProcesses 按身份结束，这里不再按 PID 结束。
   const identities = await captureIdentities([start.pid, spawned.agentPid, descendant]);
@@ -650,7 +651,8 @@ for (const signal of ['SIGINT','SIGTERM','SIGBREAK','SIGHUP']) test(`信号 ${si
   const wrapper = path.join(f.base, 'signal-entry.mjs');
   fs.writeFileSync(wrapper, `process.on('message',s=>process.emit(s));await import(${JSON.stringify(pathToFileURL(f.script).href)});`);
   const child = f.launch(wrapper, ['隔离任务']);
-  await until(() => fs.existsSync(path.join(f.base, 'descendant.json')));
+  // 假子孙进程 writeFileSync 先建文件再写内容：只看存在可能读到空文件，等到能解析出 pid 再继续。
+  await until(() => { try { return json(path.join(f.base, 'descendant.json')).pid; } catch { return null; } });
   const spawned = rows(f.home).find(r => r.event === 'spawned'), descendant = json(path.join(f.base, 'descendant.json')).pid;
   // 失败时残留的假 agent 与子孙（命令行都带本 fixture 的临时目录）由 fixture 的 cleanupProcesses 按身份结束，这里不再按 PID 结束。
   const identities = await captureIdentities([spawned.agentPid, descendant]);

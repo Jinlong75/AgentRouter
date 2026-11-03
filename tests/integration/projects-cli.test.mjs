@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const entry = fileURLToPath(new URL('../../core/ar.mjs', import.meta.url));
-const initFiles = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', '.gitignore'];
+const initFiles = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', 'docs/autonomy/README.md', 'handoff.md', '.gitignore'];
 
 function fixture(t) {
   const base = fs.mkdtempSync(path.join(tmpdir(), '项目命令 测试 '));

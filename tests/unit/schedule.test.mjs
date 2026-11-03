@@ -379,7 +379,7 @@ test('独占标记：建立、重复建立被拒、释放只删自己的；占�
   assert.equal(await readExclusive(options), null);
   const release = await acquireExclusive({ ...options, id: 'a', name: 'A', command: 'npm run shots', pid: 100 });
   const file = path.join(home, 'slots', 'exclusive.json');
-  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { id: 'a', pid: 100, created: 1000, at: 5000, name: 'A', command: 'npm run shots' });
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { id: 'a', pid: 100, created: 1000, at: 5000, name: 'A', command: 'npm run shots', scope: 'full' });
   assert.equal((await readExclusive(options)).name, 'A');
   assert.equal(await acquireExclusive({ ...options, id: 'b', name: 'B', command: 'x', pid: 200 }), null, '别人的标记还在');
   release(); release();
@@ -544,6 +544,20 @@ test('createTaskLimit：每一轮按 readLimits 给的 memLowPercent 判断内�
   assert.equal(await limit(), 4, '改回 5% 且满 30 秒后恢复');
 });
 
+test('自动档读到自动调整后的上限时以它为准（升降档影响实际名额），仍受 max 约束', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'ar-adjusted-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const loadFile = path.join(home, 'load.json');
+  writeFileSync(loadFile, JSON.stringify({ busy: false, cpu: 20 }));
+  let info = { limits: { concurrency: 1 }, mode: 'auto', estimate: 4, max: 8, adjusted: true, memLowPercent: 5 };
+  const limit = createTaskLimit({ home, readLimits: () => info, env: { AR_TEST_LOAD_FILE: loadFile } });
+  assert.equal(await limit(), 1, '降档到 1：不按估算值 4');
+  info = { ...info, limits: { concurrency: 6 } };
+  assert.equal(await limit(), 6, '升档到 6：立即生效，不等估算缓存过期');
+  info = { ...info, limits: { concurrency: 9 } };
+  assert.equal(await limit(), 8, '不超过 concurrencyMax');
+});
+
 test('createTaskLimit + acquireSlot：返回 0 时不占名额，恢复后才占', async t => {
   const home = tmp(t);
   let paused = true;
@@ -554,4 +568,20 @@ test('createTaskLimit + acquireSlot：返回 0 时不占名额，恢复后才占
   const release = await pending;
   assert.deepEqual(readdirSlots(home), ['slot-1.json']);
   release();
+});
+
+test('createTaskLimit：聚焦独占放行任务，旧标记按完全独占处理', async t => {
+  const home = tmp(t);
+  const lines = [], events = [];
+  const deps = { home, ...fakes([100]) };
+  const limit = createTaskLimit({ ...deps, readLimits: () => ({ limits: { concurrency: 3 }, mode: 'fixed' }), progress: line => lines.push(line), registry: event => events.push(event), id: 'new' });
+  const release = await acquireExclusive({ ...deps, id: 'd', name: 'D', command: 'shots --focus x', scope: 'focus', pid: 100, created: 1000 });
+  assert.equal(await limit(), 3);
+  assert.equal(limit.paused(), false);
+  assert.deepEqual(lines, []);
+  assert.deepEqual(events, []);
+  release();
+  writeFileSync(path.join(home, 'slots', 'exclusive.json'), JSON.stringify({ id: 'old', pid: 100, created: 1000, name: '旧', command: 'shots' }));
+  assert.equal(await limit(), 0);
+  assert.equal(events[0].reason, 'exclusive');
 });

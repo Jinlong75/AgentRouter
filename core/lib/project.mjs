@@ -31,6 +31,9 @@ export function loadTemplates(dir = templateDir) {
     project: (name, baseBranch) => read('project.json').replace('"{name}"', JSON.stringify(name)).replace('"{baseBranch}"', JSON.stringify(baseBranch)),
     agentsBlock: read('agents-block.md').trimEnd(),
     specsReadme: read('specs-README.md'),
+    autonomy: read('autonomy.md'),
+    handoff: read('handoff.md'),
+    target: read('target.md'),
     role: role => read(`roles/${role}.md`),
   };
 }
@@ -111,13 +114,14 @@ export function detectBaseBranch(root, current = gitBranch(root)) {
   return { name: current, step: 4, source: named ? '取当前分支（第 4 步）' : '还没有分支名，用 main（第 4 步）' };
 }
 
-export function planInit(root, templates = loadTemplates(), base = null) {
+export function planInit(root, templates = loadTemplates(), base = null, target = false) {
   root = resolve(root);
   gitRoot(root);
   const { name: branch } = base ?? detectBaseBranch(root);
   const plan = [];
   const create = (rel, content) => { if (read(root, rel) === null) plan.push({ path: rel, action: 'create', content }); };
   create('.agent-router/project.json', templates.project(basename(root), branch));
+  if (target) create('.agent-router/target.md', templates.target);
   const agents = read(root, 'AGENTS.md'), block = `${BEGIN}\n${templates.agentsBlock}\n${END}`;
   if (agents === null) plan.push({ path: 'AGENTS.md', action: 'create', content: `# ${basename(root)}\n\n${block}\n` });
   else plan.push({ path: 'AGENTS.md', action: 'update', content: agents.includes(BEGIN) && agents.includes(END)
@@ -128,6 +132,9 @@ export function planInit(root, templates = loadTemplates(), base = null) {
   else if (!/@AGENTS\.md/.test(claude)) plan.push({ path: 'CLAUDE.md', action: 'update', content: `${claude.trimEnd()}\n\n@AGENTS.md\n` });
   for (const role of ['lead', 'worker', 'reviewer']) create(`docs/roles/${role}.md`, templates.role(role));
   create('docs/specs/README.md', templates.specsReadme);
+  // TODO(lead): 已有暂离模板与内置模板不同时，升级预览如何展示差异需确定。
+  create('docs/autonomy/README.md', templates.autonomy);
+  create('handoff.md', templates.handoff);
   const ignore = read(root, '.gitignore');
   if (!/^\/?\.agent-runs\/?\s*$/m.test(ignore ?? '')) plan.push({ path: '.gitignore', action: ignore === null ? 'create' : 'update', content: `${(ignore ?? '').trimEnd()}\n.agent-runs/\n`.trimStart() });
   // 去掉内容没有变化的项：重复运行时计划为空。
@@ -158,6 +165,13 @@ export function readProjects(home) {
   } catch (error) { if (error.code === 'ENOENT') return []; throw new Error(`projects.json 无法读取（${error.message}）`); }
 }
 const saveProjects = (home, projects) => writeAtomic(projectsFile(home), `${JSON.stringify({ v: 1, projects }, null, 2)}\n`);
+
+export function registeredProject(home, root) {
+  root = resolve(root);
+  const project = readProjects(home).find(p => same(p.path, root));
+  if (!project) throw new Error(`没有登记这个项目：${root}`);
+  return project;
+}
 
 export function registerProject(home, root, now = Date.now()) {
   root = resolve(root);
@@ -194,6 +208,16 @@ async function projectStatus(p) {
   const isGit = exists ? await gitTopAsync(root) !== null : false;
   return { ...p, exists, git: isGit, initialized: exists && read(root, '.agent-router/project.json') !== null };
 }
+export function readLeadStrictConfig(root) {
+  const raw = read(root, '.agent-router/project.json');
+  let value;
+  // R2-1（主导）：配置存在却无法解析时不能静默关掉严格模式，受保护的命令一律停下。
+  try { value = raw === null ? {} : parseJson(raw); } catch (error) { throw new Error(`项目配置无法解析，严格模式无法判断，先修好 .agent-router/project.json：${error.message}`); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('项目配置无效：project.json 必须是对象');
+  if (value.leadStrict !== undefined && typeof value.leadStrict !== 'boolean') throw new Error('项目配置无效：leadStrict');
+  if (value.leadAckHours !== undefined && (!Number.isInteger(value.leadAckHours) || value.leadAckHours <= 0)) throw new Error('项目配置无效：leadAckHours');
+  return { leadStrict: value.leadStrict ?? false, leadAckHours: value.leadAckHours ?? 12 };
+}
 function readProjectConfig(root) {
   const raw = read(root, '.agent-router/project.json');
   if (raw === null) return { config: null, configError: null };
@@ -226,7 +250,7 @@ function projectShow(home, root) {
     identity: isGit ? gitIdentity(root) : null,
     globalIdentity: hasGlobalIdentity(),
     initialized: exists && read(root, '.agent-router/project.json') !== null,
-    config, configError,
+    config, configError, lead: project.lead ?? null,
     lastTask: lastTask(home, root),
     // 远程状态（Stage07b 128）：只读本地已有的远程跟踪分支，不联网；地址已去掉用户名密码。
     remote: isGit ? remoteSummary(root) : null };
@@ -310,25 +334,39 @@ function applyProjectSetting(config, root, key, value) {
     default: throw new Error(`不能改这个键：${key}`);
   }
 }
-function projectConfig(root, assignments) {
+function projectConfig(root, assignments, home) {
   root = resolve(root);
+  const leadAssignments = assignments.filter(a => /^lead\.(model|effort)=/.test(a));
+  const onlyLead = assignments.length > 0 && leadAssignments.length === assignments.length;
+  if (leadAssignments.length) registeredProject(home, root);
   const raw = read(root, '.agent-router/project.json');
-  if (raw === null) throw new Error('项目还没有初始化：先运行 ar init');
+  if (raw === null && !onlyLead) throw new Error('项目还没有初始化：先运行 ar init');
   let config;
-  try { config = parseJson(raw); } catch (error) { throw new Error(`project.json 无法解析：${error.message}`); }
+  try { config = raw === null ? {} : parseJson(raw); } catch (error) { throw new Error(`project.json 无法解析：${error.message}`); }
   if (!assignments.length) return { config };
   const next = structuredClone(config);
+  const projects = leadAssignments.length ? readProjects(home) : null;
+  const project = projects?.find(p => same(p.path, root));
+  if (projects && !project) throw new Error(`没有登记这个项目：${root}`);
   for (const a of assignments) {
     const eq = a.indexOf('=');
     if (eq <= 0) throw new Error(`用法：键=值（${a}）`);
-    applyProjectSetting(next, root, a.slice(0, eq), a.slice(eq + 1));
+    const key = a.slice(0, eq), value = a.slice(eq + 1);
+    if (key === 'lead.model' || key === 'lead.effort') {
+      if (/[\r\n]/.test(value)) throw new Error(`${key} 不能含换行`);
+      if (value.startsWith('-')) throw new Error(`${key} 不能以 - 开头`);
+      const lead = project.lead = { ...project.lead };
+      if (value) lead[key.slice(5)] = value; else delete lead[key.slice(5)];
+      if (!Object.keys(lead).length) delete project.lead;
+    } else applyProjectSetting(next, root, key, value);
   }
-  writeAtomic(join(root, '.agent-router/project.json'), `${JSON.stringify(next, null, 2)}\n`);
-  return { config: next };
+  if (assignments.length !== leadAssignments.length) writeAtomic(join(root, '.agent-router/project.json'), `${JSON.stringify(next, null, 2)}\n`);
+  if (projects) saveProjects(home, projects);
+  return { config: next, ...(projects ? { lead: project.lead ?? null } : {}) };
 }
 
 // commit-init 只提交 ar init 管理的这几个路径，绝不 git add -A / git add .。
-const INIT_FILES = ['.agent-router/project.json', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', '.gitignore'];
+const INIT_FILES = ['.agent-router/project.json', '.agent-router/target.md', 'AGENTS.md', 'CLAUDE.md', 'docs/roles/lead.md', 'docs/roles/worker.md', 'docs/roles/reviewer.md', 'docs/specs/README.md', 'docs/autonomy/README.md', 'handoff.md', '.gitignore'];
 const tail = text => String(text ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(-6).join('；');
 const AGENT_RUNS_PREFIX = '.agent-runs/';
 
@@ -474,10 +512,10 @@ export function diffSummary(oldText, newText) {
 }
 
 // 升级计划：普通 init 计划 + 角色文档差异 + 配置缺少的顶层键。项目必须已初始化。
-function planUpgrade(root, base) {
+function planUpgrade(root, base, target) {
   if (read(root, '.agent-router/project.json') === null) throw new Error('这个项目还没有初始化：先运行 ar init，再用 ar init --upgrade 更新协作约定');
   const templates = loadTemplates();
-  const plan = planInit(root, templates, base);
+  const plan = planInit(root, templates, base, target);
   const roleDiffs = [];
   for (const role of ROLES) {
     const rel = `docs/roles/${role}.md`, current = read(root, rel);
@@ -504,9 +542,9 @@ function appendConfigFields(text, fields) {
 const backupStamp = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`; };
 const listArg = (value, what) => { if (value === undefined) return []; const list = String(value).split(',').map(s => s.trim()).filter(Boolean); if (!list.length) throw new Error(`${what} 需要至少一个名字，用逗号分隔`); return list; };
 
-function upgradeCommand(root, { home, json, dryRun, replaceRoles, addFields }) {
+function upgradeCommand(root, { home, json, dryRun, target, replaceRoles, addFields }) {
   const base = detectBaseBranch(root);
-  const { plan, roleDiffs, configFields } = planUpgrade(root, base);
+  const { plan, roleDiffs, configFields } = planUpgrade(root, base, target);
   if (dryRun) {
     const items = [
       ...plan.map(({ path, action, content }) => ({ path, action, content, preview: previewOf(root, { path, action, content }) })),
@@ -562,7 +600,7 @@ function previewOf(root, change) {
   return change.content.startsWith(existing) ? change.content.slice(existing.length).trim() : change.content;
 }
 export function initCommand(rest, { home, cwd, json }) {
-  const usage = '用法：ar init [项目路径] [--dry-run] | ar init --upgrade [项目路径] [--dry-run] [--replace-role <角色,…>] [--add-field <键,…>]';
+  const usage = '用法：ar init [项目路径] [--dry-run] [--target] | ar init --upgrade [项目路径] [--dry-run] [--target] [--replace-role <角色,…>] [--add-field <键,…>]';
   const flags = { replaceRole: undefined, addField: undefined };
   const args = [];
   for (let i = 0; i < rest.length; i++) {
@@ -571,15 +609,15 @@ export function initCommand(rest, { home, cwd, json }) {
       flags[rest[i] === '--replace-role' ? 'replaceRole' : 'addField'] = rest[++i];
     } else args.push(rest[i]);
   }
-  const dryRun = args.includes('--dry-run'), upgrade = args.includes('--upgrade');
-  const positional = args.filter(a => a !== '--dry-run' && a !== '--upgrade');
-  if (positional.length > 1 || positional.some(a => a.startsWith('--')) || (!upgrade && (flags.replaceRole !== undefined || flags.addField !== undefined))) throw new Error(usage);
+  const dryRun = args.includes('--dry-run'), upgrade = args.includes('--upgrade'), target = args.includes('--target');
+  const positional = args.filter(a => a !== '--dry-run' && a !== '--upgrade' && a !== '--target');
+  if (args.filter(a => a === '--target').length > 1 || positional.length > 1 || positional.some(a => a.startsWith('--')) || (!upgrade && (flags.replaceRole !== undefined || flags.addField !== undefined))) throw new Error(usage);
   const root = resolve(cwd, positional[0] ?? '.');
   requireModernGit('init');
   gitRoot(root);
-  if (upgrade) return upgradeCommand(root, { home, json, dryRun, replaceRoles: listArg(flags.replaceRole, '--replace-role'), addFields: listArg(flags.addField, '--add-field') });
+  if (upgrade) return upgradeCommand(root, { home, json, dryRun, target, replaceRoles: listArg(flags.replaceRole, '--replace-role'), addFields: listArg(flags.addField, '--add-field') });
   const base = detectBaseBranch(root);
-  const plan = planInit(root, undefined, base);
+  const plan = planInit(root, undefined, base, target);
   const changes = dryRun ? plan.map(({ path, action }) => ({ path, action })) : applyInit(root, plan, home);
   // 主分支只有这次要新建 project.json 时才有意义（已有的不改）；--dry-run 的计划里写出取到的值和来源。
   const baseInfo = dryRun && plan.some(p => p.path === '.agent-router/project.json') ? { name: base.name, step: base.step, source: base.source } : null;
@@ -616,6 +654,7 @@ function projectShowText(p) {
   const lines = [`项目：${p.name}`, `  路径：${p.path}`, `  目录存在：${p.exists ? '是' : '否'}`, `  git 仓库：${p.git ? '是（分支 ' + p.branch + '）' : '否'}`];
   if (p.git) lines.push(`  未提交改动：${p.dirty} 项（不含 .agent-runs/）`);
   lines.push(`  已初始化：${p.initialized ? '是' : '否'}`);
+  if (p.lead) lines.push(`  主导启动参数：${JSON.stringify(p.lead)}`);
   if (p.remote?.exists) {
     const relation = { same: '和远程一样', ahead: `领先 ${p.remote.ahead} 个提交`, behind: `落后 ${p.remote.behind} 个提交`, diverged: `领先 ${p.remote.ahead}、落后 ${p.remote.behind} 个提交（分叉）`, noUpstream: '远程还没有这个分支' }[p.remote.state];
     lines.push(`  远程：${p.remote.name}（${p.remote.url}）${relation ? `，${relation}` : ''}${p.remote.credentialInUrl ? '，地址里带了凭据，不能推送' : ''}`);
@@ -718,8 +757,8 @@ export async function projectsCommand(rest, { home, homes = [home], env = proces
     case 'config': {
       const [target, ...assignments] = args;
       if (!target || target.startsWith('--')) throw new Error(usageProjects);
-      const r = projectConfig(resolve(cwd, target), assignments);
-      if (json) return { ok: true, config: r.config };
+      const r = projectConfig(resolve(cwd, target), assignments, home);
+      if (json) return { ok: true, ...r };
       return JSON.stringify(r.config, null, 2);
     }
     case 'git-init': {

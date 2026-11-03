@@ -46,6 +46,12 @@ test('最小合法文本型', () => {
   assert.deepEqual(r, { ok: true, errors: [], warnings: [] });
 });
 
+test('requiresSystemNode 只接受布尔值', () => {
+  for (const value of [true, false]) assert.equal(validateGeneric(textDecl({ requiresSystemNode: value })).ok, true);
+  const result = validateGeneric(textDecl({ requiresSystemNode: 'yes' }), { path: 'custom' });
+  assert.deepEqual(result.errors, [{ path: 'custom.requiresSystemNode', message: 'requiresSystemNode 必须是 true 或 false' }]);
+});
+
 test('最小合法 JSONL 型', () => {
   const r = validateGeneric(jsonlDecl([sayRule]));
   assert.deepEqual(r, { ok: true, errors: [], warnings: [] });

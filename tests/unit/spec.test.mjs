@@ -355,8 +355,8 @@ test('core/templates/spec.md 的 effort / model 示例是注释，复制出来�
   assert.deepEqual(parsed.warnings, []);
 });
 
-test('SPEC_TYPES 是协议里的七种类型', () => {
-  assert.deepEqual(SPEC_TYPES, ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review']);
+test('SPEC_TYPES 是协议里的八种类型', () => {
+  assert.deepEqual(SPEC_TYPES, ['code', 'test', 'fix', 'refactor', 'research', 'docs', 'review', 'chore']);
 });
 
 test('reviewer / review_block（Stage08 T3）：认识的字段，没有"不认识的字段"警告；没写是 undefined', () => {
@@ -380,4 +380,10 @@ test('reviewer / review_block：类型不对报错并带行号', () => {
   fails('---\nid: 1\nreview_block: all\n---\n', { line: 3, match: /review_block 只能是 none 或 high（当前：all）/, validate: true });
   fails('---\nid: 1\nreview_block: HIGH\n---\n', { line: 3, match: /review_block 只能是 none 或 high/, validate: true });
   fails('---\nid: 1\nreview: yes\n---\n', { line: 3, match: /review 必须是 true 或 false/, validate: true });
+});
+
+test('任务报告小节字段校验', () => {
+  const parsed = parseSpec('---\ntype: code\nreport_sections:\n  - 反向实验\n---\n');
+  assert.deepEqual(validateSpec(parsed).report_sections, ['反向实验']);
+  for (const value of ['report_sections: abc', 'report_sections:\n  - ""']) assert.throws(() => validateSpec(parseSpec(`---\ntype: code\n${value}\n---\n`)), /report_sections 必须是非空字符串数组/);
 });

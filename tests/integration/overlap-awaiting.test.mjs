@@ -59,7 +59,7 @@ function fixture(t) {
   // 假执行者：改这个文件、提交；fail 为真时不提交（门禁报“没有提交任何改动”，任务失败）。
   f.setProfile = ({ file, content, fail = false } = {}) => write(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake', concurrency: 4,
-    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...(file && !fail ? { writes: [{ path: file, content }], commit: `假执行者：改 ${file}` } : {}) } },
+    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...(file && !fail ? { writes: [{ path: file, content }], commit: `假执行者：改 ${file}` } : {}) } },
   }));
   f.spec = (name, allowed, expectCommit = false) => {
     const rel = `docs/specs/${name}.md`;
@@ -165,7 +165,7 @@ test('3 批准甲之后，与它重叠的待验收乙自动按新基线重跑门
 
   const accepted = await f.json(['accept', '甲']);
   assert.equal(accepted.code, 0, accepted.stderr + JSON.stringify(accepted.json));
-  assert.deepEqual(Object.keys(accepted.json).sort(), ['cleanup', 'merge', 'mode', 'ok', 'rebased']);
+  assert.deepEqual(Object.keys(accepted.json).sort(), ['acceptHints', 'checks', 'cleanup', 'fullVerify', 'hints', 'merge', 'mode', 'ok', 'rebased']);
   assert.deepEqual(accepted.json.rebased, [y.id], '只有重叠的乙');
   assert.equal(accepted.json.ok, true);
   const mergeCommit = git(f.repo, ['rev-parse', 'main']);
@@ -217,7 +217,9 @@ test('4 accept 的文字输出多一行"已安排重跑门禁：…"，退出码
   const lines = accepted.stdout.trimEnd().split(/\r?\n/);
   assert.match(lines[0], /^已合并：甲（合并提交 [0-9a-f]{7}）$/);
   assert.equal(lines[1], '已安排重跑门禁：乙（与 甲 的改动范围重叠，按合并后的新基线重跑，不启动执行者）');
-  assert.equal(lines.length, 2);
+  assert.match(lines[2], /^还没有通过的全量验收，已合入 1 个任务$/);
+  assert.ok(lines.some(line => line.includes('ar spec impact ')));
+  assert.equal(lines.at(-1), '验收与文档核对的自查：ar lead practices 4、ar lead practices 8');
   await until(() => f.events(y.id).filter(row => row.event === 'end').length >= 2, '乙重跑门禁结束');
 });
 

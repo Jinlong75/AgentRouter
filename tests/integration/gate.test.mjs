@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runGate } from '../../core/lib/gate.mjs';
@@ -57,6 +57,7 @@ test('全部通过：改动在范围内并已提交，验收命令退出 0', asy
   // 056：scope 多了 protected / deleted 两个数组（协议 12.3），其余字段与原断言一致。
   assert.deepEqual(gate.scope, { allowed: ['src/**'], changed: ['src/a.js'], outside: [], protected: [], deleted: [] });
   assert.equal(gate.commands.length, 1);
+  assert.equal(Object.hasOwn(gate, 'skippedVerify'), false);
   assert.equal(gate.commands[0].exit, 0);
   assert.equal(gate.commands[0].error, null);
   assert.equal(gate.commands[0].timedOut, false);
@@ -133,15 +134,50 @@ test('未提交：没提交的改动算失败，.agent-runs/ 里的文件不算'
   assert.equal(gate.summary, '有未提交的文件');
 });
 
-test('没提交：expect_commit 为真且 HEAD 等于 base 时失败', async t => {
-  const { root, base, dir } = fixture(t);
-
-  const gate = await runGate({ root, base, dir, spec: specOf({ expect_commit: true }) });
+test('exclusive verification is skipped only for a clean worktree without a commit', async t => {
+  const { root, dir } = fixture(t);
+  write(path.join(root, '.agent-router/project.json'), JSON.stringify({ exclusiveCommands: ['  node exclusive.js  '] }));
+  write(path.join(root, 'exclusive.js'), "require('node:fs').writeFileSync('verify-marker', 'ran')\n");
+  write(path.join(root, 'exclusive.js-extra'), "console.log('cheap ran')\n");
+  commitAll(root, 'configure');
+  const base = headSha(root);
+  const skipped = ['node exclusive.js', 'node exclusive.js --focus x'];
+  const cheap = 'node exclusive.js-extra';
+  const gate = await runGate({ root, base, dir, spec: specOf({
+    expect_commit: true, verify: [skipped[0], cheap, skipped[1]],
+  }) });
   assert.equal(gate.head, base);
   assert.deepEqual(gate.commit, { required: true, ok: false });
   assert.deepEqual(gate.scope.changed, []);
   assert.equal(gate.ok, false);
-  assert.equal(gate.summary, '没有提交任何改动');
+  assert.equal(gate.summary, '\u6ca1\u6709\u63d0\u4ea4\u4efb\u4f55\u6539\u52a8');
+  assert.equal(gate.commands.length, 1, '跳过的独占命令不进 commands');
+  assert.equal(gate.commands[0].exit, 0);
+  assert.match(gate.commands[0].output, /cheap ran/);
+  assert.deepEqual(gate.skippedVerify, skipped);
+  assert.equal(existsSync(path.join(root, 'verify-marker')), false);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'gate.json'), 'utf8')), gate);
+});
+
+test('没提交但工作区有改动：验收命令仍运行并保留输出', async t => {
+  const { root, base, dir } = fixture(t);
+  write(path.join(root, 'src/a.js'), '未提交的改动\n');
+  write(path.join(root, 'new.txt'), '未跟踪的文件\n');
+  const exclusive = `node -e "console.log('verify ran'); process.exit(1)"`;
+  write(path.join(root, '.agent-router/project.json'), JSON.stringify({ exclusiveCommands: [exclusive] }));
+
+  const gate = await runGate({ root, base, dir, spec: specOf({
+    expect_commit: true, verify: [exclusive],
+  }) });
+  assert.deepEqual(gate.commit, { required: true, ok: false });
+  assert.ok(gate.uncommitted.includes('src/a.js'));
+  assert.ok(gate.uncommitted.includes('new.txt'));
+  assert.equal(gate.commands.length, 1);
+  assert.deepEqual(gate.commands[0].argv, ['node', '-e', "console.log('verify ran'); process.exit(1)"]);
+  assert.equal(gate.commands[0].exit, 1);
+  assert.match(gate.commands[0].output, /verify ran/);
+  assert.equal(Object.hasOwn(gate, 'skippedVerify'), false);
+  assert.equal(gate.ok, false);
 });
 
 test('研究类：不要求提交、不改文件、没有验收命令时通过', async t => {
@@ -151,6 +187,7 @@ test('研究类：不要求提交、不改文件、没有验收命令时通过',
   assert.deepEqual(gate.commit, { required: false, ok: true });
   assert.deepEqual(gate.uncommitted, []);
   assert.deepEqual(gate.commands, []);
+  assert.equal(Object.hasOwn(gate, 'skippedVerify'), false);
   assert.equal(gate.ok, true);
   assert.equal(gate.summary, '门禁通过');
 });
@@ -164,6 +201,7 @@ test('验收失败：一条失败不中断后续命令', async t => {
     }),
   });
   assert.equal(gate.commands.length, 2);
+  assert.equal(Object.hasOwn(gate, 'skippedVerify'), false);
   assert.equal(gate.commands[0].exit, 1);
   assert.match(gate.commands[0].output, /x/);
   assert.equal(gate.commands[1].exit, 0, gate.commands[1].error ?? gate.commands[1].output);
@@ -217,6 +255,7 @@ test('git 出错时不抛出：记成门禁失败，照样写 gate.json', async 
   assert.match(gate.summary, /^无法读取 git 状态：/);
   assert.equal(gate.commit.ok, false);
   assert.deepEqual(gate.commands, []);
+  assert.equal(Object.hasOwn(gate, 'skippedVerify'), false);
   const saved = JSON.parse(readFileSync(path.join(dir, 'gate.json'), 'utf8'));
   assert.equal(saved.ok, false);
   assert.equal(saved.summary, gate.summary);
@@ -373,6 +412,7 @@ test('删除的文件：记入 deleted，不单独让门禁失败', async t => {
   const base = headSha(root);
   git(root, ['rm', '-q', 'tests/old.test.js']);
   commitAll(root, '删掉旧测试');
+  write(path.join(dir, 'report.md'), '## 断言改写\n删除 tests/old.test.js 的原因。\n');
 
   const gate = await runGate({ root, base, dir, spec: specOf({ allowed_paths: ['**'], expect_commit: true }) });
   assert.equal(gate.ok, true);

@@ -64,7 +64,7 @@ function fixture(t, { project = {} } = {}) {
   const f = { base, remote, repo, home, env, since, count: 0 };
   f.setProfile = value => write(path.join(home, 'config.json'), JSON.stringify({
     v: 2, managed: false, watchWindow: 'never', defaultProfile: 'fake',
-    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n', exit: 0, ...value } },
+    profiles: { fake: { adapter: 'fake', label: '假执行者', enabled: true, events: [], report: '假汇报\n## 已知问题\n无\n', exit: 0, ...value } },
   }));
   f.setProfile({});
   f.ar = (args, { env: extra = {} } = {}) => new Promise((resolve, reject) => {
@@ -279,7 +279,8 @@ test('6 拒绝的情况：分支不存在、分支名无效、缺值、--no-work
     [[rel, '--base'], /--base 后面要写分支名/],
     [[rel, '--base', '--detach'], /--base 后面要写分支名/],
     [[rel, '--base', 'stage/x', '--no-worktree'], /--base 只用于 worktree 模式的任务（用任务说明派发、项目开启 worktree）/],
-    [['说一句话', '--base', 'stage/x'], /--base 只用于 worktree 模式的任务（用任务说明派发、项目开启 worktree）/],
+    // 425：项目开了 worktree 时文字任务也接受 --base（成功的情况见 text-worktree.test.mjs 用例 6）；加 --no-worktree 仍拒绝。
+    [['说一句话', '--base', 'stage/x', '--no-worktree'], /--base 只用于 worktree 模式的任务（用任务说明派发、项目开启 worktree）/],
     [[mainOnly, '--base', 'stage/x'], /任务说明还没提交到 stage\/x/],
   ];
   for (const [args, pattern] of cases) {
@@ -296,6 +297,10 @@ test('6 拒绝的情况：分支不存在、分支名无效、缺值、--no-work
   const off = await f.ar(['dispatch', rel, '--base', 'stage/x', '--json']);
   assert.equal(off.code, 2);
   assert.match(JSON.parse(off.stdout).error, /--base 只用于 worktree 模式的任务/);
+  // 项目不开 worktree 时，直接写任务文字带 --base 也拒绝（425）。
+  const offText = await f.ar(['dispatch', '说一句话', '--base', 'stage/x', '--json']);
+  assert.equal(offText.code, 2, offText.stderr + offText.stdout);
+  assert.match(JSON.parse(offText.stdout).error, /--base 只用于 worktree 模式的任务/);
   assert.equal(f.rows().filter(row => row.event === 'start').length, 0, '一个任务都没有开始');
 });
 
@@ -345,4 +350,81 @@ test('8 不带 --base 的对照：dispatch.json 与 start 没有 baseBranch，ar
   const result = await f.ar(['accept', '对照', '--json']);
   assert.equal(result.code, 0, result.stderr + result.stdout);
   assert.equal(git(f.repo, ['rev-parse', 'main']), JSON.parse(result.stdout).merge);
+});
+
+// 424：派发时"任务说明只在当前分支上"的 SPEC_BASE 带 current / base，软件据此给出"以当前分支为基线派发"。
+// 本文件原先是 136（--base）的测试；424 的三条按需求追加在后，不改前面的用例。
+test('9 主工作区在新分支、说明只提交在新分支：SPEC_BASE 带 current / base，原文不变，不留记录', async t => {
+  const f = fixture(t);
+  git(f.repo, ['switch', '-q', 'main']);
+  git(f.repo, ['switch', '-q', '-c', 'feat']);
+  const rel = f.spec('分支说明');
+
+  const result = await f.ar(['dispatch', rel, '--name', '基线拒绝', '--json']);
+  assert.equal(result.code, 2, result.stderr + result.stdout);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'SPEC_BASE');
+  const error = value.specCheck.errors[0];
+  assert.equal(error.code, 'SPEC_BASE');
+  assert.equal(error.message, '当前分支是 feat，与项目基线 main 不同；请显式指定 --base feat');
+  assert.equal(value.error, error.message, '顶层 error 与原文一致');
+  assert.equal(error.current, 'feat');
+  assert.equal(error.base, 'main');
+  assert.equal(f.rows().filter(row => row.event === 'start').length, 0, '拒绝时不留记录');
+});
+
+test('10 同一状态 --base feat --detach：成功派发，start 的 baseBranch 是 feat', async t => {
+  const f = fixture(t);
+  git(f.repo, ['switch', '-q', 'main']);
+  git(f.repo, ['switch', '-q', '-c', 'feat']);
+  f.setProfile({ writes: [{ path: 'src/a.js', content: 'feat 分支\n' }], commit: '假执行者：feat 分支' });
+  const rel = f.spec('分支说明');
+  const featHead = git(f.repo, ['rev-parse', 'feat']);
+
+  const result = await f.ar(['dispatch', rel, '--name', '当前分支', '--base', 'feat', '--detach', '--json']);
+  assert.equal(result.code, 0, result.stderr + result.stdout);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.detached, true);
+  assert.ok(value.id, '没有返回 id');
+  await until(() => f.start('当前分支'), 'start 行');
+  const start = f.start('当前分支');
+  assert.equal(start.baseBranch, 'feat');
+  assert.equal(start.base, featHead);
+  assert.equal(f.dispatchJson('当前分支').baseBranch, 'feat');
+  await until(() => f.events(value.id).some(row => row.event === 'end'), '假执行者结束');
+  assert.equal(f.events(value.id).findLast(row => row.event === 'end').exit, 0);
+});
+
+test('11 游离 HEAD：SPEC_BASE 没有 current 字段，仍用原文', async t => {
+  const f = fixture(t);
+  git(f.repo, ['switch', '-q', 'main']);
+  git(f.repo, ['switch', '-q', '-c', 'feat']);
+  const rel = f.spec('分支说明');
+  git(f.repo, ['switch', '-q', '--detach', 'feat']);
+
+  const result = await f.ar(['dispatch', rel, '--name', '游离 HEAD', '--json']);
+  assert.equal(result.code, 2, result.stderr + result.stdout);
+  const value = JSON.parse(result.stdout);
+  assert.equal(value.code, 'SPEC_BASE');
+  const error = value.specCheck.errors[0];
+  assert.equal(error.code, 'SPEC_BASE');
+  assert.equal(error.message, '当前处于游离 HEAD；请指定有效本地分支');
+  assert.ok(!('current' in error), '游离 HEAD 不带 current');
+  assert.ok(!('base' in error), '游离 HEAD 不带 base');
+});
+
+test('12 说明已在 main、主工作区停在新分支：说明检查这条 SPEC_BASE 同样带 current / base（主导补）', async t => {
+  const f = fixture(t);
+  git(f.repo, ['switch', '-q', 'main']);
+  const rel = f.spec('基线上的说明');
+  git(f.repo, ['switch', '-q', '-c', 'feat2']);
+
+  const result = await f.ar(['dispatch', rel, '--name', '基线拒绝二', '--json']);
+  assert.equal(result.code, 2, result.stderr + result.stdout);
+  const error = JSON.parse(result.stdout).specCheck.errors.find(e => e.code === 'SPEC_BASE');
+  assert.ok(error, '应有 SPEC_BASE');
+  assert.equal(error.message, '当前分支是 feat2，与项目基线 main 不同；请显式指定 --base feat2');
+  assert.equal(error.current, 'feat2');
+  assert.equal(error.base, 'main');
 });
